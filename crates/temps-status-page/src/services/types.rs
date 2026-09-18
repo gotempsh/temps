@@ -160,6 +160,12 @@ pub struct CreateMonitorRequest {
     pub name: String,
     pub monitor_type: String,
     pub environment_id: i32, // Required: monitors must be associated with an environment
+    /// How often to probe, in seconds. Defaults to 60 when omitted.
+    ///
+    /// **Clamped, not rejected**: values below 30 are stored as 30 and
+    /// non-positive values as 60, and the created monitor comes back with the
+    /// clamped value — so the response always reports the interval the
+    /// scheduler will actually use.
     #[serde(default)]
     pub check_interval_seconds: Option<i32>,
     #[serde(default)]
@@ -169,6 +175,38 @@ pub struct CreateMonitorRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateMonitorRequest {
     pub check_path: String,
+}
+
+/// Floor for `status_monitors.check_interval_seconds`.
+///
+/// A monitor configured below this would probe the deployment harder than the
+/// scheduler sweeps, and each probe costs up to 4 HTTP attempts with backoff.
+pub const MIN_CHECK_INTERVAL_SECS: i32 = 30;
+
+/// Interval used when a monitor's configured interval is missing or
+/// non-positive (`0` was the effective value for every row before the
+/// scheduler honoured the column at all).
+pub const DEFAULT_CHECK_INTERVAL_SECS: i32 = 60;
+
+/// Normalise a requested check interval into the value the scheduler will
+/// actually honour.
+///
+/// Out-of-range values are **clamped, not rejected**, and the clamped value is
+/// what gets stored and returned to the caller — so `GET` of a monitor always
+/// reports the interval the scheduler is really using. Rejecting instead would
+/// make an existing row (or a competitor import) unrepresentable, while
+/// silently storing `0` or `-120` and clamping only at sweep time is what let
+/// the API lie about its own behaviour.
+///
+/// - `<= 0` → [`DEFAULT_CHECK_INTERVAL_SECS`] (unset/garbage)
+/// - `0 < n < MIN` → [`MIN_CHECK_INTERVAL_SECS`]
+/// - otherwise unchanged
+pub fn normalize_check_interval_seconds(requested: i32) -> i32 {
+    if requested <= 0 {
+        DEFAULT_CHECK_INTERVAL_SECS
+    } else {
+        requested.max(MIN_CHECK_INTERVAL_SECS)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -182,6 +220,12 @@ pub struct MonitorResponse {
     pub monitor_url: String, // The URL being monitored (constructed from environment)
     pub check_interval_seconds: i32,
     pub is_active: bool,
+    /// When the scheduler will next probe this monitor. Read-only: it is
+    /// maintained by the health-check scheduler, never accepted on write.
+    /// `null` means the monitor has not been scheduled yet and is due on the
+    /// next sweep.
+    #[schema(value_type = Option<String>, format = "date-time")]
+    pub next_check_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time")]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = "date-time")]
@@ -354,6 +398,7 @@ impl From<temps_entities::status_monitors::Model> for MonitorResponse {
             monitor_url: String::new(), // Will be populated by service layer
             check_interval_seconds: model.check_interval_seconds,
             is_active: model.is_active,
+            next_check_at: model.next_check_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
         }

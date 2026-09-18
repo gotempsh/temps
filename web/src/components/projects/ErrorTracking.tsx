@@ -187,11 +187,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // change the query key, refire the fetch, and loop forever.
   const { startDate, endDate } = useMemo(
     () => getDateRangeFromFilter(dateFilter),
-    [
-      dateFilter.quickFilter,
-      dateFilter.dateRange?.from,
-      dateFilter.dateRange?.to,
-    ]
+    [dateFilter]
   )
   const timeRange = {
     startTime: (startDate ?? new Date()).toISOString(),
@@ -251,17 +247,12 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Determine if we have errors
   const hasErrors = hasErrorGroupsData?.has_error_groups || false
 
-  // Reset to page 1 whenever filters change
-  useEffect(() => {
+  const pageScope = `${statusFilter}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
+  const [previousPageScope, setPreviousPageScope] = useState(pageScope)
+  if (pageScope !== previousPageScope) {
+    setPreviousPageScope(pageScope)
     setPage(1)
-  }, [
-    statusFilter,
-    groupSort,
-    environmentFilter,
-    dateFilter.quickFilter,
-    dateFilter.dateRange?.from,
-    dateFilter.dateRange?.to,
-  ])
+  }
 
   // Fetch error groups for the project (only if we have errors)
   const { data: errorGroupsResponse, isLoading: isLoadingGroups } = useQuery({

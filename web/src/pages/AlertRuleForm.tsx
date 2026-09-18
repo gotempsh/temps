@@ -38,7 +38,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useMemo } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
@@ -168,7 +168,10 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     values: defaultValues,
   })
 
-  const watchedTriggerType = form.watch('trigger_type')
+  const watchedTriggerType = useWatch({
+    control: form.control,
+    name: 'trigger_type',
+  })
 
   const createMutation = useMutation({
     ...createAlertRuleMutation(),

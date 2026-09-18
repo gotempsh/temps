@@ -5781,7 +5781,9 @@ mod tests {
         // Create real docker log service for testing
         // For tests, we'll create a basic Docker connection (may fail but that's OK for tests)
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker.clone()));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
+            temps_core::DockerHandle::available(docker.clone()),
+        )));
 
         // Create mock deployer with all required methods
         let mut deployer = MockContainerDeployer::new();
@@ -5912,7 +5914,9 @@ mod tests {
             log_service: Arc::new(temps_logs::LogService::new(std::env::temp_dir())),
             config_service,
             queue_service,
-            docker_log_service: Arc::new(temps_logs::DockerLogService::new(docker.clone())),
+            docker_log_service: Arc::new(temps_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::available(docker.clone()),
+            ))),
             docker,
             deployer,
             encryption_service: create_test_encryption_service(),
@@ -6836,7 +6840,9 @@ mod tests {
         let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
 
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker.clone()));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
+            temps_core::DockerHandle::available(docker.clone()),
+        )));
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_deploy_container().returning(|_| {
@@ -8689,7 +8695,9 @@ mod tests {
         let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
 
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker.clone()));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
+            temps_core::DockerHandle::available(docker.clone()),
+        )));
 
         let db_for_check = db.clone();
         let mut deployer = MockContainerDeployer::new();

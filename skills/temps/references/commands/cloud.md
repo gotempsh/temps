@@ -4,6 +4,19 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`cloud login`](#cloud-login)
+- [`cloud logout`](#cloud-logout)
+- [`cloud whoami`](#cloud-whoami)
+- [`cloud status`](#cloud-status)
+- [`cloud connect`](#cloud-connect)
+- [`cloud disconnect`](#cloud-disconnect)
+- [`cloud backup-schedule`](#cloud-backup-schedule)
+- [`cloud vps`](#cloud-vps)
+- [`cloud billing`](#cloud-billing)
+- [`cloud telemetry`](#cloud-telemetry)
+
 ## `cloud`
 
 Temps Cloud
@@ -16,6 +29,7 @@ Temps Cloud
 - `status` - Show this self-hosted instance's Temps Cloud link
 - `connect` - Connect this self-hosted instance using an enrollment code
 - `disconnect` - Disconnect this self-hosted instance from Temps Cloud
+- `backup-schedule` - The backup schedule that writes to the Temps Cloud destination
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
@@ -62,6 +76,24 @@ Disconnect this self-hosted instance from Temps Cloud
 |------|-------------|---------|----------|
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `cloud backup-schedule`
+
+The backup schedule that writes to the Temps Cloud destination
+
+**Subcommands:**
+
+- `ensure` - Create the nightly default schedule unless one already targets Temps Cloud
+
+#### `cloud backup-schedule ensure`
+
+Create the nightly default schedule unless one already targets Temps Cloud
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
 
 ### `cloud vps`
 

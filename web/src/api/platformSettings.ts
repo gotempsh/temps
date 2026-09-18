@@ -146,6 +146,36 @@ export interface ObservabilityRetentionSettings {
   otel_metrics_days: number
 }
 
+/**
+ * Geolocation database settings.
+ *
+ * Mirrors the Rust `GeoSettingsMasked` response / `GeoSettings` request. The
+ * MaxMind license key is stored encrypted and never returned: reads expose
+ * only `maxmind_license_key_saved`, and writes send `maxmind_license_key`
+ * (blank preserves the stored key) or `clear_maxmind_license_key` to remove
+ * it — the same convention as the email-provider credential fields.
+ *
+ * `refresh_interval_hours` / `stale_lookup_days` are nullable because `null`
+ * means "use the server default"; `effective_*` report the value actually
+ * applied, so the UI never has to duplicate the defaults.
+ */
+export interface GeoSettings {
+  refresh_interval_hours: number | null
+  stale_lookup_days: number | null
+  effective_refresh_interval_hours: number
+  effective_stale_lookup_days: number
+  maxmind_license_key_saved: boolean
+  last_refreshed_at: string | null
+  source: string | null
+  last_check_at: string | null
+  last_check_status: string | null
+  last_error: string | null
+  /** Write-only: a new plaintext key. Blank/omitted preserves the stored one. */
+  maxmind_license_key?: string | null
+  /** Write-only: remove the stored key and fall back to the bundled source. */
+  clear_maxmind_license_key?: boolean
+}
+
 /** Per-managed-domain hostname layout (configured under DNS providers, not here). */
 export type PublicHostnameStrategy = 'standard' | 'flat'
 
@@ -170,6 +200,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  /** Geolocation refresh policy, with the MaxMind key masked to a boolean. */
+  geo: GeoSettings
   /** Effective backend for proxy logs and OTel spans. */
   effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
@@ -227,15 +259,24 @@ export async function updatePlatformSettings(
     throw new Error(detail)
   }
 
-  // The PUT endpoint returns only an ack message, so we hand back our
-  // merged view. Callers that need the absolute server state should refetch.
+  // The PUT endpoint returns only an ack message, so we hand back our merged
+  // view, which `useUpdateSettings` places directly into the React Query
+  // cache. `geo.maxmind_license_key` is write-only plaintext the caller may
+  // have just submitted -- it must never sit in client-side cache, even
+  // briefly before the invalidating refetch lands. Strip both write-only geo
+  // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
+  // the UI actually reads back.
+  if (updated.geo) {
+    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    return { ...updated, geo: maskedGeo as GeoSettings }
+  }
   return updated
 }
 
 export function buildPlatformSettingsUpdateBody(
   updated: PlatformSettings
 ): AppSettings {
-  return {
+  const body: AppSettings = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
@@ -275,6 +316,12 @@ export function buildPlatformSettingsUpdateBody(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Same `#[serde(default)]` reasoning as the blocks below: omitting this
+    // would reset the geolocation refresh interval and staleness window to
+    // their defaults on every unrelated settings save. The server preserves
+    // the stored license key when `maxmind_license_key` is blank, and restores
+    // the read-only metadata fields this round-trips.
+    geo: updated.geo,
     // Must be sent on every save: the server deserializes `AppSettings` with
     // `#[serde(default)]`, so omitting this field would silently re-enable
     // console updates whenever any other settings page is saved.
@@ -296,6 +343,7 @@ export function buildPlatformSettingsUpdateBody(
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
   }
+  return body
 }
 
 /**

@@ -717,14 +717,19 @@ async fn create_service(
             Ok((StatusCode::CREATED, Json(service)))
         }
         Err(e) => {
+            use crate::services::ExternalServiceError as E;
             let error_msg = e.to_string();
             info!("Failed to create service: {}", error_msg);
-            if error_msg.contains("validation failed") {
-                Err(bad_request().detail(&error_msg).build())
-            } else {
-                Err(internal_server_error()
+            match &e {
+                E::LocalWorkloadsDisabled { .. } | E::DockerUnavailable(_) => {
+                    Err(conflict().detail(error_msg).build())
+                }
+                _ if error_msg.contains("validation failed") => {
+                    Err(bad_request().detail(&error_msg).build())
+                }
+                _ => Err(internal_server_error()
                     .detail(format!("Failed to create service: {}", e))
-                    .build())
+                    .build()),
             }
         }
     }
@@ -1066,6 +1071,8 @@ fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Pr
         E::UpgradeRejected { .. } => Some(bad_request().detail(e.to_string()).build()),
         E::ServiceNotFound { .. } => Some(not_found().detail(e.to_string()).build()),
         E::UpgradeInProgress { .. } => Some(conflict().detail(e.to_string()).build()),
+        E::LocalWorkloadsDisabled { .. } => Some(conflict().detail(e.to_string()).build()),
+        E::DockerUnavailable(_) => Some(conflict().detail(e.to_string()).build()),
         _ => None,
     }
 }

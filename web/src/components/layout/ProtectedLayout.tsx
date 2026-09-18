@@ -132,13 +132,7 @@ function categorizeError(error: unknown): CategorizedError {
   }
 }
 
-function ErrorDetails({
-  error,
-  message,
-}: {
-  error: unknown
-  message: string
-}) {
+function ErrorDetails({ error, message }: { error: unknown; message: string }) {
   const [copied, setCopied] = useState(false)
   const payload = (() => {
     try {

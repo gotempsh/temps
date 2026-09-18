@@ -108,9 +108,7 @@ export function McpServerCard() {
       { mcp_server: { enabled: checked } },
       {
         onSuccess: () =>
-          toast.success(
-            checked ? 'MCP server enabled' : 'MCP server disabled'
-          ),
+          toast.success(checked ? 'MCP server enabled' : 'MCP server disabled'),
       }
     )
   }
@@ -123,12 +121,12 @@ export function McpServerCard() {
           MCP Server
         </CardTitle>
         <CardDescription>
-          Lets AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS
-          Code, Windsurf, Zed) connect to this Temps instance over the Model
-          Context Protocol — e.g. ask "list my Temps projects" or "deploy the
-          latest commit" and have the assistant call real tools against this
-          instance. Every write action still requires a separate confirmation
-          before it executes.
+          Lets AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code,
+          Windsurf, Zed) connect to this Temps instance over the Model Context
+          Protocol — e.g. ask &quot;list my Temps projects&quot; or &quot;deploy
+          the latest commit&quot; and have the assistant call real tools against
+          this instance. Every write action still requires a separate
+          confirmation before it executes.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -175,12 +173,14 @@ export function McpServerCard() {
                 showLineNumbers={false}
               />
               <p className="text-xs text-muted-foreground">
-                Runs an installer wizard that mints a scoped API key and
-                writes the right config for {
-                  MCP_CLIENTS.find((c) => c.id === connectClientId)?.label
-                }. <code className="px-1 py-0.5 bg-muted rounded text-xs">--url</code>{' '}
-                targets this instance directly, regardless of which CLI
-                context is currently active on your machine.
+                Runs an installer wizard that mints a scoped API key and writes
+                the right config for{' '}
+                {MCP_CLIENTS.find((c) => c.id === connectClientId)?.label}.{' '}
+                <code className="px-1 py-0.5 bg-muted rounded text-xs">
+                  --url
+                </code>{' '}
+                targets this instance directly, regardless of which CLI context
+                is currently active on your machine.
               </p>
             </div>
             <a

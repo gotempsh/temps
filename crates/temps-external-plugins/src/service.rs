@@ -60,6 +60,8 @@ pub enum ExternalPluginsError {
     Install(#[from] InstallError),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Grant(#[from] crate::grants::GrantError),
     #[error("Plugin '{name}' is not present in the authenticated registry document")]
     NotInRegistry { name: String },
     #[error("Authenticated registry document contains duplicate entries for plugin '{name}'")]
@@ -84,6 +86,7 @@ pub struct InstallOutcome {
     pub sha256: String,
     pub signer_key_id: String,
     pub registry_source: String,
+    pub actor_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -130,9 +133,39 @@ pub struct RepositoryInstallOutcome {
     pub platform: String,
     pub sha256: String,
     pub source_commit: String,
+    pub actor_id: String,
 }
 
 impl ExternalPluginsService {
+    pub async fn plugin_grants(
+        &self,
+        name: &str,
+    ) -> Result<crate::grants::PluginGrants, crate::grants::GrantError> {
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .get(name)
+            .await
+    }
+
+    pub async fn update_plugin_grants(
+        &self,
+        name: &str,
+        config: crate::grants::PluginGrantConfig,
+    ) -> Result<crate::grants::PluginGrants, crate::grants::GrantError> {
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .update(name, config)
+            .await
+    }
+
+    pub async fn update_plugin_grants_for_actor(
+        &self,
+        name: &str,
+        actor_id: &str,
+        config: crate::grants::PluginGrantConfig,
+    ) -> Result<crate::grants::PluginGrants, crate::grants::GrantError> {
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .update_for_actor(name, actor_id, config)
+            .await
+    }
     pub async fn installation_reporting_consent(
         &self,
     ) -> Result<bool, crate::reporting::ReportingError> {
@@ -270,6 +303,7 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
+                crate::manager::repository_actor_source(&selected.source.repository),
             )
             .await
         {
@@ -292,20 +326,63 @@ impl ExternalPluginsService {
                 });
             }
         };
+        let (candidate_actor_id, candidate_source_identity) =
+            match ExternalPluginManager::candidate_actor_binding(&pending) {
+                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
+                Err(reason) => {
+                    self.manager.discard_candidate(pending).await;
+                    return Err(ExternalPluginsError::CandidateRejected {
+                        name: candidate.name.clone(),
+                        version: candidate.version.clone(),
+                        reason,
+                    });
+                }
+            };
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
+        let activation_rollback = match installer.capture_activation(&candidate).await {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                self.manager.discard_candidate(pending).await;
+                return Err(error.into());
+            }
+        };
         if let Err(error) = installer.activate(&candidate).await {
             self.manager.discard_candidate(pending).await;
             let _ = installer.discard(&candidate).await;
             return Err(error.into());
         }
+        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
+        if let Err(error) = grant_service
+            .commit_actor(
+                &candidate.name,
+                &candidate_actor_id,
+                &candidate.sha256,
+                &candidate_source_identity,
+            )
+            .await
+        {
+            let first_install = activation_rollback.was_first_install();
+            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
+                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
+            }
+            self.manager.discard_candidate(pending).await;
+            if first_install {
+                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
+                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
+                }
+            }
+            return Err(error.into());
+        }
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
+        let actor_id = candidate_actor_id;
         Ok(RepositoryInstallOutcome {
             name: candidate.name,
             version: candidate.version,
             platform,
             sha256,
             source_commit: selected.source.commit,
+            actor_id,
         })
     }
     /// Install the bridge plugins use to call the platform's own HTTP API.
@@ -665,6 +742,7 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
+                crate::manager::registry_actor_source(&self.manager.config().registry.url),
             )
             .await
         {
@@ -685,6 +763,25 @@ impl ExternalPluginsService {
             }
         };
 
+        let (candidate_actor_id, candidate_source_identity) =
+            match ExternalPluginManager::candidate_actor_binding(&pending) {
+                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
+                Err(reason) => {
+                    self.manager.discard_candidate(pending).await;
+                    return Err(ExternalPluginsError::CandidateRejected {
+                        name: candidate.name.clone(),
+                        version: candidate.version.clone(),
+                        reason,
+                    });
+                }
+            };
+        let activation_rollback = match installer.capture_activation(&candidate).await {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                self.manager.discard_candidate(pending).await;
+                return Err(error.into());
+            }
+        };
         if let Err(error) = installer.activate(&candidate).await {
             self.manager.discard_candidate(pending).await;
             if let Err(cleanup_error) = installer.discard(&candidate).await {
@@ -696,8 +793,31 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
+        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
+        if let Err(error) = grant_service
+            .commit_actor(
+                &candidate.name,
+                &candidate_actor_id,
+                &candidate.sha256,
+                &candidate_source_identity,
+            )
+            .await
+        {
+            let first_install = activation_rollback.was_first_install();
+            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
+                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
+            }
+            self.manager.discard_candidate(pending).await;
+            if first_install {
+                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
+                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
+                }
+            }
+            return Err(error.into());
+        }
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
+        let actor_id = candidate_actor_id;
 
         if let Err(error) = crate::reporting::report_if_enabled(
             &self.db,
@@ -717,6 +837,7 @@ impl ExternalPluginsService {
             sha256: candidate.sha256,
             signer_key_id: selected.identity.signer_key_id,
             registry_source: selected.identity.registry_source,
+            actor_id,
         })
     }
 
@@ -733,6 +854,17 @@ impl ExternalPluginsService {
             });
         }
         self.manager.shutdown_plugin(name).await;
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .revoke_actor(name)
+            .await
+            .map_err(|error| {
+                ExternalPluginsError::Install(InstallError::Io {
+                    plugin: name.to_string(),
+                    path: "external_plugin_actors".to_string(),
+                    reason: error.to_string(),
+                })
+            })?;
+
         self.refresh_runtime_surfaces().await;
         Ok(())
     }
@@ -1752,13 +1884,20 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let service = ExternalPluginsService::new_empty(
-            config.clone(),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("skipping protocol fixture: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("prepare protocol fixture database: {error}"),
+        };
+        let service =
+            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
 
         let outcome = service
             .install_selected(selected_plugin(
@@ -1835,13 +1974,20 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let service = ExternalPluginsService::new_empty(
-            config.clone(),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("skipping protocol fixture: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("prepare protocol fixture database: {error}"),
+        };
+        let service =
+            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
         service
             .install_selected(selected_plugin(
                 first_url,

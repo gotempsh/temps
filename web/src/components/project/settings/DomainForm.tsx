@@ -86,7 +86,8 @@ export function DomainForm({
   initialData,
   preset,
 }: DomainFormProps) {
-  const isDockerCompose = preset === 'docker-compose' || preset === 'dockercompose'
+  const isDockerCompose =
+    preset === 'docker-compose' || preset === 'dockercompose'
   // Fetch wildcard domains for initial state matching when editing
   const { data: wildcardData } = useQuery({
     ...listDomainsOptions({
@@ -104,7 +105,7 @@ export function DomainForm({
     useMemo(() => {
       if (!initialData?.domain) return { subdomain: '', selectedDomain: '' }
       return matchWildcardDomain(initialData.domain, wildcardDomains)
-    }, [initialData?.domain, wildcardDomains])
+    }, [initialData, wildcardDomains])
 
   const {
     subdomain: initialRedirectSubdomain,
@@ -112,7 +113,7 @@ export function DomainForm({
   } = useMemo(() => {
     if (!initialData?.redirect_to) return { subdomain: '', selectedDomain: '' }
     return matchWildcardDomain(initialData.redirect_to, wildcardDomains)
-  }, [initialData?.redirect_to, wildcardDomains])
+  }, [initialData, wildcardDomains])
 
   const [subdomain, setSubdomain] = useState(initialSubdomain)
   const [selectedDomain, setSelectedDomain] = useState(initialSelectedDomain)
@@ -201,7 +202,10 @@ export function DomainForm({
         environment_id: parseInt(watchedEnvironment || '0'),
       },
     }),
-    enabled: isDockerCompose && !!watchedEnvironment && parseInt(watchedEnvironment) > 0,
+    enabled:
+      isDockerCompose &&
+      !!watchedEnvironment &&
+      parseInt(watchedEnvironment) > 0,
   })
 
   // Extract unique service names from containers
@@ -315,7 +319,9 @@ export function DomainForm({
               <FormItem>
                 <FormLabel>Compose Service</FormLabel>
                 <Select
-                  onValueChange={(val) => field.onChange(val === '_all_' ? '' : val)}
+                  onValueChange={(val) =>
+                    field.onChange(val === '_all_' ? '' : val)
+                  }
                   value={field.value || '_all_'}
                 >
                   <FormControl>

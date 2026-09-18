@@ -77,7 +77,7 @@ export function CodeTabs({
   const activeId = value ?? internalId
   const active = useMemo(
     () => examples.find((e) => e.id === activeId) ?? examples[0],
-    [examples, activeId],
+    [examples, activeId]
   )
 
   const handleSelect = (id: string) => {
@@ -91,16 +91,14 @@ export function CodeTabs({
     <div
       className={cn(
         'flex flex-col overflow-hidden rounded-lg border',
-        dark
-          ? 'border-white/10 bg-zinc-950 text-zinc-100'
-          : 'bg-card',
-        className,
+        dark ? 'border-white/10 bg-zinc-950 text-zinc-100' : 'bg-card',
+        className
       )}
     >
       <div
         className={cn(
           'flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2',
-          dark ? 'border-white/10' : 'border-border',
+          dark ? 'border-white/10' : 'border-border'
         )}
       >
         <div className="flex items-center gap-0.5">
@@ -119,7 +117,7 @@ export function CodeTabs({
                       : 'text-zinc-400 hover:text-zinc-100'
                     : isActive
                       ? 'bg-muted text-foreground'
-                      : 'text-muted-foreground hover:text-foreground',
+                      : 'text-muted-foreground hover:text-foreground'
                 )}
               >
                 {example.label}
@@ -127,7 +125,9 @@ export function CodeTabs({
             )
           })}
         </div>
-        {rightSlot ? <div className="flex items-center">{rightSlot}</div> : null}
+        {rightSlot ? (
+          <div className="flex items-center">{rightSlot}</div>
+        ) : null}
       </div>
       <div
         className={cn(
@@ -135,7 +135,7 @@ export function CodeTabs({
           // In dark chrome mode we force a light foreground so tokens
           // without an explicit color utility don't inherit the theme's
           // dark `text-foreground` and disappear against zinc-950.
-          dark && '[&_code]:!text-zinc-100',
+          dark && '[&_code]:!text-zinc-100'
         )}
       >
         <CodeBlock
@@ -145,7 +145,7 @@ export function CodeTabs({
           className={cn(
             '[&_pre]:!text-[13px]',
             dark &&
-              '[&>div]:!border-0 [&>div]:!bg-transparent [&>div]:hover:!bg-transparent',
+              '[&>div]:!border-0 [&>div]:!bg-transparent [&>div]:hover:!bg-transparent'
           )}
         />
       </div>

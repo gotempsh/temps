@@ -89,7 +89,8 @@ function getBrowserInfo(userAgent: string): { name: string; icon: string } {
 function getOSName(userAgent: string): string {
   if (userAgent.includes('Windows')) return 'Windows'
   if (userAgent.includes('Mac OS')) return 'macOS'
-  if (userAgent.includes('Linux') && !userAgent.includes('Android')) return 'Linux'
+  if (userAgent.includes('Linux') && !userAgent.includes('Android'))
+    return 'Linux'
   if (userAgent.includes('Android')) return 'Android'
   if (userAgent.includes('iPhone') || userAgent.includes('iPad')) return 'iOS'
   if (userAgent.includes('CrOS')) return 'ChromeOS'
@@ -424,33 +425,39 @@ export function VisitorsList({ project }: VisitorsListProps) {
             <>
               <TooltipProvider>
                 <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-[200px] sm:w-[280px]">Visitor</TableHead>
-                      <TableHead>Location</TableHead>
-                      <TableHead className="hidden md:table-cell">Source</TableHead>
-                      <TableHead className="hidden lg:table-cell">Browser / OS</TableHead>
-                      <TableHead>First Seen</TableHead>
-                      <TableHead>Last Seen</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {data.visitors.map((visitor: VisitorInfo) => (
-                      <VisitorRow
-                        key={visitor.visitor_id}
-                        visitor={visitor}
-                        onClick={() =>
-                          navigate(
-                            `/projects/${project.slug}/analytics/visitors/${visitor.id}`
-                          )
-                        }
-                        onFilter={updateFilter}
-                        activeFilters={filters}
-                      />
-                    ))}
-                  </TableBody>
-                </Table>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-[200px] sm:w-[280px]">
+                          Visitor
+                        </TableHead>
+                        <TableHead>Location</TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Source
+                        </TableHead>
+                        <TableHead className="hidden lg:table-cell">
+                          Browser / OS
+                        </TableHead>
+                        <TableHead>First Seen</TableHead>
+                        <TableHead>Last Seen</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {data.visitors.map((visitor: VisitorInfo) => (
+                        <VisitorRow
+                          key={visitor.visitor_id}
+                          visitor={visitor}
+                          onClick={() =>
+                            navigate(
+                              `/projects/${project.slug}/analytics/visitors/${visitor.id}`
+                            )
+                          }
+                          onFilter={updateFilter}
+                          activeFilters={filters}
+                        />
+                      ))}
+                    </TableBody>
+                  </Table>
                 </div>
               </TooltipProvider>
 
@@ -548,10 +555,7 @@ function VisitorRow({
   }
 
   return (
-    <TableRow
-      className="cursor-pointer"
-      onClick={onClick}
-    >
+    <TableRow className="cursor-pointer" onClick={onClick}>
       {/* Visitor identity */}
       <TableCell>
         <div className="flex items-center gap-3">
@@ -577,9 +581,7 @@ function VisitorRow({
                 variant={visitor.is_crawler ? 'warning' : 'secondary'}
                 className="text-[10px] px-1.5 py-0"
               >
-                {visitor.is_crawler
-                  ? visitor.crawler_name || 'Bot'
-                  : 'Human'}
+                {visitor.is_crawler ? visitor.crawler_name || 'Bot' : 'Human'}
               </Badge>
             </div>
           </div>
@@ -592,7 +594,9 @@ function VisitorRow({
           {visitor.country ? (
             <button
               type="button"
-              onClick={(e) => handleFilter(e, 'filter_country', visitor.country)}
+              onClick={(e) =>
+                handleFilter(e, 'filter_country', visitor.country)
+              }
               title={`Filter by ${visitor.country}`}
               className="text-base leading-none hover:scale-110 transition-transform"
             >
@@ -666,9 +670,7 @@ function VisitorRow({
       {/* Browser / OS */}
       <TableCell className="hidden lg:table-cell">
         <div className="flex items-center gap-1.5">
-          <span className="text-sm">
-            {browserInfo?.name || 'Unknown'}
-          </span>
+          <span className="text-sm">{browserInfo?.name || 'Unknown'}</span>
           {osName && osName !== 'Unknown' && (
             <span className="text-xs text-muted-foreground">/ {osName}</span>
           )}

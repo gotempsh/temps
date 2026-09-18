@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { buildAutomationSettingsUpdate } from './index.js'
-import type { AppSettings } from '../../api/types.gen.js'
+import {
+  buildAutomationSettingsUpdate,
+  describeGeoRefreshState,
+  type GeoStatusSnapshot,
+} from './index.js'
 
 describe('buildAutomationSettingsUpdate', () => {
   test('reports no fields to update when nothing was provided', () => {
@@ -25,7 +28,7 @@ describe('buildAutomationSettingsUpdate', () => {
   })
 
   test('falls back to the current letsencrypt email when only mode is given', () => {
-    const current: Partial<AppSettings> = { letsencrypt: { email: 'ops@example.com', environment: 'staging' } }
+    const current = { letsencrypt: { email: 'ops@example.com', environment: 'staging' } }
     const result = buildAutomationSettingsUpdate({ letsencryptMode: 'production' }, current)
     expect(result).toEqual({
       updates: { letsencrypt: { email: 'ops@example.com', environment: 'production' } },
@@ -50,7 +53,7 @@ describe('buildAutomationSettingsUpdate', () => {
   })
 
   test('rate limiting keeps the existing rpm when only enabled is toggled', () => {
-    const current: Partial<AppSettings> = { rate_limiting: { enabled: false, max_requests_per_minute: 30 } }
+    const current = { rate_limiting: { enabled: false, max_requests_per_minute: 30 } }
     const result = buildAutomationSettingsUpdate({ rateLimitingEnabled: 'false' }, current)
     expect(result).toEqual({
       updates: { rate_limiting: { enabled: false, max_requests_per_minute: 30 } },
@@ -165,5 +168,84 @@ describe('buildAutomationSettingsUpdate', () => {
     expect(result).toEqual({
       error: '--console-force-https must be auto, always or never, got "true"',
     })
+  })
+})
+
+describe('describeGeoRefreshState', () => {
+  const base: GeoStatusSnapshot = {
+    license_key_configured: true,
+    refresh_interval_hours: 24,
+    is_stale: false,
+  }
+
+  test('reports a current database as OK with its age and source', () => {
+    const state = describeGeoRefreshState({
+      ...base,
+      last_check_at: '2026-09-17T03:14:00Z',
+      last_check_status: 'ok',
+      age_days: 2,
+      source: 'maxmind_official',
+    })
+    expect(state.level).toBe('ok')
+    expect(state.headline).toBe('Geolocation data is current')
+    expect(state.detail).toContain('maxmind_official')
+  })
+
+  test('explains an unlicensed instance instead of showing a blank status', () => {
+    const state = describeGeoRefreshState({
+      ...base,
+      license_key_configured: false,
+      last_check_at: '2026-09-17T03:14:00Z',
+      last_check_status: 'skipped_no_license_key',
+    })
+    expect(state.level).toBe('warn')
+    expect(state.headline).toBe('Automatic refreshes are not running')
+    // Must name the fix, not just the gap.
+    expect(state.detail).toContain('temps settings update --setting geo')
+    expect(state.detail).toContain('every 24 hours')
+  })
+
+  test('surfaces the recorded reason a check failed', () => {
+    const state = describeGeoRefreshState({
+      ...base,
+      last_check_at: '2026-09-17T03:14:00Z',
+      last_check_status: 'error',
+      last_error: 'HTTP 401',
+    })
+    expect(state.level).toBe('warn')
+    expect(state.headline).toBe('Last refresh check failed')
+    expect(state.detail).toContain('HTTP 401')
+  })
+
+  test('falls back to a message when no reason was recorded for a failure', () => {
+    const state = describeGeoRefreshState({
+      ...base,
+      last_check_at: '2026-09-17T03:14:00Z',
+      last_check_status: 'error',
+    })
+    expect(state.detail).toContain('No reason was recorded')
+  })
+
+  test('distinguishes "never checked, licensed" from "never checked, unlicensed"', () => {
+    const licensed = describeGeoRefreshState(base)
+    expect(licensed.level).toBe('ok')
+    expect(licensed.headline).toBe('No refresh has run yet on this instance')
+
+    const unlicensed = describeGeoRefreshState({ ...base, license_key_configured: false })
+    expect(unlicensed.level).toBe('warn')
+    expect(unlicensed.detail).toContain('will not download anything')
+  })
+
+  test('reports a stale database with its age', () => {
+    const state = describeGeoRefreshState({
+      ...base,
+      last_check_at: '2026-09-17T03:14:00Z',
+      last_check_status: 'ok',
+      is_stale: true,
+      age_days: 120,
+    })
+    expect(state.level).toBe('warn')
+    expect(state.headline).toBe('Geolocation data is stale')
+    expect(state.detail).toContain('120 days old')
   })
 })

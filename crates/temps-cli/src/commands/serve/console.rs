@@ -74,7 +74,7 @@ use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // Multi-node support
 use temps_deployments::handlers::nodes::NodeAppState;
@@ -1019,96 +1019,90 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     }
 }
 
-/// Source URL for downloading GeoLite2-City.mmdb when missing on startup.
-/// Mirrors `setup.rs::GEOLITE2_DOWNLOAD_URL` so `temps serve` recovers a missing
-/// database the same way the setup wizard would.
-const GEOLITE2_DOWNLOAD_URL: &str =
-    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+/// Download GeoLite2-City.mmdb to `dest` when it is missing.
+///
+/// Delegates to `temps_geo::refresh`, which owns every download path: the
+/// source selection (MaxMind with a license key, the repository copy without
+/// one), validation that the bytes really are a parseable database, and the
+/// `.tmp`-then-rename write. The scheduled refresh job calls the same code, so
+/// startup recovery and periodic refresh can no longer drift apart.
+/// `license_key` is the plaintext key the caller decrypted from the settings
+/// row, or `None` to use the repository copy. It is never logged here.
+async fn download_geolite2_database_on_startup(
+    dest: &Path,
+    license_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let http = temps_geo::refresh::build_http_client()
+        .map_err(|e| anyhow::anyhow!("Failed to build the GeoLite2 download client: {}", e))?;
 
-/// Download GeoLite2-City.mmdb to `dest` from GitHub (same source as `temps setup`).
-/// Writes to a sibling `.tmp` file and renames atomically on success.
-async fn download_geolite2_database_on_startup(dest: &Path) -> anyhow::Result<()> {
-    use futures::StreamExt;
-    use std::io::Write;
+    info!(
+        "Downloading GeoLite2-City.mmdb to {} (MaxMind license key configured: {})",
+        dest.display(),
+        license_key.is_some()
+    );
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+    temps_geo::refresh::ensure_mmdb_present(dest, license_key, &http)
+        .await
+        .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create data directory {}: {}",
-                parent.display(),
-                e
+                "{}",
+                temps_geo::redact_license_key(e.to_string(), license_key)
             )
         })?;
-    }
-
-    info!(
-        "Downloading GeoLite2-City.mmdb from {} to {}",
-        GEOLITE2_DOWNLOAD_URL,
-        dest.display()
-    );
-
-    let response = reqwest::Client::new()
-        .get(GEOLITE2_DOWNLOAD_URL)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start GeoLite2 download: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to download GeoLite2 database: HTTP {}",
-            response.status()
-        ));
-    }
-
-    let temp_path = dest.with_extension("mmdb.tmp");
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create temporary file {}: {}",
-            temp_path.display(),
-            e
-        )
-    })?;
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| anyhow::anyhow!("Download error: {}", e))?;
-        file.write_all(&chunk)
-            .map_err(|e| anyhow::anyhow!("Failed to write to {}: {}", temp_path.display(), e))?;
-        downloaded += chunk.len() as u64;
-    }
-    drop(file);
-
-    std::fs::rename(&temp_path, dest).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to move {} to {}: {}",
-            temp_path.display(),
-            dest.display(),
-            e
-        )
-    })?;
-
-    if downloaded < 1_000_000 {
-        return Err(anyhow::anyhow!(
-            "Downloaded GeoLite2 database is too small ({} bytes); file may be corrupted",
-            downloaded
-        ));
-    }
-
-    info!(
-        "✓ Downloaded GeoLite2 database to {} ({:.1} MB)",
-        dest.display(),
-        downloaded as f64 / 1024.0 / 1024.0
-    );
 
     Ok(())
 }
 
+/// Read the MaxMind license key configured in the settings row, decrypted.
+///
+/// A key that cannot be read or decrypted is reported as "no key" rather than
+/// as a startup failure: the download then falls back to the repository copy,
+/// which is strictly better than refusing to boot over an optional credential.
+/// The plaintext is returned to the single caller below and never logged.
+async fn configured_maxmind_license_key(
+    db: &Arc<DbConnection>,
+    encryption_service: &Arc<EncryptionService>,
+) -> Option<String> {
+    let settings = match temps_entities::settings::Entity::find_by_id(1)
+        .one(db.as_ref())
+        .await
+    {
+        Ok(Some(row)) => temps_core::AppSettings::from_json(row.data),
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                "Could not read the settings row for the MaxMind license key; falling back to \
+                 the bundled GeoLite2 source: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    match settings
+        .geo
+        .decrypt_license_key(encryption_service.as_ref())
+    {
+        Ok(key) => key,
+        Err(e) => {
+            warn!(
+                "Could not decrypt the stored MaxMind license key; falling back to the bundled \
+                 GeoLite2 source: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Validate GeoLite2-City database exists in multiple locations.
 /// Checks current directory and data directory; if neither has the file,
-/// downloads it to `default_db_path` from the same GitHub URL used by
-/// `temps setup`. Errors only after the download attempt fails.
-async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()> {
+/// downloads it to `default_db_path`. Errors only after the download attempt
+/// fails.
+async fn validate_geolite2_database(
+    default_db_path: &Path,
+    license_key: Option<&str>,
+) -> anyhow::Result<()> {
     // Check multiple locations in order of preference
     let search_paths = vec![
         // 1. Current working directory (most convenient for local development)
@@ -1132,7 +1126,7 @@ async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()
         search_paths[0].display(),
         search_paths[1].display()
     );
-    match download_geolite2_database_on_startup(default_db_path).await {
+    match download_geolite2_database_on_startup(default_db_path, license_key).await {
         Ok(()) => Ok(()),
         Err(e) => Err(anyhow::anyhow!(
             "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
@@ -1153,6 +1147,11 @@ async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()
                # Option B: Data directory\n\
                cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
             6. Start the server again\n\n\
+            🔑 Automatic downloads and refreshes:\n\
+            Add a MaxMind license key (free MaxMind account) under\n\
+            Settings → Metrics Monitoring → Geolocation database, and Temps\n\
+            downloads GeoLite2-City itself and re-checks it on the refresh\n\
+            interval configured there (default every 24 hours).\n\n\
             🐳 For Docker users:\n\
             See Dockerfile in the repository for embedding the database",
             search_paths[0].display(),
@@ -1261,6 +1260,87 @@ pub struct ConsoleApiParams {
     /// Authenticated external-plugin registry configuration resolved from the
     /// paired `temps serve` bootstrap options.
     pub external_plugin_registry: temps_external_plugins::catalog::RegistryConfig,
+    /// Whether this process runs workloads itself. Decides which plugins are
+    /// constructed at all — see `register_local_workload_plugins` — and is
+    /// published to clients through `GET /api/platform/features`.
+    pub profile: super::ServeProfile,
+}
+
+/// How long the `control-plane` profile waits for a Docker ping before
+/// deciding the daemon is unavailable. Short on purpose: this runs on the
+/// startup path, and "no daemon" is an expected, supported answer here.
+const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The operator-facing message for "this profile needs Docker and it isn't
+/// there". Shared by both failure points so the remediation steps can't drift
+/// apart.
+fn docker_unavailable_error(reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "❌ Docker dependency check FAILED\n\n\
+        The system requires Docker to be running and accessible.\n\n\
+        Error details: {}\n\n\
+        Solutions:\n\
+        1. Ensure Docker daemon is running\n\
+           - macOS: Check Docker Desktop application\n\
+           - Linux: Run 'sudo systemctl start docker'\n\n\
+        2. Verify Docker socket permissions\n\
+           - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
+        3. Check Docker environment variables\n\
+           - DOCKER_HOST may need to be set\n\n\
+        4. Run this control plane without local workloads\n\
+           - `temps serve --profile control-plane` needs no Docker daemon; \
+             applications then run on worker nodes joined with `temps join`\n\n\
+        Deployment features will not be available until Docker is accessible.",
+        reason
+    )
+}
+
+/// Storage backend selection for the log aggregator.
+#[derive(Debug, thiserror::Error)]
+pub enum LogStorageConfigError {
+    #[error(
+        "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
+         other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
+         logs on local disk"
+    )]
+    MissingS3Variable { variable: &'static str },
+}
+
+/// Resolve the log-aggregator storage backend.
+///
+/// Previously three `std::env::var(..).expect(..)` calls on the startup path:
+/// an operator who set `TEMPS_LOG_STORAGE_BACKEND=s3` and forgot one variable
+/// got a panic with a bare message and no indication that the other two would
+/// have failed as well. Returns a typed error the caller renders instead.
+fn log_aggregator_storage_config(
+    data_dir: &std::path::Path,
+) -> Result<StorageConfig, LogStorageConfigError> {
+    fn required(variable: &'static str) -> Result<String, LogStorageConfigError> {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(LogStorageConfigError::MissingS3Variable { variable })
+    }
+
+    let backend =
+        std::env::var("TEMPS_LOG_STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into());
+    if backend != "s3" {
+        return Ok(StorageConfig::Filesystem {
+            base_path: data_dir.join("log-aggregator"),
+        });
+    }
+
+    Ok(StorageConfig::S3 {
+        bucket: required("TEMPS_LOG_S3_BUCKET")?,
+        region: std::env::var("TEMPS_LOG_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT").ok(),
+        access_key_id: required("TEMPS_LOG_S3_ACCESS_KEY_ID")?,
+        secret_access_key: required("TEMPS_LOG_S3_SECRET_ACCESS_KEY")?,
+        prefix: Some(std::env::var("TEMPS_LOG_S3_PREFIX").unwrap_or_else(|_| "logs/".to_string())),
+        force_path_style: std::env::var("TEMPS_LOG_S3_FORCE_PATH_STYLE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+    })
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1838,6 +1918,11 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Platform info + update status ──
         // OS type, architecture, and supported platform strings — no secrets.
         "get_platform_info",
+        // Which subsystems this process actually provides (serve profile plus a
+        // boolean per capability). No secrets, and it is what lets the assistant
+        // answer "why can't I create a database here?" with the real reason
+        // instead of guessing from a failed call.
+        "get_platform_features",
         // Server's externally-reachable public IP as detected at startup.
         "get_public_ip",
         // Whether an in-place binary update is possible and what version is available.
@@ -2186,6 +2271,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         self_updater,
         traefik_discovery,
         external_plugin_registry,
+        profile,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2218,35 +2304,74 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // This ensures clear error messages if any critical resources are missing
     debug!("Pre-validating plugin dependencies...");
 
-    // 1. Validate Docker connectivity
+    // 1. Validate Docker connectivity.
+    //
+    // In the `full` profile this is fatal and unchanged: that profile's entire
+    // job is running containers here, so a missing daemon is a
+    // misconfiguration the operator must see immediately.
+    //
+    // In `control-plane` the daemon is genuinely optional — the process runs
+    // no workloads — so an unreachable one is reported at info level and
+    // startup continues with no handle registered. Reachability is probed with
+    // a real `ping`, not just client construction: a bollard client is a lazy
+    // descriptor that "connects" successfully to a socket that does not exist,
+    // and reporting `docker: true` on that basis would be a lie.
     debug!("Checking Docker daemon connectivity...");
-    let docker = match bollard::Docker::connect_with_defaults() {
-        Ok(d) => d,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "❌ Docker dependency check FAILED\n\n\
-                The system requires Docker to be running and accessible.\n\n\
-                Error details: {}\n\n\
-                Solutions:\n\
-                1. Ensure Docker daemon is running\n\
-                   - macOS: Check Docker Desktop application\n\
-                   - Linux: Run 'sudo systemctl start docker'\n\n\
-                2. Verify Docker socket permissions\n\
-                   - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
-                3. Check Docker environment variables\n\
-                   - DOCKER_HOST may need to be set\n\n\
-                Deployment features will not be available until Docker is accessible.",
-                e
-            ));
+    let (docker_handle, docker_available) = if profile.local_workloads_enabled() {
+        // `full`: a daemon is this profile's entire job, so a missing one is a
+        // misconfiguration the operator must see immediately. Probe it for
+        // real rather than trusting client construction — a bollard client is
+        // a lazy descriptor that "connects" successfully to a socket path
+        // that does not exist, so construction alone proves nothing and
+        // reporting `docker: true` on that basis would be a lie the console
+        // shows to the operator.
+        let client = bollard::Docker::connect_with_defaults()
+            .map_err(|e| docker_unavailable_error(&e.to_string()))?;
+
+        match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, client.ping()).await {
+            Ok(Ok(_)) => debug!("✓ Docker daemon is accessible"),
+            Ok(Err(e)) => return Err(docker_unavailable_error(&e.to_string())),
+            Err(_) => {
+                return Err(docker_unavailable_error(&format!(
+                    "the daemon did not answer a ping within {}s",
+                    DOCKER_PROBE_TIMEOUT.as_secs()
+                )))
+            }
         }
+
+        (temps_core::DockerHandle::available(Arc::new(client)), true)
+    } else {
+        // `control-plane`: no client is constructed at all. Not "constructed
+        // and unused" — constructed. This profile is designed to run in a
+        // container with no Docker socket and no DOCKER_HOST, where
+        // `connect_with_defaults()` itself fails, and where any probe would
+        // only produce a guaranteed error line on every boot. Every
+        // daemon-dependent path resolves this handle and fails with a typed
+        // `DockerUnavailable` naming the remedy.
+        info!(
+            profile = profile.as_str(),
+            "Local workloads are disabled: no Docker client is constructed and no daemon is \
+             contacted. Applications run on worker nodes joined with `temps join`; see \
+             GET /api/platform/features"
+        );
+        (
+            temps_core::DockerHandle::disabled(
+                profile.as_str(),
+                temps_core::CONTROL_PLANE_DOCKER_REASON,
+            ),
+            false,
+        )
     };
-    let docker = Arc::new(docker);
-    debug!("✓ Docker daemon is accessible");
+    let docker_handle = Arc::new(docker_handle);
 
     // 2. Validate GeoPlugin dependencies (GeoLite2 database)
     debug!("Checking GeoLite2 database...");
     let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
-    validate_geolite2_database(&geo_db_path).await?;
+    // The license key is an admin setting on the `settings` row, not an env
+    // var, so a startup download uses whatever the admin configured through
+    // the UI -- the same value the scheduled refresh job reads each tick.
+    let maxmind_license_key = configured_maxmind_license_key(&db, &encryption_service).await;
+    validate_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await?;
     debug!("✓ GeoLite2 database file found");
 
     // 3. Validate logs directory is writable
@@ -2284,7 +2409,27 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(db.clone());
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
-    service_context.register_service(docker.clone());
+    // The Docker client handle is ALWAYS registered; the daemon behind it is
+    // not always there. Plugins resolve the handle with `require_service` (it
+    // genuinely always exists) and then make the *daemon* optional at the
+    // point of use, so a control plane with no socket never panics inside
+    // `require_service::<bollard::Docker>()`.
+    service_context.register_service(docker_handle.clone());
+    // The raw client stays registered too, but only when one exists, so any
+    // consumer that has not been migrated to the handle fails the boot-time
+    // `verify_required_services` check with a readable error naming itself
+    // rather than panicking half-way through initialization.
+    if let Some(client) = docker_handle.cloned() {
+        service_context.register_service(client);
+    }
+    // The single boot-time answer to "may this process run workloads?".
+    // Registered before any plugin runs so `register_services` can consult it.
+    let local_workload_policy = Arc::new(if profile.local_workloads_enabled() {
+        temps_core::LocalWorkloadPolicy::full(docker_available)
+    } else {
+        temps_core::LocalWorkloadPolicy::control_plane(docker_available)
+    });
+    service_context.register_service(local_workload_policy.clone());
     // Pre-registered here (rather than left solely to AuthPlugin, which also
     // registers an equivalent instance) because TeamsPlugin, GitPlugin,
     // DomainsPlugin, and DeploymentsPlugin all gate sensitive mutations via
@@ -2359,6 +2504,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         service_context.register_service(waker as Arc<dyn temps_core::OnDemandWaker>);
         debug!("Registered OnDemandWaker for environment wake/sleep endpoints");
     }
+
+    // Whether this process runs workloads on its own host. Plugins that exist
+    // only to manage local containers are not constructed at all when it is
+    // false: an unconstructed plugin holds no services, spawns no background
+    // loops, and costs nothing. Skipping is deliberately limited to plugins
+    // whose services no kept plugin requires — the startup requirement check
+    // in `PluginManager::initialize_plugins` turns any mistake here into one
+    // readable error instead of a panic during initialization.
+    let local_workloads = profile.local_workloads_enabled();
+    let mut skipped_plugins: Vec<&'static str> = Vec::new();
 
     // Register plugins in dependency order:
     // 1. ConfigPlugin - provides configuration services
@@ -2480,10 +2635,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let providers_plugin = Box::new(ProvidersPlugin::new());
     plugin_manager.register_plugin(providers_plugin);
 
-    // 5.1. KvPlugin - provides key-value storage (depends on database, docker)
-    debug!("Registering KvPlugin");
-    let kv_plugin = Box::new(KvPlugin::new());
-    plugin_manager.register_plugin(kv_plugin);
+    // 5.1. KvPlugin - provides key-value storage (depends on database, docker).
+    // Managed Redis runs as a container on this host, so there is nothing for
+    // it to manage without local workloads.
+    if local_workloads {
+        debug!("Registering KvPlugin");
+        let kv_plugin = Box::new(KvPlugin::new());
+        plugin_manager.register_plugin(kv_plugin);
+    } else {
+        skipped_plugins.push("kv");
+    }
 
     // 5.2. BlobPlugin - provides blob storage (depends on database, docker)
     debug!("Registering BlobPlugin");
@@ -2521,7 +2682,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(error_tracking_plugin);
 
     // 8.5. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
-    // MUST be registered before DeploymentsPlugin since deployments depend on vulnerability scanner services
+    //
+    // Registered in EVERY profile. Scanning a fresh image requires Trivy
+    // against THIS host's local image store, and is gated internally: the
+    // scanner holds a `DockerHandle` and returns a typed
+    // `ScannerError::DockerUnavailable` from every scan call on a
+    // control-plane process (no local daemon), rather than failing plugin
+    // registration. Dropping the plugin entirely would also 404 the
+    // `/vulnerability-scans` API and lose access to scan history recorded
+    // before this instance was reconfigured to `control-plane`, which is a
+    // control-plane responsibility, not a local-workload one.
+    //
+    // Scanning images that live only on a worker node is not implemented in
+    // any profile today -- there is no remote scan orchestration over the
+    // agent channel. `PlatformFeatures::vulnerability_scanning` is `false`
+    // under `control-plane` and that is the honest, complete picture; no
+    // code path here silently claims otherwise.
     debug!("Registering VulnerabilityScannerPlugin");
     let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
     plugin_manager.register_plugin(vulnerability_scanner_plugin);
@@ -2529,9 +2705,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 8.6. AgentsPlugin - MUST be registered before DeploymentsPlugin so DeploymentsPlugin can
     // resolve AgentSyncService via the plugin context. If registered after, DeploymentsPlugin
     // falls back to NoOpAgentSyncService and agent sync is silently skipped on every deployment.
-    debug!("Registering AgentsPlugin");
-    let agents_plugin = Box::new(AgentsPlugin::new());
-    plugin_manager.register_plugin(agents_plugin);
+    // Agent sandboxes ARE local containers. DeploymentsPlugin resolves the
+    // AgentSyncService with `get_service` and falls back to a no-op, so
+    // skipping this is safe — see the ordering note above.
+    if local_workloads {
+        debug!("Registering AgentsPlugin");
+        let agents_plugin = Box::new(AgentsPlugin::new());
+        plugin_manager.register_plugin(agents_plugin);
+    } else {
+        skipped_plugins.push("agents");
+    }
 
     // 8.7. AI Gateway Plugin - registers the provider-neutral AiService.
     // Application harness turns must see the sandbox provider registered by
@@ -2561,45 +2744,47 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
     // Consumes the shared SandboxProvider registered by AgentsPlugin.
-    debug!("Registering SandboxPlugin");
-    let sandbox_plugin = Box::new(SandboxPlugin::new());
-    plugin_manager.register_plugin(sandbox_plugin);
+    // Consumes the SandboxProvider AgentsPlugin registers, so it goes
+    // wherever AgentsPlugin goes.
+    if local_workloads {
+        debug!("Registering SandboxPlugin");
+        let sandbox_plugin = Box::new(SandboxPlugin::new());
+        plugin_manager.register_plugin(sandbox_plugin);
+    } else {
+        skipped_plugins.push("sandbox");
+    }
 
     // 9.1. LogAggregatorPlugin - structured log collection, storage, search, and streaming
-    // Depends on database, Docker (from DeployerPlugin), and AuditLogger (from AuditPlugin)
+    // Depends on database, Docker (from DeployerPlugin), and AuditLogger (from AuditPlugin).
+    //
+    // Registered in EVERY profile. Its local collector tails containers on
+    // this host's daemon and is gated internally on the local-workload
+    // policy, but `RemoteLogCollectorService` — which collects logs from
+    // worker nodes over the agent — and the `/logs/search` and `/logs/tail`
+    // routes are exactly what a control plane needs most. Dropping the plugin
+    // would 404 those routes and leave worker logs uncollected, which is the
+    // opposite of what this profile is for.
     debug!("Registering LogAggregatorPlugin");
-    let log_aggregator_storage_config = match std::env::var("TEMPS_LOG_STORAGE_BACKEND")
-        .unwrap_or_else(|_| "filesystem".to_string())
-        .as_str()
-    {
-        "s3" => StorageConfig::S3 {
-            bucket: std::env::var("TEMPS_LOG_S3_BUCKET")
-                .expect("TEMPS_LOG_S3_BUCKET must be set when using S3 storage backend"),
-            region: std::env::var("TEMPS_LOG_S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_string()),
-            endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT").ok(),
-            access_key_id: std::env::var("TEMPS_LOG_S3_ACCESS_KEY_ID")
-                .expect("TEMPS_LOG_S3_ACCESS_KEY_ID must be set when using S3 storage backend"),
-            secret_access_key: std::env::var("TEMPS_LOG_S3_SECRET_ACCESS_KEY")
-                .expect("TEMPS_LOG_S3_SECRET_ACCESS_KEY must be set when using S3 storage backend"),
-            prefix: Some(
-                std::env::var("TEMPS_LOG_S3_PREFIX").unwrap_or_else(|_| "logs/".to_string()),
-            ),
-            force_path_style: std::env::var("TEMPS_LOG_S3_FORCE_PATH_STYLE")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
-        },
-        _ => StorageConfig::Filesystem {
-            base_path: config.data_dir.join("log-aggregator"),
-        },
-    };
+    let log_aggregator_storage_config =
+        log_aggregator_storage_config(&config.data_dir).map_err(|e| {
+            anyhow::anyhow!("❌ Log aggregator storage configuration is invalid\n\n{e}")
+        })?;
     let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(log_aggregator_storage_config));
     plugin_manager.register_plugin(log_aggregator_plugin);
 
-    // 9.5. ImportPlugin - provides workload import functionality (depends on GitPlugin, ProjectsPlugin, DeploymentsPlugin)
-    debug!("Registering ImportPlugin");
-    let import_plugin = Box::new(ImportPlugin::new());
-    plugin_manager.register_plugin(import_plugin);
+    // 9.5. ImportPlugin - provides workload import functionality (depends on
+    // GitPlugin, ProjectsPlugin, DeploymentsPlugin).
+    //
+    // Every importer inspects containers on the local Docker daemon to adopt
+    // an existing Compose / Coolify / Dokploy / Portainer / Kamal / CapRover
+    // stack, so there is nothing for it to read here.
+    if local_workloads {
+        debug!("Registering ImportPlugin");
+        let import_plugin = Box::new(ImportPlugin::new());
+        plugin_manager.register_plugin(import_plugin);
+    } else {
+        skipped_plugins.push("import");
+    }
 
     // 9.6. StatusPagePlugin - provides status page and monitoring (depends on database and projects)
     debug!("Registering StatusPagePlugin");
@@ -2626,6 +2811,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(auth_plugin);
 
     // 11. BackupPlugin - provides backup services (depends on database, audit, and notification services, and providers)
+    //
+    // Registered in EVERY profile. Only backup *execution against a container
+    // on this host* depends on a local daemon, and that is gated inside the
+    // plugin by the local-workload policy. Scheduling, retention, listing,
+    // restore orchestration and backups of services owned by worker nodes are
+    // control-plane responsibilities and must keep running here — skipping
+    // the plugin would remove the entire backup API, not just local execution.
     debug!("Registering BackupPlugin");
     let backup_plugin = Box::new(BackupPlugin::new());
     plugin_manager.register_plugin(backup_plugin);
@@ -2694,6 +2886,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         info!(
             "Registered {} extra plugin(s) from binary entrypoint",
             extra_count
+        );
+    }
+
+    // One line naming everything this profile left out, so an operator
+    // wondering why an endpoint 404s does not have to read the source. The
+    // capabilities endpoint answers the same question programmatically.
+    if skipped_plugins.is_empty() {
+        info!(profile = profile.as_str(), "All plugins registered");
+    } else {
+        info!(
+            profile = profile.as_str(),
+            skipped = %skipped_plugins.join(", "),
+            docker_available,
+            "Serve profile runs no local workloads: the listed plugins were not constructed and \
+             their background tasks were not started. Applications run on worker nodes joined \
+             with `temps join`; see GET /api/platform/features"
         );
     }
 
@@ -3330,7 +3538,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             external_service_manager,
             alarm_service,
             ExternalServiceHealthConfig::default(),
-            docker.clone(),
+            docker_handle.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
         );
 
@@ -4775,5 +4983,124 @@ mod error_telemetry_tests {
 
         let event = build_error_summary_event(&summary);
         assert_eq!(event.properties["overflow"], serde_json::json!(3));
+    }
+}
+
+#[cfg(test)]
+mod log_storage_config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `std::env` is process-global; these tests mutate it, so they must not
+    /// interleave with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const S3_VARIABLES: [&str; 3] = [
+        "TEMPS_LOG_S3_BUCKET",
+        "TEMPS_LOG_S3_ACCESS_KEY_ID",
+        "TEMPS_LOG_S3_SECRET_ACCESS_KEY",
+    ];
+
+    fn clear_log_storage_env() {
+        std::env::remove_var("TEMPS_LOG_STORAGE_BACKEND");
+        for variable in S3_VARIABLES {
+            std::env::remove_var(variable);
+        }
+    }
+
+    /// Holds the lock AND guarantees the environment is clean again.
+    ///
+    /// Cleaning up at the end of each test body only works while every test
+    /// passes: a failed assertion unwinds straight past it and leaks
+    /// `TEMPS_LOG_STORAGE_BACKEND=s3` into whichever test takes the lock next,
+    /// turning one real failure into a cascade of unrelated ones. Cleanup
+    /// belongs in `Drop`, which runs on the unwind path too.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clear_log_storage_env();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            clear_log_storage_env();
+        }
+    }
+
+    #[test]
+    fn defaults_to_the_filesystem_backend() {
+        let _guard = EnvGuard::acquire();
+
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+            .expect("the filesystem backend needs no configuration");
+
+        match config {
+            StorageConfig::Filesystem { base_path } => {
+                assert_eq!(base_path, std::path::Path::new("/srv/temps/log-aggregator"));
+            }
+            other => panic!("expected the filesystem backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_backend_missing_a_variable_is_an_error_not_a_panic() {
+        let _guard = EnvGuard::acquire();
+        std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
+        std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
+        // TEMPS_LOG_S3_ACCESS_KEY_ID deliberately unset.
+
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+            .expect_err("an incomplete S3 configuration must be reported");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("TEMPS_LOG_S3_ACCESS_KEY_ID"),
+            "{rendered}"
+        );
+        // The remedy has to be in the message: this is the only place an
+        // operator sees it.
+        assert!(rendered.contains("TEMPS_LOG_STORAGE_BACKEND"), "{rendered}");
+    }
+
+    #[test]
+    fn a_blank_variable_counts_as_missing() {
+        let _guard = EnvGuard::acquire();
+        std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
+        std::env::set_var("TEMPS_LOG_S3_BUCKET", "   ");
+        std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
+        std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
+
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+            .expect_err("a whitespace-only bucket name is not a bucket name");
+
+        assert!(error.to_string().contains("TEMPS_LOG_S3_BUCKET"));
+    }
+
+    #[test]
+    fn complete_s3_configuration_is_accepted() {
+        let _guard = EnvGuard::acquire();
+        std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
+        std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
+        std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
+        std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
+
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+            .expect("all required variables are present");
+
+        match config {
+            StorageConfig::S3 { bucket, region, .. } => {
+                assert_eq!(bucket, "temps-logs");
+                assert_eq!(region, "us-east-1", "region falls back to a default");
+            }
+            other => panic!("expected the S3 backend, got {other:?}"),
+        }
     }
 }

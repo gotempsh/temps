@@ -31,11 +31,13 @@ enum ControlPlaneOverlayReconcileError {
     Allocation(#[from] temps_network::allocator::AllocatorError),
     #[error(transparent)]
     Setup(#[from] temps_network::control_plane::ControlPlaneSetupError),
+    #[error("Docker daemon unavailable for control-plane overlay reconciliation: {0}")]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 async fn reconcile_control_plane_overlay(
     db: Arc<sea_orm::DatabaseConnection>,
-    docker: Arc<bollard::Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<&str>,
     underlay_dev: Option<&str>,
 ) -> Result<bool, ControlPlaneOverlayReconcileError> {
@@ -53,9 +55,10 @@ async fn reconcile_control_plane_overlay(
         return Ok(false);
     };
 
+    let raw_docker = docker.require()?;
     let overlay = temps_network::control_plane::setup(
         db.clone(),
-        docker.as_ref(),
+        raw_docker.as_ref(),
         private_address,
         underlay_dev,
     )
@@ -66,7 +69,7 @@ async fn reconcile_control_plane_overlay(
 
 fn spawn_control_plane_overlay_setup_watcher(
     db: Arc<sea_orm::DatabaseConnection>,
-    docker: Arc<bollard::Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<String>,
     underlay_dev: Option<String>,
 ) {
@@ -132,74 +135,73 @@ impl DeployerPlugin {
         Self
     }
 
-    /// Detect if Docker BuildKit is available by checking daemon version and capabilities
-    async fn detect_buildkit() -> bool {
-        match bollard::Docker::connect_with_defaults() {
-            Ok(docker) => {
-                // Check Docker version
-                match docker.version().await {
-                    Ok(version) => {
-                        // BuildKit is available in Docker Engine 18.09+
-                        if let Some(version_str) = version.version {
-                            tracing::debug!("Docker version: {}", version_str);
+    /// Detect if Docker BuildKit is available by checking daemon version and capabilities.
+    ///
+    /// Returns `false` immediately when no Docker client is available in this process;
+    /// the caller is expected to gate this behind `local_workloads_enabled`.
+    async fn detect_buildkit(handle: &temps_core::DockerHandle) -> bool {
+        let docker = match handle.cloned() {
+            Some(d) => d,
+            None => return false,
+        };
+        // Check Docker version
+        match docker.version().await {
+            Ok(version) => {
+                // BuildKit is available in Docker Engine 18.09+
+                if let Some(version_str) = version.version {
+                    tracing::debug!("Docker version: {}", version_str);
 
-                            // Parse version and check if >= 18.09
-                            if let Some(major_minor) =
-                                version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
-                            {
-                                if let (Ok(major), Ok(minor)) =
-                                    (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
-                                {
-                                    let supports_buildkit =
-                                        major > 18 || (major == 18 && minor >= 9);
+                    // Parse version and check if >= 18.09
+                    if let Some(major_minor) =
+                        version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
+                    {
+                        if let (Ok(major), Ok(minor)) =
+                            (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
+                        {
+                            let supports_buildkit = major > 18 || (major == 18 && minor >= 9);
 
-                                    if !supports_buildkit {
-                                        tracing::warn!(
-                                            "Docker {}.{} does not support BuildKit (requires 18.09+)",
-                                            major, minor
-                                        );
-                                        return false;
-                                    }
-
-                                    tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
-                                }
-                            }
-                        }
-
-                        // Check Docker info for BuildKit support
-                        match docker.info().await {
-                            Ok(info) => {
-                                // Log out all info for debug
-                                tracing::debug!(
-                                    "Docker info arch: {:?} os: {:?}",
-                                    info.architecture,
-                                    info.os_type
+                            if !supports_buildkit {
+                                tracing::warn!(
+                                    "Docker {}.{} does not support BuildKit (requires 18.09+)",
+                                    major,
+                                    minor
                                 );
-                                // Check if BuildKit is explicitly disabled
-                                // Note: BuildKit is enabled by default in newer Docker versions
-                                tracing::debug!("Docker info retrieved successfully");
+                                return false;
+                            }
 
-                                // Modern Docker (20.10+) has BuildKit enabled by default
-                                tracing::debug!("BuildKit available and will be used for builds");
-                                true
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Failed to get Docker info: {}, assuming BuildKit available",
-                                    e
-                                );
-                                true // Assume available if we can't check
-                            }
+                            tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
                         }
                     }
+                }
+
+                // Check Docker info for BuildKit support
+                match docker.info().await {
+                    Ok(info) => {
+                        // Log out all info for debug
+                        tracing::debug!(
+                            "Docker info arch: {:?} os: {:?}",
+                            info.architecture,
+                            info.os_type
+                        );
+                        // Check if BuildKit is explicitly disabled
+                        // Note: BuildKit is enabled by default in newer Docker versions
+                        tracing::debug!("Docker info retrieved successfully");
+
+                        // Modern Docker (20.10+) has BuildKit enabled by default
+                        tracing::debug!("BuildKit available and will be used for builds");
+                        true
+                    }
                     Err(e) => {
-                        tracing::warn!("Failed to get Docker version: {}", e);
-                        false
+                        tracing::debug!(
+                            "Failed to get Docker info: {}, assuming BuildKit available",
+                            e
+                        );
+                        true // Assume available if we can't check
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to connect to Docker: {}", e);
+                tracing::warn!("Failed to get Docker version: {}", e);
                 false
             }
         }
@@ -217,16 +219,47 @@ impl TempsPlugin for DeployerPlugin {
         "deployer"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<temps_core::DockerHandle>(),
+            RequiredService::of::<temps_config::ConfigService>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Create Docker client
-            let docker = context.require_service::<bollard::Docker>();
+            // Obtain the process-wide Docker handle (always registered; may be Disabled).
+            let docker = context.require_service::<temps_core::DockerHandle>();
 
-            // Check if buildkit is available
-            let use_buildkit = Self::detect_buildkit().await;
+            // Whether this process is allowed to build and run containers on
+            // its own daemon. Absent from the registry in embeddings that
+            // never register one, which keeps the single-binary behaviour.
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let local_workloads_enabled = local_workloads.local_workloads_enabled();
+            if !local_workloads_enabled {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; the deployer registers its \
+                     services for the deployment API but performs no daemon setup (no BuildKit \
+                     probe, no app network, no overlay or cluster-DNS reconciliation). \
+                     Applications run on worker nodes joined with `temps join`"
+                );
+            }
+
+            // Check if buildkit is available. Probing means talking to the
+            // daemon, which is exactly what a no-local-workloads profile must
+            // not do at boot.
+            let use_buildkit = if local_workloads_enabled {
+                Self::detect_buildkit(&docker).await
+            } else {
+                false
+            };
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
             // Load build limits and cluster-DNS settings. Only the control plane
@@ -258,9 +291,11 @@ impl TempsPlugin for DeployerPlugin {
                     }
                 };
 
-            // Create DockerRuntime service
+            // Create DockerRuntime service.  Pass the DockerHandle — the runtime
+            // defers any actual daemon access to the point of use, so constructing
+            // it here is always safe regardless of whether a daemon is present.
             let server_config = config_service.get_server_config();
-            let mut docker_runtime = DockerRuntime::new(
+            let mut docker_runtime = DockerRuntime::new_with_handle(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
@@ -289,11 +324,13 @@ impl TempsPlugin for DeployerPlugin {
             // Reconcile the app network and its metadata-egress rules during
             // every server start, even when cluster DNS is disabled and no new
             // deployment occurs after a Docker or firewall restart.
-            if let Err(error) = docker_runtime.ensure_network_exists().await {
-                tracing::warn!(
-                    error = %error,
-                    "Could not reconcile the app network during deployer startup"
-                );
+            if local_workloads_enabled {
+                if let Err(error) = docker_runtime.ensure_network_exists().await {
+                    tracing::warn!(
+                        error = %error,
+                        "Could not reconcile the app network during deployer startup"
+                    );
+                }
             }
 
             // A control-plane-hosted managed service must participate in the
@@ -304,13 +341,19 @@ impl TempsPlugin for DeployerPlugin {
             // The same idempotent operation is available at runtime through
             // `temps network setup-multi-node`, so enabling multi-node does not
             // require restarting this process.
-            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
-                spawn_control_plane_overlay_setup_watcher(
-                    db,
-                    docker.clone(),
-                    control_plane_private_address,
-                    std::env::var("TEMPS_UNDERLAY_DEV").ok(),
-                );
+            //
+            // Skipped when this process runs no workloads: there is no local
+            // container to give an overlay address to, and the watcher would
+            // otherwise retry against an absent daemon forever.
+            if local_workloads_enabled {
+                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                    spawn_control_plane_overlay_setup_watcher(
+                        db,
+                        docker.clone(),
+                        control_plane_private_address,
+                        std::env::var("TEMPS_UNDERLAY_DEV").ok(),
+                    );
+                }
             }
 
             // Learn the daemon's architecture once, up front: every later
@@ -319,7 +362,14 @@ impl TempsPlugin for DeployerPlugin {
             // architecture, which is wrong whenever `DOCKER_HOST` points at a
             // daemon on another machine. The scheduler and the pre-transfer
             // platform check both depend on this value being the daemon's.
-            match docker_runtime.refresh_daemon_platform().await {
+            match if local_workloads_enabled {
+                docker_runtime.refresh_daemon_platform().await
+            } else {
+                // Nothing is built or run here, so the daemon's architecture is
+                // not a scheduling input — and asking for it would be the one
+                // Docker round-trip this profile exists to avoid.
+                None
+            } {
                 Some(platform) => tracing::info!(
                     platform = %platform,
                     "Control-plane container platform detected"
@@ -352,7 +402,7 @@ impl TempsPlugin for DeployerPlugin {
             // DB (e.g. an embedded/test configuration) must skip DNS startup,
             // never fail the deployer plugin — do not promote this to
             // `require_service`.
-            if cluster_dns_enabled {
+            if cluster_dns_enabled && local_workloads_enabled {
                 tracing::info!(
                     "cluster DNS resolver enabled (AppSettings.cluster_dns.enabled=true); \
                      starting control-plane Hickory resolver"
@@ -380,6 +430,12 @@ impl TempsPlugin for DeployerPlugin {
                         ),
                     }
                 }
+            } else if cluster_dns_enabled {
+                tracing::info!(
+                    "cluster DNS is enabled in settings, but this process runs no local \
+                     containers, so the control-plane resolver is not started here; worker \
+                     nodes run their own"
+                );
             } else {
                 tracing::info!(
                     "cluster DNS resolver disabled (experimental beta, off by default — \

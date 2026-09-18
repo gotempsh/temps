@@ -122,7 +122,7 @@ export function Revenue() {
     return opts
   }, [])
 
-  const events = eventsQuery.data ?? []
+  const events = useMemo(() => eventsQuery.data ?? [], [eventsQuery.data])
   const hasFilters =
     !!dateRange || projectFilter !== ALL_PROJECTS || typeFilter !== ALL_TYPES
 
@@ -429,9 +429,7 @@ function StatBlock({
         ) : (
           <p className={valueClass}>{value}</p>
         )}
-        {hint && (
-          <p className="text-xs text-muted-foreground">{hint}</p>
-        )}
+        {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
       </CardContent>
     </Card>
   )
@@ -467,7 +465,8 @@ function MrrDelta({
   minor: number | null | undefined
   currency: string | null | undefined
 }) {
-  if (minor == null || minor === 0) return <span className="text-muted-foreground">—</span>
+  if (minor == null || minor === 0)
+    return <span className="text-muted-foreground">—</span>
   const positive = minor > 0
   const cls = positive
     ? 'text-emerald-600 dark:text-emerald-400'

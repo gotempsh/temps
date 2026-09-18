@@ -201,6 +201,47 @@ impl AuditOperation for ForwardedIpTrustUpdatedAudit {
     }
 }
 
+/// `GEO_LICENSE_KEY_UPDATED` — the MaxMind license key was stored, rotated,
+/// or removed.
+///
+/// A separate event from `SETTINGS_UPDATED` for the same reason as the two
+/// above: this is a credential write. Storing or clearing it changes which
+/// third party this instance authenticates to and downloads geolocation data
+/// from, and under one undifferentiated `SETTINGS_UPDATED` row "somebody
+/// replaced the MaxMind credential" is indistinguishable from "somebody
+/// changed the refresh interval".
+///
+/// Booleans only. Neither the key nor its ciphertext is recorded — an audit
+/// trail is a long-lived, widely-readable store, and "a key was set" is the
+/// entire security-relevant fact.
+#[derive(Debug, Clone, serde::Serialize)]
+struct GeoLicenseKeyUpdatedAudit {
+    context: AuditContext,
+    /// A new key was submitted and encrypted (first save or a rotation).
+    key_set: bool,
+    /// The stored key was removed, reverting downloads to the bundled copy.
+    key_cleared: bool,
+}
+
+impl AuditOperation for GeoLicenseKeyUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "GEO_LICENSE_KEY_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 /// Audit record for a console-triggered platform update. Written before the
 /// process exits, so the trail survives the restart it causes.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -332,6 +373,10 @@ pub struct AppSettingsResponse {
     /// Retention windows for raw proxy logs and OpenTelemetry data.
     pub observability_retention: ObservabilityRetentionSettings,
 
+    /// Geolocation refresh policy and freshness, with the MaxMind license key
+    /// reported only as a boolean.
+    pub geo: GeoSettingsMasked,
+
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
     /// `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -392,6 +437,58 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_core::McpServerSettings,
+}
+
+/// Geolocation settings with the MaxMind license key masked.
+///
+/// The stored value is AES-256-GCM ciphertext, and neither it nor the
+/// plaintext is ever returned: the UI only needs to know whether a key is
+/// saved, so it can render the "leave blank to keep current" affordance the
+/// email-provider credentials use. The refresh metadata below is reported
+/// read-only — it is written by the refresh job, not by a settings save.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GeoSettingsMasked {
+    /// `null` means the effective default (24 hours).
+    pub refresh_interval_hours: Option<u32>,
+    /// `null` means the effective default (30 days).
+    pub stale_lookup_days: Option<u32>,
+    /// Refresh cadence actually applied, with defaults and bounds resolved.
+    pub effective_refresh_interval_hours: u32,
+    /// Staleness window actually applied, with defaults and bounds resolved.
+    pub effective_stale_lookup_days: u32,
+    /// True when a MaxMind license key is stored. The key is never returned.
+    pub maxmind_license_key_saved: bool,
+    /// When new database bytes were last installed (ISO 8601, UTC).
+    pub last_refreshed_at: Option<String>,
+    /// `maxmind_official` or `bundled_github`.
+    pub source: Option<String>,
+    /// When a refresh was last attempted, successful or not (ISO 8601, UTC).
+    pub last_check_at: Option<String>,
+    /// `ok` or `error` for the most recent refresh attempt.
+    pub last_check_status: Option<String>,
+    /// Redacted reason the last refresh failed. Never contains the key.
+    pub last_error: Option<String>,
+}
+
+impl From<temps_core::GeoSettings> for GeoSettingsMasked {
+    fn from(geo: temps_core::GeoSettings) -> Self {
+        Self {
+            refresh_interval_hours: geo.refresh_interval_hours,
+            stale_lookup_days: geo.stale_lookup_days,
+            effective_refresh_interval_hours: geo.effective_refresh_interval_hours(),
+            effective_stale_lookup_days: geo.effective_stale_lookup_days(),
+            maxmind_license_key_saved: geo.license_key_configured(),
+            last_refreshed_at: geo.last_refreshed_at.map(iso8601),
+            source: geo.source,
+            last_check_at: geo.last_check_at.map(iso8601),
+            last_check_status: geo.last_check_status,
+            last_error: geo.last_error,
+        }
+    }
+}
+
+fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -634,6 +731,7 @@ impl From<AppSettings> for AppSettingsResponse {
             monitored_services_count: None,
             observability_compression: settings.observability_compression,
             observability_retention: settings.observability_retention,
+            geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
@@ -2344,6 +2442,53 @@ fn validate_observability_retention(
     Ok(())
 }
 
+/// Reject out-of-range geolocation knobs instead of silently clamping them, so
+/// an admin who types `0` is told the value was not applied rather than
+/// discovering later that the job runs hourly.
+///
+/// `None` is valid and means "use the default", which is how the field is
+/// cleared.
+fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
+    if let Some(hours) = geo.refresh_interval_hours {
+        if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
+            ..=temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS)
+            .contains(&hours)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Geolocation Refresh Interval")
+                .detail(format!(
+                    "geo.refresh_interval_hours must be between {} and {} (got {}); leave it \
+                     empty to use the default of {} hours",
+                    temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS,
+                    temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS,
+                    hours,
+                    temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                ))
+                .build());
+        }
+    }
+
+    if let Some(days) = geo.stale_lookup_days {
+        if !(temps_core::MIN_GEO_STALE_LOOKUP_DAYS..=temps_core::MAX_GEO_STALE_LOOKUP_DAYS)
+            .contains(&days)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Geolocation Staleness Window")
+                .detail(format!(
+                    "geo.stale_lookup_days must be between {} and {} (got {}); leave it empty to \
+                     use the default of {} days",
+                    temps_core::MIN_GEO_STALE_LOOKUP_DAYS,
+                    temps_core::MAX_GEO_STALE_LOOKUP_DAYS,
+                    days,
+                    temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS,
+                ))
+                .build());
+        }
+    }
+
+    Ok(())
+}
+
 /// Normalize the edge target: trim whitespace and treat an empty string as
 /// `None` so an operator clearing the field disables DNS record sync.
 fn normalize_edge_target(settings: &mut AppSettings) {
@@ -2493,6 +2638,15 @@ async fn update_settings(
         }
     }
 
+    // Whether this request asked to store, rotate, or clear the MaxMind
+    // license key. Set inside the preservation block below (where the
+    // write-only plaintext field is still intact) and consumed twice: by the
+    // service, to decide whether the locked row's ciphertext wins, and by the
+    // dedicated audit record after a successful save.
+    // Left uninitialized deliberately: the only path that skips the block
+    // below aborts the save, so there is no default to fall back to.
+    let geo_license_key_intent: temps_core::GeoLicenseKeyIntent;
+
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
     // so any client round-trip would otherwise wipe them on save. We always
@@ -2518,6 +2672,38 @@ async fn update_settings(
             // The dedicated credential endpoint is the only write path for
             // encrypted provider secrets and native-verification proof.
             preserve_provider_credential_proof(&mut settings, &current_settings);
+            // Geo: restore the refresh metadata only the refresh job may
+            // write, then turn a newly submitted MaxMind license key into
+            // ciphertext (blank preserves the stored one, exactly like the
+            // email-provider credential fields). The plaintext field is
+            // `skip_serializing`, so it cannot reach the settings row even if
+            // this is ever bypassed — but it is consumed here regardless.
+            //
+            // The intent is captured *before* the write-only fields are
+            // consumed and passed down to the service, which re-applies it
+            // against the row it locks: `current_settings` here comes from the
+            // 5s-cached snapshot, so the ciphertext preserved below may
+            // already be stale by the time the row is locked.
+            geo_license_key_intent = settings.geo.license_key_intent();
+            settings.geo.preserve_recorded_state(&current_settings.geo);
+            settings
+                .geo
+                .apply_license_key_update(
+                    &current_settings.geo,
+                    app_state.encryption_service.as_ref(),
+                )
+                .map_err(|error| {
+                    // The error reports a cipher/encoding failure and never
+                    // echoes its input, so it is safe to surface verbatim.
+                    tracing::error!(%error, "Failed to encrypt the submitted MaxMind license key");
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("License Key Not Saved")
+                        .detail(format!(
+                            "The MaxMind license key could not be encrypted, so the settings \
+                             were not saved: {error}"
+                        ))
+                        .build()
+                })?;
             // Legacy flat credential
             if settings
                 .agent_sandbox
@@ -2597,6 +2783,7 @@ async fn update_settings(
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
+    validate_geo_settings(&settings.geo)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
@@ -2651,7 +2838,11 @@ async fn update_settings(
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
 
-    match app_state.config_service.update_settings(settings).await {
+    match app_state
+        .config_service
+        .update_settings_with_geo_intent(settings, geo_license_key_intent)
+        .await
+    {
         Ok(_) => {
             let audit = SettingsUpdatedAudit {
                 context: AuditContext {
@@ -2697,6 +2888,35 @@ async fn update_settings(
                         "Failed to create the Temps Cloud bulk activation guard audit log: {}",
                         e
                     );
+                }
+            }
+
+            // A credential write gets its own record, with booleans only.
+            match geo_license_key_intent {
+                temps_core::GeoLicenseKeyIntent::Unchanged => {}
+                intent => {
+                    let key_set = intent == temps_core::GeoLicenseKeyIntent::Set;
+                    info!(
+                        key_set,
+                        key_cleared = !key_set,
+                        "MaxMind license key changed"
+                    );
+                    let geo_key_audit = GeoLicenseKeyUpdatedAudit {
+                        context: AuditContext {
+                            user_id: auth.user_id(),
+                            ip_address: Some(metadata.ip_address.clone()),
+                            user_agent: metadata.user_agent.clone(),
+                        },
+                        key_set,
+                        key_cleared: !key_set,
+                    };
+                    if let Err(e) = app_state
+                        .audit_service
+                        .create_audit_log(&geo_key_audit)
+                        .await
+                    {
+                        error!("Failed to create the MaxMind license key audit log: {}", e);
+                    }
                 }
             }
 
@@ -4207,6 +4427,92 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 60);
         assert_eq!(response.observability_retention.otel_logs_days, 90);
         assert_eq!(response.observability_retention.otel_metrics_days, 90);
+    }
+
+    #[test]
+    fn response_surfaces_geo_policy_without_the_license_key() {
+        let now = chrono::Utc::now();
+        let mut settings = AppSettings::default();
+        settings.geo.refresh_interval_hours = Some(6);
+        settings.geo.stale_lookup_days = Some(14);
+        settings.geo.maxmind_license_key = Some("plaintext-key".to_string());
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext-blob".to_string());
+        settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        settings.geo.last_refreshed_at = Some(now);
+        settings.geo.last_check_at = Some(now);
+        settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.geo.refresh_interval_hours, Some(6));
+        assert_eq!(response.geo.stale_lookup_days, Some(14));
+        assert_eq!(response.geo.effective_refresh_interval_hours, 6);
+        assert_eq!(response.geo.effective_stale_lookup_days, 14);
+        assert!(response.geo.maxmind_license_key_saved);
+        assert_eq!(
+            response.geo.source.as_deref(),
+            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert!(response.geo.last_refreshed_at.is_some());
+
+        let rendered = serde_json::to_string(&response).expect("serialize the settings response");
+        assert!(
+            !rendered.contains("plaintext-key"),
+            "the settings response must never carry the plaintext license key"
+        );
+        assert!(
+            !rendered.contains("ciphertext-blob"),
+            "the settings response must never carry the stored ciphertext"
+        );
+    }
+
+    #[test]
+    fn response_reports_effective_geo_defaults_when_unconfigured() {
+        let response = AppSettingsResponse::from(AppSettings::default());
+
+        assert_eq!(response.geo.refresh_interval_hours, None);
+        assert_eq!(response.geo.stale_lookup_days, None);
+        assert_eq!(
+            response.geo.effective_refresh_interval_hours,
+            temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(
+            response.geo.effective_stale_lookup_days,
+            temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS
+        );
+        assert!(!response.geo.maxmind_license_key_saved);
+        assert_eq!(response.geo.last_check_status, None);
+    }
+
+    #[test]
+    fn geo_validation_accepts_the_supported_boundaries_and_none() {
+        assert!(validate_geo_settings(&temps_core::GeoSettings::default()).is_ok());
+        assert!(validate_geo_settings(&temps_core::GeoSettings {
+            refresh_interval_hours: Some(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS),
+            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS),
+            ..temps_core::GeoSettings::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn geo_validation_rejects_a_zero_refresh_interval() {
+        let error = validate_geo_settings(&temps_core::GeoSettings {
+            refresh_interval_hours: Some(0),
+            ..temps_core::GeoSettings::default()
+        })
+        .expect_err("a zero interval would turn the job into a download loop");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn geo_validation_rejects_an_out_of_range_staleness_window() {
+        let error = validate_geo_settings(&temps_core::GeoSettings {
+            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS + 1),
+            ..temps_core::GeoSettings::default()
+        })
+        .expect_err("an absurd window must be reported, not silently clamped");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
     }
 
     #[test]

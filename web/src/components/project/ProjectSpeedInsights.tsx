@@ -64,7 +64,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
@@ -579,15 +579,8 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     }),
   })
 
-  useEffect(() => {
-    if (
-      environmentsData &&
-      environmentsData.length > 0 &&
-      selectedEnvironment === null
-    ) {
-      setSelectedEnvironment(environmentsData[0].id)
-    }
-  }, [environmentsData, selectedEnvironment])
+  const effectiveEnvironment =
+    selectedEnvironment ?? environmentsData?.[0]?.id ?? null
 
   const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
   const startDate = window.from
@@ -610,13 +603,13 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
         start_date: startDate,
         end_date: endDate,
         project_id: project.id,
-        environment_id: selectedEnvironment!,
+        environment_id: effectiveEnvironment!,
         device_type: device,
         include_bots: includeBots,
         ...filters,
       },
     }),
-    enabled: selectedEnvironment !== null,
+    enabled: effectiveEnvironment !== null,
     refetchInterval: 300000,
   })
 
@@ -824,7 +817,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Select
-            value={selectedEnvironment?.toString()}
+            value={effectiveEnvironment?.toString()}
             onValueChange={(value) => setSelectedEnvironment(Number(value))}
             disabled={!environmentsData || environmentsData.length === 0}
           >
@@ -1028,7 +1021,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           {/* Web vitals by country, on a world map */}
           <SpeedWorldMap
             projectId={project.id}
-            environmentId={selectedEnvironment}
+            environmentId={effectiveEnvironment}
             startDate={startDate}
             endDate={endDate}
             device={device}
@@ -1040,7 +1033,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           {/* Per-page / per-dimension breakdown */}
           <SpeedBreakdownCard
             projectId={project.id}
-            environmentId={selectedEnvironment}
+            environmentId={effectiveEnvironment}
             startDate={startDate}
             endDate={endDate}
             device={device}

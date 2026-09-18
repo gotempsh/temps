@@ -105,8 +105,26 @@ impl TempsPlugin for BlobPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Get Docker client and encryption service from registry
-            let docker = context.require_service::<bollard::Docker>();
+            // Get Docker handle and encryption service from registry.
+            // The Blob service is a local workload (a RustFS container on this
+            // host); it is not registered on control-plane processes where no
+            // local daemon is present.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
+            let docker = match docker_handle.cloned() {
+                Some(d) => d,
+                None => {
+                    info!(
+                        "Blob plugin: local Docker daemon is unavailable ({}); \
+                         the Blob service runs as a managed container on worker \
+                         nodes joined with `temps join`. Skipping registration.",
+                        docker_handle
+                            .unavailable_error()
+                            .map(|e| e.profile)
+                            .unwrap_or("unknown"),
+                    );
+                    return Ok(());
+                }
+            };
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             // Create RustfsService from temps-providers
@@ -144,6 +162,14 @@ impl TempsPlugin for BlobPlugin {
         Box::pin(async move {
             debug!("Initializing Blob plugin services (deferred to background)...");
 
+            // If Docker was unavailable during register_services, nothing was
+            // registered and there is nothing to initialize.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
+            if !docker_handle.is_available() {
+                debug!("Blob plugin: Docker not available; skipping initialization");
+                return Ok(());
+            }
+
             // Container start is deferred to a background task so plugin
             // initialization (and thus console API readiness) doesn't block
             // on Docker pull/start. Until the container is up, blob requests
@@ -151,11 +177,13 @@ impl TempsPlugin for BlobPlugin {
             // surfaced sooner.
             let rustfs_service = context.require_service::<RustfsService>();
             let external_service_manager = context.require_service::<ExternalServiceManager>();
-            let docker = context.require_service::<bollard::Docker>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             tokio::spawn(async move {
-                report_legacy_duplicate_containers(docker, encryption_service).await;
+                // Cloned is safe: we checked is_available() above.
+                if let Some(docker) = docker_handle.cloned() {
+                    report_legacy_duplicate_containers(docker, encryption_service).await;
+                }
 
                 match external_service_manager
                     .get_service_by_name(BLOB_RUSTFS_SERVICE_NAME)
@@ -223,6 +251,13 @@ impl TempsPlugin for BlobPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        // When Docker was unavailable during register_services, BlobService
+        // and RustfsService were not registered — skip routes too.
+        let docker_handle = context.require_service::<temps_core::DockerHandle>();
+        if !docker_handle.is_available() {
+            debug!("Blob plugin: Docker not available; skipping route registration");
+            return None;
+        }
         // Get services from context
         let blob_service = context.require_service::<BlobService>();
         let rustfs_service = context.require_service::<RustfsService>();

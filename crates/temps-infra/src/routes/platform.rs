@@ -3,32 +3,94 @@
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::problemdetails::Problem;
+use temps_core::problemdetails::{self, Problem};
 use tracing::{debug, info};
 use utoipa::OpenApi;
 
-use crate::services::PlatformInfoService;
-use crate::types::{PlatformInfo, ServiceAccessInfo};
+use crate::services::{PlatformInfoError, PlatformInfoService};
+use crate::types::{
+    NetworkInterface, PlatformFeatures, PlatformInfo, PrivateIpInfo, PublicIpInfo,
+    ServiceAccessInfo,
+};
+
+// ---------------------------------------------------------------------------
+// Error conversion: PlatformInfoError -> Problem (RFC 7807)
+// ---------------------------------------------------------------------------
+
+impl From<PlatformInfoError> for Problem {
+    fn from(err: PlatformInfoError) -> Self {
+        match err {
+            // The caller asked for Docker-derived data on a process that has
+            // no daemon.  This is a client-visible conflict — the client
+            // should consult the /platform/features endpoint instead of
+            // retrying, and join a worker node if they need container
+            // platform info.
+            PlatformInfoError::DockerUnavailable { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Docker Unavailable")
+                    .with_detail(err.to_string())
+            }
+
+            // Docker daemon connectivity / protocol errors.
+            PlatformInfoError::Docker(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Docker Error")
+                .with_detail(err.to_string()),
+
+            // OS-level failure enumerating network interfaces.
+            PlatformInfoError::NetworkInterfaces(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Network Interface Error")
+                    .with_detail(err.to_string())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App-state trait
+// ---------------------------------------------------------------------------
 
 /// Application state containing the platform info service
 pub trait InfraAppState: Send + Sync + 'static {
     fn platform_info_service(&self) -> &PlatformInfoService;
 }
 
+// ---------------------------------------------------------------------------
+// OpenAPI doc
+// ---------------------------------------------------------------------------
+
 /// OpenAPI documentation for platform information endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_platform_info, get_public_ip, get_private_ip, get_access_info),
+    paths(
+        get_platform_info,
+        get_platform_features,
+        get_public_ip,
+        get_private_ip,
+        get_access_info
+    ),
     components(
-        schemas(PlatformInfo, ServiceAccessInfo)
+        schemas(
+            PlatformFeatures,
+            PlatformInfo,
+            ServiceAccessInfo,
+            PublicIpInfo,
+            PrivateIpInfo,
+            NetworkInterface
+        )
     ),
     tags(
         (name = "Platform", description = "Platform information and compatibility")
     )
 )]
 pub struct PlatformInfoApiDoc;
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 /// Get platform information
 #[utoipa::path(
@@ -38,6 +100,8 @@ pub struct PlatformInfoApiDoc;
         (status = 200, description = "Successfully retrieved platform information", body = PlatformInfo),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Docker daemon unavailable in this profile"),
+        (status = 500, description = "Internal server error"),
     ),
     tag = "Platform",
     security(("bearer_auth" = []))
@@ -45,7 +109,7 @@ pub struct PlatformInfoApiDoc;
 pub async fn get_platform_info<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PlatformInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -53,17 +117,42 @@ where
 
     info!("Getting platform info");
 
-    match app_state.platform_info_service().get_platform_info().await {
-        Ok(platform_info) => Ok(Json(serde_json::json!({
-            "platforms": platform_info.platforms
-        }))),
-        Err(e) => {
-            tracing::error!("Failed to get platform info: {}", e);
-            Ok(Json(serde_json::json!({
-                "platforms": ["linux/amd64"]  // Fallback to default
-            })))
-        }
-    }
+    let platform_info = app_state
+        .platform_info_service()
+        .get_platform_info()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(platform_info))
+}
+
+/// Report which capabilities this server process actually provides.
+///
+/// Always present, in every profile — a client must be able to tell
+/// "unavailable here, and here is why" from "endpoint does not exist".
+#[utoipa::path(
+    get,
+    path = "/platform/features",
+    responses(
+        (status = 200, description = "Capabilities of this server process", body = PlatformFeatures),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+    ),
+    tag = "Platform",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_platform_features<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+) -> Result<Json<PlatformFeatures>, Problem>
+where
+    T: InfraAppState,
+{
+    permission_guard!(auth, PlatformInfoRead);
+
+    debug!("Reporting platform features");
+
+    Ok(Json(app_state.platform_info_service().features().clone()))
 }
 
 /// Get public IP address of the server
@@ -71,7 +160,7 @@ where
     get,
     path = "/platform/public-ip",
     responses(
-        (status = 200, description = "Successfully retrieved public IP address"),
+        (status = 200, description = "Successfully retrieved public IP address", body = PublicIpInfo),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -81,7 +170,7 @@ where
 pub async fn get_public_ip<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PublicIpInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -89,19 +178,12 @@ where
 
     info!("Getting public IP address");
 
-    let ip_info = app_state.platform_info_service().get_public_ip().await;
-
-    if let Some(ip) = ip_info.ip {
-        Ok(Json(serde_json::json!({
-            "ip": ip,
-            "source": ip_info.source
-        })))
-    } else {
-        Ok(Json(serde_json::json!({
-            "error": ip_info.error.unwrap_or_else(|| "Unable to determine public IP address".to_string()),
-            "ip": null
-        })))
+    let mut ip_info = app_state.platform_info_service().get_public_ip().await;
+    if ip_info.ip.is_none() && ip_info.error.is_none() {
+        ip_info.error = Some("Unable to determine public IP address".to_string());
     }
+
+    Ok(Json(ip_info))
 }
 
 /// Get private/local IP address of the server
@@ -109,9 +191,10 @@ where
     get,
     path = "/platform/private-ip",
     responses(
-        (status = 200, description = "Successfully retrieved private IP address"),
+        (status = 200, description = "Successfully retrieved private IP address", body = PrivateIpInfo),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Failed to enumerate network interfaces"),
     ),
     tag = "Platform",
     security(("bearer_auth" = []))
@@ -119,7 +202,7 @@ where
 pub async fn get_private_ip<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PrivateIpInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -127,17 +210,13 @@ where
 
     info!("Getting private IP address");
 
-    match app_state.platform_info_service().get_private_ip().await {
-        Ok(ip_info) => Ok(Json(serde_json::json!({
-            "primary_ip": ip_info.primary_ip,
-            "ipv4_addresses": ip_info.ipv4_addresses,
-            "ipv6_addresses": ip_info.ipv6_addresses
-        }))),
-        Err(e) => Ok(Json(serde_json::json!({
-            "error": "Unable to get network interfaces",
-            "details": e.to_string()
-        }))),
-    }
+    let ip_info = app_state
+        .platform_info_service()
+        .get_private_ip()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(ip_info))
 }
 
 /// Get information about how the service is being accessed
@@ -195,6 +274,10 @@ where
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
 /// Configure platform infrastructure routes
 ///
 /// This function returns a router with all platform-related routes configured.
@@ -206,7 +289,51 @@ where
 {
     Router::new()
         .route("/.well-known/temps.json", get(get_platform_info::<T>))
+        .route("/platform/features", get(get_platform_features::<T>))
         .route("/platform/public-ip", get(get_public_ip::<T>))
         .route("/platform/private-ip", get(get_private_ip::<T>))
         .route("/platform/access-info", get(get_access_info::<T>))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_unavailable_maps_to_409_conflict() {
+        let err = PlatformInfoError::DockerUnavailable {
+            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
+            reason: "no socket".to_string(),
+        };
+        let problem = Problem::from(err);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn network_interfaces_error_maps_to_500() {
+        // We can't construct bollard::errors::Error directly without a live
+        // daemon, so we test the NetworkInterfaces arm as a proxy for the 500
+        // mapping, and rely on the compiler's exhaustiveness check for the
+        // Docker arm.
+        let err = PlatformInfoError::NetworkInterfaces(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        let problem = Problem::from(err);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn network_interfaces_not_found_maps_to_500() {
+        let err = PlatformInfoError::NetworkInterfaces(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such device",
+        ));
+        let problem = Problem::from(err);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

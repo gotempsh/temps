@@ -48,7 +48,10 @@ export function StatusBadge({ status }: { status: string }) {
       )
     case 'captured':
       return (
-        <Badge variant="outline" className="gap-1 border-blue-500 text-blue-600">
+        <Badge
+          variant="outline"
+          className="gap-1 border-blue-500 text-blue-600"
+        >
           <Archive className="h-3 w-3" />
           Captured
         </Badge>
@@ -62,7 +65,10 @@ export function StatusBadge({ status }: { status: string }) {
       )
     case 'delivery_unknown':
       return (
-        <Badge variant="outline" className="gap-1 border-amber-500 text-amber-600">
+        <Badge
+          variant="outline"
+          className="gap-1 border-amber-500 text-amber-600"
+        >
           <AlertTriangle className="h-3 w-3" />
           Delivery unknown
         </Badge>
@@ -103,7 +109,10 @@ export function EventIcon({
 
 const EVENT_BADGE_CONFIG: Record<
   string,
-  { variant: 'default' | 'secondary' | 'destructive' | 'outline'; label: string }
+  {
+    variant: 'default' | 'secondary' | 'destructive' | 'outline'
+    label: string
+  }
 > = {
   open: { variant: 'secondary', label: 'Opened' },
   opened: { variant: 'secondary', label: 'Opened' },
@@ -121,7 +130,10 @@ export function EventBadge({
   type: string
   iconClassName?: string
 }) {
-  const config = EVENT_BADGE_CONFIG[type] || { variant: 'outline' as const, label: type }
+  const config = EVENT_BADGE_CONFIG[type] || {
+    variant: 'outline' as const,
+    label: type,
+  }
 
   return (
     <Badge variant={config.variant} className="gap-1 text-xs">

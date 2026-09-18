@@ -27,18 +27,25 @@ pub struct DockerImporter {
 }
 
 impl DockerImporter {
-    /// Create a new Docker importer
-    pub fn new() -> ImportResult<Self> {
-        let docker = Docker::connect_with_local_defaults()
+    /// Create a new Docker importer from a [`temps_core::DockerHandle`].
+    ///
+    /// Returns an error when the handle reports no local daemon — this is the
+    /// expected path on a `control-plane` profile process, and callers should
+    /// log a warning and continue without the Docker importer rather than
+    /// failing startup.
+    pub fn new(docker_handle: Arc<temps_core::DockerHandle>) -> ImportResult<Self> {
+        let docker = docker_handle
+            .require()
             .map_err(|e| temps_import_types::ImportError::SourceNotAccessible(e.to_string()))?;
 
         Ok(Self {
-            docker: Arc::new(docker),
+            docker,
             version: env!("CARGO_PKG_VERSION").to_string(),
         })
     }
 
-    /// Create with a custom Docker client
+    /// Create with a pre-built Docker client (used in tests and for
+    /// integrations that already have a validated client).
     pub fn with_docker(docker: Docker) -> Self {
         Self {
             docker: Arc::new(docker),

@@ -27,6 +27,14 @@ use crate::channel::PluginChannel;
 use crate::install::open_verified_executable;
 use crate::proxy::PluginProxy;
 
+pub(crate) fn repository_actor_source(repository: &str) -> String {
+    format!("repository:{repository}")
+}
+
+pub(crate) fn registry_actor_source(registry_url: &str) -> String {
+    format!("registry:{registry_url}")
+}
+
 /// State of a single external plugin process.
 pub struct ExternalPluginProcess {
     /// The parsed manifest from the handshake
@@ -342,6 +350,8 @@ pub struct ExternalPluginManager {
     /// console; `None` leaves plugins without one, so their API calls fail
     /// closed rather than being attributed to nobody.
     actor_crypto: crate::proxy::ActorCryptoSlot,
+    ai_service: Arc<RwLock<Option<Arc<dyn temps_ai::AiService>>>>,
+    audit_service: Arc<RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
 }
 
 impl ExternalPluginManager {
@@ -352,6 +362,8 @@ impl ExternalPluginManager {
             db,
             host_api: Arc::new(crate::channel::HostApiSlot::new(None)),
             actor_crypto: crate::proxy::ActorCryptoSlot::default(),
+            ai_service: Arc::new(RwLock::new(None)),
+            audit_service: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -369,6 +381,21 @@ impl ExternalPluginManager {
         // Every proxy already holds a clone of this slot, so mounted routes
         // start minting immediately — no rebuild, no ordering requirement.
         self.actor_crypto.set(crypto);
+    }
+
+    pub async fn set_ai_service(&self, service: Arc<dyn temps_ai::AiService>) {
+        *self.ai_service.write().await = Some(service);
+    }
+
+    pub async fn ai_available(&self) -> bool {
+        match self.ai_service.read().await.clone() {
+            Some(service) => service.is_available().await,
+            None => false,
+        }
+    }
+
+    pub async fn set_audit_service(&self, service: Arc<dyn temps_core::AuditLogger>) {
+        *self.audit_service.write().await = Some(service);
     }
 
     /// Discover and start all plugins in the plugins directory.
@@ -568,6 +595,7 @@ impl ExternalPluginManager {
 
     /// Spawn a single plugin binary and complete the handshake without adding
     /// it to the active process table.
+    #[allow(clippy::too_many_arguments)] // Keep verified identity inputs explicit at the process security boundary.
     async fn spawn_plugin(
         &self,
         binary_path: &Path,
@@ -576,6 +604,8 @@ impl ExternalPluginManager {
         expected_version: &str,
         instance_name: &str,
         data_name: &str,
+        source_identity: String,
+        defer_actor_commit: bool,
     ) -> Result<ExternalPluginProcess, String> {
         let binary_name = binary_path
             .file_name()
@@ -916,6 +946,12 @@ impl ExternalPluginManager {
             self.db.clone(),
             self.host_api.clone(),
             manifest.capabilities.clone(),
+            manifest.host_permissions.clone(),
+            expected_sha256.to_string(),
+            source_identity,
+            defer_actor_commit,
+            self.ai_service.clone(),
+            self.audit_service.clone(),
             &auth_secret,
         )
         .await;
@@ -951,6 +987,20 @@ impl ExternalPluginManager {
         expected_sha256: &str,
         binary_path: &Path,
     ) -> Result<PluginManifest, String> {
+        let source_identity = match crate::install::repository_source(
+            &self.config.plugins_dir,
+            expected_name,
+        )
+        .await
+        {
+            Ok(Some(receipt)) => repository_actor_source(&receipt.repository),
+            Ok(None) => registry_actor_source(&self.config.registry.url),
+            Err(error) => {
+                return Err(format!(
+                    "Cannot resolve verified source identity for {expected_name}: {error}"
+                ))
+            }
+        };
         let process = self
             .spawn_plugin(
                 binary_path,
@@ -959,6 +1009,8 @@ impl ExternalPluginManager {
                 expected_version,
                 expected_name,
                 expected_name,
+                source_identity,
+                false,
             )
             .await?;
         let manifest = process.manifest.clone();
@@ -981,6 +1033,7 @@ impl ExternalPluginManager {
         expected_version: &str,
         expected_sha256: &str,
         binary_path: &Path,
+        source_identity: String,
     ) -> Result<PendingPlugin, String> {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let instance_name = format!("candidate-{}", &suffix[..16]);
@@ -992,12 +1045,23 @@ impl ExternalPluginManager {
                 expected_version,
                 &instance_name,
                 expected_name,
+                source_identity,
+                true,
             )
             .await?;
         Ok(PendingPlugin {
             expected_name: expected_name.to_string(),
             process,
         })
+    }
+
+    pub(crate) fn candidate_actor_binding(pending: &PendingPlugin) -> Result<(&str, &str), String> {
+        pending
+            .process
+            .channel
+            .as_ref()
+            .map(PluginChannel::actor_binding)
+            .ok_or_else(|| "Candidate has no authenticated plugin channel".to_string())
     }
 
     /// Atomically swap the process table entry, then stop the old process.
@@ -1098,6 +1162,17 @@ impl ExternalPluginManager {
             }
         }
         false
+    }
+
+    pub async fn event_delivery_allowed(&self, plugin_name: &str) -> bool {
+        let plugins = self.plugins.read().await;
+        match plugins
+            .get(plugin_name)
+            .and_then(|process| process.channel.as_ref())
+        {
+            Some(channel) => channel.can_receive_events().await,
+            None => false,
+        }
     }
 
     /// Check if a plugin is running.
@@ -1235,6 +1310,20 @@ mod tests {
     }
 
     #[test]
+    fn repository_candidate_and_restart_use_the_same_actor_source_identity() {
+        let verified_repository = "https://github.com/example/plugin";
+
+        let candidate_identity = repository_actor_source(verified_repository);
+        let restart_receipt_identity = repository_actor_source(verified_repository);
+
+        assert_eq!(candidate_identity, restart_receipt_identity);
+        assert_eq!(
+            candidate_identity,
+            "repository:https://github.com/example/plugin"
+        );
+    }
+
+    #[test]
     fn plugin_processes_receive_distinct_auth_secrets() {
         let first = generate_plugin_auth_secret();
         let second = generate_plugin_auth_secret();
@@ -1364,7 +1453,13 @@ mod tests {
 
         // Act
         let error = match manager
-            .prepare_candidate("expected-plugin", "1.0.0", &digest, &binary)
+            .prepare_candidate(
+                "expected-plugin",
+                "1.0.0",
+                &digest,
+                &binary,
+                "registry:https://registry.invalid".to_string(),
+            )
             .await
         {
             Ok(_) => panic!("signed and declared identities must match"),

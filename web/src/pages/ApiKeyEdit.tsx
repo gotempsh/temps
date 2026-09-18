@@ -68,7 +68,9 @@ export default function ApiKeyEdit() {
     }
   }, [apiKey, apiKeyError, refetchApiKey])
 
-  useEffect(() => {
+  const [loadedApiKey, setLoadedApiKey] = useState(apiKey)
+  if (apiKey !== loadedApiKey) {
+    setLoadedApiKey(apiKey)
     if (apiKey) {
       setFormData({
         name: apiKey.name,
@@ -78,7 +80,7 @@ export default function ApiKeyEdit() {
           : '',
       })
     }
-  }, [apiKey])
+  }
 
   const updateMutation = useMutation({
     mutationFn: (data: UpdateApiKeyRequest) =>

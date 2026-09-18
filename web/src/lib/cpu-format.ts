@@ -12,7 +12,9 @@
 //   formatCpuUsage(2.4, 1)    -> "0.024 / 1 core"
 //   formatCpuUsage(0, 2)      -> "0.00 / 2 cores"
 
-export function coresFromPercent(percent: number | null | undefined): number | null {
+export function coresFromPercent(
+  percent: number | null | undefined
+): number | null {
   if (percent == null || !Number.isFinite(percent)) return null
   return percent / 100
 }
@@ -40,7 +42,7 @@ function formatLimitCores(limitCores: number): string {
 
 export function formatCpuUsage(
   cpuPercent: number | null | undefined,
-  limitCores: number | null | undefined,
+  limitCores: number | null | undefined
 ): string {
   const cores = coresFromPercent(cpuPercent)
   if (cores == null) return '—'
@@ -73,7 +75,7 @@ export function formatMicrocores(micro: number | null | undefined): string {
 // progress bars that should fill at the cap, not at 100% of all host cores.
 export function cpuPercentOfLimit(
   cpuPercent: number | null | undefined,
-  limitCores: number | null | undefined,
+  limitCores: number | null | undefined
 ): number | null {
   if (cpuPercent == null || !Number.isFinite(cpuPercent)) return null
   if (limitCores == null || limitCores <= 0) return null

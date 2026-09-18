@@ -18,7 +18,6 @@ use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbS
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
 use crate::services::ExternalServiceManager;
-use bollard::Docker;
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -27,6 +26,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use temps_core::DockerHandle;
 use temps_core::EncryptionService;
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_backups,
@@ -98,8 +98,9 @@ pub struct ExternalServiceHealthMonitor {
     alarm_service: Arc<AlarmService>,
     config: ExternalServiceHealthConfig,
     /// Docker handle used by the per-service MariaDB binlog archiver to read
-    /// closed binlog segments out of the container.
-    docker: Arc<Docker>,
+    /// closed binlog segments out of the container. May be Disabled on
+    /// control-plane profiles — binlog archiving is skipped gracefully.
+    docker: Arc<DockerHandle>,
     /// Decrypts `s3_sources` credentials so the archiver can build an S3 client.
     encryption_service: Arc<EncryptionService>,
     /// Last time we ran the binlog archiver for each MariaDB service, keyed by
@@ -125,7 +126,7 @@ impl ExternalServiceHealthMonitor {
         manager: Arc<ExternalServiceManager>,
         alarm_service: Arc<AlarmService>,
         config: ExternalServiceHealthConfig,
-        docker: Arc<Docker>,
+        docker: Arc<DockerHandle>,
         encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
@@ -580,7 +581,17 @@ impl ExternalServiceHealthMonitor {
         };
         let s3_client = creds.build_s3_client().await;
 
-        let mariadb = MariaDbService::new(service.name.clone(), self.docker.clone());
+        let docker_client = match self.docker.get() {
+            Some(d) => d,
+            None => {
+                info!(
+                    service_id = service.id,
+                    "Docker unavailable on this process; skipping MariaDB binlog archiving"
+                );
+                return;
+            }
+        };
+        let mariadb = MariaDbService::new(service.name.clone(), docker_client.clone());
         match mariadb
             .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
             .await

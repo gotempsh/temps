@@ -7,7 +7,7 @@
  * Mirrors the Rust `PluginManifest::builder()` pattern.
  */
 
-import type { NavEntry, NavSection, PluginManifest, UiManifest } from "./types.js";
+import type { NavEntry, NavSection, PluginManifest, PluginHostPermission, UiManifest } from "./types.js";
 
 export class ManifestBuilder {
   private _name: string;
@@ -19,6 +19,7 @@ export class ManifestBuilder {
   private _requiresDb = false;
   private _healthPath = "/health";
   private _events: string[] = [];
+  private _hostPermissions: PluginHostPermission[] = [];
 
   constructor(name: string, version: string) {
     this._name = name;
@@ -84,6 +85,12 @@ export class ManifestBuilder {
     return this;
   }
 
+  /** Declare desired access. This does not grant it; administrators control approval. */
+  requestPermissions(...permissions: PluginHostPermission[]): this {
+    this._hostPermissions = [...new Set([...this._hostPermissions, ...permissions])];
+    return this;
+  }
+
   build(): PluginManifest {
     return {
       name: this._name,
@@ -95,6 +102,7 @@ export class ManifestBuilder {
       requires_db: this._requiresDb,
       health_path: this._healthPath,
       events: this._events,
+      host_permissions: [...this._hostPermissions],
     };
   }
 }

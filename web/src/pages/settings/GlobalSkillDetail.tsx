@@ -30,7 +30,7 @@ import {
   Wand2,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -68,14 +68,14 @@ export function GlobalSkillDetail() {
   const [description, setDescription] = useState('')
   const [content, setContent] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [loadedSkill, setLoadedSkill] = useState(skill)
 
-  useEffect(() => {
-    if (skill) {
-      setName(skill.name)
-      setDescription(skill.description ?? '')
-      setContent(skill.content)
-    }
-  }, [skill])
+  if (skill !== loadedSkill) {
+    setLoadedSkill(skill)
+    setName(skill?.name ?? '')
+    setDescription(skill?.description ?? '')
+    setContent(skill?.content ?? '')
+  }
 
   const updateMutation = useMutation({
     ...updateGlobalSkillMutation(),

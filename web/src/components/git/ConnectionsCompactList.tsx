@@ -121,10 +121,9 @@ export function ConnectionsCompactList({
       if (data.health_status === 'healthy') {
         toast.success(`Connection "${data.account_name}" is healthy`)
       } else if (data.health_status === 'unhealthy') {
-        toast.error(
-          `Connection "${data.account_name}" is unhealthy`,
-          { description: data.health_message ?? undefined }
-        )
+        toast.error(`Connection "${data.account_name}" is unhealthy`, {
+          description: data.health_message ?? undefined,
+        })
       } else {
         toast.message(`Health status: ${data.health_status}`)
       }
@@ -308,14 +307,11 @@ export function ConnectionsCompactList({
       const railColor = unhealthy
         ? 'bg-destructive'
         : healthy
-        ? 'bg-emerald-500'
-        : 'bg-muted-foreground/30'
+          ? 'bg-emerald-500'
+          : 'bg-muted-foreground/30'
 
       return (
-        <li
-          key={c.id}
-          className="relative flex flex-col gap-1 px-4 py-3 pl-5"
-        >
+        <li key={c.id} className="relative flex flex-col gap-1 px-4 py-3 pl-5">
           <span
             aria-hidden
             className={`absolute inset-y-2 left-1.5 w-[3px] rounded-full ${railColor}`}
@@ -340,15 +336,15 @@ export function ConnectionsCompactList({
                 unhealthy
                   ? 'font-medium text-destructive'
                   : healthy
-                  ? 'text-emerald-600 dark:text-emerald-400'
-                  : ''
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : ''
               }
             >
               {unhealthy && c.health_message
                 ? c.health_message
                 : healthy
-                ? 'Healthy'
-                : 'Not checked yet'}
+                  ? 'Healthy'
+                  : 'Not checked yet'}
             </span>
             <span aria-hidden>·</span>
             <span className="flex items-center gap-1">
@@ -374,10 +370,7 @@ export function ConnectionsCompactList({
 
     if (variant === 'two-line') {
       return (
-        <li
-          key={c.id}
-          className="flex items-start gap-3 px-3 py-3 sm:px-4"
-        >
+        <li key={c.id} className="flex items-start gap-3 px-3 py-3 sm:px-4">
           <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-muted">
             <Users className="h-4 w-4 text-muted-foreground" />
           </div>
@@ -426,10 +419,7 @@ export function ConnectionsCompactList({
       .toUpperCase()
 
     return (
-      <li
-        key={c.id}
-        className="flex items-center gap-3 px-3 py-2.5 sm:px-4"
-      >
+      <li key={c.id} className="flex items-center gap-3 px-3 py-2.5 sm:px-4">
         <div className="flex size-9 shrink-0 items-center justify-center rounded-full border bg-muted text-xs font-semibold text-muted-foreground">
           {initials || '?'}
         </div>
@@ -454,9 +444,7 @@ export function ConnectionsCompactList({
               )}
             </span>
             {c.installation_id && (
-              <span className="font-mono truncate">
-                id:{c.installation_id}
-              </span>
+              <span className="font-mono truncate">id:{c.installation_id}</span>
             )}
           </div>
         </div>
@@ -496,8 +484,8 @@ export function ConnectionsCompactList({
             <AlertDialogTitle>Delete Connection</AlertDialogTitle>
             <AlertDialogDescription>
               Are you sure you want to delete the connection for{' '}
-              <strong>{deleteDialog.connectionName}</strong>? This action
-              cannot be undone and will remove all associated repositories.
+              <strong>{deleteDialog.connectionName}</strong>? This action cannot
+              be undone and will remove all associated repositories.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

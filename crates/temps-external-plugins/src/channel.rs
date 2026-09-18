@@ -19,9 +19,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
+use temps_core::external_plugin::channel::PluginHostPermission;
 use temps_core::external_plugin::channel::*;
 use temps_core::external_plugin::manifest::PluginCapability;
 use temps_core::external_plugin::PluginEvent;
@@ -31,6 +33,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
+static AI_CONCURRENCY: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(8)));
+
 /// A live channel connection to a single plugin.
 pub struct PluginChannel {
     /// Plugin name (for logging).
@@ -39,6 +44,10 @@ pub struct PluginChannel {
     tx: mpsc::UnboundedSender<ChannelMessage>,
     /// Background task reading from the WebSocket.
     reader_task: JoinHandle<()>,
+    grant_service: PluginGrantService,
+    actor_id: String,
+    source_identity: String,
+    host_permissions: Vec<PluginHostPermission>,
 }
 
 impl PluginChannel {
@@ -46,15 +55,43 @@ impl PluginChannel {
     ///
     /// Returns `None` if the connection fails (the plugin may not support
     /// the channel yet — this is not fatal).
+    #[allow(clippy::too_many_arguments)] // Explicit security dependencies stay visible at the process boundary.
     pub async fn connect(
         socket_path: &Path,
         plugin_name: String,
         db: Arc<DatabaseConnection>,
         host_api: Arc<HostApiSlot>,
         capabilities: Vec<PluginCapability>,
+        host_permissions: Vec<PluginHostPermission>,
+        binary_sha256: String,
+        source_identity: String,
+        defer_actor_commit: bool,
+        ai_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_ai::AiService>>>>,
+        audit_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
         auth_secret: &str,
     ) -> Option<Self> {
         let socket_path_str = socket_path.to_string_lossy().to_string();
+        let grant_service = PluginGrantService::new(db.clone());
+        let actor_result = if defer_actor_commit {
+            grant_service
+                .prepare_actor(&plugin_name, &source_identity)
+                .await
+        } else {
+            grant_service
+                .ensure_actor(&plugin_name, &binary_sha256, &source_identity)
+                .await
+        };
+        let actor = match actor_result {
+            Ok(grants) => grants.actor,
+            Err(error) => {
+                warn!(plugin = %plugin_name, error = %error, "Cannot bind durable plugin actor");
+                return None;
+            }
+        };
+        let bound_actor_id = actor.id;
+        let channel_actor_id = bound_actor_id.clone();
+        let channel_grants = grant_service.clone();
+        let channel_permissions = host_permissions.clone();
 
         // Connect to the plugin's Unix socket and upgrade to WebSocket.
         // tokio-tungstenite doesn't support Unix sockets directly, so we
@@ -214,6 +251,11 @@ impl PluginChannel {
                             &db,
                             &host_api,
                             &capabilities,
+                            &host_permissions,
+                            &grant_service,
+                            &bound_actor_id,
+                            &ai_service,
+                            &audit_service,
                             &req,
                         )
                         .await;
@@ -240,7 +282,15 @@ impl PluginChannel {
             plugin_name,
             tx: msg_tx,
             reader_task,
+            grant_service: channel_grants,
+            actor_id: channel_actor_id,
+            source_identity,
+            host_permissions: channel_permissions,
         })
+    }
+
+    pub(crate) fn actor_binding(&self) -> (&str, &str) {
+        (&self.actor_id, &self.source_identity)
     }
 
     /// Push a platform event to the plugin over the channel.
@@ -248,6 +298,22 @@ impl PluginChannel {
         self.tx
             .send(ChannelMessage::Event(ChannelEvent { event }))
             .map_err(|_| format!("Channel closed for plugin '{}'", self.plugin_name))
+    }
+
+    pub async fn can_receive_events(&self) -> bool {
+        self.grant_service
+            .get(&self.plugin_name)
+            .await
+            .is_ok_and(|grants| {
+                grants.actor.id == self.actor_id
+                    && self
+                        .host_permissions
+                        .contains(&PluginHostPermission::EventsRead)
+                    && grants
+                        .config
+                        .permissions
+                        .contains(&PluginHostPermission::EventsRead)
+            })
     }
 
     /// Check if the channel is still alive.
@@ -308,11 +374,17 @@ pub type HostApiSlot = tokio::sync::RwLock<Option<Arc<dyn HostApiBridge>>>;
 /// error, which is the point of the typed protocol. A method this build does
 /// not know cannot reach here at all — it fails to deserialize, and the
 /// reader loop answers `MethodNotFound`.
+#[allow(clippy::too_many_arguments)] // Dispatcher receives each independently-auditable authority source explicitly.
 async fn dispatch_request(
     plugin_name: &str,
     db: &DatabaseConnection,
     host_api: &HostApiSlot,
     capabilities: &[PluginCapability],
+    host_permissions: &[PluginHostPermission],
+    grants: &PluginGrantService,
+    bound_actor_id: &str,
+    ai_service: &tokio::sync::RwLock<Option<Arc<dyn temps_ai::AiService>>>,
+    audit_service: &tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>,
     req: &ChannelRequest,
 ) -> ChannelResponse {
     debug!(
@@ -322,18 +394,197 @@ async fn dispatch_request(
         "Dispatching channel request"
     );
 
-    let outcome = match &req.call {
-        PlatformCallRequest::GetProject(p) => handle_get_project(db, p).await,
-        PlatformCallRequest::ListProjects(p) => handle_list_projects(db, p).await,
-        PlatformCallRequest::GetEnvironment(p) => handle_get_environment(db, p).await,
-        PlatformCallRequest::ListEnvironments(p) => handle_list_environments(db, p).await,
-        PlatformCallRequest::GetDeployment(p) => handle_get_deployment(db, p).await,
-        PlatformCallRequest::GetLastDeployment(p) => handle_get_last_deployment(db, p).await,
-        PlatformCallRequest::ListDeployments(p) => handle_list_deployments(db, p).await,
-        PlatformCallRequest::ApiCall(call) => {
-            handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
+    let current = match grants.get(plugin_name).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ChannelResponse::err(
+                req.id,
+                ChannelErrorCode::PermissionDenied,
+                format!("Plugin actor authorization failed: {error}"),
+            )
         }
     };
+    if current.actor.id != bound_actor_id {
+        return ChannelResponse::err(
+            req.id,
+            ChannelErrorCode::PermissionDenied,
+            "This channel belongs to a replaced plugin actor",
+        );
+    }
+    let effective = |permission| {
+        host_permissions.contains(&permission) && current.config.permissions.contains(&permission)
+    };
+    let required_permission = match &req.call {
+        PlatformCallRequest::GetProject(_) | PlatformCallRequest::ListProjects(_) => {
+            Some(PluginHostPermission::ProjectsRead)
+        }
+        PlatformCallRequest::GetEnvironment(_) | PlatformCallRequest::ListEnvironments(_) => {
+            Some(PluginHostPermission::EnvironmentsRead)
+        }
+        PlatformCallRequest::GetDeployment(_)
+        | PlatformCallRequest::GetLastDeployment(_)
+        | PlatformCallRequest::ListDeployments(_) => Some(PluginHostPermission::DeploymentsRead),
+        PlatformCallRequest::ApiCall(call) => Some(if call.method.is_mutating() {
+            PluginHostPermission::ApiWrite
+        } else {
+            PluginHostPermission::ApiRead
+        }),
+        PlatformCallRequest::GenerateAi(_) => Some(PluginHostPermission::AiGenerate),
+        PlatformCallRequest::GetHostCapabilities(_) => None,
+    };
+    let allowed = required_permission.is_none_or(&effective);
+    let Some(auditor) = audit_service.read().await.clone() else {
+        return ChannelResponse::err(
+            req.id,
+            ChannelErrorCode::Internal,
+            "Plugin host-operation audit service is unavailable",
+        );
+    };
+    let audit = PluginHostOperationAudit {
+        actor: PluginAuditActor {
+            id: current.actor.id.clone(),
+            name: plugin_name.to_string(),
+            kind: "plugin",
+        },
+        operation: req.call.method_name().to_string(),
+        request_id: req.id,
+        permission: required_permission.map(|p| p.as_str().to_string()),
+        outcome: if allowed { "allowed" } else { "denied" },
+    };
+    if auditor.create_audit_log(&audit).await.is_err() {
+        return ChannelResponse::err(
+            req.id,
+            ChannelErrorCode::Internal,
+            "Plugin host operation was stopped because its security audit could not be recorded",
+        );
+    }
+    let denied = |permission: PluginHostPermission| {
+        Err(ChannelError::new(
+            ChannelErrorCode::PermissionDenied,
+            format!(
+                "Plugin '{plugin_name}' lacks current '{}' permission",
+                permission.as_str()
+            ),
+        ))
+    };
+    let outcome = match &req.call {
+        PlatformCallRequest::GetProject(p) => {
+            if effective(PluginHostPermission::ProjectsRead) {
+                handle_get_project(db, p).await
+            } else {
+                denied(PluginHostPermission::ProjectsRead)
+            }
+        }
+        PlatformCallRequest::ListProjects(p) => {
+            if effective(PluginHostPermission::ProjectsRead) {
+                handle_list_projects(db, p).await
+            } else {
+                denied(PluginHostPermission::ProjectsRead)
+            }
+        }
+        PlatformCallRequest::GetEnvironment(p) => {
+            if effective(PluginHostPermission::EnvironmentsRead) {
+                handle_get_environment(db, p).await
+            } else {
+                denied(PluginHostPermission::EnvironmentsRead)
+            }
+        }
+        PlatformCallRequest::ListEnvironments(p) => {
+            if effective(PluginHostPermission::EnvironmentsRead) {
+                handle_list_environments(db, p).await
+            } else {
+                denied(PluginHostPermission::EnvironmentsRead)
+            }
+        }
+        PlatformCallRequest::GetDeployment(p) => {
+            if effective(PluginHostPermission::DeploymentsRead) {
+                handle_get_deployment(db, p).await
+            } else {
+                denied(PluginHostPermission::DeploymentsRead)
+            }
+        }
+        PlatformCallRequest::GetLastDeployment(p) => {
+            if effective(PluginHostPermission::DeploymentsRead) {
+                handle_get_last_deployment(db, p).await
+            } else {
+                denied(PluginHostPermission::DeploymentsRead)
+            }
+        }
+        PlatformCallRequest::ListDeployments(p) => {
+            if effective(PluginHostPermission::DeploymentsRead) {
+                handle_list_deployments(db, p).await
+            } else {
+                denied(PluginHostPermission::DeploymentsRead)
+            }
+        }
+        PlatformCallRequest::ApiCall(call) => {
+            let permission = if call.method.is_mutating() {
+                PluginHostPermission::ApiWrite
+            } else {
+                PluginHostPermission::ApiRead
+            };
+            if effective(permission) {
+                handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
+            } else {
+                denied(permission)
+            }
+        }
+        PlatformCallRequest::GetHostCapabilities(_) => {
+            let ai = ai_service.read().await.clone();
+            let configured = match ai {
+                Some(service) => service.is_available().await,
+                None => false,
+            };
+            Ok(PlatformCallResponse::GetHostCapabilities(
+                HostCapabilities {
+                    actor: current.actor.clone(),
+                    permissions: current
+                        .config
+                        .permissions
+                        .into_iter()
+                        .filter(|p| host_permissions.contains(p))
+                        .collect(),
+                    ai: PluginAiCapability {
+                        configured,
+                        reason: (!configured)
+                            .then(|| "No host AI provider is configured".to_string()),
+                        setup_path: "/settings/ai-providers".into(),
+                        daily_call_limit: current.config.ai_daily_call_limit,
+                        max_output_tokens: current.config.ai_max_output_tokens,
+                        max_prompt_bytes: MAX_PROMPT_BYTES,
+                    },
+                },
+            ))
+        }
+        PlatformCallRequest::GenerateAi(request) => {
+            if effective(PluginHostPermission::AiGenerate) {
+                handle_generate_ai(plugin_name, grants, &current, ai_service, request.clone()).await
+            } else {
+                denied(PluginHostPermission::AiGenerate)
+            }
+        }
+    };
+
+    if allowed {
+        let completion = PluginHostOperationAudit {
+            actor: PluginAuditActor {
+                id: current.actor.id.clone(),
+                name: plugin_name.to_string(),
+                kind: "plugin",
+            },
+            operation: req.call.method_name().to_string(),
+            request_id: req.id,
+            permission: required_permission.map(|permission| permission.as_str().to_string()),
+            outcome: if outcome.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        };
+        if auditor.create_audit_log(&completion).await.is_err() {
+            error!(plugin_actor_id = %current.actor.id, plugin = %plugin_name, request_id = req.id, "Plugin host operation outcome audit failed after execution");
+        }
+    }
 
     match outcome {
         Ok(result) => ChannelResponse::ok(req.id, result),
@@ -344,6 +595,49 @@ async fn dispatch_request(
     }
 }
 
+#[derive(serde::Serialize)]
+struct PluginHostOperationAudit {
+    actor: PluginAuditActor,
+    operation: String,
+    request_id: u64,
+    permission: Option<String>,
+    outcome: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct PluginAuditActor {
+    id: String,
+    name: String,
+    kind: &'static str,
+}
+
+impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
+    fn operation_type(&self) -> String {
+        match self.outcome {
+            "allowed" => "EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED",
+            "denied" => "EXTERNAL_PLUGIN_HOST_OPERATION_DENIED",
+            "succeeded" => "EXTERNAL_PLUGIN_HOST_OPERATION_SUCCEEDED",
+            "failed" => "EXTERNAL_PLUGIN_HOST_OPERATION_FAILED",
+            _ => "EXTERNAL_PLUGIN_HOST_OPERATION_FAILED",
+        }
+        .to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+    fn user_agent(&self) -> &str {
+        "external-plugin-channel"
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize plugin host-operation audit: {error}")
+        })
+    }
+}
+
 /// Serve an [`ApiCall`] through the platform's own router.
 async fn handle_api_call(
     plugin_name: &str,
@@ -351,6 +645,27 @@ async fn handle_api_call(
     capabilities: &[PluginCapability],
     call: ApiCall,
 ) -> Result<PlatformCallResponse, ChannelError> {
+    // Generic delegation is intentionally a narrow compatibility surface.
+    // Privileged namespaces use dedicated brokers with their own limits.
+    let segments = call.path.split('/').collect::<Vec<_>>();
+    let allowed = matches!(
+        segments.as_slice(),
+        ["", "projects" | "environments" | "deployments"]
+    ) || matches!(segments.as_slice(), ["", "projects" | "environments" | "deployments", id] if id.parse::<i32>().is_ok());
+    if !allowed
+        || call.path.contains("..")
+        || call.path.contains('%')
+        || call.path.contains('?')
+        || call.path.contains('#')
+    {
+        return Err(ChannelError::new(
+            ChannelErrorCode::PermissionDenied,
+            format!(
+                "Plugin '{plugin_name}' cannot delegate the protected API path '{}'",
+                call.path
+            ),
+        ));
+    }
     // Capability first: refuse before the request reaches the router, and
     // name what is missing. A plugin author debugging this alone cannot
     // guess "add api_write to your manifest" from a bare 403.
@@ -382,6 +697,128 @@ async fn handle_api_call(
     api.call(plugin_name, call)
         .await
         .map(PlatformCallResponse::ApiCall)
+}
+
+async fn handle_generate_ai(
+    plugin_name: &str,
+    grant_service: &PluginGrantService,
+    grants: &crate::grants::PluginGrants,
+    ai_slot: &tokio::sync::RwLock<Option<Arc<dyn temps_ai::AiService>>>,
+    request: GenerateAi,
+) -> Result<PlatformCallResponse, ChannelError> {
+    if request.prompt.len() > MAX_PROMPT_BYTES as usize
+        || request
+            .system
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_SYSTEM_BYTES)
+        || request.purpose.is_empty()
+        || request.purpose.len() > 64
+        || !request
+            .purpose
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(ChannelError::new(
+            ChannelErrorCode::InvalidParams,
+            "AI request exceeds the bounded input limits or has an invalid purpose",
+        ));
+    }
+    if request
+        .temperature
+        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+    {
+        return Err(ChannelError::new(
+            ChannelErrorCode::InvalidParams,
+            "temperature must be finite and within 0..=2",
+        ));
+    }
+    let max_tokens = request
+        .max_tokens
+        .unwrap_or(grants.config.ai_max_output_tokens);
+    if max_tokens == 0 || max_tokens > grants.config.ai_max_output_tokens {
+        return Err(ChannelError::new(
+            ChannelErrorCode::InvalidParams,
+            format!(
+                "max_tokens must be within 1..={}",
+                grants.config.ai_max_output_tokens
+            ),
+        ));
+    }
+    let Some(ai) = ai_slot.read().await.clone() else {
+        return Err(ChannelError::new(
+            ChannelErrorCode::Internal,
+            "Host AI service is unavailable",
+        ));
+    };
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        AI_CONCURRENCY.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        ChannelError::new(
+            ChannelErrorCode::Internal,
+            "Host AI concurrency limit is busy",
+        )
+    })?
+    .map_err(|_| {
+        ChannelError::new(
+            ChannelErrorCode::Internal,
+            "Host AI concurrency limiter is closed",
+        )
+    })?;
+    if !grant_service
+        .consume_ai_call(grants, max_tokens)
+        .await
+        .map_err(|error| {
+            ChannelError::new(
+                ChannelErrorCode::Internal,
+                format!("Cannot enforce plugin AI quota: {error}"),
+            )
+        })?
+    {
+        return Err(ChannelError::new(
+            ChannelErrorCode::PermissionDenied,
+            "Plugin AI daily call limit reached or permission was revoked",
+        ));
+    }
+    info!(plugin_actor_id = %grants.actor.id, plugin = %plugin_name, purpose = %request.purpose, "Plugin AI operation allowed");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        ai.complete(temps_ai::AiRequest {
+            purpose: format!("plugin.{}.{}", grants.actor.id, request.purpose),
+            prompt: request.prompt,
+            system: request.system,
+            max_tokens: Some(max_tokens),
+            temperature: request.temperature,
+            ..Default::default()
+        }),
+    )
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(response)) if response.text.len() <= 1_048_576 => {
+            Ok(PlatformCallResponse::GenerateAi(GenerateAiResult {
+                text: response.text,
+                model: response.model,
+            }))
+        }
+        Ok(Ok(_)) => Err(ChannelError::new(
+            ChannelErrorCode::Internal,
+            "Host AI response exceeded the 1 MiB channel limit",
+        )),
+        Ok(Err(_error)) => {
+            warn!(plugin_actor_id = %grants.actor.id, plugin = %plugin_name, "Plugin AI operation failed; provider detail withheld");
+            Err(ChannelError::new(
+                ChannelErrorCode::Internal,
+                "Host AI generation failed",
+            ))
+        }
+        Err(_) => Err(ChannelError::new(
+            ChannelErrorCode::Internal,
+            "Host AI generation timed out",
+        )),
+    }
 }
 
 // ── Method handlers ────────────────────────────────────────────────────
@@ -634,6 +1071,10 @@ fn deployment_to_info(d: &temps_entities::deployments::Model) -> DeploymentInfo 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_ai::{AiError, AiRequest, AiResponse, AiService};
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[test]
     fn test_format_dt() {
@@ -657,5 +1098,172 @@ mod tests {
     #[test]
     fn test_format_dt_opt_none() {
         assert_eq!(format_dt_opt(&None), None);
+    }
+
+    struct StubAi {
+        response: Result<AiResponse, AiError>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiService for StubAi {
+        async fn is_available(&self) -> bool {
+            !matches!(self.response, Err(AiError::NotAvailable))
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.response {
+                Ok(response) => Ok(response.clone()),
+                Err(AiError::NotAvailable) => Err(AiError::NotAvailable),
+                Err(_) => Err(AiError::Provider {
+                    purpose: "plugin.test".to_string(),
+                    reason: "sensitive provider detail".to_string(),
+                }),
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+    }
+
+    async fn ai_test_grants(
+        name: &str,
+        daily_limit: u32,
+    ) -> Option<(
+        TestDatabase,
+        PluginGrantService,
+        crate::grants::PluginGrants,
+    )> {
+        let database = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable; skipping plugin AI broker test: {error}");
+                return None;
+            }
+            Err(error) => panic!("failed to prepare plugin AI database: {error}"),
+        };
+        let service = PluginGrantService::new(database.connection_arc());
+        service
+            .ensure_actor(name, "sha256:test", &format!("repository:trusted/{name}"))
+            .await
+            .expect("create plugin actor");
+        let grants = service
+            .update(
+                name,
+                crate::grants::PluginGrantConfig {
+                    permissions: vec![PluginHostPermission::AiGenerate],
+                    ai_daily_call_limit: daily_limit,
+                    ai_max_output_tokens: 128,
+                },
+            )
+            .await
+            .expect("grant plugin AI access");
+        Some((database, service, grants))
+    }
+
+    fn ai_request() -> GenerateAi {
+        GenerateAi {
+            purpose: "summary".to_string(),
+            prompt: "Summarize the deployment status".to_string(),
+            system: None,
+            max_tokens: Some(64),
+            temperature: Some(0.2),
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_ai_uses_host_service_and_returns_bounded_response() {
+        let Some((_database, grant_service, grants)) = ai_test_grants("ai-success", 2).await else {
+            return;
+        };
+        let ai = Arc::new(StubAi {
+            response: Ok(AiResponse {
+                text: "healthy".to_string(),
+                json: None,
+                model: "host-model".to_string(),
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let slot: tokio::sync::RwLock<Option<Arc<dyn AiService>>> =
+            tokio::sync::RwLock::new(Some(ai.clone()));
+
+        let response =
+            handle_generate_ai("ai-success", &grant_service, &grants, &slot, ai_request())
+                .await
+                .expect("host AI generation succeeds");
+
+        match response {
+            PlatformCallResponse::GenerateAi(result) => {
+                assert_eq!(result.text, "healthy");
+                assert_eq!(result.model, "host-model");
+            }
+            other => panic!("unexpected response: {}", other.method_name()),
+        }
+        assert_eq!(ai.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generate_ai_sanitizes_provider_failure() {
+        let Some((_database, grant_service, grants)) = ai_test_grants("ai-failure", 2).await else {
+            return;
+        };
+        let ai: Arc<dyn AiService> = Arc::new(StubAi {
+            response: Err(AiError::Provider {
+                purpose: "test".to_string(),
+                reason: "sensitive provider detail".to_string(),
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let slot = tokio::sync::RwLock::new(Some(ai));
+
+        let error = handle_generate_ai("ai-failure", &grant_service, &grants, &slot, ai_request())
+            .await
+            .expect_err("provider failure is returned");
+
+        assert_eq!(error.code, ChannelErrorCode::Internal);
+        assert_eq!(error.message, "Host AI generation failed");
+        assert!(!error.message.contains("sensitive provider detail"));
+    }
+
+    #[tokio::test]
+    async fn generate_ai_denies_unconfigured_and_exhausted_quota_without_provider_call() {
+        let Some((_database, grant_service, grants)) = ai_test_grants("ai-quota", 0).await else {
+            return;
+        };
+        let ai = Arc::new(StubAi {
+            response: Ok(AiResponse {
+                text: "must not run".to_string(),
+                json: None,
+                model: "host-model".to_string(),
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let configured: tokio::sync::RwLock<Option<Arc<dyn AiService>>> =
+            tokio::sync::RwLock::new(Some(ai.clone()));
+        let denied = handle_generate_ai(
+            "ai-quota",
+            &grant_service,
+            &grants,
+            &configured,
+            ai_request(),
+        )
+        .await
+        .expect_err("zero quota denies generation");
+        assert_eq!(denied.code, ChannelErrorCode::PermissionDenied);
+        assert_eq!(ai.calls.load(Ordering::SeqCst), 0);
+
+        let missing: tokio::sync::RwLock<Option<Arc<dyn AiService>>> =
+            tokio::sync::RwLock::new(None);
+        let unavailable =
+            handle_generate_ai("ai-quota", &grant_service, &grants, &missing, ai_request())
+                .await
+                .expect_err("missing host AI service fails");
+        assert_eq!(unavailable.code, ChannelErrorCode::Internal);
+        assert_eq!(unavailable.message, "Host AI service is unavailable");
     }
 }

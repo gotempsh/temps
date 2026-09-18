@@ -23,7 +23,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { EmailProviderLogo, type EmailProviderType } from '@/components/ui/email-provider-logo'
+import {
+  EmailProviderLogo,
+  type EmailProviderType,
+} from '@/components/ui/email-provider-logo'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -63,7 +66,9 @@ type DnsRecord = EmailDomainWithDnsResponse['dns_records'][number]
 async function listEmailDomains(): Promise<EmailDomain[]> {
   const response = await listEmailDomainsSdk()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email domains')
+    )
   }
   return response.data ?? []
 }
@@ -71,7 +76,9 @@ async function listEmailDomains(): Promise<EmailDomain[]> {
 async function verifyEmailDomain(id: number): Promise<EmailDomainWithDns> {
   const response = await verifyDomain({ path: { id } })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to verify email domain'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to verify email domain')
+    )
   }
   return response.data
 }
@@ -79,21 +86,31 @@ async function verifyEmailDomain(id: number): Promise<EmailDomainWithDns> {
 async function deleteEmailDomain(id: number): Promise<void> {
   const response = await deleteEmailDomainSdk({ path: { id } })
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to delete email domain'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to delete email domain')
+    )
   }
 }
 
 async function listEmailProviders(): Promise<EmailProvider[]> {
   const response = await listEmailProvidersSdk()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email providers'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email providers')
+    )
   }
   return response.data ?? []
 }
 
 // Status dot — small color-coded indicator that mirrors the Storage page's
 // HealthDot, so it sits cleanly on the bottom-right of the provider-logo tile.
-function StatusDot({ status, className }: { status: string; className?: string }) {
+function StatusDot({
+  status,
+  className,
+}: {
+  status: string
+  className?: string
+}) {
   const tone =
     status === 'verified'
       ? 'bg-green-500'
@@ -219,12 +236,20 @@ export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
   // backend already considers SPF+DKIM sufficient and marked it "verified".
   // Both rows still appear in DnsRecordsTable with their real status.
   const requiredRecords = records.filter(
-    r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+    (r) => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
   )
-  const verifiedCount = requiredRecords.filter(r => r.status === 'verified').length
-  const pendingCount = requiredRecords.filter(r => r.status === 'pending').length
-  const failedCount = requiredRecords.filter(r => r.status === 'failed').length
-  const unknownCount = requiredRecords.filter(r => !r.status || r.status === 'unknown').length
+  const verifiedCount = requiredRecords.filter(
+    (r) => r.status === 'verified'
+  ).length
+  const pendingCount = requiredRecords.filter(
+    (r) => r.status === 'pending'
+  ).length
+  const failedCount = requiredRecords.filter(
+    (r) => r.status === 'failed'
+  ).length
+  const unknownCount = requiredRecords.filter(
+    (r) => !r.status || r.status === 'unknown'
+  ).length
   const totalCount = requiredRecords.length
 
   const allVerified = verifiedCount === totalCount && totalCount > 0
@@ -420,12 +445,14 @@ export function EmailDomainsManagement() {
       // Exclude them from the counts shown here too, so the toast reflects
       // the records that actually gate the domain status.
       const required = data.dns_records.filter(
-        r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+        (r) => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
       )
-      const verifiedCount = required.filter(r => r.status === 'verified').length
+      const verifiedCount = required.filter(
+        (r) => r.status === 'verified'
+      ).length
       const totalCount = required.length
-      const pendingCount = required.filter(r => r.status === 'pending').length
-      const failedCount = required.filter(r => r.status === 'failed').length
+      const pendingCount = required.filter((r) => r.status === 'pending').length
+      const failedCount = required.filter((r) => r.status === 'failed').length
 
       if (data.domain.status === 'verified') {
         toast.success('Domain verified', {
@@ -446,12 +473,15 @@ export function EmailDomainsManagement() {
       }
 
       queryClient.setQueryData(['email-domain', data.domain.id], data)
-      queryClient.setQueryData(['email-domains'], (oldDomains: EmailDomain[] | undefined) => {
-        if (!oldDomains) return oldDomains
-        return oldDomains.map((d) =>
-          d.id === data.domain.id ? data.domain : d
-        )
-      })
+      queryClient.setQueryData(
+        ['email-domains'],
+        (oldDomains: EmailDomain[] | undefined) => {
+          if (!oldDomains) return oldDomains
+          return oldDomains.map((d) =>
+            d.id === data.domain.id ? data.domain : d
+          )
+        }
+      )
     },
     onError: (error: Error) => {
       toast.error('Failed to verify domain', { description: error.message })
@@ -500,19 +530,13 @@ export function EmailDomainsManagement() {
           title="No email domains configured"
           description="Add a domain to start sending emails. You'll need to configure DNS records for verification."
           action={
-            <CreateActionButton
-              to="/email/domains/new"
-              label="Add domain"
-            />
+            <CreateActionButton to="/email/domains/new" label="Add domain" />
           }
         />
       ) : (
         <>
           <div className="mb-4 flex items-center justify-end">
-            <CreateActionButton
-              to="/email/domains/new"
-              label="Add Domain"
-            />
+            <CreateActionButton to="/email/domains/new" label="Add Domain" />
           </div>
 
           <div className="overflow-hidden rounded-lg border">
@@ -531,7 +555,9 @@ export function EmailDomainsManagement() {
                       <div className="flex size-9 items-center justify-center rounded-md border bg-background">
                         {provider ? (
                           <EmailProviderLogo
-                            provider={provider.provider_type as EmailProviderType}
+                            provider={
+                              provider.provider_type as EmailProviderType
+                            }
                             size={18}
                           />
                         ) : (
@@ -566,7 +592,8 @@ export function EmailDomainsManagement() {
                             : 'Never verified'}
                         </span>
                         <span className="hidden sm:inline">
-                          Created {formatDistanceToNow(new Date(domain.created_at), {
+                          Created{' '}
+                          {formatDistanceToNow(new Date(domain.created_at), {
                             addSuffix: true,
                           })}
                         </span>
@@ -593,7 +620,9 @@ export function EmailDomainsManagement() {
                               'animate-spin'
                           )}
                         />
-                        <span className="sr-only">Verify DNS for {domain.domain}</span>
+                        <span className="sr-only">
+                          Verify DNS for {domain.domain}
+                        </span>
                       </Button>
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
@@ -603,14 +632,20 @@ export function EmailDomainsManagement() {
                             className="size-8"
                           >
                             <EllipsisVertical className="size-3.5" />
-                            <span className="sr-only">Actions for {domain.domain}</span>
+                            <span className="sr-only">
+                              Actions for {domain.domain}
+                            </span>
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          <DropdownMenuItem onClick={() => handleOpen(domain.id)}>
+                          <DropdownMenuItem
+                            onClick={() => handleOpen(domain.id)}
+                          >
                             Open domain
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleVerify(domain.id)}>
+                          <DropdownMenuItem
+                            onClick={() => handleVerify(domain.id)}
+                          >
                             <RefreshCw className="mr-2 size-4" />
                             Verify DNS
                           </DropdownMenuItem>
@@ -633,7 +668,6 @@ export function EmailDomainsManagement() {
           </div>
         </>
       )}
-
     </div>
   )
 }

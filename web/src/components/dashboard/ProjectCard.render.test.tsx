@@ -30,9 +30,7 @@ describe('ProjectCard deployment state', () => {
     )
 
     expect(markup).toContain('flex min-w-0 flex-1 items-center gap-3')
-    expect(markup).toContain(
-      'truncate font-semibold group-hover:underline'
-    )
+    expect(markup).toContain('truncate font-semibold group-hover:underline')
     expect(markup).toContain('flex min-w-0 items-center gap-2')
     expect(markup).toContain('flex shrink-0 items-center gap-2')
   })

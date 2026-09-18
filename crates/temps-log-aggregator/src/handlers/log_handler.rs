@@ -119,6 +119,11 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::S3 { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("S3 Error")
                 .with_detail(error.to_string()),
+            LogAggregatorError::DockerUnavailable(_) => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Docker Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

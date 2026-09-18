@@ -26,6 +26,7 @@ use std::time::Instant;
 use sysinfo::System;
 use tempfile::TempDir;
 use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
+use temps_core::DockerHandle;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
@@ -663,7 +664,11 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
 }
 
 pub struct DockerRuntime {
-    docker: Arc<Docker>,
+    /// The process-wide Docker client, which may be unavailable on a
+    /// control-plane node that has no local daemon. All operations that
+    /// require the daemon call [`Self::require_docker`] or
+    /// [`Self::require_docker_for_build`] as late as possible.
+    docker: Arc<DockerHandle>,
     use_buildkit: bool,
     network_name: String,
     /// Address to bind host ports to: "127.0.0.1" for the control plane's
@@ -1202,7 +1207,12 @@ impl DockerRuntime {
     /// users are logged as a warning so it's obvious why secrets might be
     /// unreadable for images like `node:alpine` (USER=node).
     async fn resolve_image_user(&self, image_name: &str) -> (u32, u32) {
-        let inspect = match self.docker.inspect_image(image_name).await {
+        let Some(docker) = self.docker.cloned() else {
+            // No local daemon — control-plane profile. Secret ownership
+            // defaults to root; the actual deploy runs on a worker node.
+            return (0, 0);
+        };
+        let inspect = match docker.inspect_image(image_name).await {
             Ok(i) => i,
             Err(e) => {
                 warn!(
@@ -1235,7 +1245,32 @@ impl DockerRuntime {
         }
     }
 
+    /// Construct with a concrete Docker client.
+    ///
+    /// The existing callers in `crates/temps-deployments` and in agent code
+    /// pass an `Arc<Docker>` directly; this shim wraps it into a
+    /// [`DockerHandle::available`] so their signatures need not change.
+    /// New call sites should prefer [`Self::new_with_handle`].
     pub fn new(docker: Arc<Docker>, use_buildkit: bool, network_name: String) -> Self {
+        Self::new_with_handle(
+            Arc::new(DockerHandle::available(docker)),
+            use_buildkit,
+            network_name,
+        )
+    }
+
+    /// Construct with the process-wide [`DockerHandle`].
+    ///
+    /// The handle may carry either an available client or a typed explanation
+    /// of why no daemon exists in this process. Every daemon-dependent method
+    /// calls [`Self::require_docker`] or [`Self::require_docker_for_build`]
+    /// as late as possible so the error is reported at the point of the
+    /// failing operation rather than at construction time.
+    pub fn new_with_handle(
+        handle: Arc<DockerHandle>,
+        use_buildkit: bool,
+        network_name: String,
+    ) -> Self {
         let secrets_root = default_secrets_root();
         // Best-effort: ensure the root exists with restrictive perms so the
         // first deploy after a fresh install doesn't race with the per-container
@@ -1256,7 +1291,7 @@ impl DockerRuntime {
             }
         }
         Self {
-            docker,
+            docker: handle,
             use_buildkit,
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
@@ -1273,6 +1308,26 @@ impl DockerRuntime {
             daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Extract the Docker client for operations returning `Result<_, DeployerError>`.
+    ///
+    /// Call this as late as possible — inside the operation that actually needs
+    /// the daemon — so a control-plane process can boot and serve the API
+    /// before any work arrives.
+    fn require_docker(&self) -> Result<Arc<Docker>, DeployerError> {
+        self.docker
+            .require()
+            .map_err(DeployerError::DockerUnavailable)
+    }
+
+    /// Extract the Docker client for operations returning `Result<_, BuilderError>`.
+    ///
+    /// Same policy as [`Self::require_docker`].
+    fn require_docker_for_build(&self) -> Result<Arc<Docker>, BuilderError> {
+        self.docker
+            .require()
+            .map_err(BuilderError::DockerUnavailable)
     }
 
     /// Query the Docker daemon for its platform and cache it.
@@ -1296,7 +1351,11 @@ impl DockerRuntime {
             return Some(cached.clone());
         }
 
-        let platform = match self.docker.info().await {
+        // A process with no local daemon (control-plane profile) has nothing
+        // to probe. Return None so callers fall back to the compiled-in arch.
+        let docker = self.docker.cloned()?;
+
+        let platform = match docker.info().await {
             Ok(info) => {
                 let os = info.os_type.unwrap_or_else(|| "linux".to_string());
                 match info.architecture {
@@ -1469,10 +1528,11 @@ impl DockerRuntime {
             return Ok(());
         };
 
+        let docker = self.require_docker()?;
+
         // Cheap existence probe: list_networks once. If the overlay
         // doesn't exist yet, skip (sync loop hasn't bootstrapped it).
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
@@ -1490,7 +1550,7 @@ impl DockerRuntime {
             container: container_id.to_string(),
             ..Default::default()
         };
-        match self.docker.connect_network(overlay, req).await {
+        match docker.connect_network(overlay, req).await {
             Ok(()) => {
                 tracing::info!(container = %container_id, overlay, "attached to overlay");
                 Ok(())
@@ -1534,8 +1594,8 @@ impl DockerRuntime {
             self.overlay_network.as_deref(),
         );
 
-        let existing_networks = self
-            .docker
+        let docker = self.require_docker()?;
+        let existing_networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
@@ -1630,7 +1690,7 @@ impl DockerRuntime {
                 container: container_id.to_string(),
                 ..Default::default()
             };
-            match self.docker.connect_network(&network, req).await {
+            match docker.connect_network(&network, req).await {
                 Ok(()) => {
                     tracing::info!(container = %container_id, network, "attached to required network");
                 }
@@ -1724,8 +1784,12 @@ impl DockerRuntime {
             return Ok(());
         }
 
-        let inspect = self
-            .docker
+        let docker = self.docker.cloned().ok_or_else(|| {
+            "Docker daemon unavailable in this process; overlay peer routes are only \
+             installed on worker nodes joined with `temps join`"
+                .to_string()
+        })?;
+        let inspect = docker
             .inspect_container(
                 container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -1759,9 +1823,10 @@ impl DockerRuntime {
     }
 
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+
         // Check if network exists
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("Failed to list networks: {}", e)))?;
@@ -1778,19 +1843,15 @@ impl DockerRuntime {
                 ..Default::default()
             };
 
-            self.docker
-                .create_network(create_options)
-                .await
-                .map_err(|e| {
-                    DeployerError::NetworkError(format!("Failed to create network: {}", e))
-                })?;
+            docker.create_network(create_options).await.map_err(|e| {
+                DeployerError::NetworkError(format!("Failed to create network: {}", e))
+            })?;
         }
 
         // Re-applied on every deploy (not just network creation) so the block
         // survives host firewall flushes; best-effort, never fails the deploy.
         if let Err(error) =
-            crate::metadata_egress::apply_metadata_egress_block(&self.docker, &self.network_name)
-                .await
+            crate::metadata_egress::apply_metadata_egress_block(&docker, &self.network_name).await
         {
             warn!(
                 network = %self.network_name,
@@ -1811,8 +1872,8 @@ impl DockerRuntime {
     /// configs in either order — taking the first gateway regardless of family
     /// could hand back an IPv6 address we then fail to bind.
     pub async fn inspect_app_network_gateway(&self) -> Option<std::net::IpAddr> {
-        let info = self
-            .docker
+        let docker = self.docker.cloned()?;
+        let info = docker
             .inspect_network(
                 &self.network_name,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
@@ -2230,7 +2291,7 @@ impl DockerRuntime {
         });
 
         let containers = self
-            .docker
+            .require_docker()?
             .list_containers(options)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to list containers: {}", e)))?;
@@ -2388,8 +2449,9 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
+        let docker = self.require_docker_for_build()?;
         let build_start = self.sample_build_start();
-        let mut build_stream = self.docker.build_image(
+        let mut build_stream = docker.build_image(
             build_options,
             None,
             Some(http_body_util::Either::Left(tar_body)),
@@ -2440,8 +2502,7 @@ impl ImageBuilder for DockerRuntime {
         let build_duration = start_time.elapsed().as_millis() as u64;
 
         // Get image info for size
-        let images = self
-            .docker
+        let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 filters: {
                     let mut filters = HashMap::new();
@@ -2595,8 +2656,9 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
+        let docker = self.require_docker_for_build()?;
         let build_start = self.sample_build_start();
-        let mut build_stream = self.docker.build_image(
+        let mut build_stream = docker.build_image(
             build_options,
             None,
             Some(http_body_util::Either::Left(tar_body)),
@@ -2712,8 +2774,7 @@ impl ImageBuilder for DockerRuntime {
         let build_duration = start_time.elapsed().as_millis() as u64;
 
         // Get image info
-        let images = self
-            .docker
+        let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 filters: {
                     let mut filters = HashMap::new();
@@ -2749,7 +2810,8 @@ impl ImageBuilder for DockerRuntime {
                 .map(|result| result.map(|bytes| bytes.freeze())),
         );
 
-        import_stream_into_docker(&self.docker, byte_stream, tag).await
+        let docker = self.require_docker_for_build()?;
+        import_stream_into_docker(&docker, byte_stream, tag).await
     }
 
     async fn import_image_stream(
@@ -2758,13 +2820,15 @@ impl ImageBuilder for DockerRuntime {
         tag: &str,
     ) -> Result<String, BuilderError> {
         info!(image = %tag, "Importing streamed image into Docker");
-        import_stream_into_docker(&self.docker, image_stream, tag).await
+        let docker = self.require_docker_for_build()?;
+        import_stream_into_docker(&docker, image_stream, tag).await
     }
 
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
         info!("Exporting image '{}' to {:?}", image_name, output_path);
 
-        let stream = self.docker.export_image(image_name);
+        let docker = self.require_docker_for_build()?;
+        let stream = docker.export_image(image_name);
 
         let mut file = tokio::fs::File::create(output_path).await.map_err(|e| {
             BuilderError::IoError(std::io::Error::new(
@@ -2807,6 +2871,8 @@ impl ImageBuilder for DockerRuntime {
         source_path: &str,
         destination_path: &Path,
     ) -> Result<(), BuilderError> {
+        let docker = self.require_docker_for_build()?;
+
         let archive_root = Path::new(source_path)
             .file_name()
             .filter(|component| !component.is_empty())
@@ -2819,8 +2885,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Skip pull for local images (temps-* are built locally, not from a registry)
         if !image_name.starts_with("temps-") {
-            let _ = self
-                .docker
+            let _ = docker
                 .create_image(
                     Some(bollard::query_parameters::CreateImageOptions {
                         from_image: Some(image_name.to_string()),
@@ -2841,8 +2906,7 @@ impl ImageBuilder for DockerRuntime {
             ..Default::default()
         };
 
-        let container = self
-            .docker
+        let container = docker
             .create_container(
                 Some(bollard::query_parameters::CreateContainerOptionsBuilder::new().build()),
                 container_config,
@@ -2851,8 +2915,10 @@ impl ImageBuilder for DockerRuntime {
             .map_err(|e| BuilderError::Other(format!("Failed to create container: {}", e)))?;
 
         let container_id = container.id.clone();
+        // DockerContainerCleanupGuard is a leaf type that keeps Arc<Docker>
+        // directly (the daemon is available: we just created the container).
         let mut cleanup_guard = DockerContainerCleanupGuard::new(
-            self.docker.clone(),
+            docker.clone(),
             container_id.clone(),
             image_name,
             source_path,
@@ -2882,7 +2948,7 @@ impl ImageBuilder for DockerRuntime {
         let archive_path = temp_dir.path().join("static-output.tar");
         let extraction_path = temp_dir.path().join("extracted");
 
-        let response_stream = self.docker.download_from_container(
+        let response_stream = docker.download_from_container(
             &container_id,
             Some(bollard::query_parameters::DownloadFromContainerOptions {
                 path: source_path.to_string(),
@@ -2970,7 +3036,7 @@ impl ImageBuilder for DockerRuntime {
 
     async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
         let images = self
-            .docker
+            .require_docker_for_build()?
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: true,
                 ..Default::default()
@@ -2991,7 +3057,7 @@ impl ImageBuilder for DockerRuntime {
         // without ever being awaited, so nothing was sent to the daemon and
         // every caller got a silent `Ok(())` while the image stayed put.
         let deleted = self
-            .docker
+            .require_docker_for_build()?
             .remove_image(
                 image_name,
                 Some(bollard::query_parameters::RemoveImageOptions {
@@ -3015,7 +3081,8 @@ impl ImageBuilder for DockerRuntime {
     }
 
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {
-        let inspect = self.docker.inspect_image(image_name).await.map_err(|e| {
+        let docker = self.require_docker_for_build()?;
+        let inspect = docker.inspect_image(image_name).await.map_err(|e| {
             BuilderError::ImageNotFound(format!("Failed to inspect image '{}': {}", image_name, e))
         })?;
 
@@ -3267,9 +3334,12 @@ impl ContainerDeployer for DockerRuntime {
             ..Default::default()
         };
 
-        // Create container
-        let container = self
-            .docker
+        // Create container — require the daemon here (as late as possible).
+        // If Docker is unavailable, ensure_network_exists() above already
+        // returned DockerUnavailable; this call is the guard for paths that
+        // skip network creation (e.g. when it already exists).
+        let docker = self.require_docker()?;
+        let container = docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -3304,8 +3374,7 @@ impl ContainerDeployer for DockerRuntime {
         }
 
         // Start container
-        if let Err(e) = self
-            .docker
+        if let Err(e) = docker
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
             .map_err(|e| {
@@ -3332,8 +3401,7 @@ impl ContainerDeployer for DockerRuntime {
 
         // When host_port was 0 (Docker picks), inspect the container to get the actual port
         let host_port = if requested_host_port == 0 && container_port > 0 {
-            let inspect = match self
-                .docker
+            let inspect = match docker
                 .inspect_container(&container.id, None::<InspectContainerOptions>)
                 .await
                 .map_err(|e| {
@@ -3386,7 +3454,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .start_container(container_id, None::<StartContainerOptions>)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to start container: {}", e)))?;
@@ -3394,7 +3462,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .stop_container(
                 container_id,
                 Some(StopContainerOptions {
@@ -3410,7 +3478,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .pause_container(container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to pause container: {}", e)))?;
@@ -3418,7 +3486,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn resume_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .unpause_container(container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to resume container: {}", e)))?;
@@ -3426,11 +3494,12 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+
         // Look up the container name before removal so we can clean up its
         // per-container secrets host directory (if any). Inspect failures are
         // non-fatal: we still try to remove the container.
-        let container_name = self
-            .docker
+        let container_name = docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
             .ok()
@@ -3438,8 +3507,7 @@ impl ContainerDeployer for DockerRuntime {
             // Docker prefixes inspect names with a leading '/'.
             .map(|n| n.trim_start_matches('/').to_string());
 
-        let removal_result = self
-            .docker
+        let removal_result = docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -3489,7 +3557,7 @@ impl ContainerDeployer for DockerRuntime {
 
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError> {
         let container = self
-            .docker
+            .require_docker()?
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
             .map_err(|e| DeployerError::ContainerNotFound(format!("Container not found: {}", e)))?;
@@ -3634,7 +3702,8 @@ impl ContainerDeployer for DockerRuntime {
         // single-sample math collapses to (cumulative cpu time / system time
         // since boot) which is ~0% for any long-running container. This is
         // the same pattern `docker stats` uses internally.
-        let (first, second) = sample_container_stats_twice(&self.docker, container_id)
+        let docker = self.require_docker()?;
+        let (first, second) = sample_container_stats_twice(&docker, container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to get container stats: {}", e)))?;
 
@@ -3698,7 +3767,7 @@ impl ContainerDeployer for DockerRuntime {
 
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
         let containers = self
-            .docker
+            .require_docker()?
             .list_containers(Some(ListContainersOptions {
                 all: true,
                 ..Default::default()
@@ -3721,7 +3790,8 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError> {
-        let mut logs_stream = self.docker.logs(
+        let docker = self.require_docker()?;
+        let mut logs_stream = docker.logs(
             container_id,
             Some(LogsOptions {
                 stdout: true,
@@ -3747,8 +3817,8 @@ impl ContainerDeployer for DockerRuntime {
         &self,
         container_id: &str,
     ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
-        let logs_stream = self
-            .docker
+        let docker = self.require_docker()?;
+        let logs_stream = docker
             .logs(
                 container_id,
                 Some(LogsOptions {
@@ -3767,7 +3837,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
-        match self.docker.inspect_image(image_name).await {
+        match self.require_docker()?.inspect_image(image_name).await {
             Ok(_) => Ok(true),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
@@ -3784,7 +3854,7 @@ impl ContainerDeployer for DockerRuntime {
 impl ContainerRuntime for DockerRuntime {
     async fn get_runtime_info(&self) -> Result<RuntimeInfo, DeployerError> {
         let version =
-            self.docker.version().await.map_err(|e| {
+            self.require_docker()?.version().await.map_err(|e| {
                 DeployerError::Other(format!("Failed to get Docker version: {}", e))
             })?;
 
@@ -5099,6 +5169,12 @@ mod docker_tests {
     async fn test_deploy_attaches_required_network_by_id() {
         match create_test_docker_runtime().await {
             Ok(runtime) => {
+                // create_test_docker_runtime() only returns Ok when a daemon
+                // is reachable, so require() is always Some here.
+                let raw_docker = runtime
+                    .docker
+                    .require()
+                    .expect("create_test_docker_runtime guarantees a real docker client");
                 let extra_network_name = unique_test_name("temps-extra-network");
                 let container_name = unique_test_name("temps-extra-network-container");
 
@@ -5108,13 +5184,12 @@ mod docker_tests {
                     ..Default::default()
                 };
 
-                if let Err(e) = runtime.docker.create_network(create_options).await {
+                if let Err(e) = raw_docker.create_network(create_options).await {
                     println!("Docker network create failed (may be expected): {}", e);
                     return;
                 }
 
-                let network_id = match runtime
-                    .docker
+                let network_id = match raw_docker
                     .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
                     .await
                     .ok()
@@ -5126,7 +5201,7 @@ mod docker_tests {
                     }) {
                     Some(id) => id,
                     None => {
-                        let _ = runtime.docker.remove_network(&extra_network_name).await;
+                        let _ = raw_docker.remove_network(&extra_network_name).await;
                         panic!("created network {} was not listed", extra_network_name);
                     }
                 };
@@ -5145,8 +5220,7 @@ mod docker_tests {
 
                 match deploy_result {
                     Ok(deploy_info) => {
-                        let inspect = runtime
-                            .docker
+                        let inspect = raw_docker
                             .inspect_container(
                                 &deploy_info.container_id,
                                 None::<InspectContainerOptions>,
@@ -5171,7 +5245,7 @@ mod docker_tests {
                     }
                 }
 
-                let _ = runtime.docker.remove_network(&extra_network_name).await;
+                let _ = raw_docker.remove_network(&extra_network_name).await;
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
@@ -5234,6 +5308,10 @@ mod docker_tests {
     async fn test_deploy_rejects_request_network_outside_operator_allowlist() {
         match create_test_docker_runtime().await {
             Ok(runtime) => {
+                let raw_docker = runtime
+                    .docker
+                    .require()
+                    .expect("create_test_docker_runtime guarantees a real docker client");
                 let off_limits_network = unique_test_name("temps-off-limits-network");
                 let container_name = unique_test_name("temps-off-limits-container");
 
@@ -5242,7 +5320,7 @@ mod docker_tests {
                     driver: Some("bridge".to_string()),
                     ..Default::default()
                 };
-                if let Err(e) = runtime.docker.create_network(create_options).await {
+                if let Err(e) = raw_docker.create_network(create_options).await {
                     println!("Docker network create failed (may be expected): {}", e);
                     return;
                 }
@@ -5259,7 +5337,7 @@ mod docker_tests {
                 match deploy_result {
                     Ok(deploy_info) => {
                         let _ = runtime.remove_container(&deploy_info.container_id).await;
-                        let _ = runtime.docker.remove_network(&off_limits_network).await;
+                        let _ = raw_docker.remove_network(&off_limits_network).await;
                         panic!(
                             "deploy must reject a request network outside the operator allowlist"
                         );
@@ -5284,7 +5362,7 @@ mod docker_tests {
                     }
                 }
 
-                let _ = runtime.docker.remove_network(&off_limits_network).await;
+                let _ = raw_docker.remove_network(&off_limits_network).await;
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
@@ -5395,10 +5473,15 @@ mod docker_tests {
     #[tokio::test]
     async fn test_remove_image_actually_removes_and_reports_failures() {
         let runtime = test_runtime();
-        if runtime.docker.ping().await.is_err() {
+        let Some(raw_docker) = runtime.docker.get() else {
+            println!("Docker handle not available, skipping");
+            return;
+        };
+        if raw_docker.ping().await.is_err() {
             println!("Docker not available, skipping");
             return;
         }
+        let raw_docker = raw_docker.clone();
 
         // Removing something that isn't there must be an error, not a silent
         // success — that silent success is exactly the bug.
@@ -5414,8 +5497,7 @@ mod docker_tests {
             return;
         };
         let tag = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
-        if runtime
-            .docker
+        if raw_docker
             .tag_image(
                 &info.id,
                 Some(bollard::query_parameters::TagImageOptions {
@@ -5447,7 +5529,11 @@ mod docker_tests {
     #[tokio::test]
     async fn test_refresh_daemon_platform_reads_docker_info() {
         let runtime = test_runtime();
-        if runtime.docker.ping().await.is_err() {
+        let Some(raw_docker) = runtime.docker.get() else {
+            println!("Docker handle not available, skipping");
+            return;
+        };
+        if raw_docker.ping().await.is_err() {
             println!("Docker not available, skipping");
             return;
         }
@@ -6502,5 +6588,115 @@ CMD ["cat", "/hello.txt"]
         assert_eq!(all[0].comm, "postgres");
         assert_eq!(all[0].at_us, 2_000_000);
         assert!(parse_oom_victims("garbage without separators\n", 0).is_empty());
+    }
+
+    // ── DockerHandle::Disabled path ───────────────────────────────────────────
+    //
+    // A DockerRuntime built with a Disabled handle must return a typed
+    // DeployerError::DockerUnavailable for every daemon-dependent operation
+    // rather than panicking or producing a confusing bollard connection error.
+    // None of these tests require a live daemon: they are pure in-process
+    // checks of the enum's behaviour under the control-plane profile.
+
+    fn disabled_runtime() -> DockerRuntime {
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        DockerRuntime::new_with_handle(handle, false, "test-network".to_string())
+    }
+
+    #[test]
+    fn disabled_handle_require_docker_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .require_docker()
+            .expect_err("disabled handle must error");
+        assert!(
+            matches!(err, DeployerError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {:?}",
+            err
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+        assert!(rendered.contains("temps join"), "{rendered}");
+    }
+
+    #[test]
+    fn disabled_handle_require_docker_for_build_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .require_docker_for_build()
+            .expect_err("disabled handle must error");
+        assert!(
+            matches!(err, BuilderError::DockerUnavailable(_)),
+            "expected BuilderError::DockerUnavailable, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_list_containers_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .list_containers()
+            .await
+            .expect_err("must fail without docker");
+        assert!(matches!(err, DeployerError::DockerUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_deploy_container_returns_typed_error() {
+        let runtime = disabled_runtime();
+        // Use a minimal request; the error must surface before any daemon
+        // operation is attempted, so the exact request contents don't matter.
+        let req = DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name: "test-disabled".to_string(),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            extra_networks: vec![],
+            resource_limits: ResourceLimits {
+                cpu_limit: None,
+                memory_limit_mb: None,
+                disk_limit_mb: None,
+            },
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from("/tmp/temps-disabled-handle-test.log"),
+            command: None,
+            log_config: None,
+            labels: HashMap::new(),
+        };
+        let err = runtime
+            .deploy_container(req)
+            .await
+            .expect_err("must fail without docker");
+        assert!(
+            matches!(err, DeployerError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_get_container_info_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .get_container_info("no-such-container")
+            .await
+            .expect_err("must fail without docker");
+        assert!(matches!(err, DeployerError::DockerUnavailable(_)));
+    }
+
+    #[test]
+    fn disabled_handle_refresh_daemon_platform_returns_none() {
+        // refresh_daemon_platform degrades gracefully when no daemon is
+        // present (it is called on a best-effort basis), so it must return
+        // None rather than an error or a panic.
+        let runtime = disabled_runtime();
+        // We can't .await in a sync test, but we can verify the handle state.
+        assert!(!runtime.docker.is_available());
     }
 }

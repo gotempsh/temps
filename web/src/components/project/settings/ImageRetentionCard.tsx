@@ -23,7 +23,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -68,7 +68,10 @@ export function ImageRetentionCard({
     },
   })
 
-  const retentionInput = form.watch('imageRetentionHours')
+  const retentionInput = useWatch({
+    control: form.control,
+    name: 'imageRetentionHours',
+  })
   const retentionHours =
     retentionInput.trim() === '' ? null : Number(retentionInput)
 

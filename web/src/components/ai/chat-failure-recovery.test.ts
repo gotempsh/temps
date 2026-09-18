@@ -1,16 +1,29 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, expect, test } from 'bun:test'
-import { canRefreshLocalCredential, isHarnessFailure } from './chat-failure-recovery'
+import {
+  canRefreshLocalCredential,
+  isHarnessFailure,
+} from './chat-failure-recovery'
 
 describe('chat failure recovery', () => {
   test('offers supported local refresh only for authentication failures', () => {
-    expect(canRefreshLocalCredential('harness_authentication_required', 'codex')).toBe(true)
-    expect(canRefreshLocalCredential('harness_authentication_required', 'opencode')).toBe(true)
+    expect(
+      canRefreshLocalCredential('harness_authentication_required', 'codex')
+    ).toBe(true)
+    expect(
+      canRefreshLocalCredential('harness_authentication_required', 'opencode')
+    ).toBe(true)
     for (const provider of ['claude_cli', 'gateway']) {
-      expect(canRefreshLocalCredential('harness_authentication_required', provider)).toBe(false)
+      expect(
+        canRefreshLocalCredential('harness_authentication_required', provider)
+      ).toBe(false)
     }
-    for (const code of ['provider_rate_limited', 'provider_quota_exhausted', 'unsupported_workspace_credential']) {
+    for (const code of [
+      'provider_rate_limited',
+      'provider_quota_exhausted',
+      'unsupported_workspace_credential',
+    ]) {
       expect(canRefreshLocalCredential(code, 'codex')).toBe(false)
     }
   })

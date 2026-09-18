@@ -76,6 +76,19 @@ pub enum WorkflowError {
         /// One `describe()`d blocker per line: what is wrong and how to fix it.
         details: String,
     },
+
+    /// A job that needs to run application workloads locally (build a image,
+    /// run a container) executed on a process with no local Docker daemon —
+    /// the `control-plane` serve profile (see
+    /// [`crate::LocalWorkloadPolicy`]/[`crate::DockerHandle`]).
+    ///
+    /// Distinct from a generic [`Self::JobExecutionFailed`] so this refusal
+    /// is checked *before* the job reaches its daemon-dependent path (never
+    /// a raw bollard/`BuilderError::DockerUnavailable` surfacing instead),
+    /// and so the message always names the remedy rather than reading like
+    /// an ordinary build/deploy failure.
+    #[error("{0}")]
+    LocalWorkloadsDisabled(String),
 }
 
 /// Trait for writing logs in real-time during workflow execution

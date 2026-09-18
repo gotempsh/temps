@@ -12,12 +12,16 @@
  *   manifest: () =>
  *     createManifest("hello-world", "0.1.0")
  *       .displayName("Hello World")
+ *       .requestPermissions("projects_read")
  *       .addNav("Hello", "hand", "/hello")
  *       .build(),
  *
  *   handler: (ctx) => async (req, res) => {
  *     const auth = extractAuthContext(req);
- *     const projects = await ctx.temps.listProjects();
+ *     const access = await ctx.permissions();
+ *     const projects = access.permissions.includes("projects_read")
+ *       ? await ctx.temps.listProjects()
+ *       : [];
  *
  *     res.writeHead(200, { "Content-Type": "application/json" });
  *     res.end(JSON.stringify({
@@ -40,6 +44,7 @@ export { PluginContext } from "./context.js";
 
 // Platform client
 export { TempsClient } from "./client.js";
+export { PluginAiClient } from "./ai.js";
 
 // Protocol helpers
 export {
@@ -71,6 +76,12 @@ export {
 
 // Types
 export type {
+  PluginHostPermission,
+  PluginActor,
+  PluginHostCapabilities,
+  PluginAiCapabilities,
+  PluginAiRequest,
+  PluginAiResponse,
   // Plugin definition
   TempsPlugin,
   RequestHandler,
@@ -82,6 +93,8 @@ export type {
   UiRoute,
   // Protocol
   HandshakeMessage,
+  HelloMessage,
+  PluginLaunchConfig,
   ManifestMessage,
   ReadyMessage,
   ChannelMessage,

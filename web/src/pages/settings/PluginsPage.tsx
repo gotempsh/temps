@@ -47,6 +47,7 @@ import {
   Loader2,
   Puzzle,
   RefreshCw,
+  Shield,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
@@ -58,6 +59,7 @@ import {
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import { RepositoryUpdate } from '@/components/plugins/RepositoryUpdate'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
+import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
 
 export function PluginsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -67,6 +69,7 @@ export function PluginsPage() {
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
+  const [permissionsName, setPermissionsName] = useState<string | null>(null)
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
@@ -125,6 +128,14 @@ export function PluginsPage() {
 
   return (
     <div className="space-y-6">
+      <PluginPermissionsDialog
+        name={permissionsName}
+        open={canManagePlugins && permissionsName !== null}
+        onOpenChange={(open) => {
+          if (!open) setPermissionsName(null)
+        }}
+        onSensitiveError={handleSensitiveActionError}
+      />
       {canManagePlugins && verificationDialog}
       <AlertDialog
         open={canManagePlugins && uninstallName !== null}
@@ -281,6 +292,18 @@ export function PluginsPage() {
                       <PluginNavigationHint nav={plugin.nav} />
                     </div>
                     <div className="flex items-center gap-2">
+                      {canManagePlugins && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Permissions for ${plugin.display_name || plugin.name}`}
+                          title="Plugin permissions"
+                          disabled={managementPending}
+                          onClick={() => setPermissionsName(plugin.name)}
+                        >
+                          <Shield className="size-4" aria-hidden="true" />
+                        </Button>
+                      )}
                       {canManagePlugins && (
                         <RepositoryUpdate
                           name={plugin.name}

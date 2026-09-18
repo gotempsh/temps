@@ -164,7 +164,7 @@ export default function Dashboards({ project }: DashboardsProps) {
               dashboard={d}
               rollup={rollupStatus(
                 dashboardTiles(d.layout?.sections),
-                statusModel.rulesFor,
+                statusModel.rulesFor
               )}
               onOpen={() => navigate(String(d.id))}
               onEdit={() => navigate(`${d.id}/edit`)}

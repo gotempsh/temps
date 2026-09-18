@@ -212,11 +212,13 @@ export function SessionDetail({
 
   const isLoading = isLoadingSession || isLoadingVisitor
 
-  // Reset page when date changes
-  React.useEffect(() => {
+  const dateScope = `${dateRange?.from?.getTime() ?? ''}\u0000${dateRange?.to?.getTime() ?? ''}`
+  const [previousDateScope, setPreviousDateScope] = React.useState(dateScope)
+  if (dateScope !== previousDateScope) {
+    setPreviousDateScope(dateScope)
     setLogsPage(1)
     setEventsPage(1)
-  }, [dateRange])
+  }
 
   // Reset page when limit changes
   const handleLogsLimitChange = (value: string) => {

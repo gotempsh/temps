@@ -94,7 +94,9 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
         <Card>
           <CardContent className="flex flex-col items-start gap-3 p-6 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <p className="text-sm font-medium">Autofix isn't set up yet</p>
+              <p className="text-sm font-medium">
+                Autofix isn&apos;t set up yet
+              </p>
               <p className="text-xs text-muted-foreground">
                 {readiness.firstIncomplete?.description ??
                   'Finish setup to run AI fixes on your errors.'}
@@ -124,8 +126,8 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
             <Sparkles className="h-12 w-12 text-muted-foreground mb-4" />
             <h2 className="text-lg font-semibold mb-2">No unresolved errors</h2>
             <p className="text-sm text-muted-foreground">
-              When errors occur, they'll appear here and you can fix them with
-              AI.
+              When errors occur, they&apos;ll appear here and you can fix them
+              with AI.
             </p>
           </CardContent>
         </Card>

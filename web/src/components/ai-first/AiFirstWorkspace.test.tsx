@@ -52,8 +52,8 @@ describe('HarnessPicker', () => {
     const base = {
       auth_command: 'login',
       auth_flavors: [],
-    credential_saved: true,
-    credential_verification_status: 'verified',
+      credential_saved: true,
+      credential_verification_status: 'verified',
       current_auth_type: 'subscription',
       default_model: null,
       default_permission_mode_id: 'default',

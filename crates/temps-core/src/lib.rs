@@ -40,6 +40,7 @@ pub mod release_images {
     pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
+pub mod docker_handle;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
@@ -47,6 +48,7 @@ pub mod sandbox_runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod serve_profile;
 pub mod source_drop;
 pub mod static_files;
 pub mod telemetry;
@@ -54,11 +56,15 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub use docker_handle::{DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
     SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy, SelfUpdateRestartMode, SelfUpdateStatus,
     SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+};
+pub use serve_profile::{
+    policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;
@@ -149,13 +155,19 @@ pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
     AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
     ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, ImageRetentionSettings, LetsEncryptSettings, McpServerSettings,
-    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
+    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
+    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
     TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
-    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+    DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
+    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
+    GEO_SOURCE_MAXMIND_OFFICIAL, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    MAX_GEO_REFRESH_INTERVAL_HOURS, MAX_GEO_STALE_LOOKUP_DAYS,
     MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
 };
 pub use async_trait;
 pub use chrono;

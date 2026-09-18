@@ -25,8 +25,13 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
+/// Key of the geolocation section inside the singleton `settings.data`
+/// document. Named once so the surgical, geo-only writer below cannot drift
+/// from `AppSettings`' serde field name.
+const GEO_SETTINGS_KEY: &str = "geo";
+
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{AgentSandboxSettings, AppSettings, PublicHostnameStrategy};
+use temps_core::{AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PublicHostnameStrategy};
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
@@ -65,6 +70,36 @@ pub(crate) fn preserve_provider_credential_proof(
                 extra.remove("credential_verified");
             }
         }
+    }
+}
+
+/// Rebase the geolocation section onto the row locked by the settings writer.
+///
+/// Two fields classes are restored:
+///
+/// * **Recorded state** (`source`, `build_epoch`, `last_refreshed_at`,
+///   `last_check_at`, `last_check_status`, `last_error`) is written only by
+///   the background refresh job, through `update_geo_settings`. A settings
+///   save must never carry an older copy of it back over a check the job just
+///   recorded, so the locked row always wins.
+/// * **The encrypted license key** is kept from the locked row unless this
+///   request explicitly set or cleared it. The handler encrypts (and consumes)
+///   the plaintext before this lock is taken, so the incoming ciphertext alone
+///   cannot be distinguished from one carried forward out of a stale snapshot.
+pub(crate) fn preserve_geo_recorded_state(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    license_key_intent: GeoLicenseKeyIntent,
+) {
+    incoming.geo.preserve_recorded_state(&current.geo);
+    match license_key_intent {
+        GeoLicenseKeyIntent::Unchanged => {
+            incoming.geo.maxmind_license_key_encrypted =
+                current.geo.maxmind_license_key_encrypted.clone();
+        }
+        // The incoming value is this request's own result: fresh ciphertext
+        // for `Set`, `None` for `Cleared`. Either way it is authoritative.
+        GeoLicenseKeyIntent::Set | GeoLicenseKeyIntent::Cleared => {}
     }
 }
 
@@ -1027,10 +1062,32 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         true
     }
 
-    /// Update the application settings
-    pub async fn update_settings(
+    /// Update the application settings.
+    ///
+    /// Equivalent to [`Self::update_settings_with_geo_intent`] with
+    /// [`GeoLicenseKeyIntent::Unchanged`]: a caller that does not say it is
+    /// changing the MaxMind license key never changes it.
+    pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
+        self.update_settings_with_geo_intent(settings, GeoLicenseKeyIntent::Unchanged)
+            .await
+    }
+
+    /// Update the application settings, declaring whether this write intends
+    /// to change the stored MaxMind license key.
+    ///
+    /// `geo_license_key_intent` exists because the geo section has a second
+    /// writer: the background refresh job records `source`/`build_epoch`/
+    /// `last_check_*` through [`Self::update_geo_settings`] on its own timer.
+    /// An admin's settings PUT is built from a 5-second-cached snapshot, so
+    /// without an explicit signal the request cannot tell "the admin submitted
+    /// this key" from "this ciphertext came out of a snapshot that is already
+    /// stale" — and the latter silently reverts a key saved moments earlier.
+    /// The recorded freshness metadata is likewise always taken from the
+    /// locked row, never from the request.
+    pub async fn update_settings_with_geo_intent(
         &self,
         mut settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
     ) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
         let cache_generation = self.settings_cache.read().await.generation;
@@ -1087,6 +1144,12 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         settings.plugin_installation_reporting_enabled =
             locked_settings.plugin_installation_reporting_enabled;
         preserve_provider_credential_proof(&mut settings, &locked_settings);
+        // The geo section's freshness metadata belongs to the refresh job, and
+        // its license key belongs to whichever request last submitted one.
+        // Both are rebased here, under the lock, so a settings save built from
+        // a stale snapshot can neither erase a check the job just recorded nor
+        // revert a key that was stored while this request was in flight.
+        preserve_geo_recorded_state(&mut settings, &locked_settings, geo_license_key_intent);
 
         let previous_compression = existing
             .as_ref()
@@ -1418,6 +1481,119 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // here would then regress the cache out of commit order.
         self.invalidate_settings_cache().await;
         Ok(current)
+    }
+
+    /// Atomically update only the geolocation section of the shared settings
+    /// row.
+    ///
+    /// The geo database refresh job records its freshness metadata
+    /// (`last_check_at`, `source`, `build_epoch`, ...) on its own schedule,
+    /// which can land in the same instant as an admin saving an unrelated
+    /// settings page. Going through `update_setting_field` would read the whole
+    /// document through the 5s cache and write it back, so whichever writer
+    /// committed second would discard the other's change. Here the row is
+    /// re-read under an exclusive lock and only `geo` is mutated.
+    ///
+    /// The closure receives the *stored* section, so callers can preserve
+    /// fields they are not writing (e.g. recording a failed check must leave
+    /// the last successful refresh intact).
+    ///
+    /// Only the document's `"geo"` key is parsed and rewritten. Deserializing
+    /// the whole row into `AppSettings` would be unsafe here: `from_json` is
+    /// `unwrap_or_default()`, so one malformed key anywhere in the document
+    /// would turn this unattended, timer-driven write into a reset of every
+    /// unrelated setting on it (MFA requirements, security headers, rate
+    /// limits, IP trust, ceilings) with no admin action and no audit entry.
+    /// A `geo` section that will not deserialize is therefore reported as
+    /// [`ConfigServiceError::MalformedSettingsSection`] and nothing is
+    /// written, rather than silently overwritten with defaults — which would
+    /// discard the stored license key.
+    pub async fn update_geo_settings<F>(
+        &self,
+        mutate: F,
+    ) -> Result<temps_core::GeoSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::GeoSettings),
+    {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let mut geo = match document.get(GEO_SETTINGS_KEY) {
+                None | Some(serde_json::Value::Null) => temps_core::GeoSettings::default(),
+                Some(stored) => serde_json::from_value(stored.clone()).map_err(|error| {
+                    warn!(
+                        %error,
+                        "Stored geolocation settings are malformed; refusing to overwrite them \
+                         with defaults from the refresh job"
+                    );
+                    ConfigServiceError::MalformedSettingsSection {
+                        section: GEO_SETTINGS_KEY,
+                    }
+                })?,
+            };
+            mutate(&mut geo);
+            let updated = geo.clone();
+            let geo_json = serde_json::to_value(&geo).map_err(|error| {
+                ConfigServiceError::Serialization(format!(
+                    "Failed to serialize the geolocation settings section: {error}"
+                ))
+            })?;
+
+            match document.as_object_mut() {
+                // Every other key is left byte-for-byte as it was read.
+                Some(object) => {
+                    object.insert(GEO_SETTINGS_KEY.to_string(), geo_json);
+                }
+                // Not a JSON object at all (a corrupt or `null` `data`
+                // column): there is nothing to preserve, so write a document
+                // that carries only the section this method owns.
+                None => {
+                    document = serde_json::json!({ GEO_SETTINGS_KEY: geo_json });
+                }
+            }
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+            transaction.commit().await?;
+            // Invalidate rather than publish this clone, for the same
+            // commit-order reason documented on `update_cloud_features`.
+            self.invalidate_settings_cache().await;
+            return Ok(updated);
+        }
+
+        // No row yet (a fresh install whose first geo check runs before any
+        // settings save): insert the defaults with this section applied.
+        let mut geo = temps_core::GeoSettings::default();
+        mutate(&mut geo);
+        let updated = geo.clone();
+        let settings = AppSettings {
+            geo,
+            ..AppSettings::default()
+        };
+        settings::ActiveModel {
+            id: Set(1),
+            data: Set(settings.to_json()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&transaction)
+        .await?;
+        transaction.commit().await?;
+        // Invalidate rather than publish this clone, for the same commit-order
+        // reason documented on `update_cloud_features`.
+        self.invalidate_settings_cache().await;
+        Ok(updated)
     }
 
     /// Atomically merge one provider credential into the shared settings row.
@@ -2306,7 +2482,257 @@ mod tests {
             update_sql.contains("plugin_installation_reporting_enabled"),
             "{update_sql}"
         );
-        assert!(!update_sql.contains("stale"), "{update_sql}");
+        // Matched as a quoted JSON *value* so the assertion stays about the
+        // forged ciphertext: unrelated field names legitimately contain
+        // "stale" as a substring (e.g. `geo.stale_lookup_days`).
+        assert!(!update_sql.contains(r#""stale""#), "{update_sql}");
+    }
+
+    /// The race the geo section actually has two writers for: the refresh job
+    /// records a check through `update_geo_settings` while an admin's settings
+    /// PUT, built from the 5s-cached snapshot, is already in flight. The PUT
+    /// touched nothing geo-related, so neither the job's metadata nor the
+    /// stored license key may come back to the pre-race values.
+    #[tokio::test]
+    async fn settings_save_cannot_clobber_the_refresh_jobs_recorded_geo_state() {
+        // What both writers started from: no metadata, no key.
+        let stale_snapshot = AppSettings::from_json(settings_row("example.test").data);
+        assert_eq!(stale_snapshot.geo, temps_core::GeoSettings::default());
+
+        // The job (and a concurrent key save) committed first, so this is what
+        // the row holds by the time the PUT takes the lock.
+        let checked_at = Utc::now();
+        let mut locked = settings_row("example.test");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        locked_settings.geo.build_epoch = Some(1_767_225_600);
+        locked_settings.geo.last_refreshed_at = Some(checked_at);
+        locked_settings.geo.last_check_at = Some(checked_at);
+        locked_settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+        locked_settings.geo.maxmind_license_key_encrypted =
+            Some("just-saved-ciphertext".to_string());
+        locked.data = locked_settings.to_json();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        // The admin's payload: an unrelated field changed, geo carried
+        // forward verbatim out of the stale snapshot.
+        let mut incoming = stale_snapshot.clone();
+        incoming.preview_domain = "new.example.test".into();
+        incoming.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_ERROR.to_string());
+        incoming.geo.last_error = Some("a failure the client invented".to_string());
+
+        svc.update_settings(incoming).await.expect("settings save");
+
+        let cached = svc.get_settings().await.expect("rebased settings");
+        assert_eq!(cached.preview_domain, "new.example.test");
+        assert_eq!(
+            cached.geo.source.as_deref(),
+            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert_eq!(cached.geo.build_epoch, Some(1_767_225_600));
+        assert_eq!(
+            cached.geo.last_check_status.as_deref(),
+            Some(temps_core::GEO_CHECK_STATUS_OK)
+        );
+        assert_eq!(cached.geo.last_error, None);
+        assert!(cached.geo.last_check_at.is_some());
+        assert_eq!(
+            cached.geo.maxmind_license_key_encrypted.as_deref(),
+            Some("just-saved-ciphertext"),
+            "a save that never touched the key must not revert it"
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("just-saved-ciphertext"), "{update_sql}");
+        assert!(
+            !update_sql.contains("a failure the client invented"),
+            "{update_sql}"
+        );
+    }
+
+    /// The counterpart: a request that *did* submit a key must still store it,
+    /// otherwise the rebase above would make the field unwritable.
+    #[tokio::test]
+    async fn settings_save_that_submitted_a_license_key_replaces_the_stored_one() {
+        let mut locked = settings_row("example.test");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.geo.maxmind_license_key_encrypted = Some("previous".to_string());
+        locked.data = locked_settings.to_json();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        // What the handler produces for a submitted key: ciphertext in place
+        // and the intent declared explicitly.
+        let mut incoming = AppSettings::from_json(settings_row("example.test").data);
+        incoming.geo.maxmind_license_key_encrypted = Some("rotated-ciphertext".to_string());
+        svc.update_settings_with_geo_intent(incoming, GeoLicenseKeyIntent::Set)
+            .await
+            .expect("settings save");
+
+        assert_eq!(
+            svc.get_settings()
+                .await
+                .expect("settings")
+                .geo
+                .maxmind_license_key_encrypted
+                .as_deref(),
+            Some("rotated-ciphertext")
+        );
+
+        // And clearing it is honoured rather than treated as an omission.
+        let mut cleared = AppSettings::from_json(locked.data.clone());
+        cleared.geo.maxmind_license_key_encrypted = None;
+        preserve_geo_recorded_state(
+            &mut cleared,
+            &AppSettings::from_json(locked.data),
+            GeoLicenseKeyIntent::Cleared,
+        );
+        assert_eq!(cleared.geo.maxmind_license_key_encrypted, None);
+    }
+
+    /// The refresh job's write is unattended and fires on a timer, so it must
+    /// touch nothing but `geo` — a document it cannot fully parse must never
+    /// become `AppSettings::default()` (which would silently reset MFA
+    /// requirements, security headers, rate limits and IP trust).
+    #[tokio::test]
+    async fn geo_update_rewrites_only_the_geo_key_of_the_settings_document() {
+        let mut settings = AppSettings {
+            preview_domain: "keep.example.test".into(),
+            require_mfa_for_admins: true,
+            ..AppSettings::default()
+        };
+        settings.rate_limiting.enabled = true;
+        let mut document = settings.to_json();
+        // A sub-document `AppSettings` does not own, plus a key it does own
+        // but whose stored shape it could not deserialize.
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "admin_gate".to_string(),
+                serde_json::json!({"allowed_ips": ["203.0.113.7"]}),
+            );
+            object.insert(
+                "security_headers".to_string(),
+                serde_json::json!("not the shape AppSettings expects"),
+            );
+        }
+        let row = settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE.
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let updated = svc
+            .update_geo_settings(|geo| {
+                geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+                geo.build_epoch = Some(1_767_225_600);
+            })
+            .await
+            .expect("record the geo check");
+        assert_eq!(
+            updated.last_check_status.as_deref(),
+            Some(temps_core::GEO_CHECK_STATUS_OK)
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("geo update statement");
+        assert!(update_sql.contains("keep.example.test"), "{update_sql}");
+        assert!(update_sql.contains("203.0.113.7"), "{update_sql}");
+        assert!(
+            update_sql.contains("not the shape AppSettings expects"),
+            "an unparsable unrelated key must survive byte-for-byte: {update_sql}"
+        );
+        assert!(update_sql.contains("1767225600"), "{update_sql}");
+    }
+
+    /// A `geo` section that will not deserialize is reported instead of being
+    /// overwritten with defaults, which would discard the stored license key.
+    #[tokio::test]
+    async fn geo_update_refuses_to_overwrite_a_malformed_geo_section() {
+        let mut document = AppSettings::default().to_json();
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                GEO_SETTINGS_KEY.to_string(),
+                serde_json::json!("not an object"),
+            );
+        }
+        let row = settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .update_geo_settings(|geo| geo.build_epoch = Some(1))
+            .await
+            .expect_err("a malformed section must be reported, not reset");
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection { section: "geo" }
+        ));
     }
 
     #[tokio::test]

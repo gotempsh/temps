@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { z } from 'zod'
+import { pluginGrantsSchema } from './plugin-grants'
 
 export const repositoryInstallSchema = z.object({
   name: z
@@ -31,6 +32,7 @@ export const repositoryInstallSchema = z.object({
   trusted: z
     .boolean()
     .refine(Boolean, 'Confirm you trust this plugin before installing.'),
+  grants: pluginGrantsSchema.optional(),
 })
 export type RepositoryInstallValues = z.infer<typeof repositoryInstallSchema>
 
@@ -57,5 +59,6 @@ export function repositoryInstallBody(values: RepositoryInstallValues) {
     repository_url: values.repository_url,
     ...(values.name ? { name: values.name } : {}),
     ...(values.ref_name ? { ref_name: values.ref_name } : {}),
+    ...(values.grants ? { grants: values.grants } : {}),
   }
 }

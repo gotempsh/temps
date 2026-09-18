@@ -91,8 +91,8 @@ export const ForgotPassword = () => {
                 <span className="font-medium text-foreground">
                   {form.getValues('email')}
                 </span>
-                , we've sent a link to reset your password. The link expires in
-                1 hour.
+                , we&apos;ve sent a link to reset your password. The link
+                expires in 1 hour.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -109,7 +109,7 @@ export const ForgotPassword = () => {
             <CardHeader>
               <CardTitle className="text-2xl">Forgot password?</CardTitle>
               <CardDescription>
-                Enter your email and we'll send you a link to reset your
+                Enter your email and we&apos;ll send you a link to reset your
                 password.
               </CardDescription>
             </CardHeader>
@@ -120,7 +120,7 @@ export const ForgotPassword = () => {
                   <AlertTitle>Password reset unavailable</AlertTitle>
                   <AlertDescription>
                     No email provider is configured on this server, so reset
-                    links can't be sent. Contact your administrator.
+                    links can&apos;t be sent. Contact your administrator.
                   </AlertDescription>
                 </Alert>
               )}

@@ -248,9 +248,10 @@ function QuestionVariant({
                             const cur = prev[q.question] ?? []
                             return {
                               ...prev,
-                              [q.question]: checked === true
-                                ? [...cur, opt.label]
-                                : cur.filter((l) => l !== opt.label),
+                              [q.question]:
+                                checked === true
+                                  ? [...cur, opt.label]
+                                  : cur.filter((l) => l !== opt.label),
                             }
                           })
                         }}

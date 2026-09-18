@@ -12,7 +12,8 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_core::{
-    Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
+    DockerHandle, Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError,
+    WorkflowExecutor,
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
@@ -1222,6 +1223,18 @@ impl WorkflowExecutionService {
                     .ok()
                     .and_then(|settings| settings.registry_mirror_prefix);
 
+                // Same source of truth the cross-build platform detection
+                // below already reads: the `NodeScheduler` wired at plugin
+                // registration from `LocalWorkloadPolicy`. A control plane
+                // with no local Docker daemon must refuse this job before it
+                // ever reaches `ImageBuilder` -- worker-side builds are
+                // deferred to ADR-045, so today this is a hard refusal.
+                let local_workloads_enabled = self
+                    .node_scheduler
+                    .get()
+                    .map(|scheduler| scheduler.local_workloads_enabled())
+                    .unwrap_or(true);
+
                 let mut builder = BuildImageJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .download_job_id(download_job_id)
@@ -1229,7 +1242,8 @@ impl WorkflowExecutionService {
                     .dockerfile_path(dockerfile_path.to_string())
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
-                    .registry_mirror_prefix(registry_mirror_prefix);
+                    .registry_mirror_prefix(registry_mirror_prefix)
+                    .local_workloads_enabled(local_workloads_enabled);
 
                 builder = builder
                     .preset(project.preset)
@@ -1657,18 +1671,61 @@ impl WorkflowExecutionService {
                 }
 
                 // If using external image, set the image tag directly (bypasses build job lookup)
-                if let Some(image_tag) = external_image_tag {
+                if let Some(ref image_tag) = external_image_tag {
                     debug!("🐳 Using external image tag for deployment: {}", image_tag);
-                    builder = builder.external_image_tag(image_tag);
+                    builder = builder.external_image_tag(image_tag.clone());
                 }
 
-                // Apply container log rotation settings from config
+                // Apply container log rotation settings from config, and — for a
+                // registry-sourced image — the same private-registry credentials
+                // `PullExternalImageJob` uses, so a worker node can pull the image
+                // itself via `POST /agent/images/pull` without the control plane
+                // ever needing a Docker daemon. Only forwarded when the image's
+                // registry matches the configured registry (same matching rule as
+                // `PullExternalImageJob`, never send credentials to a registry that
+                // didn't ask for them).
                 if let Ok(settings) = self.config_service.get_settings().await {
                     builder =
                         builder.container_log_config(temps_deployer::ContainerLogConfig::new(
                             settings.container_logs.max_size.clone(),
                             settings.container_logs.max_file,
                         ));
+
+                    if let Some(ref image_tag) = external_image_tag {
+                        let reg = &settings.docker_registry;
+                        if reg.enabled {
+                            if let (Some(username), Some(password), Some(registry_url)) = (
+                                reg.username.clone(),
+                                reg.password.clone(),
+                                reg.registry_url.clone(),
+                            ) {
+                                let image_registry =
+                                    PullExternalImageJob::registry_from_image_ref(image_tag);
+                                let configured_registry =
+                                    PullExternalImageJob::registry_host_from_url(&registry_url);
+                                if matches!(
+                                    (&image_registry, &configured_registry),
+                                    (Some(image_registry), Some(configured_registry))
+                                        if image_registry == configured_registry
+                                ) {
+                                    builder = builder.registry_credentials(
+                                        temps_deployer::remote::RemotePullCredentials {
+                                            username: Some(username),
+                                            password: Some(password),
+                                            identity_token: None,
+                                            server_address: Some(registry_url),
+                                        },
+                                    );
+                                } else {
+                                    warn!(
+                                        image_registry = ?image_registry,
+                                        configured_registry = ?configured_registry,
+                                        "Skipping Docker registry credentials for remote pull because the image registry does not match"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let job = builder.build(self.container_deployer.clone())?;
@@ -1934,6 +1991,12 @@ impl WorkflowExecutionService {
                     download_job_id,
                     build_job_id,
                     self.db.clone(),
+                    // This service always owns a real Docker client today
+                    // (see the `docker: Arc<bollard::Docker>` field above);
+                    // wrap it so `TrivyScanner` gets a `DockerUnavailable`
+                    // error instead of a panic on the day this service is
+                    // itself constructed without one.
+                    Arc::new(DockerHandle::available(self.docker.clone())),
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());

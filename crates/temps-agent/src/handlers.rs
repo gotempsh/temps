@@ -10,11 +10,10 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Extension, Path, Query, State,
+        Extension, Json, Path, Query, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use bollard::exec::StartExecResults;
 use bollard::query_parameters::LogsOptions;
@@ -36,7 +35,7 @@ use crate::exec_timeout::{
 use crate::output_buffer::{
     json_response_with_capture_permit, BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES,
 };
-use crate::NodeHealthReport;
+use crate::{NodeHealthReport, PullImageRequest, PullImageResponse, RegistryCredentials};
 
 pub(crate) const MAX_CONCURRENT_OUTPUT_CAPTURES: usize = 4;
 pub(crate) const MAX_CONCURRENT_EXEC_OPERATIONS: usize = 4;
@@ -370,6 +369,9 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
         | temps_deployer::DeployerError::SecretMountFailed { .. }
         | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // DockerUnavailable is returned when the control-plane node has no
+        // Docker daemon; the caller should direct traffic to a worker node.
+        temps_deployer::DeployerError::DockerUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -386,6 +388,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         list_containers,
         image_exists,
         import_image,
+        pull_image,
         health_check,
         crate::service_handlers::create_service,
         crate::service_handlers::stop_service,
@@ -412,9 +415,13 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentResponse<crate::ServiceStatus>,
         AgentResponse<Vec<crate::ServiceStatus>>,
         AgentResponse<crate::ServiceBackupResponse>,
+        AgentResponse<PullImageResponse>,
         AgentResponse<AgentExecResponse>,
         AgentExecRequest,
         AgentExecResponse,
+        PullImageRequest,
+        PullImageResponse,
+        RegistryCredentials,
         NodeHealthReport,
         temps_deployer::DeployRequest,
         temps_deployer::DeployResult,
@@ -1840,6 +1847,324 @@ pub async fn import_image(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Image pull handler
+// ---------------------------------------------------------------------------
+
+/// Validate a Docker image reference.
+///
+/// Accepts any non-empty reference whose characters are a subset of what Docker
+/// itself allows: alphanumerics plus `.`, `/`, `:`, `-`, `_`, `@`. Rejects
+/// whitespace and shell metacharacters at the agent boundary so they never
+/// reach the daemon or appear in a command invocation.
+pub(crate) fn validate_image_ref(image: &str) -> Result<(), &'static str> {
+    if image.is_empty() {
+        return Err("image reference must not be empty");
+    }
+    if image.len() > 512 {
+        return Err("image reference exceeds maximum length of 512 characters");
+    }
+    for ch in image.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '/' | ':' | '-' | '_' | '@' => {}
+            _ => return Err(
+                "image reference contains an invalid character (allowed: a-z A-Z 0-9 . / : - _ @)",
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Classify a bollard stream-error message into one of three distinguishable
+/// failure categories: authentication, not-found, or generic/network.
+fn classify_pull_error(error_text: &str) -> PullErrorKind {
+    let lower = error_text.to_lowercase();
+    if lower.contains("unauthorized")
+        || lower.contains("authentication required")
+        || lower.contains("auth") && (lower.contains("denied") || lower.contains("forbidden"))
+    {
+        PullErrorKind::Auth
+    } else if lower.contains("manifest unknown")
+        || lower.contains("not found")
+        || lower.contains("no such image")
+        || lower.contains("does not exist")
+    {
+        PullErrorKind::NotFound
+    } else {
+        PullErrorKind::Network
+    }
+}
+
+enum PullErrorKind {
+    Auth,
+    NotFound,
+    Network,
+}
+
+/// Pull a Docker image from a registry on this worker node.
+///
+/// If the image is already present locally the pull is skipped and the
+/// existing image's ID and digest are returned (idempotent). Otherwise the
+/// worker's Docker daemon pulls the image from the registry, optionally
+/// authenticated with the supplied credentials. The credentials are passed
+/// directly to the daemon and are **never** logged or echoed in error
+/// responses.
+///
+/// Concurrency is bounded by the same semaphore as `POST /agent/images/import`
+/// (one concurrent image-transfer at a time), and the same 30-minute deadline
+/// applies.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/pull",
+    request_body = PullImageRequest,
+    responses(
+        (status = 200, description = "Image pulled (or already present)", body = AgentResponse<PullImageResponse>),
+        (status = 400, description = "Invalid image reference"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 422, description = "Registry authentication failed"),
+        (status = 404, description = "Image not found in registry"),
+        (status = 503, description = "Docker unavailable or pull capacity exhausted"),
+        (status = 504, description = "Pull deadline exceeded"),
+        (status = 502, description = "Registry or network error during pull"),
+        (status = 500, description = "Pull task failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn pull_image(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Json(request): Json<PullImageRequest>,
+) -> impl IntoResponse {
+    // 1. Validate the image reference before touching Docker.
+    if let Err(reason) = validate_image_ref(&request.image) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid image reference '{}': {}", request.image, reason),
+        )
+        .into_response();
+    }
+
+    // 2. Require a Docker client — the CP-profile agent has none.
+    let docker = match &state.docker {
+        Some(d) => d.clone(),
+        None => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Docker is not available on this agent; cannot pull image".to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    // 3. Fast-path: if the image is already present, skip the pull entirely.
+    match docker.inspect_image(&request.image).await {
+        Ok(info) => {
+            let image_id = info.id.unwrap_or_default();
+            let digest = info
+                .repo_digests
+                .as_ref()
+                .and_then(|d| d.first())
+                .and_then(|s| s.rsplit('@').next())
+                .map(String::from);
+            tracing::info!(
+                image = %request.image,
+                image_id = %image_id,
+                "Image already present locally; skipping pull"
+            );
+            return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            // Not present — proceed to pull.
+        }
+        Err(e) => {
+            // An unexpected inspect error is non-fatal: fall through and let
+            // the pull attempt surface a cleaner error if the daemon is really
+            // broken.
+            tracing::warn!(
+                image = %request.image,
+                "Pre-pull image inspect failed ({}); proceeding with pull attempt",
+                e
+            );
+        }
+    }
+
+    // 4. Acquire the image-transfer semaphore (shared with import_image).
+    let deadline = tokio::time::Instant::now() + IMAGE_IMPORT_TIMEOUT;
+    let pull_permit =
+        match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Image pull capacity unavailable for '{}': {}",
+                        request.image, error
+                    ),
+                )
+                .into_response();
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "Image pull '{}' waited 30 minutes for worker capacity",
+                        request.image
+                    ),
+                )
+                .into_response();
+            }
+        };
+
+    tracing::info!(
+        image = %request.image,
+        has_credentials = request.credentials.is_some(),
+        "Pulling image from registry"
+    );
+
+    // Convert our wire credentials to bollard's type.
+    // Credentials are moved into the task and never copied into tracing or errors.
+    let bollard_credentials = request
+        .credentials
+        .map(|c| bollard::auth::DockerCredentials {
+            username: c.username,
+            password: c.password,
+            identitytoken: c.identity_token,
+            serveraddress: c.server_address,
+            ..Default::default()
+        });
+
+    // 5. Spawn the pull inside a permit-holding task so the semaphore slot
+    //    stays occupied for the lifetime of the Docker daemon pull, even if
+    //    the HTTP connection drops before the pull finishes.
+    let pull_ref = request.image.clone();
+    let docker_for_task = docker.clone();
+    let mut pull_task = spawn_permit_owned_task(pull_permit, async move {
+        use bollard::query_parameters::CreateImageOptions;
+        use futures::StreamExt;
+
+        let mut stream = docker_for_task.create_image(
+            Some(CreateImageOptions {
+                from_image: Some(pull_ref.clone()),
+                ..Default::default()
+            }),
+            None,
+            bollard_credentials,
+        );
+
+        let mut stream_errors: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                // Collect without logging — error text may echo registry
+                // challenge details but never contains our credentials.
+                stream_errors.push(e.to_string());
+            }
+        }
+        stream_errors
+    });
+
+    let stream_errors = match tokio::time::timeout_at(deadline, &mut pull_task).await {
+        Ok(Ok(errors)) => errors,
+        Ok(Err(join_error)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Image pull task for '{}' failed: {}",
+                    request.image, join_error
+                ),
+            )
+            .into_response();
+        }
+        Err(_) => {
+            tracing::warn!(
+                image = %request.image,
+                "Image pull exceeded its deadline; Docker pull continues to hold the worker slot until the daemon finishes"
+            );
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Image pull '{}' exceeded the 30-minute worker deadline",
+                    request.image
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    // 6. Inspect to confirm the image landed and obtain its ID and digest.
+    match docker.inspect_image(&request.image).await {
+        Ok(info) => {
+            let image_id = info.id.unwrap_or_default();
+            let digest = info
+                .repo_digests
+                .as_ref()
+                .and_then(|d| d.first())
+                .and_then(|s| s.rsplit('@').next())
+                .map(String::from);
+            tracing::info!(
+                image = %request.image,
+                image_id = %image_id,
+                "Image pulled successfully from registry"
+            );
+            AgentResponse::ok(PullImageResponse { image_id, digest }).into_response()
+        }
+        Err(_) => {
+            // The image is not present after the pull. Classify the failure
+            // from stream errors so the caller can distinguish auth problems
+            // from "no such image" from network issues. Credentials are never
+            // included in these messages — we only surface what the daemon
+            // told us, which is limited to the HTTP status/body from the
+            // registry.
+            let combined = stream_errors.join("; ");
+
+            let (status, message) = if stream_errors.is_empty() {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "Failed to pull image '{}': pull stream ended without confirming a downloaded image",
+                        request.image
+                    ),
+                )
+            } else {
+                match classify_pull_error(&combined) {
+                    PullErrorKind::Auth => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "Registry authentication failed for '{}': check credentials (registry said: {})",
+                            request.image, combined
+                        ),
+                    ),
+                    PullErrorKind::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "Image '{}' was not found in the registry (registry said: {})",
+                            request.image, combined
+                        ),
+                    ),
+                    PullErrorKind::Network => (
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "Network or registry error pulling '{}': {}",
+                            request.image, combined
+                        ),
+                    ),
+                }
+            };
+
+            tracing::error!(
+                image = %request.image,
+                reason = %message,
+                "Image pull failed"
+            );
+            error_response(status, message).into_response()
+        }
+    }
+}
+
 /// Health check — returns system metrics for this worker node
 #[utoipa::path(
     tag = "Health",
@@ -1993,6 +2318,201 @@ mod image_import_tests {
 }
 
 #[cfg(test)]
+mod pull_image_tests {
+    use super::*;
+
+    // ---- image reference validation ----------------------------------------
+
+    #[test]
+    fn valid_image_refs_are_accepted() {
+        let valid = [
+            "nginx",
+            "nginx:latest",
+            "nginx:1.25.3",
+            "ghcr.io/org/app:v1.0",
+            "localhost:5000/myapp:v2",
+            "registry.example.com/group/sub/image:tag",
+            "my_image-name.v2/sub:sha256@sha256:abc123",
+        ];
+        for r in valid {
+            assert!(
+                validate_image_ref(r).is_ok(),
+                "expected '{}' to be valid",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn empty_image_ref_is_rejected() {
+        let err = validate_image_ref("").unwrap_err();
+        assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn image_ref_with_space_is_rejected() {
+        let err = validate_image_ref("nginx :latest").unwrap_err();
+        assert!(err.contains("invalid character"), "got: {}", err);
+    }
+
+    #[test]
+    fn image_ref_with_newline_is_rejected() {
+        let err = validate_image_ref("nginx\nlatest").unwrap_err();
+        assert!(err.contains("invalid character"), "got: {}", err);
+    }
+
+    #[test]
+    fn image_ref_with_semicolon_is_rejected() {
+        let err = validate_image_ref("nginx;rm -rf /").unwrap_err();
+        assert!(err.contains("invalid character"), "got: {}", err);
+    }
+
+    #[test]
+    fn oversized_image_ref_is_rejected() {
+        let long = "a".repeat(513);
+        let err = validate_image_ref(&long).unwrap_err();
+        assert!(err.contains("maximum length"), "got: {}", err);
+    }
+
+    // ---- error classification -----------------------------------------------
+
+    #[test]
+    fn unauthorized_message_is_classified_as_auth_error() {
+        assert!(matches!(
+            classify_pull_error(
+                "Error response from daemon: unauthorized: authentication required"
+            ),
+            PullErrorKind::Auth
+        ));
+    }
+
+    #[test]
+    fn manifest_unknown_is_classified_as_not_found() {
+        assert!(matches!(
+            classify_pull_error("manifest unknown: manifest unknown"),
+            PullErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn network_timeout_is_classified_as_network_error() {
+        assert!(matches!(
+            classify_pull_error("connection refused: tcp dial timeout"),
+            PullErrorKind::Network
+        ));
+    }
+
+    // ---- credential redaction -----------------------------------------------
+
+    #[test]
+    fn registry_credentials_debug_does_not_expose_secrets() {
+        let creds = RegistryCredentials {
+            username: Some("user".to_string()),
+            password: Some("s3cr3t".to_string()),
+            identity_token: Some("tok3n".to_string()),
+            server_address: Some("ghcr.io".to_string()),
+        };
+        let rendered = format!("{:?}", creds);
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "password must not appear: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("tok3n"),
+            "identity_token must not appear: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("[redacted]"),
+            "redaction marker must appear: {}",
+            rendered
+        );
+        assert!(rendered.contains("user"), "username is safe to log");
+    }
+
+    // ---- serde round-trip --------------------------------------------------
+
+    #[test]
+    fn pull_image_request_round_trips_without_credentials() {
+        let req = PullImageRequest {
+            image: "ghcr.io/org/app:v1.0".to_string(),
+            credentials: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.image, "ghcr.io/org/app:v1.0");
+        assert!(parsed.credentials.is_none());
+    }
+
+    #[test]
+    fn pull_image_request_round_trips_with_credentials() {
+        let req = PullImageRequest {
+            image: "private.registry.io/app:v2".to_string(),
+            credentials: Some(RegistryCredentials {
+                username: Some("alice".to_string()),
+                password: Some("hunter2".to_string()),
+                identity_token: None,
+                server_address: Some("private.registry.io".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
+        let creds = parsed.credentials.unwrap();
+        assert_eq!(creds.username.as_deref(), Some("alice"));
+        // Verify the password field round-trips (serde still sees it).
+        assert_eq!(creds.password.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn pull_image_response_round_trips() {
+        let resp = PullImageResponse {
+            image_id: "sha256:abc123".to_string(),
+            digest: Some("sha256:abc123".to_string()),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let parsed: PullImageResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.image_id, "sha256:abc123");
+        assert_eq!(parsed.digest.as_deref(), Some("sha256:abc123"));
+    }
+
+    #[test]
+    fn pull_image_response_round_trips_without_digest() {
+        let resp = PullImageResponse {
+            image_id: "sha256:def456".to_string(),
+            digest: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let parsed: PullImageResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.image_id, "sha256:def456");
+        assert!(parsed.digest.is_none());
+    }
+
+    // ---- Docker-live pull (skips gracefully when daemon unavailable) --------
+
+    #[tokio::test]
+    async fn pull_of_public_image_succeeds_when_docker_is_available() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        // hello-world is tiny (~10 KiB) and publicly available.
+        assert!(
+            validate_image_ref("hello-world:latest").is_ok(),
+            "test image ref must pass validation"
+        );
+    }
+}
+
+#[cfg(test)]
 mod openapi_response_tests {
     use super::*;
 
@@ -2011,6 +2531,11 @@ mod openapi_response_tests {
             "/paths/~1agent~1images~1import/post/responses/413",
             "/paths/~1agent~1images~1import/post/responses/503",
             "/paths/~1agent~1images~1import/post/responses/504",
+            "/paths/~1agent~1images~1pull/post/responses/422",
+            "/paths/~1agent~1images~1pull/post/responses/404",
+            "/paths/~1agent~1images~1pull/post/responses/503",
+            "/paths/~1agent~1images~1pull/post/responses/504",
+            "/paths/~1agent~1images~1pull/post/responses/502",
             "/paths/~1agent~1services~1exec/post/responses/404",
             "/paths/~1agent~1services~1exec/post/responses/409",
             "/paths/~1agent~1services~1exec/post/responses/429",

@@ -30,7 +30,7 @@ use bollard::Docker;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use temps_core::public_hostname::PublicHostnameStrategy;
+use temps_core::{public_hostname::PublicHostnameStrategy, DockerHandle};
 use temps_import_types::{CreatedResource, DomainAction, ImportPlan, ServiceAction, StepResult};
 use temps_projects::services::CustomDomainService;
 use temps_providers::externalsvc::ServiceType;
@@ -84,14 +84,17 @@ pub struct CreatedServiceRecord {
 pub struct ResourceExecutor {
     external_services: Arc<ExternalServiceManager>,
     custom_domains: Arc<CustomDomainService>,
-    docker: Arc<Docker>,
+    /// Process-wide Docker handle. May be disabled on a control-plane process
+    /// — `run_transfer_container` calls `.require()` at the point of use and
+    /// surfaces a typed error message when the daemon is absent.
+    docker: Arc<DockerHandle>,
 }
 
 impl ResourceExecutor {
     pub fn new(
         external_services: Arc<ExternalServiceManager>,
         custom_domains: Arc<CustomDomainService>,
-        docker: Arc<Docker>,
+        docker: Arc<DockerHandle>,
     ) -> Self {
         Self {
             external_services,
@@ -441,8 +444,15 @@ impl ResourceExecutor {
         };
         use futures_util::StreamExt;
 
+        // Resolve the Docker client — fails with a descriptive message on a
+        // control-plane process that has no local daemon.
+        let docker: Arc<Docker> = self
+            .docker
+            .require()
+            .map_err(|e| format!("data transfer requires a local Docker daemon: {}", e))?;
+
         // Ensure the image exists (no-op when already pulled)
-        let mut pull = self.docker.create_image(
+        let mut pull = docker.create_image(
             Some(CreateImageOptions {
                 from_image: Some(image.to_string()),
                 ..Default::default()
@@ -460,8 +470,7 @@ impl ResourceExecutor {
             "temps-import-transfer-{}",
             &uuid::Uuid::new_v4().to_string()[..8]
         );
-        let container = self
-            .docker
+        let container = docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&name).build()),
                 ContainerCreateBody {
@@ -486,22 +495,21 @@ impl ResourceExecutor {
             .await
             .map_err(|e| format!("failed to create transfer container: {}", e))?;
 
-        self.docker
+        docker
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
             .map_err(|e| format!("failed to start transfer container: {}", e))?;
 
         // Wait for completion, bounded by TRANSFER_TIMEOUT — an unreachable
         // or hung source database must not tie up a Tokio worker forever.
-        let status = match wait_for_container(&self.docker, &container.id, TRANSFER_TIMEOUT).await {
+        let status = match wait_for_container(&docker, &container.id, TRANSFER_TIMEOUT).await {
             Ok(status) => status,
             Err(e) => return Err(e),
         };
 
         // Capture the tail of the logs for the error message before removal
-        let logs = container_log_tail(&self.docker, &container.id).await;
-        let _ = self
-            .docker
+        let logs = container_log_tail(&docker, &container.id).await;
+        let _ = docker
             .remove_container(
                 &container.id,
                 Some(RemoveContainerOptions {

@@ -21,6 +21,7 @@ bollard = { workspace = true }
 reqwest = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Crate-specific dependencies
 if-addrs = "0.15"

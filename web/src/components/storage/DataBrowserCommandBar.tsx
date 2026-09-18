@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import Fuse from 'fuse.js'
 import {
   CommandDialog,
@@ -74,6 +74,11 @@ export function DataBrowserCommandBar({
   supportsSql,
 }: DataBrowserCommandBarProps) {
   const [input, setInput] = useState('')
+  const [previousOpen, setPreviousOpen] = useState(open)
+  if (previousOpen !== open) {
+    setPreviousOpen(open)
+    if (open) setInput('')
+  }
   const { record, blend, store } = useFrecency()
 
   const fuse = useMemo(
@@ -127,11 +132,6 @@ export function DataBrowserCommandBar({
       )
       .slice(0, 8)
   }, [views, input])
-
-  // Reset input when opened
-  useEffect(() => {
-    if (open) setInput('')
-  }, [open])
 
   const iconFor = (t: CommandTarget) =>
     t.kind === 'entity' ? (
@@ -210,9 +210,7 @@ export function DataBrowserCommandBar({
         )}
 
         {results.length > 0 && (
-          <CommandGroup
-            heading={input.trim() ? 'Matches' : 'Recent'}
-          >
+          <CommandGroup heading={input.trim() ? 'Matches' : 'Recent'}>
             {!input.trim() && results.length > 0 && (
               <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 flex items-center gap-1">
                 <Clock className="h-3 w-3" />
@@ -236,7 +234,10 @@ export function DataBrowserCommandBar({
                     <div className="truncate flex items-center gap-2">
                       <span className="font-medium">{t.name}</span>
                       {t.label && (
-                        <Badge variant="outline" className="text-[10px] h-4 px-1">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] h-4 px-1"
+                        >
                           {t.label}
                         </Badge>
                       )}

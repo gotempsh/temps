@@ -16,6 +16,8 @@ export const sections = [
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
   { title: 'How scheduling works', id: 'scheduling' },
+  { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
+  { title: 'Building from source', id: 'control-plane-builds' },
   { title: 'Mixed architectures', id: 'mixed-architectures' },
   { title: 'Current limitations', id: 'limitations' },
 ]
@@ -246,7 +248,7 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 When you deploy an application with multiple replicas, the **node scheduler** distributes containers across available nodes using **round-robin** scheduling:
 
 1. The scheduler queries all nodes with `status = "active"` and a heartbeat within the last 90 seconds
-2. If no active worker nodes exist, all replicas run locally on the control plane
+2. If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead
 3. If active workers exist, replicas are distributed evenly across all nodes (including local) in round-robin order
 4. Each container records which node it was assigned to in the database
 
@@ -255,6 +257,128 @@ The deployment job creates a `RemoteNodeDeployer` for each remote assignment, wh
 <Note>
 The scheduler currently uses simple round-robin. Label-based scheduling (e.g., "only deploy to nodes with `gpu=true`") is planned but not yet implemented — labels are stored but not used for filtering.
 </Note>
+
+---
+
+## A control plane that runs no workloads {{ anchor: true, id: 'control-plane-profile' }}
+
+By default the control plane is also a worker: it builds images, runs
+application containers, provisions managed databases and stores backups on its
+own disk, which is why `temps serve` requires a reachable Docker daemon.
+
+`--profile control-plane` separates the two roles. The process keeps the
+console, API, proxy, analytics, session replay, error tracking, OpenTelemetry,
+monitoring, status pages, alerts, domains and ACME, auth, teams,
+notifications, email, webhooks, feature flags, the job queue, log aggregation,
+backup orchestration and the AI gateway — but it runs **no workloads of its
+own**. Applications run on worker nodes joined with `temps join`.
+
+**No Docker daemon is required, and none is contacted.** The process
+constructs no Docker client at all in this profile, so it runs in a container
+with no socket mounted and no `DOCKER_HOST` set. Every path that would need a
+daemon fails with a typed error naming the remedy, rather than panicking or
+quietly running a container here.
+
+```bash
+temps serve --profile control-plane
+# or, equivalently:
+TEMPS_SERVE_PROFILE=control-plane temps serve
+```
+
+The default is `--profile full`, which is the behaviour described everywhere
+else in these docs and is unchanged.
+
+### What the control-plane profile turns off
+
+These plugins are not constructed at all — they hold no memory and start no
+background tasks:
+
+| Not available here | Why | Where it happens instead |
+| --- | --- | --- |
+| Deployer local runtime setup | No app network, overlay or cluster-DNS reconciliation against a local daemon | The worker node's agent |
+| Local managed-service provisioning | Managed PostgreSQL/Redis/MariaDB run as containers on a host | A worker node (`node_id`), or an external database |
+| Key-value store (`kv`) | Managed Redis is a local container | A worker node |
+| Local backup execution | Backup engines exec into containers on this host | The node that owns the service. Backup scheduling, retention, listing and restore orchestration keep running here |
+| Local container log tailing | The local collector tails containers on this host's daemon | Worker-node logs are collected over the agent. `/logs/search` and `/logs/tail` keep working |
+| Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
+| Agent sandboxes and the sandbox API | Sandboxes are local containers | A `full`-profile host |
+| Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
+| Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
+| On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
+
+<Note>
+Vulnerability scanning is **off** in this profile and honestly reported as
+such. It is not silently delegated to a worker: the scanner needs the image in
+a local image store, and in this profile no application image is ever stored on
+the control plane. Run the `full` profile if image scanning is a requirement.
+</Note>
+
+Deployments, projects, environments and the whole console API keep working —
+they target worker nodes. The node scheduler will not produce a local
+placement in this profile: if no eligible worker node is available the
+deployment fails with a message saying so, rather than quietly assigning
+replicas to a host that cannot start them.
+
+```
+This control plane does not run application containers (serve profile
+'control-plane'), and no eligible worker node is available for the 2
+requested replica(s). Join a worker node with `temps join` — or run the
+control plane with `--profile full` if it should host workloads itself
+```
+
+### Asking the server what it provides
+
+Any client can read the running process's capabilities instead of probing
+endpoints and guessing:
+
+```bash
+curl -H "Authorization: Bearer $TEMPS_API_KEY" https://your-temps/api/platform/features
+```
+
+```json
+{
+  "profile": "control-plane",
+  "docker": false,
+  "deployments_local": false,
+  "image_builds_local": false,
+  "managed_services": false,
+  "backups_local": false,
+  "backups_remote": true,
+  "sandboxes": false,
+  "kv": false,
+  "imports": false,
+  "log_aggregation": true,
+  "vulnerability_scanning": false
+}
+```
+
+`docker` reports whether a Docker client exists in this process *and* a daemon
+answered a ping at startup. It is deliberately separate from `profile`:
+mounting a socket into a control-plane container does not turn it into a
+worker, and the profile's refusals are enforced on the profile, not on whether
+a socket happens to be present.
+
+## Building from source {{ anchor: true, id: 'control-plane-builds' }}
+
+Deployments of a **prebuilt image from a registry** work in this profile: the
+control plane tells the target worker to pull the image, and the worker pulls
+it directly from the registry. No image data passes through the control plane
+and no local daemon is involved.
+
+Deployments that **build from source** do not work in this profile yet. The
+build path runs against a local daemon, and this process has none. A build is
+refused with an explicit error rather than being attempted:
+
+```
+This control plane runs no image builds (serve profile 'control-plane').
+Deploy a prebuilt image from a registry instead, or run the full profile on a
+node with Docker.
+```
+
+Moving the build onto the worker node that will run the image is tracked in
+[issue #1034](https://github.com/gotempsh/temps/issues/1034) — it moves
+application source and build secrets across the control-plane → worker trust
+boundary, so it needs its own security review before implementation starts.
 
 ---
 

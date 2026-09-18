@@ -1756,9 +1756,19 @@ impl BackupCommand {
             )
         })?;
 
-        // Get service instance from manager
-        let service =
-            manager.get_service_instance(ext_backup.metadata.service_name.clone(), svc_type);
+        // Get service instance from manager. Resolving an engine can fail (a
+        // container-backed engine needs a Docker daemon that may be absent), so
+        // the restore stops here rather than later with a less specific error.
+        let service = manager
+            .get_service_instance(ext_backup.metadata.service_name.clone(), svc_type)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Could not resolve the restore engine for service '{}' (type {}): {}",
+                    ext_backup.metadata.service_name,
+                    ext_backup.metadata.service_type,
+                    e
+                )
+            })?;
 
         // Parse the decrypted config into a JSON value
         let parameters: serde_json::Value = serde_json::from_str(decrypted_config)

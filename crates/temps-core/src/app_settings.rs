@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::EncryptionService;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -176,6 +178,11 @@ pub struct AppSettings {
     /// Retention windows for raw proxy and OpenTelemetry telemetry.
     /// TimescaleDB policies are updated at runtime by the Settings API.
     pub observability_retention: ObservabilityRetentionSettings,
+
+    /// Geolocation database refresh policy, MaxMind credential (encrypted at
+    /// rest), and the self-recorded freshness metadata of the last refresh.
+    #[serde(default)]
+    pub geo: GeoSettings,
 
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
@@ -1564,6 +1571,327 @@ impl Default for ObservabilityRetentionSettings {
     }
 }
 
+/// How often the scheduled job re-downloads the GeoLite2 city database when the
+/// admin has not chosen an interval. MaxMind publishes GeoLite2 twice a week,
+/// so a daily check picks up a new build within a day of release.
+pub const DEFAULT_GEO_REFRESH_INTERVAL_HOURS: u32 = 24;
+/// Lower bound on the refresh interval. Guards against a `0` turning the job
+/// into a download loop that would get the operator's license key rate-limited.
+pub const MIN_GEO_REFRESH_INTERVAL_HOURS: u32 = 1;
+/// Upper bound (one year). Past this the value is almost certainly a units
+/// mistake (days or minutes typed as hours).
+pub const MAX_GEO_REFRESH_INTERVAL_HOURS: u32 = 24 * 365;
+
+/// How old a cached IP -> location row may get before the next lookup
+/// re-resolves it against the in-memory database.
+pub const DEFAULT_GEO_STALE_LOOKUP_DAYS: u32 = 30;
+pub const MIN_GEO_STALE_LOOKUP_DAYS: u32 = 1;
+pub const MAX_GEO_STALE_LOOKUP_DAYS: u32 = 365 * 10;
+
+/// `GeoSettings::source` when the database came from MaxMind's authenticated
+/// endpoint using the operator's license key.
+pub const GEO_SOURCE_MAXMIND_OFFICIAL: &str = "maxmind_official";
+/// `GeoSettings::source` when the database came from the copy committed to the
+/// Temps repository (no license key needed).
+pub const GEO_SOURCE_BUNDLED_GITHUB: &str = "bundled_github";
+/// `GeoSettings::last_check_status` for a refresh attempt that succeeded.
+pub const GEO_CHECK_STATUS_OK: &str = "ok";
+/// `GeoSettings::last_check_status` for a refresh attempt that failed.
+pub const GEO_CHECK_STATUS_ERROR: &str = "error";
+/// `GeoSettings::last_check_status` when the scheduled job deliberately did not
+/// download anything because no MaxMind license key is configured.
+///
+/// Recorded rather than left silent: an operator who sees "no refresh in 40
+/// days" has to be able to tell a broken download from a database that is not
+/// being refreshed by design, and the status endpoint, `temps doctor` and the
+/// settings UI all render this as "add a license key to enable refreshes".
+pub const GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY: &str = "skipped_no_license_key";
+
+/// Whether a settings write intended to change the stored MaxMind license key.
+///
+/// The plaintext key is encrypted (and consumed) by the handler *before* the
+/// service takes the settings row's write lock, so by the time the row is
+/// locked the incoming ciphertext is indistinguishable from a value carried
+/// forward out of a stale snapshot. Threading the intent explicitly is what
+/// lets the service tell "this request set a key" from "this request happened
+/// to be built from a snapshot that had one", and therefore keep a
+/// concurrently-saved key instead of reverting it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeoLicenseKeyIntent {
+    /// The request did not touch the key: whatever is on the locked row wins.
+    #[default]
+    Unchanged,
+    /// The request submitted a new key, already encrypted into
+    /// [`GeoSettings::maxmind_license_key_encrypted`].
+    Set,
+    /// The request explicitly cleared the key.
+    Cleared,
+}
+
+/// What went wrong handling the encrypted MaxMind license key.
+///
+/// Neither variant's `reason` can carry key material: both are built from
+/// `EncryptionService` failures, which report cipher/encoding problems and
+/// never echo their input.
+#[derive(Debug, thiserror::Error)]
+pub enum GeoSettingsError {
+    #[error("Failed to encrypt the MaxMind license key before storing it: {reason}")]
+    EncryptLicenseKey { reason: String },
+
+    #[error(
+        "Failed to decrypt the stored MaxMind license key (it may have been encrypted with a \
+         different server encryption key; re-enter it in Settings): {reason}"
+    )]
+    DecryptLicenseKey { reason: String },
+}
+
+/// Geolocation database configuration and freshness state.
+///
+/// Both the data-policy knobs an admin sets and the metadata the refresh job
+/// records live on one typed struct on purpose. The `settings` row is a shared
+/// JSON document and `AppSettings` is deserialized/reserialized in full by the
+/// generic settings endpoint, so any geo key kept *outside* this struct would
+/// be silently dropped the next time an unrelated settings page was saved.
+///
+/// The license key is stored as ciphertext only
+/// ([`GeoSettings::maxmind_license_key_encrypted`]). The plaintext field
+/// beside it is write-only input from the admin UI: it is `skip_serializing`,
+/// so it can never be persisted or returned, and
+/// [`GeoSettings::apply_license_key_update`] clears it after encrypting.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct GeoSettings {
+    /// How often the scheduled refresh job runs. `None` means
+    /// [`DEFAULT_GEO_REFRESH_INTERVAL_HOURS`]; read it through
+    /// [`GeoSettings::effective_refresh_interval_hours`].
+    #[schema(minimum = 1, maximum = 8760, example = 24)]
+    pub refresh_interval_hours: Option<u32>,
+
+    /// Age at which a stored IP -> location row is re-resolved on its next
+    /// lookup. `None` means [`DEFAULT_GEO_STALE_LOOKUP_DAYS`]; read it through
+    /// [`GeoSettings::effective_stale_lookup_days`].
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub stale_lookup_days: Option<u32>,
+
+    /// Plaintext MaxMind license key, accepted on a settings write only.
+    ///
+    /// `skip_serializing` is load-bearing: this field is never persisted to
+    /// the settings row and never appears in any response, so a plaintext key
+    /// cannot leak through a GET-then-PUT round trip even if a caller forgets
+    /// to run [`GeoSettings::apply_license_key_update`].
+    ///
+    /// Blank or absent preserves the stored key, matching the email-provider
+    /// credential convention; use [`GeoSettings::clear_maxmind_license_key`]
+    /// to actually remove it.
+    #[serde(default, skip_serializing)]
+    pub maxmind_license_key: Option<String>,
+
+    /// Remove the stored license key, reverting downloads to the bundled
+    /// repository copy. Write-only, like the plaintext field above.
+    #[serde(default, skip_serializing)]
+    pub clear_maxmind_license_key: bool,
+
+    /// AES-256-GCM ciphertext of the MaxMind license key, as produced by
+    /// `EncryptionService::encrypt_string`. Never returned by the API.
+    pub maxmind_license_key_encrypted: Option<String>,
+
+    /// When new database bytes were last installed and swapped in.
+    /// Self-recorded by the refresh job; never writable by a client.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+
+    /// [`GEO_SOURCE_MAXMIND_OFFICIAL`] or [`GEO_SOURCE_BUNDLED_GITHUB`].
+    pub source: Option<String>,
+
+    /// MaxMind `build_epoch` of the database that was last installed.
+    pub build_epoch: Option<u64>,
+
+    /// When a refresh was last attempted, successful or not.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_check_at: Option<DateTime<Utc>>,
+
+    /// [`GEO_CHECK_STATUS_OK`] or [`GEO_CHECK_STATUS_ERROR`].
+    pub last_check_status: Option<String>,
+
+    /// Redacted reason the last refresh failed, so an operator can act on it
+    /// without reading server logs. Never contains the license key.
+    pub last_error: Option<String>,
+}
+
+/// `Debug` reports whether a key is stored, never the ciphertext and never the
+/// plaintext, so no accidental `{:?}` can put key material in a log line.
+impl std::fmt::Debug for GeoSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoSettings")
+            .field("refresh_interval_hours", &self.refresh_interval_hours)
+            .field("stale_lookup_days", &self.stale_lookup_days)
+            .field("license_key_configured", &self.license_key_configured())
+            .field("last_refreshed_at", &self.last_refreshed_at)
+            .field("source", &self.source)
+            .field("build_epoch", &self.build_epoch)
+            .field("last_check_at", &self.last_check_at)
+            .field("last_check_status", &self.last_check_status)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
+impl GeoSettings {
+    /// Refresh cadence actually applied, with the default and the safety
+    /// bounds resolved.
+    pub fn effective_refresh_interval_hours(&self) -> u32 {
+        self.refresh_interval_hours
+            .unwrap_or(DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+            .clamp(
+                MIN_GEO_REFRESH_INTERVAL_HOURS,
+                MAX_GEO_REFRESH_INTERVAL_HOURS,
+            )
+    }
+
+    /// [`Self::effective_refresh_interval_hours`] as a sleep duration.
+    pub fn effective_refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.effective_refresh_interval_hours()) * 3600)
+    }
+
+    /// Staleness window actually applied to stored IP lookups.
+    pub fn effective_stale_lookup_days(&self) -> u32 {
+        self.stale_lookup_days
+            .unwrap_or(DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            .clamp(MIN_GEO_STALE_LOOKUP_DAYS, MAX_GEO_STALE_LOOKUP_DAYS)
+    }
+
+    /// Whether a MaxMind license key is stored. This is the only thing about
+    /// the key that any response or log line may report.
+    pub fn license_key_configured(&self) -> bool {
+        self.maxmind_license_key_encrypted
+            .as_deref()
+            .is_some_and(|ciphertext| !ciphertext.is_empty())
+    }
+
+    /// When MaxMind built the installed data, from [`Self::build_epoch`].
+    pub fn build_time(&self) -> Option<DateTime<Utc>> {
+        self.build_epoch
+            .and_then(|epoch| i64::try_from(epoch).ok())
+            .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+    }
+
+    /// Age of the *data*, derived from [`Self::build_epoch`] when known.
+    ///
+    /// Preferred over `last_refreshed_at` for staleness because a download
+    /// that just completed can still deliver a months-old build -- which is
+    /// precisely how an instance ends up geolocating an IP to the wrong city.
+    pub fn age_days(&self, now: DateTime<Utc>) -> Option<i64> {
+        let reference = self.build_time().or(self.last_refreshed_at)?;
+        Some((now - reference).num_days().max(0))
+    }
+
+    pub fn last_check_failed(&self) -> bool {
+        self.last_check_status.as_deref() == Some(GEO_CHECK_STATUS_ERROR)
+    }
+
+    /// Restore the fields only the refresh job may write.
+    ///
+    /// A bulk settings save (including one built from an older GET response,
+    /// which never carries these) must not be able to forge or wipe the
+    /// freshness metadata `temps doctor` and `/api/geo/status` report on.
+    pub fn preserve_recorded_state(&mut self, current: &GeoSettings) {
+        self.last_refreshed_at = current.last_refreshed_at;
+        self.source = current.source.clone();
+        self.build_epoch = current.build_epoch;
+        self.last_check_at = current.last_check_at;
+        self.last_check_status = current.last_check_status.clone();
+        self.last_error = current.last_error.clone();
+    }
+
+    /// What this (not yet applied) write intends to do to the stored license
+    /// key, read from the same two write-only fields
+    /// [`Self::apply_license_key_update`] consumes and with the same
+    /// precedence, so the two can never disagree.
+    ///
+    /// Must be called *before* `apply_license_key_update`, which takes those
+    /// fields; afterwards it always reports [`GeoLicenseKeyIntent::Unchanged`].
+    pub fn license_key_intent(&self) -> GeoLicenseKeyIntent {
+        let submitted = self
+            .maxmind_license_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        if submitted {
+            // A real key wins over a stale clear flag from a form that
+            // submitted both, matching `apply_license_key_update`.
+            GeoLicenseKeyIntent::Set
+        } else if self.clear_maxmind_license_key {
+            GeoLicenseKeyIntent::Cleared
+        } else {
+            GeoLicenseKeyIntent::Unchanged
+        }
+    }
+
+    /// Resolve the incoming license-key fields against what is already stored,
+    /// encrypting a newly submitted key.
+    ///
+    /// Mirrors the email-provider credential UX: a non-empty plaintext key
+    /// replaces the stored one, a blank or absent value preserves it, and
+    /// `clear_maxmind_license_key` removes it. The plaintext and the clear
+    /// flag are always consumed, so the struct this leaves behind holds
+    /// ciphertext only.
+    pub fn apply_license_key_update(
+        &mut self,
+        current: &GeoSettings,
+        encryption: &EncryptionService,
+    ) -> Result<(), GeoSettingsError> {
+        let submitted = self
+            .maxmind_license_key
+            .take()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
+        let clear = std::mem::take(&mut self.clear_maxmind_license_key);
+
+        self.maxmind_license_key_encrypted = match (submitted, clear) {
+            // An explicit new key always wins over a stale clear flag from a
+            // form that submitted both.
+            (Some(key), _) => Some(encryption.encrypt_string(&key).map_err(|e| {
+                GeoSettingsError::EncryptLicenseKey {
+                    reason: e.to_string(),
+                }
+            })?),
+            (None, true) => None,
+            (None, false) => current.maxmind_license_key_encrypted.clone(),
+        };
+
+        Ok(())
+    }
+
+    /// Decrypt the stored license key for the one caller that needs it: the
+    /// download path building MaxMind's authenticated URL.
+    ///
+    /// The returned plaintext must never be logged, serialized, or placed in
+    /// an error message -- see `temps_geo::refresh::redact_license_key`.
+    pub fn decrypt_license_key(
+        &self,
+        encryption: &EncryptionService,
+    ) -> Result<Option<String>, GeoSettingsError> {
+        let Some(ciphertext) = self
+            .maxmind_license_key_encrypted
+            .as_deref()
+            .filter(|ciphertext| !ciphertext.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let plaintext = encryption.decrypt_string(ciphertext).map_err(|e| {
+            GeoSettingsError::DecryptLicenseKey {
+                reason: e.to_string(),
+            }
+        })?;
+        let plaintext = plaintext.trim().to_string();
+        Ok(if plaintext.is_empty() {
+            None
+        } else {
+            Some(plaintext)
+        })
+    }
+}
+
 impl Default for MonitoringSettings {
     fn default() -> Self {
         Self {
@@ -1615,6 +1943,7 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
@@ -2202,6 +2531,350 @@ mod tests {
             !parsed.cluster_dns.enabled,
             "cluster_dns must default to disabled when deserializing a legacy settings row"
         );
+    }
+
+    /// A throwaway key so the encryption round-trip is exercised without
+    /// depending on a data directory.
+    fn test_encryption() -> EncryptionService {
+        EncryptionService::new(&"a".repeat(64)).expect("build encryption service")
+    }
+
+    #[test]
+    fn geo_defaults_are_applied_when_unset() {
+        let geo = GeoSettings::default();
+        assert_eq!(geo.refresh_interval_hours, None);
+        assert_eq!(geo.stale_lookup_days, None);
+        assert_eq!(
+            geo.effective_refresh_interval_hours(),
+            DEFAULT_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(
+            geo.effective_stale_lookup_days(),
+            DEFAULT_GEO_STALE_LOOKUP_DAYS
+        );
+        assert!(!geo.license_key_configured());
+        assert_eq!(geo.age_days(Utc::now()), None);
+        assert!(!geo.last_check_failed());
+    }
+
+    #[test]
+    fn geo_knobs_are_clamped_rather_than_rejected_at_read_time() {
+        let geo = GeoSettings {
+            refresh_interval_hours: Some(0),
+            stale_lookup_days: Some(u32::MAX),
+            ..GeoSettings::default()
+        };
+        assert_eq!(
+            geo.effective_refresh_interval_hours(),
+            MIN_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(geo.effective_refresh_interval().as_secs(), 3600);
+        assert_eq!(geo.effective_stale_lookup_days(), MAX_GEO_STALE_LOOKUP_DAYS);
+    }
+
+    #[test]
+    fn geo_age_prefers_the_build_epoch_over_the_download_time() {
+        let now = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let geo = GeoSettings {
+            build_epoch: Some(
+                u64::try_from(
+                    DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                        .expect("parse build time")
+                        .timestamp(),
+                )
+                .expect("positive epoch"),
+            ),
+            last_refreshed_at: Some(now),
+            ..GeoSettings::default()
+        };
+
+        assert_eq!(geo.age_days(now), Some(31));
+    }
+
+    #[test]
+    fn geo_age_falls_back_to_the_download_time_and_is_never_negative() {
+        let now = Utc::now();
+        let downloaded_only = GeoSettings {
+            last_refreshed_at: Some(now - chrono::Duration::days(3)),
+            ..GeoSettings::default()
+        };
+        assert_eq!(downloaded_only.age_days(now), Some(3));
+
+        let future_build = GeoSettings {
+            build_epoch: u64::try_from((now + chrono::Duration::days(5)).timestamp()).ok(),
+            ..GeoSettings::default()
+        };
+        assert_eq!(future_build.age_days(now), Some(0));
+    }
+
+    #[test]
+    fn geo_license_key_is_encrypted_on_submission_and_decrypts_back() {
+        let encryption = test_encryption();
+        let mut incoming = GeoSettings {
+            maxmind_license_key: Some("  a-real-license-key  ".to_string()),
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&GeoSettings::default(), &encryption)
+            .expect("encrypt the submitted key");
+
+        assert_eq!(
+            incoming.maxmind_license_key, None,
+            "plaintext must be consumed"
+        );
+        assert!(incoming.license_key_configured());
+        let ciphertext = incoming
+            .maxmind_license_key_encrypted
+            .as_deref()
+            .expect("ciphertext stored");
+        assert!(
+            !ciphertext.contains("a-real-license-key"),
+            "the stored value must not embed the plaintext"
+        );
+        assert_eq!(
+            incoming
+                .decrypt_license_key(&encryption)
+                .expect("decrypt")
+                .as_deref(),
+            Some("a-real-license-key"),
+            "the key must round-trip with surrounding whitespace trimmed"
+        );
+    }
+
+    #[test]
+    fn geo_blank_license_key_preserves_the_stored_one() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+
+        for submitted in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut incoming = GeoSettings {
+                maxmind_license_key: submitted,
+                ..GeoSettings::default()
+            };
+            incoming
+                .apply_license_key_update(&current, &encryption)
+                .expect("preserve the stored key");
+            assert_eq!(
+                incoming.maxmind_license_key_encrypted.as_deref(),
+                Some("stored-ciphertext"),
+                "a blank submission must not wipe the stored key"
+            );
+        }
+    }
+
+    #[test]
+    fn geo_license_key_can_be_explicitly_cleared() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+        let mut incoming = GeoSettings {
+            clear_maxmind_license_key: true,
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&current, &encryption)
+            .expect("clear the stored key");
+
+        assert_eq!(incoming.maxmind_license_key_encrypted, None);
+        assert!(!incoming.license_key_configured());
+        assert!(
+            !incoming.clear_maxmind_license_key,
+            "the write-only flag must be consumed so it never persists"
+        );
+    }
+
+    #[test]
+    fn geo_a_new_key_wins_over_a_stale_clear_flag() {
+        let encryption = test_encryption();
+        let mut incoming = GeoSettings {
+            maxmind_license_key: Some("replacement-key".to_string()),
+            clear_maxmind_license_key: true,
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&GeoSettings::default(), &encryption)
+            .expect("encrypt the submitted key");
+
+        assert_eq!(
+            incoming
+                .decrypt_license_key(&encryption)
+                .expect("decrypt")
+                .as_deref(),
+            Some("replacement-key")
+        );
+    }
+
+    #[test]
+    fn geo_plaintext_license_key_is_never_serialized() {
+        let mut settings = AppSettings::default();
+        settings.geo.maxmind_license_key = Some("must-not-persist".to_string());
+        settings.geo.clear_maxmind_license_key = true;
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext".to_string());
+
+        let json = settings.to_json();
+        let rendered = serde_json::to_string(&json).expect("render settings json");
+        assert!(
+            !rendered.contains("must-not-persist"),
+            "a plaintext license key must never reach the settings document"
+        );
+        assert!(!rendered.contains("clear_maxmind_license_key"));
+
+        let back = AppSettings::from_json(json);
+        assert_eq!(back.geo.maxmind_license_key, None);
+        assert!(!back.geo.clear_maxmind_license_key);
+        assert_eq!(
+            back.geo.maxmind_license_key_encrypted.as_deref(),
+            Some("ciphertext"),
+            "the ciphertext must survive the round trip"
+        );
+    }
+
+    #[test]
+    fn geo_debug_output_never_contains_key_material() {
+        let geo = GeoSettings {
+            maxmind_license_key: Some("plaintext-key".to_string()),
+            maxmind_license_key_encrypted: Some("ciphertext-blob".to_string()),
+            ..GeoSettings::default()
+        };
+        let rendered = format!("{:?}", geo);
+        assert!(!rendered.contains("plaintext-key"));
+        assert!(!rendered.contains("ciphertext-blob"));
+        assert!(rendered.contains("license_key_configured: true"));
+    }
+
+    /// The intent signal must agree with what `apply_license_key_update`
+    /// actually does, for every combination of the two write-only fields --
+    /// they are read in two different layers (handler and service) and a
+    /// divergence would either revert a just-saved key or fail to store one.
+    #[test]
+    fn geo_license_key_intent_matches_what_the_update_applies() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+
+        let cases = [
+            (None, false, GeoLicenseKeyIntent::Unchanged),
+            (
+                Some("   ".to_string()),
+                false,
+                GeoLicenseKeyIntent::Unchanged,
+            ),
+            (None, true, GeoLicenseKeyIntent::Cleared),
+            (Some("new-key".to_string()), false, GeoLicenseKeyIntent::Set),
+            (Some("new-key".to_string()), true, GeoLicenseKeyIntent::Set),
+        ];
+
+        for (submitted, clear, expected) in cases {
+            let mut incoming = GeoSettings {
+                maxmind_license_key: submitted,
+                clear_maxmind_license_key: clear,
+                ..GeoSettings::default()
+            };
+            assert_eq!(incoming.license_key_intent(), expected);
+
+            incoming
+                .apply_license_key_update(&current, &encryption)
+                .expect("apply the license key update");
+            assert_eq!(
+                incoming.license_key_intent(),
+                GeoLicenseKeyIntent::Unchanged,
+                "the write-only fields must be consumed"
+            );
+
+            match expected {
+                GeoLicenseKeyIntent::Unchanged => assert_eq!(
+                    incoming.maxmind_license_key_encrypted.as_deref(),
+                    Some("stored-ciphertext")
+                ),
+                GeoLicenseKeyIntent::Cleared => {
+                    assert_eq!(incoming.maxmind_license_key_encrypted, None)
+                }
+                GeoLicenseKeyIntent::Set => assert_eq!(
+                    incoming
+                        .decrypt_license_key(&encryption)
+                        .expect("decrypt")
+                        .as_deref(),
+                    Some("new-key")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn geo_recorded_state_is_restored_from_the_stored_document() {
+        let now = Utc::now();
+        let current = GeoSettings {
+            last_refreshed_at: Some(now),
+            source: Some(GEO_SOURCE_MAXMIND_OFFICIAL.to_string()),
+            build_epoch: Some(1_767_225_600),
+            last_check_at: Some(now),
+            last_check_status: Some(GEO_CHECK_STATUS_OK.to_string()),
+            last_error: None,
+            ..GeoSettings::default()
+        };
+        // What a client PUT looks like: policy knobs only, no metadata.
+        let mut incoming = GeoSettings {
+            refresh_interval_hours: Some(6),
+            source: Some("forged".to_string()),
+            last_check_status: Some(GEO_CHECK_STATUS_ERROR.to_string()),
+            last_error: Some("a failure the client invented".to_string()),
+            ..GeoSettings::default()
+        };
+
+        incoming.preserve_recorded_state(&current);
+
+        assert_eq!(incoming.refresh_interval_hours, Some(6));
+        assert_eq!(
+            incoming.source.as_deref(),
+            Some(GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert_eq!(incoming.build_epoch, Some(1_767_225_600));
+        assert_eq!(
+            incoming.last_check_status.as_deref(),
+            Some(GEO_CHECK_STATUS_OK)
+        );
+        assert_eq!(incoming.last_error, None);
+        assert!(!incoming.last_check_failed());
+    }
+
+    #[test]
+    fn geo_settings_round_trip_through_the_settings_document() {
+        let now = Utc::now();
+        let mut settings = AppSettings::default();
+        settings.geo.refresh_interval_hours = Some(12);
+        settings.geo.stale_lookup_days = Some(7);
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext".to_string());
+        settings.geo.source = Some(GEO_SOURCE_BUNDLED_GITHUB.to_string());
+        settings.geo.build_epoch = Some(1_767_225_600);
+        settings.geo.last_refreshed_at = Some(now);
+        settings.geo.last_check_at = Some(now);
+        settings.geo.last_check_status = Some(GEO_CHECK_STATUS_OK.to_string());
+        settings.geo.last_error = None;
+
+        let back = AppSettings::from_json(settings.to_json());
+        assert_eq!(back.geo, settings.geo);
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_geo_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+        assert_eq!(parsed.geo, GeoSettings::default());
+        assert!(!parsed.geo.license_key_configured());
     }
 
     #[test]

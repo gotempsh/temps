@@ -41,6 +41,7 @@ http = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 log = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }

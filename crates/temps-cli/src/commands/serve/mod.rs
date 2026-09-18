@@ -57,6 +57,47 @@ pub enum ServeRole {
     Console,
 }
 
+/// How much of the platform this `temps serve` process runs itself.
+///
+/// Orthogonal to [`ServeRole`], which only decides which listeners this
+/// process binds. The profile decides whether this host runs *workloads*:
+/// application containers, image builds, managed databases, agent sandboxes
+/// and local backups. Splitting the two matters because the combinations are
+/// all legitimate — a control-plane-profile process can still be `--role=all`
+/// and serve :80/:443 for applications running on worker nodes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ServeProfile {
+    /// The single-binary default: this host runs the console AND the
+    /// workloads — containers, builds, managed services, sandboxes, local
+    /// backups. Requires a reachable Docker daemon.
+    #[default]
+    Full,
+    /// Hosted control plane: console, API, analytics, error tracking, OTel,
+    /// monitoring, alerts, domains/ACME, auth, teams, notifications, email,
+    /// webhooks, flags, queue, AI gateway and the proxy — but no local
+    /// workloads. Applications run on worker nodes that joined with
+    /// `temps join`. Docker is not required, which is what lets this profile
+    /// run in a container with no Docker socket mounted.
+    ControlPlane,
+}
+
+impl ServeProfile {
+    /// Whether this process may run containers, builds and managed services
+    /// on its own host.
+    pub fn local_workloads_enabled(self) -> bool {
+        matches!(self, ServeProfile::Full)
+    }
+
+    /// Stable identifier used in logs and by `GET /api/platform/features`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServeProfile::Full => temps_core::PROFILE_FULL,
+            ServeProfile::ControlPlane => temps_core::PROFILE_CONTROL_PLANE,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ServeCommand {
     /// Address to bind the server to
@@ -133,6 +174,23 @@ pub struct ServeCommand {
     /// sibling proxy has a fixed address to forward console traffic to.
     #[arg(long, value_enum, default_value_t = ServeRole::All, env = "TEMPS_ROLE")]
     pub role: ServeRole,
+
+    /// How much of the platform this process runs itself.
+    ///
+    /// `full` (default) is the single-binary control plane: it runs the
+    /// console AND application containers, image builds, managed databases,
+    /// agent sandboxes and local backups on this host, and requires a
+    /// reachable Docker daemon.
+    ///
+    /// `control-plane` runs the console, API, proxy and every observability
+    /// subsystem, but no workloads: applications run on worker nodes that
+    /// joined with `temps join`. Docker is optional, so this profile runs in a
+    /// container with no Docker socket mounted. Plugins that only exist to
+    /// manage local containers are not constructed at all, and their
+    /// background loops never start. `GET /api/platform/features` reports
+    /// exactly what the running process provides.
+    #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
+    pub profile: ServeProfile,
 }
 
 impl ServeCommand {
@@ -463,7 +521,8 @@ impl ServeCommand {
         //
         // Both are non-fatal — if Docker is unavailable we log and continue.
         // The proxy server (80/443) MUST come up regardless.
-        let docker_handle: Option<Arc<bollard::Docker>> = {
+        let docker_handle: Option<Arc<bollard::Docker>> = if self.profile.local_workloads_enabled()
+        {
             let docker_rt = tokio::runtime::Runtime::new()?;
             proxy::optional_docker_feature(
                 docker_rt.block_on(async {
@@ -478,6 +537,21 @@ impl ServeCommand {
                 "on-demand scale-to-zero and workspace preview gateway",
             )
             .map(Arc::new)
+        } else {
+            // `--profile control-plane`: nothing downstream of this handle is
+            // a control-plane concern. On-demand wake/sleep drives containers
+            // on THIS host, the preview gateway is a local container, and
+            // Traefik label discovery inspects local containers. Not probing
+            // the daemon at all is the point — a probe in a container with no
+            // socket is a guaranteed error line on every boot, and everything
+            // it would enable is unavailable here regardless.
+            info!(
+                profile = self.profile.as_str(),
+                "Local workloads are disabled: skipping the Docker connection, on-demand \
+                 scale-to-zero, the workspace preview gateway and Traefik label discovery. \
+                 Applications run on worker nodes joined with `temps join`"
+            );
+            None
         };
 
         // The on-demand wake manager is a PROXY-side concern: it watches request
@@ -618,7 +692,14 @@ impl ServeCommand {
             // constructed with above, so an operator who only flips the enable
             // flag watches a network the proxy can actually reach.
             let discovery_config = traefik_discovery_config.clone();
-            Arc::new(if !discovery_config.enabled {
+            Arc::new(if !self.profile.local_workloads_enabled() {
+                TraefikDiscoveryHandle::not_running(
+                    discovery_config,
+                    "this process runs with `--profile control-plane`, which adopts no local \
+                     containers; run Traefik label discovery on the node that owns the \
+                     containers",
+                )
+            } else if !discovery_config.enabled {
                 TraefikDiscoveryHandle::not_running(
                     discovery_config,
                     format!("{ENABLED_ENV} is not set to 'true' on this server"),
@@ -743,6 +824,7 @@ impl ServeCommand {
             self_updater,
             traefik_discovery: traefik_discovery_handle,
             external_plugin_registry,
+            profile: self.profile,
         };
 
         if self.role == ServeRole::Console {
@@ -883,6 +965,88 @@ impl ServeCommand {
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
         )
+    }
+}
+
+#[cfg(test)]
+mod serve_profile_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        serve: ServeCommand,
+    }
+
+    fn parse(args: &[&str]) -> ServeCommand {
+        let mut argv = vec!["temps", "--database-url", "postgres://localhost/temps"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv)
+            .expect("serve arguments should parse")
+            .serve
+    }
+
+    #[test]
+    fn profile_defaults_to_full() {
+        // The default must stay `full`: every existing install starts
+        // `temps serve` with no `--profile` and expects to run workloads.
+        assert_eq!(parse(&[]).profile, ServeProfile::Full);
+    }
+
+    #[test]
+    fn profile_accepts_kebab_case_control_plane() {
+        assert_eq!(
+            parse(&["--profile", "control-plane"]).profile,
+            ServeProfile::ControlPlane
+        );
+    }
+
+    #[test]
+    fn profile_accepts_explicit_full() {
+        assert_eq!(parse(&["--profile", "full"]).profile, ServeProfile::Full);
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected() {
+        let parsed = TestCli::try_parse_from([
+            "temps",
+            "--database-url",
+            "postgres://localhost/temps",
+            "--profile",
+            "controlplane",
+        ]);
+
+        let rendered = match parsed {
+            Ok(_) => panic!("an unrecognised profile must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(rendered.contains("control-plane"), "{rendered}");
+    }
+
+    #[test]
+    fn profile_is_independent_of_role() {
+        // A control-plane-profile process still binds :80/:443 by default:
+        // applications on worker nodes are reached through this proxy.
+        let parsed = parse(&["--profile", "control-plane"]);
+        assert_eq!(parsed.role, ServeRole::All);
+    }
+
+    #[test]
+    fn only_the_full_profile_runs_local_workloads() {
+        assert!(ServeProfile::Full.local_workloads_enabled());
+        assert!(!ServeProfile::ControlPlane.local_workloads_enabled());
+    }
+
+    #[test]
+    fn profile_identifiers_match_the_shared_constants() {
+        // These strings are served by `GET /api/platform/features`, so they
+        // must not drift from the values temps-core publishes.
+        assert_eq!(ServeProfile::Full.as_str(), temps_core::PROFILE_FULL);
+        assert_eq!(
+            ServeProfile::ControlPlane.as_str(),
+            temps_core::PROFILE_CONTROL_PLANE
+        );
     }
 }
 

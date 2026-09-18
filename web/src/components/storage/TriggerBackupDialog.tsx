@@ -180,18 +180,18 @@ export function TriggerBackupDialog({
                   )
                   const selectedIsDefault =
                     selectedSource &&
-                    (selectedSource as { is_default?: boolean })
-                      .is_default === true
+                    (selectedSource as { is_default?: boolean }).is_default ===
+                      true
                   return (
-                  <FormItem>
-                    <FormLabel>Storage Destination</FormLabel>
-                    <Select
-                      onValueChange={(v) => field.onChange(Number(v))}
-                      value={field.value?.toString()}
-                    >
-                      <FormControl>
-                        <SelectTrigger>
-                          {/* Explicit children override Radix's default
+                    <FormItem>
+                      <FormLabel>Storage Destination</FormLabel>
+                      <Select
+                        onValueChange={(v) => field.onChange(Number(v))}
+                        value={field.value?.toString()}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            {/* Explicit children override Radix's default
                               behavior of mirroring the selected SelectItem's
                               full two-line (name + bucket-path) content into
                               the trigger, which has no width/height budget
@@ -199,76 +199,76 @@ export function TriggerBackupDialog({
                               single-line summary here instead; the bucket
                               path is still visible in the open dropdown and
                               in the FormDescription below. */}
-                          <SelectValue placeholder="Select an S3 source">
-                            {selectedSource && (
-                              <span className="flex min-w-0 items-center gap-1.5">
-                                <span className="truncate">
-                                  {selectedSource.name}
-                                </span>
-                                {selectedIsDefault ? (
-                                  <span
-                                    title="Default source"
-                                    className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
-                                  >
-                                    <Star className="h-3 w-3 fill-current" />
-                                    Default
+                            <SelectValue placeholder="Select an S3 source">
+                              {selectedSource && (
+                                <span className="flex min-w-0 items-center gap-1.5">
+                                  <span className="truncate">
+                                    {selectedSource.name}
                                   </span>
-                                ) : null}
-                              </span>
-                            )}
-                          </SelectValue>
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {s3Sources?.map((source) => {
-                          const isDefault =
-                            (source as { is_default?: boolean }).is_default ===
-                            true
-                          return (
-                            // pl-2 overrides the shadcn SelectItem default of
-                            // pl-8 (which reserves a check-mark gutter we
-                            // don't render here). Without this override the
-                            // menu rows look indented relative to the trigger
-                            // when an option is selected. The hidden check
-                            // <span> inside SelectItem still positions
-                            // absolutely at left-2; we accept the slight
-                            // visual overlap because we never render it.
-                            <SelectItem
-                              key={source.id}
-                              value={source.id.toString()}
-                              className="pl-2"
-                            >
-                              <div className="flex flex-col items-start text-left">
-                                <span className="flex items-center gap-1.5">
-                                  {source.name}
-                                  {isDefault ? (
+                                  {selectedIsDefault ? (
                                     <span
                                       title="Default source"
-                                      className="inline-flex items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
                                     >
                                       <Star className="h-3 w-3 fill-current" />
                                       Default
                                     </span>
                                   ) : null}
                                 </span>
-                                <span className="text-xs text-muted-foreground">
-                                  {source.bucket_name}
-                                  {source.bucket_path &&
-                                    `/${source.bucket_path}`}
-                                </span>
-                              </div>
-                            </SelectItem>
-                          )
-                        })}
-                      </SelectContent>
-                    </Select>
-                    <FormDescription>
-                      {defaultSource
-                        ? `Defaults to ⭐ ${defaultSource.name}. Pick a different source to override.`
-                        : 'The S3-compatible storage where the backup will be saved.'}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
+                              )}
+                            </SelectValue>
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {s3Sources?.map((source) => {
+                            const isDefault =
+                              (source as { is_default?: boolean })
+                                .is_default === true
+                            return (
+                              // pl-2 overrides the shadcn SelectItem default of
+                              // pl-8 (which reserves a check-mark gutter we
+                              // don't render here). Without this override the
+                              // menu rows look indented relative to the trigger
+                              // when an option is selected. The hidden check
+                              // <span> inside SelectItem still positions
+                              // absolutely at left-2; we accept the slight
+                              // visual overlap because we never render it.
+                              <SelectItem
+                                key={source.id}
+                                value={source.id.toString()}
+                                className="pl-2"
+                              >
+                                <div className="flex flex-col items-start text-left">
+                                  <span className="flex items-center gap-1.5">
+                                    {source.name}
+                                    {isDefault ? (
+                                      <span
+                                        title="Default source"
+                                        className="inline-flex items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                      >
+                                        <Star className="h-3 w-3 fill-current" />
+                                        Default
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground">
+                                    {source.bucket_name}
+                                    {source.bucket_path &&
+                                      `/${source.bucket_path}`}
+                                  </span>
+                                </div>
+                              </SelectItem>
+                            )
+                          })}
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        {defaultSource
+                          ? `Defaults to ⭐ ${defaultSource.name}. Pick a different source to override.`
+                          : 'The S3-compatible storage where the backup will be saved.'}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
                   )
                 }}
               />

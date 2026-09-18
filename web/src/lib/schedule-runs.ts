@@ -63,7 +63,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail ?? body.title ?? detail
     } catch {
       // fall through with statusText
@@ -82,7 +85,7 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
 export async function listScheduleRuns(
   scheduleId: number,
   page = 1,
-  pageSize = 20,
+  pageSize = 20
 ): Promise<ScheduleRunListResponse> {
   const params = new URLSearchParams({
     page: String(page),
@@ -90,7 +93,7 @@ export async function listScheduleRuns(
   })
   const response = await fetch(
     `/api/backups/schedules/${scheduleId}/runs?${params}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<ScheduleRunListResponse>(response)
 }
@@ -102,7 +105,7 @@ export async function listScheduleRuns(
 export function listScheduleRunsOptions(
   scheduleId: number | undefined,
   page = 1,
-  pageSize = 20,
+  pageSize = 20
 ) {
   return {
     queryKey: ['schedule-runs', scheduleId, page, pageSize] as const,
@@ -153,7 +156,7 @@ export interface ScheduleRunJobEntry {
 export async function listScheduleRunJobs(
   runId: number,
   page = 1,
-  pageSize = 50,
+  pageSize = 50
 ): Promise<ScheduleRunJobEntry[]> {
   const params = new URLSearchParams({
     page: String(page),
@@ -161,7 +164,7 @@ export async function listScheduleRunJobs(
   })
   const response = await fetch(
     `/api/backups/schedule-runs/${runId}/jobs?${params}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<ScheduleRunJobEntry[]>(response)
 }
@@ -169,7 +172,7 @@ export async function listScheduleRunJobs(
 export function listScheduleRunJobsOptions(
   runId: number | undefined,
   page = 1,
-  pageSize = 50,
+  pageSize = 50
 ) {
   return {
     queryKey: ['schedule-run-jobs', runId, page, pageSize] as const,
@@ -212,16 +215,13 @@ export interface ScheduleRunResponse {
  * a run is already in flight or the schedule is disabled).
  */
 export async function runScheduleNow(
-  scheduleId: number,
+  scheduleId: number
 ): Promise<ScheduleRunResponse> {
-  const response = await fetch(
-    `/api/backups/schedules/${scheduleId}/run`,
-    {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-    },
-  )
+  const response = await fetch(`/api/backups/schedules/${scheduleId}/run`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+  })
   return readJsonOrThrow<ScheduleRunResponse>(response)
 }
 
@@ -240,7 +240,7 @@ export interface CancelBackupResponse {
  * Returns `cancelled: 0` if the backup was already terminal.
  */
 export async function cancelBackup(
-  backupId: number,
+  backupId: number
 ): Promise<CancelBackupResponse> {
   const response = await fetch(`/api/backups/${backupId}/cancel`, {
     method: 'POST',
@@ -256,15 +256,12 @@ export async function cancelBackup(
  * Returns the number of children cancelled.
  */
 export async function cancelScheduleRun(
-  runId: number,
+  runId: number
 ): Promise<CancelBackupResponse> {
-  const response = await fetch(
-    `/api/backups/schedule-runs/${runId}/cancel`,
-    {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-    },
-  )
+  const response = await fetch(`/api/backups/schedule-runs/${runId}/cancel`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+  })
   return readJsonOrThrow<CancelBackupResponse>(response)
 }

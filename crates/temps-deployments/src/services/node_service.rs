@@ -67,6 +67,19 @@ pub enum NodeError {
         excluded: String,
     },
 
+    #[error(
+        "This control plane does not run application containers (serve profile \
+         'control-plane'), and no eligible worker node is available for the \
+         {requested_replicas} requested replica(s). Join a worker node with \
+         `temps join` — or run the control plane with `--profile full` if it \
+         should host workloads itself"
+    )]
+    LocalWorkloadsDisabled {
+        /// Replicas the deployment asked for, so the message reflects the
+        /// request rather than implying a single container.
+        requested_replicas: u32,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 

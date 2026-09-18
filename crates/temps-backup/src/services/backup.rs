@@ -8771,9 +8771,19 @@ ORDER BY a.opened_at DESC
         );
         let service_type = temps_providers::ServiceType::from_str(&service.service_type)
             .map_err(|e| BackupError::Validation(e.to_string()))?;
+        // Resolving an engine can now fail (the Docker daemon a container-backed
+        // engine needs may be absent), so this Result is propagated rather than
+        // used directly — the backup cannot proceed without the engine.
         let service_instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type);
+            .get_service_instance(service.name.clone(), service_type)
+            .map_err(|e| {
+                error!(
+                    "Could not resolve the backup engine for service '{}' (type={}, id={}): {}",
+                    service.name, service.service_type, service.id, e
+                );
+                BackupError::ExternalService(e.to_string())
+            })?;
 
         let service_config = self
             .external_service_manager

@@ -301,6 +301,20 @@ pub struct BuildImageJob {
     /// applied to implicit Docker Hub base images in the generated
     /// Dockerfile. `None` (the default) leaves every `FROM` line untouched.
     registry_mirror_prefix: Option<String>,
+    /// Whether this process may run builds/containers locally at all.
+    ///
+    /// Wired from the same `LocalWorkloadPolicy`/`NodeScheduler` source of
+    /// truth the scheduler already uses for cross-build platform detection
+    /// (see `WorkflowExecutionService`'s `BuildImageJob` construction).
+    /// `true` by default so every existing caller/test keeps building
+    /// locally unless a control-plane profile explicitly disables it.
+    ///
+    /// Checked before `image_builder` is touched at all: git-source builds
+    /// are out of scope for the control-plane profile (worker-side builds
+    /// are ADR-045), so this must refuse with a typed, actionable error
+    /// instead of reaching `ImageBuilder::build_image_with_callback` and
+    /// surfacing a raw `BuilderError::DockerUnavailable`.
+    local_workloads_enabled: bool,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -333,7 +347,15 @@ impl BuildImageJob {
             preset: None,
             preset_config: None,
             registry_mirror_prefix: None,
+            local_workloads_enabled: true,
         }
+    }
+
+    /// Set whether this process may build images locally. See the
+    /// `local_workloads_enabled` field doc for why this exists.
+    pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 
     pub fn with_build_config(mut self, build_config: BuildConfig) -> Self {
@@ -1325,6 +1347,20 @@ impl WorkflowTask for BuildImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        // Refuse before touching the download job's output or the image
+        // builder at all: a control plane with no local Docker daemon can
+        // never complete this job, and reaching `ImageBuilder` first would
+        // surface a raw `BuilderError::DockerUnavailable` instead of a
+        // message naming the actual remedy. Worker-side builds are
+        // deferred to ADR-045; today this is a hard, typed refusal.
+        if !self.local_workloads_enabled {
+            let message = "This control plane runs no builds; deploy from a registry image, \
+                or run the full profile on a node with Docker"
+                .to_string();
+            self.log(&context, format!("ERROR: {}", message)).await?;
+            return Err(WorkflowError::LocalWorkloadsDisabled(message));
+        }
+
         // Get typed output from the download job
         let repo_output = RepositoryOutput::from_context(&context, &self.download_job_id)?;
 
@@ -1477,6 +1513,7 @@ pub struct BuildImageJobBuilder {
     preset: Option<StoredPreset>,
     preset_config: Option<StoredPresetConfig>,
     registry_mirror_prefix: Option<String>,
+    local_workloads_enabled: bool,
 }
 
 impl BuildImageJobBuilder {
@@ -1491,7 +1528,16 @@ impl BuildImageJobBuilder {
             preset: None,
             preset_config: None,
             registry_mirror_prefix: None,
+            local_workloads_enabled: true,
         }
+    }
+
+    /// Whether this process may build images locally. Defaults to `true` so
+    /// every existing caller keeps building locally unless a control-plane
+    /// profile explicitly disables it. See `BuildImageJob`'s field doc.
+    pub fn local_workloads_enabled(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 
     pub fn job_id(mut self, job_id: String) -> Self {
@@ -1590,6 +1636,7 @@ impl BuildImageJobBuilder {
         }
         job = job.with_preset_config(self.preset_config);
         job = job.with_registry_mirror_prefix(self.registry_mirror_prefix);
+        job = job.with_local_workloads_enabled(self.local_workloads_enabled);
 
         Ok(job)
     }
@@ -1685,6 +1732,121 @@ mod tests {
         fn get_native_platform(&self) -> String {
             "linux/amd64".to_string()
         }
+    }
+
+    /// An `ImageBuilder` that panics if any method is called, so a test can
+    /// prove a code path never reaches the daemon at all.
+    struct PanicsIfCalledImageBuilder;
+
+    #[async_trait]
+    impl ImageBuilder for PanicsIfCalledImageBuilder {
+        async fn build_image(&self, _request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            panic!("ImageBuilder::build_image must not be called under a disabled local-workload policy");
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
+            panic!("ImageBuilder::import_image must not be called under a disabled local-workload policy");
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
+            panic!("ImageBuilder::extract_from_image must not be called under a disabled local-workload policy");
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            panic!("ImageBuilder::list_images must not be called under a disabled local-workload policy");
+        }
+
+        async fn remove_image(&self, _image_name: &str) -> Result<(), BuilderError> {
+            panic!("ImageBuilder::remove_image must not be called under a disabled local-workload policy");
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            _request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            panic!(
+                "ImageBuilder::build_image_with_callback must not be called under a disabled \
+                 local-workload policy"
+            );
+        }
+
+        async fn inspect_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            panic!("ImageBuilder::inspect_image must not be called under a disabled local-workload policy");
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), BuilderError> {
+            panic!("ImageBuilder::save_image must not be called under a disabled local-workload policy");
+        }
+
+        fn get_native_platform(&self) -> String {
+            panic!("ImageBuilder::get_native_platform must not be called under a disabled local-workload policy");
+        }
+    }
+
+    /// The control-plane profile (`local_workloads_enabled(false)`) must
+    /// refuse a git-source build with a typed, actionable error *before*
+    /// touching the download job's output or the image builder at all --
+    /// worker-side builds are deferred to ADR-045
+    /// (`docs/adr/045-worker-side-image-builds.md`); today this is a hard
+    /// refusal, not a degraded attempt. Uses a context with no download-job
+    /// output set and an `ImageBuilder` that panics if invoked, so either
+    /// reaching past the guard fails the test immediately.
+    #[tokio::test]
+    async fn control_plane_profile_refuses_before_touching_the_image_builder() {
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .local_workloads_enabled(false)
+            .build(Arc::new(PanicsIfCalledImageBuilder))
+            .unwrap();
+
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.execute(context).await.unwrap_err();
+        match error {
+            WorkflowError::LocalWorkloadsDisabled(message) => {
+                assert!(message.contains("registry image"), "{message}");
+                assert!(message.contains("full profile"), "{message}");
+                assert!(message.contains("Docker"), "{message}");
+            }
+            other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
+        }
+    }
+
+    /// The default (`local_workloads_enabled(true)`, the historical
+    /// single-binary behaviour) must be unaffected by the new guard.
+    #[tokio::test]
+    async fn full_profile_still_reaches_the_image_builder() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(builder.clone())
+            .unwrap();
+
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        job.build_image(&repo, &context).await.unwrap();
+        assert_eq!(builder.builds(), vec![("myapp:latest".to_string(), None)]);
     }
 
     #[test]

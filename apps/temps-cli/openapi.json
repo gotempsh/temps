@@ -3011,6 +3011,25 @@
               "null"
             ]
           },
+          "geo": {
+            "default": {
+              "build_epoch": null,
+              "last_check_at": null,
+              "last_check_status": null,
+              "last_error": null,
+              "last_refreshed_at": null,
+              "maxmind_license_key_encrypted": null,
+              "refresh_interval_hours": null,
+              "source": null,
+              "stale_lookup_days": null
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GeoSettings",
+                "description": "Geolocation database refresh policy, MaxMind credential (encrypted at\nrest), and the self-recorded freshness metadata of the last refresh."
+              }
+            ]
+          },
           "image_retention": {
             "default": {
               "default_hours": 336,
@@ -3340,6 +3359,10 @@
               "null"
             ]
           },
+          "geo": {
+            "$ref": "#/components/schemas/GeoSettingsMasked",
+            "description": "Geolocation refresh policy and freshness, with the MaxMind license key\nreported only as a boolean."
+          },
           "image_retention": {
             "$ref": "#/components/schemas/ImageRetentionSettings",
             "description": "Deployment-image retention policy. No sensitive content, passed through\nas-is so the settings UI can show and edit the system-wide default."
@@ -3461,6 +3484,7 @@
           "monitoring",
           "observability_compression",
           "observability_retention",
+          "geo",
           "effective_metrics_store",
           "effective_observability_store",
           "insecure_tls",
@@ -10998,6 +11022,7 @@
       "CreateMonitorRequest": {
         "properties": {
           "check_interval_seconds": {
+            "description": "How often to probe, in seconds. Defaults to 60 when omitted.\n\n**Clamped, not rejected**: values below 30 are stored as 30 and\nnon-positive values as 60, and the created monitor comes back with the\nclamped value — so the response always reports the interval the\nscheduler will actually use.",
             "format": "int32",
             "type": [
               "integer",
@@ -21483,6 +21508,107 @@
         ],
         "type": "object"
       },
+      "GeoDatabaseStatusResponse": {
+        "description": "Freshness of the geolocation database backing this instance",
+        "properties": {
+          "age_days": {
+            "description": "Age in days of the loaded data, from `build_time` when known and from\n`last_refreshed_at` otherwise",
+            "example": 3,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "build_epoch": {
+            "description": "MaxMind `build_epoch` of the loaded database (Unix seconds)",
+            "example": 1767225600,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "build_time": {
+            "description": "When MaxMind built the loaded data (ISO 8601, UTC)",
+            "example": "2026-09-01T02:00:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_stale": {
+            "description": "Whether `age_days` has passed `stale_after_days`, or the last check\nfailed",
+            "example": false,
+            "type": "boolean"
+          },
+          "last_check_at": {
+            "description": "When a refresh was last attempted, successful or not (ISO 8601, UTC)",
+            "example": "2026-09-17T03:14:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "description": "`ok` or `error` for the most recent refresh attempt; `null` when none\nhas run yet",
+            "example": "ok",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Redacted reason the last refresh failed, so an operator can act on it\nwithout reading server logs",
+            "example": "Geo database download from source 'maxmind_official' failed: HTTP 401",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "description": "When new database bytes were last installed (ISO 8601, UTC)",
+            "example": "2026-09-01T03:14:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "license_key_configured": {
+            "description": "Whether a MaxMind license key is configured. The key itself is never\nreturned, logged, or persisted.",
+            "example": true,
+            "type": "boolean"
+          },
+          "refresh_interval_hours": {
+            "description": "How often the scheduled refresh job runs",
+            "example": 24,
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "Where the loaded database was downloaded from: `maxmind_official` when\na license key is configured, `bundled_github` otherwise. `null` when no\nrefresh has run yet (the database was provisioned by the operator).",
+            "example": "maxmind_official",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_after_days": {
+            "description": "Age after which this instance treats the database, and cached IP\nlookups, as stale",
+            "example": 30,
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "license_key_configured",
+          "stale_after_days",
+          "is_stale",
+          "refresh_interval_hours"
+        ],
+        "type": "object"
+      },
       "GeoLocationResponse": {
         "description": "Response containing geolocation information for an IP address",
         "properties": {
@@ -21579,6 +21705,176 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "GeoSettings": {
+        "description": "Geolocation database configuration and freshness state.\n\nBoth the data-policy knobs an admin sets and the metadata the refresh job\nrecords live on one typed struct on purpose. The `settings` row is a shared\nJSON document and `AppSettings` is deserialized/reserialized in full by the\ngeneric settings endpoint, so any geo key kept *outside* this struct would\nbe silently dropped the next time an unrelated settings page was saved.\n\nThe license key is stored as ciphertext only\n([`GeoSettings::maxmind_license_key_encrypted`]). The plaintext field\nbeside it is write-only input from the admin UI: it is `skip_serializing`,\nso it can never be persisted or returned, and\n[`GeoSettings::apply_license_key_update`] clears it after encrypting.",
+        "properties": {
+          "build_epoch": {
+            "default": null,
+            "description": "MaxMind `build_epoch` of the database that was last installed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_check_at": {
+            "default": null,
+            "description": "When a refresh was last attempted, successful or not.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "default": null,
+            "description": "[`GEO_CHECK_STATUS_OK`] or [`GEO_CHECK_STATUS_ERROR`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "default": null,
+            "description": "Redacted reason the last refresh failed, so an operator can act on it\nwithout reading server logs. Never contains the license key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "default": null,
+            "description": "When new database bytes were last installed and swapped in.\nSelf-recorded by the refresh job; never writable by a client.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxmind_license_key_encrypted": {
+            "default": null,
+            "description": "AES-256-GCM ciphertext of the MaxMind license key, as produced by\n`EncryptionService::encrypt_string`. Never returned by the API.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refresh_interval_hours": {
+            "default": null,
+            "description": "How often the scheduled refresh job runs. `None` means\n[`DEFAULT_GEO_REFRESH_INTERVAL_HOURS`]; read it through\n[`GeoSettings::effective_refresh_interval_hours`].",
+            "example": 24,
+            "format": "int32",
+            "maximum": 8760,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "description": "[`GEO_SOURCE_MAXMIND_OFFICIAL`] or [`GEO_SOURCE_BUNDLED_GITHUB`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_lookup_days": {
+            "default": null,
+            "description": "Age at which a stored IP -> location row is re-resolved on its next\nlookup. `None` means [`DEFAULT_GEO_STALE_LOOKUP_DAYS`]; read it through\n[`GeoSettings::effective_stale_lookup_days`].",
+            "example": 30,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GeoSettingsMasked": {
+        "description": "Geolocation settings with the MaxMind license key masked.\n\nThe stored value is AES-256-GCM ciphertext, and neither it nor the\nplaintext is ever returned: the UI only needs to know whether a key is\nsaved, so it can render the \"leave blank to keep current\" affordance the\nemail-provider credentials use. The refresh metadata below is reported\nread-only — it is written by the refresh job, not by a settings save.",
+        "properties": {
+          "effective_refresh_interval_hours": {
+            "description": "Refresh cadence actually applied, with defaults and bounds resolved.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "effective_stale_lookup_days": {
+            "description": "Staleness window actually applied, with defaults and bounds resolved.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_check_at": {
+            "description": "When a refresh was last attempted, successful or not (ISO 8601, UTC).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "description": "`ok` or `error` for the most recent refresh attempt.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Redacted reason the last refresh failed. Never contains the key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "description": "When new database bytes were last installed (ISO 8601, UTC).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxmind_license_key_saved": {
+            "description": "True when a MaxMind license key is stored. The key is never returned.",
+            "type": "boolean"
+          },
+          "refresh_interval_hours": {
+            "description": "`null` means the effective default (24 hours).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`maxmind_official` or `bundled_github`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_lookup_days": {
+            "description": "`null` means the effective default (30 days).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "effective_refresh_interval_hours",
+          "effective_stale_lookup_days",
+          "maxmind_license_key_saved"
+        ],
         "type": "object"
       },
       "GetDeploymentsParams": {
@@ -22588,7 +22884,7 @@
             ]
           },
           "scan_limit_reached": {
-            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found in this scan window, but unread chunks may contain newer\nlines. `next_cursor` continues into another bounded scan window.",
             "type": "boolean"
           },
           "scanned_bytes": {
@@ -24876,6 +25172,16 @@
       "InstallPluginRequest": {
         "additionalProperties": false,
         "properties": {
+          "grants": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            ]
+          },
           "name": {
             "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
             "type": "string"
@@ -24916,6 +25222,16 @@
       "InstallRepositoryRequest": {
         "additionalProperties": false,
         "properties": {
+          "grants": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            ]
+          },
           "name": {
             "type": [
               "string",
@@ -28426,6 +28742,14 @@
           },
           "name": {
             "type": "string"
+          },
+          "next_check_at": {
+            "description": "When the scheduler will next probe this monitor. Read-only: it is\nmaintained by the health-check scheduler, never accepted on write.\n`null` means the monitor has not been scheduled yet and is due on the\nnext sweep.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "project_id": {
             "format": "int32",
@@ -32887,6 +33211,74 @@
         ],
         "type": "object"
       },
+      "PlatformFeatures": {
+        "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.\n\n**Honesty contract**: every field that is `true` MUST be backed by a\nregistered, reachable subsystem. A `true` that is not true is worse than\nthe endpoint not existing — it causes the console to render controls that\nsilently fail instead of showing an onboarding state.",
+        "properties": {
+          "backups_local": {
+            "description": "Backups can be produced from services running on this host.\nRemote backups of worker-node services are reported separately in\n[`backups_remote`][Self::backups_remote].",
+            "type": "boolean"
+          },
+          "backups_remote": {
+            "description": "Backups of services on worker nodes can be orchestrated, scheduled and\nretained by this process. `true` when the backup scheduler is\nconfigured and worker credentials are present, regardless of profile.",
+            "type": "boolean"
+          },
+          "deployments_local": {
+            "description": "Application containers can run on this host. `false` in the\n`control-plane` profile: applications run on worker nodes joined with\n`temps join`.",
+            "type": "boolean"
+          },
+          "docker": {
+            "description": "Whether a Docker client exists AND a daemon answered a ping at startup.\nIn the `control-plane` profile a daemon may still be present for\ndiagnostics, but no workloads are placed here regardless.",
+            "type": "boolean"
+          },
+          "image_builds_local": {
+            "description": "Container images can be built by this process. Requires a local Docker\ndaemon; always `false` when `docker` is `false`.",
+            "type": "boolean"
+          },
+          "imports": {
+            "description": "Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,\nCapRover) are available. Requires a local Docker daemon to run importer\ncontainers.",
+            "type": "boolean"
+          },
+          "kv": {
+            "description": "Managed key-value store is registered and reachable.",
+            "type": "boolean"
+          },
+          "log_aggregation": {
+            "description": "Structured log aggregation, search and tailing is active.",
+            "type": "boolean"
+          },
+          "managed_services": {
+            "description": "Managed services (PostgreSQL, Redis, MariaDB, …) can be provisioned on\nthis host. Requires a local Docker daemon.",
+            "type": "boolean"
+          },
+          "profile": {
+            "description": "Serve profile this process was started with: `\"full\"` or\n`\"control-plane\"`.",
+            "type": "string"
+          },
+          "sandboxes": {
+            "description": "Agent sandboxes / workspace previews run in this process. Requires a\nlocal Docker daemon.",
+            "type": "boolean"
+          },
+          "vulnerability_scanning": {
+            "description": "Container image vulnerability scanning is available. Requires a local\nDocker daemon to pull and scan images.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "profile",
+          "docker",
+          "deployments_local",
+          "image_builds_local",
+          "managed_services",
+          "backups_local",
+          "backups_remote",
+          "sandboxes",
+          "kv",
+          "imports",
+          "log_aggregation",
+          "vulnerability_scanning"
+        ],
+        "type": "object"
+      },
       "PlatformInfo": {
         "description": "Platform compatibility information",
         "properties": {
@@ -32938,6 +33330,64 @@
         ],
         "type": "object"
       },
+      "PluginActorInfo": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "active"
+        ],
+        "type": "object"
+      },
+      "PluginAiCapability": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "daily_call_limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_output_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_prompt_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path",
+          "daily_call_limit",
+          "max_output_tokens",
+          "max_prompt_bytes"
+        ],
+        "type": "object"
+      },
       "PluginCapability": {
         "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
         "enum": [
@@ -32973,6 +33423,74 @@
           "plugins"
         ],
         "type": "object"
+      },
+      "PluginGrantConfig": {
+        "properties": {
+          "ai_daily_call_limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ai_max_output_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "ai_daily_call_limit",
+          "ai_max_output_tokens"
+        ],
+        "type": "object"
+      },
+      "PluginGrantsResponse": {
+        "properties": {
+          "actor": {
+            "$ref": "#/components/schemas/PluginActorInfo"
+          },
+          "ai": {
+            "$ref": "#/components/schemas/PluginAiCapability"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          },
+          "requested_permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "actor",
+          "requested_permissions",
+          "permissions",
+          "ai"
+        ],
+        "type": "object"
+      },
+      "PluginHostPermission": {
+        "description": "Host-owned permissions granted to one durable external-plugin actor.",
+        "enum": [
+          "ai_generate",
+          "projects_read",
+          "environments_read",
+          "deployments_read",
+          "api_read",
+          "api_write",
+          "events_read"
+        ],
+        "type": "string"
       },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
@@ -33012,6 +33530,13 @@
           "hide_header": {
             "description": "Suppress the console's own header strip above this plugin's UI.\n\nThe console normally renders the plugin's icon, display name and\nversion above the iframe. For a plugin whose UI is a full working\nsurface with its own header, that is a second title bar competing\nfor the same vertical space — and vertical space is exactly what a\ndense full-page layout has none of. Opt out and the frame gets the\nfull height.\n\nThe nav entry still names the plugin, so nothing becomes\nunidentifiable by setting this.",
             "type": "boolean"
+          },
+          "host_permissions": {
+            "description": "Host-brokered operations requested by this plugin. These are requests,\nnot authority: an administrator must grant each one separately.",
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
           },
           "name": {
             "description": "Unique plugin identifier (kebab-case, e.g., \"backup-manager\")",
@@ -53845,6 +54370,12 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Docker daemon unavailable in this profile"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -54228,8 +54759,19 @@
     },
     "/_temps/sentry/envelope": {
       "post": {
-        "description": "No DSN credential — the project/environment/deployment are resolved from\nthe `Host` header via the proxy's route table, the same way\n`/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via\n`Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy\nforwards to the console from any domain a project is deployed on\n(`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without\nper-domain DSN configuration.\n\nSince there is no credential, an `Origin`/`Referer` check stands in for\nauthentication: the request must claim to come from the same host it\nresolves to, or it is rejected. This is weaker than a DSN (both are\nvisible to anyone who can read the page), but it closes the trivial case\nof a script targeting an arbitrary victim domain with no recon at all.",
+        "description": "Two resolution paths, tried in this order:\n\n1. **DSN credential.** An explicit `?sentry_key=` / `X-Sentry-Auth` /\n   `Authorization: DSN` value, or — failing that — the `dsn` field browser\n   SDKs embed in the envelope header whenever `Sentry.init({ tunnel })` is\n   used. The credential alone decides the project; `Host` and `Origin` are\n   not consulted. This is what makes the endpoint usable from an app Temps\n   does not deploy, which by definition has no route-table entry at all.\n2. **`Host`.** Unchanged legacy behaviour for same-origin, Temps-deployed\n   apps: the project/environment/deployment are resolved from the `Host`\n   header via the proxy's route table, the same way `/api/_temps/event`\n   (analytics) resolves. The proxy forwards anything under `/api/_temps`\n   to the console regardless of `Host`\n   (`temps-proxy::services::ROUTE_PREFIX_TEMPS`), so it works on custom\n   domains and previews without per-domain DSN configuration.\n\nOn path 2 there is no credential, so an `Origin`/`Referer` check stands in\nfor authentication: the request must claim to come from the same host it\nresolves to, or it is rejected. That check is deliberately **skipped** on\npath 1 — a tunneled request from another origin is the entire point there,\nand the DSN is a stronger claim than a self-reported `Origin`. Path 1 does\nhonour the DSN row's own `allowed_origins` list when the operator has set\none (`403` when the `Origin` is off it); an empty or absent list, which is\nevery row Temps mints today, permits any origin.\n\n# Ordering, and why it matters\n\nThis route is unauthenticated and reachable from every domain a project is\ndeployed to, so the expensive work is placed strictly after the cheap\nadmission control:\n\n1. Shape gate + resolution cache + a global unresolved-credential budget,\n   all before any database round trip (mirroring `temps-analytics`'s\n   ADR-040 §2 defence).\n2. Per-project rate limiting.\n3. Only then `decompress_if_needed`, which can inflate up to\n   `MAX_DECOMPRESSED_SIZE`.\n\nThe credential-free branch has to inflate the body to read an SDK-embedded\nDSN, so when `Host` has not already resolved the request that inflate is\ncharged against the same global budget a forged key pays into.\n\nAn *explicit* credential that does not resolve is a `401`, never a silent\nfall-through to `Host`: a typo'd key must fail loudly rather than land the\ndata under whichever project the `Host` happens to match. An *embedded*\nenvelope DSN that does not resolve falls through to path 2, because that\nvalue was sniffed rather than presented — an app tunneling a third-party\nDSN through Temps keeps working exactly as it did before.",
         "operationId": "ingest_tunneled_envelope",
+        "parameters": [
+          {
+            "description": "DSN public key; resolves the project without consulting Host",
+            "in": "query",
+            "name": "sentry_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
@@ -54251,8 +54793,11 @@
           "400": {
             "description": "Bad request"
           },
+          "401": {
+            "description": "An explicit DSN key was presented but did not resolve"
+          },
           "403": {
-            "description": "Origin/Referer does not match the resolved host"
+            "description": "Origin/Referer does not match the resolved host (Host-resolved requests), or the Origin is not in the DSN's allowed_origins (keyed requests)"
           },
           "404": {
             "description": "Unknown host"
@@ -76079,6 +76624,62 @@
         ]
       }
     },
+    "/geo/status": {
+      "get": {
+        "operationId": "get_geo_database_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeoDatabaseStatusResponse"
+                }
+              }
+            },
+            "description": "Geolocation database status retrieved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the freshness of the geolocation database",
+        "tags": [
+          "geo"
+        ]
+      }
+    },
     "/geo/{ip}": {
       "get": {
         "operationId": "get_ip_geolocation",
@@ -88478,6 +89079,39 @@
         ]
       }
     },
+    "/platform/features": {
+      "get": {
+        "description": "Always present, in every profile — a client must be able to tell\n\"unavailable here, and here is why\" from \"endpoint does not exist\".",
+        "operationId": "get_platform_features",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformFeatures"
+                }
+              }
+            },
+            "description": "Capabilities of this server process"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report which capabilities this server process actually provides.",
+        "tags": [
+          "Platform"
+        ]
+      }
+    },
     "/platform/private-ip": {
       "get": {
         "operationId": "get_private_ip",
@@ -88490,6 +89124,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Failed to enumerate network interfaces"
           }
         },
         "security": [
@@ -115744,6 +116381,84 @@
           }
         ],
         "summary": "Reload all external plugins.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/grants": {
+      "get": {
+        "operationId": "get_plugin_grants",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginGrantsResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      },
+      "put": {
+        "operationId": "put_plugin_grants",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginGrantsResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Plugins"
         ]

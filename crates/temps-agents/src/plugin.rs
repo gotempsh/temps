@@ -948,6 +948,7 @@ mod tests {
             tools_config: None,
             webhook_id: None,
             webhook_token: None,
+            cron_next_run_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

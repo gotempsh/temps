@@ -329,6 +329,70 @@ pub struct ServiceStatus {
     pub health: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Image pull request/response types
+// ---------------------------------------------------------------------------
+
+/// Request to pull an image from a registry on this worker node.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PullImageRequest {
+    /// Image reference, e.g. `"ghcr.io/org/app:v1.0"` or `"nginx:latest"`.
+    pub image: String,
+    /// Optional registry credentials for private registries.
+    /// When absent the Docker daemon uses whatever credentials it has cached
+    /// (e.g. from a prior `docker login`). When present the credentials are
+    /// forwarded to the daemon via the `X-Registry-Auth` header; they are
+    /// **never** logged or echoed in error messages.
+    #[serde(default)]
+    pub credentials: Option<RegistryCredentials>,
+}
+
+/// Registry credentials for private-registry access.
+///
+/// Mirrors the fields of [`bollard::auth::DockerCredentials`]. `password` and
+/// `identity_token` are intentionally excluded from `Debug` output so they do
+/// not appear in log files.
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegistryCredentials {
+    /// Registry username.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password or access-token for the registry user.
+    /// **Never logged.**
+    #[serde(default)]
+    pub password: Option<String>,
+    /// OAuth/OIDC identity token (mutually exclusive with `username`/`password`).
+    /// **Never logged.**
+    #[serde(default)]
+    pub identity_token: Option<String>,
+    /// Registry server address, e.g. `"ghcr.io"`. Derived from the image
+    /// reference when absent.
+    #[serde(default)]
+    pub server_address: Option<String>,
+}
+
+impl std::fmt::Debug for RegistryCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCredentials")
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .field("identity_token", &"[redacted]")
+            .field("server_address", &self.server_address)
+            .finish()
+    }
+}
+
+/// Successful result of pulling an image from a registry.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PullImageResponse {
+    /// Resolved image ID, e.g. `"sha256:abc123..."`.
+    pub image_id: String,
+    /// Registry digest, e.g. `"sha256:abc123..."`, when the registry reported
+    /// one. `null` for images that were already present locally before the
+    /// pull (or when the registry did not include a digest in the manifest).
+    pub digest: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

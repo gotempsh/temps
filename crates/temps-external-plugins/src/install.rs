@@ -124,6 +124,19 @@ pub struct InstallCandidate {
     install_directory: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct ActivationRollback {
+    plugin_name: String,
+    plugin_root: PathBuf,
+    previous: Option<ActiveRecord>,
+}
+
+impl ActivationRollback {
+    pub(crate) fn was_first_install(&self) -> bool {
+        self.previous.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveInstallation {
     pub name: String,
@@ -611,6 +624,54 @@ impl PluginInstaller {
             );
         }
         Ok(())
+    }
+
+    pub(crate) async fn capture_activation(
+        &self,
+        candidate: &InstallCandidate,
+    ) -> Result<ActivationRollback, InstallError> {
+        let active_path = candidate.plugin_root.join(ACTIVE_FILE);
+        let previous = match tokio::fs::symlink_metadata(&active_path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error(&candidate.name, &active_path, error)),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(invalid_receipt(
+                    &candidate.name,
+                    &active_path,
+                    "active record is not a regular file",
+                ));
+            }
+            Ok(_) => {
+                let bytes =
+                    read_regular_file_capped(&candidate.name, &active_path, 16 * 1024).await?;
+                Some(serde_json::from_slice(&bytes).map_err(|error| {
+                    invalid_receipt(&candidate.name, &active_path, error.to_string())
+                })?)
+            }
+        };
+        Ok(ActivationRollback {
+            plugin_name: candidate.name.clone(),
+            plugin_root: candidate.plugin_root.clone(),
+            previous,
+        })
+    }
+
+    pub(crate) async fn restore_activation(
+        &self,
+        rollback: ActivationRollback,
+    ) -> Result<(), InstallError> {
+        let active_path = rollback.plugin_root.join(ACTIVE_FILE);
+        match rollback.previous {
+            Some(previous) => {
+                write_json_atomically(&rollback.plugin_name, &active_path, &previous).await?
+            }
+            None => match tokio::fs::remove_file(&active_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&rollback.plugin_name, &active_path, error)),
+            },
+        }
+        sync_directory(&rollback.plugin_name, &rollback.plugin_root).await
     }
 
     /// Remove a prepared release that never reached the activation commit
@@ -2282,6 +2343,73 @@ mod tests {
             PluginInstaller::new(config.clone()).expect("test installer"),
             config,
         )
+    }
+
+    #[tokio::test]
+    async fn activation_rollback_restores_previous_record_and_removes_first_install_record() {
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        let (installer, _) = installer("https://registry.invalid", &signing);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("rollback-plugin");
+        tokio::fs::create_dir_all(&plugin_root)
+            .await
+            .expect("create plugin root");
+        let candidate = InstallCandidate {
+            name: "rollback-plugin".to_string(),
+            version: "2.0.0".to_string(),
+            platform: "test-platform".to_string(),
+            sha256: "sha256:new".to_string(),
+            binary_path: plugin_root.join("2.0.0/plugin"),
+            plugin_root: plugin_root.clone(),
+            install_directory: "2.0.0".to_string(),
+        };
+
+        let first_install = installer
+            .capture_activation(&candidate)
+            .await
+            .expect("capture absent activation");
+        assert!(first_install.was_first_install());
+        installer
+            .activate(&candidate)
+            .await
+            .expect("activate first install");
+        installer
+            .restore_activation(first_install)
+            .await
+            .expect("remove rejected first activation");
+        assert!(!plugin_root.join(ACTIVE_FILE).exists());
+
+        write_json_atomically(
+            &candidate.name,
+            &plugin_root.join(ACTIVE_FILE),
+            &ActiveRecord {
+                version: "1.0.0".to_string(),
+                directory: "1.0.0".to_string(),
+            },
+        )
+        .await
+        .expect("write previous activation");
+        let upgrade = installer
+            .capture_activation(&candidate)
+            .await
+            .expect("capture previous activation");
+        assert!(!upgrade.was_first_install());
+        installer
+            .activate(&candidate)
+            .await
+            .expect("activate upgrade");
+        installer
+            .restore_activation(upgrade)
+            .await
+            .expect("restore previous activation");
+        let restored: ActiveRecord = serde_json::from_slice(
+            &tokio::fs::read(plugin_root.join(ACTIVE_FILE))
+                .await
+                .expect("read restored activation"),
+        )
+        .expect("decode restored activation");
+        assert_eq!(restored.version, "1.0.0");
+        assert_eq!(restored.directory, "1.0.0");
     }
 
     fn rotated_keyset(

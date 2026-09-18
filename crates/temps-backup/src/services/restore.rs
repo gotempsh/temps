@@ -775,7 +775,10 @@ impl RestoreService {
             })?;
         let instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type);
+            .get_service_instance(service.name.clone(), service_type)
+            .map_err(|e| RestoreError::ExternalService {
+                reason: format!("get service instance: {}", e),
+            })?;
         let capabilities = instance
             .restore_capabilities(service_config)
             .await
@@ -1635,7 +1638,11 @@ async fn run_restore_inner(
         );
     }
 
-    let instance = mgr.get_service_instance(target_service.name.clone(), service_type);
+    let instance = mgr
+        .get_service_instance(target_service.name.clone(), service_type)
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("get service instance: {}", e),
+        })?;
 
     // Decrypt S3 credentials once.
     let decrypted_access_key =

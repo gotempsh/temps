@@ -188,7 +188,9 @@ export function ImprovedOnboardingDashboard() {
         'external-url',
         'screenshot-setup',
       ]
-      const nextStep: OnboardingStep = hasConnections ? 'project' : 'git-provider'
+      const nextStep: OnboardingStep = hasConnections
+        ? 'project'
+        : 'git-provider'
       setCompletedSteps(skippedDomainSteps)
       setCurrentStep(nextStep)
       setWantsExpose(true)
@@ -413,10 +415,7 @@ export function ImprovedOnboardingDashboard() {
   // Check if all steps are complete
   // Note: Git connections are optional - projects can be created from templates, public repos, or manual deployments
   const allStepsComplete =
-    hasActiveDomain &&
-    hasProjects &&
-    hasExternalUrl &&
-    hasPreviewDomain
+    hasActiveDomain && hasProjects && hasExternalUrl && hasPreviewDomain
 
   if (allStepsComplete) {
     return (

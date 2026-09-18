@@ -6,11 +6,12 @@
 //! Implements cron job configuration using the database
 
 use async_trait::async_trait;
-use chrono::{DateTime, Timelike as _, Utc};
+use chrono::{DateTime, TimeZone as _, Timelike as _, Utc};
 use cron::Schedule;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Select, Set,
 };
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -69,6 +70,11 @@ pub enum CronServiceError {
     #[error("Failed to notify about cron error: {0}")]
     NotificationError(String),
 }
+
+/// Floor for the cron scheduler's between-tick sleep.
+///
+/// See [`DatabaseCronConfigService::duration_until_next_minute`].
+const MIN_SCHEDULER_SLEEP: Duration = Duration::from_secs(1);
 
 /// Database-backed cron configuration service
 pub struct DatabaseCronConfigService {
@@ -369,34 +375,116 @@ impl DatabaseCronConfigService {
         Ok(executions)
     }
 
+    /// Time remaining until the top of the next minute.
+    ///
+    /// Replaces an `unwrap()`-based computation: `second()` and `nanosecond()`
+    /// can exceed their usual range during a leap second, which made the old
+    /// arithmetic capable of producing a negative `chrono::Duration` and
+    /// panicking in `to_std()`. Clamping keeps the sleep inside one minute.
+    ///
+    /// Floored at [`MIN_SCHEDULER_SLEEP`]: during a leap second the clamp
+    /// above can land a nanosecond short of the minute boundary, and a 1ns
+    /// sleep would spin the scheduler loop — re-running the due query
+    /// thousands of times in that second. One second of extra latency on a
+    /// per-minute scheduler is not observable; a hot loop is.
+    fn duration_until_next_minute(now: DateTime<Utc>) -> Duration {
+        const NANOS_PER_MINUTE: u64 = 60 * 1_000_000_000;
+        let into_minute = (u64::from(now.second()) * 1_000_000_000 + u64::from(now.nanosecond()))
+            .min(NANOS_PER_MINUTE - 1);
+        Duration::from_nanos(NANOS_PER_MINUTE - into_minute).max(MIN_SCHEDULER_SLEEP)
+    }
+
+    /// Select the crons that are due at `now`.
+    ///
+    /// The scheduler used to load the entire `crons` table every single
+    /// minute and filter in Rust — 1,440 full scans a day, almost all of
+    /// which decide to do nothing. `next_run` already existed and was already
+    /// maintained; it just was not being used to narrow the query.
+    ///
+    /// `next_run IS NULL` is included so a row that has never been scheduled
+    /// (or predates `next_run` being maintained) still gets picked up and
+    /// seeded instead of sitting invisible forever. Soft-deleted rows are
+    /// excluded here rather than in `process_cron` so they stop being fetched
+    /// at all.
+    fn due_crons_query(now: UtcDateTime) -> Select<crons::Entity> {
+        crons::Entity::find()
+            .filter(crons::Column::DeletedAt.is_null())
+            .filter(
+                Condition::any()
+                    .add(crons::Column::NextRun.is_null())
+                    .add(crons::Column::NextRun.lte(now)),
+            )
+    }
+
+    /// Persist a cron's next occurrence.
+    ///
+    /// Uses `update_many` + `col_expr` rather than an ActiveModel save so the
+    /// scheduler does not bump `updated_at` on every run — that column
+    /// records when the *configuration* last changed, and the user sees it.
+    async fn persist_next_run(
+        &self,
+        cron_id: i32,
+        next_run: UtcDateTime,
+    ) -> Result<(), CronServiceError> {
+        crons::Entity::update_many()
+            .col_expr(crons::Column::NextRun, Expr::value(next_run))
+            .filter(crons::Column::Id.eq(cron_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Terminal `next_run` for a cron that can never fire again.
+    ///
+    /// The `crons` table has no `enabled` column, so `next_run` is the only
+    /// place a "this will never run again" state can be recorded. `NULL` is
+    /// already taken — [`Self::due_crons_query`] reads it as "never scheduled,
+    /// seed me" — and any realistic timestamp is eventually reached by the
+    /// `next_run <= now` predicate, so the sentinel is a fixed far-future
+    /// instant. A retired cron is simply never selected by the due query
+    /// again; the row stays visible, listable and editable, and re-deploying
+    /// with a live schedule overwrites the sentinel through
+    /// `configure_crons`'s normal `calculate_next_run` path.
+    fn retired_sentinel() -> UtcDateTime {
+        Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .single()
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// Park a cron whose schedule has no further occurrences on the terminal
+    /// sentinel so the scheduler stops re-selecting it every minute.
+    async fn retire_cron(&self, cron: &crons::Model) -> Result<(), CronServiceError> {
+        info!(
+            cron_id = cron.id,
+            schedule = %cron.schedule,
+            "Cron schedule has no further occurrences; retiring it (redeploy with a live schedule to resume)"
+        );
+        self.persist_next_run(cron.id, Self::retired_sentinel())
+            .await
+    }
+
     pub async fn start_cron_scheduler(&self) {
         debug!("Starting cron scheduler");
 
         loop {
+            time::sleep(Self::duration_until_next_minute(Utc::now())).await;
+
             let now = Utc::now();
 
-            // Only run at the start of each minute
-            if now.second() != 0 {
-                // Sleep until next minute
-                let next_minute = now
-                    .with_second(0)
-                    .and_then(|dt| dt.with_nanosecond(0))
-                    .unwrap()
-                    + chrono::Duration::minutes(1);
-                let sleep_duration = (next_minute - now).to_std().unwrap();
-                time::sleep(sleep_duration).await;
-                continue;
-            }
-
             // Use a block to ensure db connection is dropped after use
-            let crons_list = match crons::Entity::find().all(self.db.as_ref()).await {
+            let crons_list = match Self::due_crons_query(now).all(self.db.as_ref()).await {
                 Ok(crons_list) => crons_list,
                 Err(e) => {
-                    error!("Failed to fetch crons: {}", e);
-                    time::sleep(Duration::from_secs(60)).await;
+                    error!("Failed to fetch due crons: {}", e);
                     continue;
                 }
             };
+
+            if crons_list.is_empty() {
+                continue;
+            }
+
+            debug!("Processing {} due cron(s)", crons_list.len());
 
             // Process crons in chunks to limit concurrency
             for chunk in crons_list.chunks(10) {
@@ -412,15 +500,6 @@ impl DatabaseCronConfigService {
                     }
                 }
             }
-
-            // Sleep until next minute
-            let next_minute = now
-                .with_second(0)
-                .and_then(|dt| dt.with_nanosecond(0))
-                .unwrap()
-                + chrono::Duration::minutes(1);
-            let sleep_duration = (next_minute - now).to_std().unwrap();
-            time::sleep(sleep_duration).await;
         }
     }
 
@@ -440,29 +519,42 @@ impl DatabaseCronConfigService {
                 schedule: cron.schedule.clone(),
                 message: e.to_string(),
             })?;
-        let next_run = cron.next_run;
 
-        let should_run = match next_run {
-            Some(next) => next <= now,
-            None => {
-                // If next_run is not set, calculate it from the schedule
-                if let Some(next) = schedule.upcoming(Utc).next() {
-                    next <= now
-                } else {
-                    false
-                }
+        // Whether there is any occurrence left *after* now. Deliberately not
+        // an early return: a cron whose `next_run` is already due but whose
+        // expression has no further occurrence (a 7-field expression with a
+        // fixed year, say) still owes exactly one final run. Returning here —
+        // as this did — skipped that run entirely, persisted nothing, and left
+        // the row due forever so the scheduler re-selected it every minute.
+        let upcoming = schedule.upcoming(Utc).next();
+
+        let Some(due_at) = cron.next_run else {
+            // Never scheduled before (a new cron, or a row predating
+            // `next_run` being maintained). Seed the due time so it stops
+            // being re-selected on every sweep, and let it fire at its next
+            // real occurrence rather than immediately — an unseeded cron
+            // must not be treated as overdue.
+            match upcoming {
+                Some(upcoming) => self.persist_next_run(cron.id, upcoming).await?,
+                // Never scheduled and nothing left to schedule: there is no
+                // final run to owe, so retire it straight away.
+                None => self.retire_cron(cron).await?,
             }
+            return Ok(());
         };
 
-        if should_run {
-            // Calculate the next run time
-            let next_run = schedule.upcoming(Utc).next();
+        let should_run = due_at <= now;
 
-            // Update the next_run time in the database
-            if let Some(next_run) = next_run {
-                let mut cron_update: crons::ActiveModel = cron.clone().into();
-                cron_update.next_run = Set(Some(next_run));
-                cron_update.update(self.db.as_ref()).await?;
+        if should_run {
+            // Advance the due time *before* executing. A failed execution
+            // returns early below, and leaving `next_run` in the past would
+            // then replay the same minute on every sweep.
+            match upcoming {
+                Some(upcoming) => self.persist_next_run(cron.id, upcoming).await?,
+                // This is the final run. Park the row on the terminal
+                // sentinel *before* executing, for the same reason: a failure
+                // below must not replay it every minute forever.
+                None => self.retire_cron(cron).await?,
             }
 
             // Execute the cron
@@ -633,6 +725,73 @@ impl DatabaseCronConfigService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scheduler must ask the database for the crons that are due, not
+    /// for the whole table. A regression here is silent — crons still fire —
+    /// so the predicate is asserted directly.
+    #[test]
+    fn due_crons_query_selects_only_live_crons_that_are_due() {
+        use sea_orm::{DbBackend, QueryTrait};
+
+        let sql = DatabaseCronConfigService::due_crons_query(Utc::now())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(
+            sql.contains("\"deleted_at\" IS NULL"),
+            "soft-deleted crons must not even be fetched: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_run\" IS NULL"),
+            "a cron that has never been scheduled must still be selected so it can be seeded: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_run\" <="),
+            "due selection must happen in SQL, not in Rust: {sql}"
+        );
+    }
+
+    #[test]
+    fn duration_until_next_minute_is_the_remainder_of_the_minute() {
+        let at_15s = Utc
+            .with_ymd_and_hms(2026, 4, 2, 10, 30, 15)
+            .single()
+            .expect("valid timestamp");
+        assert_eq!(
+            DatabaseCronConfigService::duration_until_next_minute(at_15s),
+            Duration::from_secs(45)
+        );
+
+        let on_the_minute = Utc
+            .with_ymd_and_hms(2026, 4, 2, 10, 30, 0)
+            .single()
+            .expect("valid timestamp");
+        assert_eq!(
+            DatabaseCronConfigService::duration_until_next_minute(on_the_minute),
+            Duration::from_secs(60),
+            "waking exactly on the minute must wait a full minute, not fire twice"
+        );
+    }
+
+    /// Leap seconds put `second()` at 60 and `nanosecond()` above 1e9. The
+    /// previous implementation subtracted its way to a negative
+    /// `chrono::Duration` and panicked in `to_std()`; the sleep must stay
+    /// inside one minute instead.
+    #[test]
+    fn duration_until_next_minute_survives_a_leap_second() {
+        let leap = Utc
+            .with_ymd_and_hms(2026, 6, 30, 23, 59, 59)
+            .single()
+            .expect("valid timestamp")
+            .with_nanosecond(1_500_000_000)
+            .expect("leap-second nanosecond is representable");
+
+        let wait = DatabaseCronConfigService::duration_until_next_minute(leap);
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_secs(60),
+            "leap-second wait must stay within one minute, got {wait:?}"
+        );
+    }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::upstream_config::UpstreamList;
 
@@ -700,6 +859,304 @@ mod tests {
         let environment = environment.insert(db).await?;
 
         Ok((project, environment))
+    }
+
+    /// A 7-field expression pinned to a past year parses fine but has no
+    /// upcoming occurrence — the exact shape that used to wedge the scheduler.
+    const EXHAUSTED_SCHEDULE: &str = "0 0 0 1 1 * 2020";
+
+    async fn insert_cron(
+        db: &DatabaseConnection,
+        project_id: i32,
+        environment_id: i32,
+        schedule: &str,
+        next_run: Option<UtcDateTime>,
+    ) -> crons::Model {
+        crons::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            path: Set("/api/cron/finalize".to_string()),
+            schedule: Set(schedule.to_string()),
+            next_run: Set(next_run),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("cron insert")
+    }
+
+    fn cron_service(db: &Arc<DatabaseConnection>) -> DatabaseCronConfigService {
+        DatabaseCronConfigService::new(
+            db.clone(),
+            Arc::new(MockQueue),
+            create_test_deployment_token_service(db.clone()),
+        )
+    }
+
+    /// A row that has never been scheduled must be *seeded*, not fired. It is
+    /// only in the due set because `next_run IS NULL` means "unknown", and
+    /// treating unknown as overdue would fire every cron once on upgrade.
+    #[tokio::test]
+    async fn process_cron_seeds_a_null_next_run_without_firing() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let cron = insert_cron(db.as_ref(), project.id, environment.id, "0 0 * * *", None).await;
+
+        let service = cron_service(&db);
+        let now = Utc::now();
+        service
+            .process_cron(&cron, now)
+            .await
+            .expect("seeding must not error");
+
+        let reloaded = crons::Entity::find_by_id(cron.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("cron still exists");
+        let next_run = reloaded.next_run.expect("a NULL next_run must be seeded");
+        assert!(
+            next_run > now,
+            "an unseeded cron must be scheduled forward, not treated as overdue: {next_run}"
+        );
+
+        let executions = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            executions.is_empty(),
+            "seeding must not fire the cron: {executions:?}"
+        );
+
+        // And it is out of the due set now, instead of being re-selected every
+        // minute forever.
+        let due: Vec<i32> = DatabaseCronConfigService::due_crons_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(!due.contains(&cron.id), "a seeded cron is no longer due");
+    }
+
+    /// The regression this PR reintroduced and then fixed: a cron whose
+    /// `next_run` is due but whose expression has no *further* occurrence
+    /// still owes one final run. Returning early skipped that run, persisted
+    /// nothing, and left the row due every minute forever.
+    #[tokio::test]
+    async fn process_cron_runs_the_final_occurrence_then_retires_the_row() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+
+        // A deployment + container so `get_deployment_url` resolves and the
+        // run is genuinely *attempted* (the request then fails against a
+        // hostname that does not resolve, which is recorded as a 500).
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("final-run-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("deployment insert");
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("final-run-container-id".to_string()),
+            container_name: Set("final-run-container.invalid".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("container insert");
+
+        let due_at = Utc::now() - chrono::Duration::minutes(1);
+        let cron = insert_cron(
+            db.as_ref(),
+            project.id,
+            environment.id,
+            EXHAUSTED_SCHEDULE,
+            Some(due_at),
+        )
+        .await;
+
+        let service = cron_service(&db);
+        // The request itself fails (unresolvable host), which is reported as
+        // an error — the point is that it was attempted at all.
+        let _ = service.process_cron(&cron, Utc::now()).await;
+
+        let executions = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "the final due occurrence must actually run, not be skipped because \
+             there is nothing after it"
+        );
+
+        let reloaded = crons::Entity::find_by_id(cron.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("cron still exists");
+        assert_eq!(
+            reloaded.next_run,
+            Some(DatabaseCronConfigService::retired_sentinel()),
+            "a cron with no further occurrence must be parked on the terminal \
+             sentinel, not left due"
+        );
+
+        let due: Vec<i32> = DatabaseCronConfigService::due_crons_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(
+            !due.contains(&cron.id),
+            "a retired cron must never be re-selected by the due query"
+        );
+    }
+
+    /// Same terminal state, reached from the other direction: a row that was
+    /// never scheduled *and* has nothing left to schedule owes no final run,
+    /// so it is retired immediately rather than seeded.
+    #[tokio::test]
+    async fn process_cron_retires_an_unseeded_exhausted_schedule_without_running_it() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let cron = insert_cron(
+            db.as_ref(),
+            project.id,
+            environment.id,
+            EXHAUSTED_SCHEDULE,
+            None,
+        )
+        .await;
+
+        let service = cron_service(&db);
+        service
+            .process_cron(&cron, Utc::now())
+            .await
+            .expect("retiring must not error");
+
+        let reloaded = crons::Entity::find_by_id(cron.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("cron still exists");
+        assert_eq!(
+            reloaded.next_run,
+            Some(DatabaseCronConfigService::retired_sentinel())
+        );
+
+        let executions = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            executions.is_empty(),
+            "a never-scheduled cron owes no run: {executions:?}"
+        );
+    }
+
+    /// A due cron with occurrences left runs and is advanced to the next one —
+    /// the ordinary case, asserted so the finite-schedule handling above
+    /// cannot regress it.
+    #[tokio::test]
+    async fn process_cron_advances_a_recurring_schedule_past_now() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let cron = insert_cron(
+            db.as_ref(),
+            project.id,
+            environment.id,
+            "* * * * *",
+            Some(Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .await;
+
+        let service = cron_service(&db);
+        let now = Utc::now();
+        // No deployment exists, so the run itself errors — the scheduling
+        // half is what this asserts.
+        let _ = service.process_cron(&cron, now).await;
+
+        let reloaded = crons::Entity::find_by_id(cron.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("cron still exists");
+        let next_run = reloaded.next_run.expect("next_run must be advanced");
+        assert!(
+            next_run > now,
+            "a due cron must be advanced past now even when the run fails, \
+             or the same minute replays on every sweep: {next_run}"
+        );
+        assert_ne!(
+            Some(next_run),
+            Some(DatabaseCronConfigService::retired_sentinel()),
+            "a live recurring schedule must never be retired"
+        );
+    }
+
+    /// The scheduler sleep must never collapse to a hot spin.
+    #[test]
+    fn duration_until_next_minute_is_floored_at_one_second() {
+        // A leap-second instant clamps to one nanosecond before the minute
+        // boundary, which used to produce a 1ns sleep.
+        let leap = Utc
+            .with_ymd_and_hms(2026, 6, 30, 23, 59, 59)
+            .single()
+            .expect("valid timestamp")
+            .with_nanosecond(1_999_999_999)
+            .expect("leap-second nanosecond is representable");
+
+        assert!(
+            DatabaseCronConfigService::duration_until_next_minute(leap) >= Duration::from_secs(1),
+            "the scheduler must never sleep for less than a second"
+        );
     }
 
     #[test]

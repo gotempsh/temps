@@ -177,6 +177,10 @@ export function ManualProjectConfigurator({
     control: form.control,
     name: 'sourceType',
   })
+  const watchedServices =
+    useWatch({ control: form.control, name: 'storageServices' }) || []
+  const watchedEnvVars =
+    useWatch({ control: form.control, name: 'environmentVariables' }) || []
   // Fetch existing services
   const {
     data: existingServices,
@@ -570,8 +574,6 @@ export function ManualProjectConfigurator({
   // Render databases step. The API still calls these storage services, but
   // "Databases" is the user-facing concept in project creation.
   const renderDatabases = () => {
-    const watchedServices = form.watch('storageServices') || []
-
     return (
       <div className="space-y-4">
         {areServicesPending && (
@@ -693,8 +695,7 @@ export function ManualProjectConfigurator({
 
   // Render environment variables step
   const renderEnvVars = () => {
-    const watchedEnvVars = form.watch('environmentVariables') || []
-    const selectedDatabases = (form.watch('storageServices') || [])
+    const selectedDatabases = watchedServices
       .map((serviceId) =>
         availableServices.find((service) => service.id === serviceId)
       )
@@ -903,7 +904,12 @@ export function ManualProjectConfigurator({
   return (
     <div className={cn('space-y-6', className)}>
       <Form {...form}>
-        <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+        <form
+          onSubmit={(event) => {
+            void form.handleSubmit(handleSubmit)(event)
+          }}
+          className="space-y-6"
+        >
           {/* Source Type Selection */}
           <Card>
             <CardHeader>

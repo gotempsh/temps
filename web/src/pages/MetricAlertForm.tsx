@@ -66,10 +66,12 @@ import { AnomalyBacktest } from '@/components/metrics/AnomalyBacktest'
 import {
   GroupByBuilder,
   LabelFilterBuilder,
-  labelFiltersToTuples,
   MAX_GROUP_BY_KEYS,
-  tuplesToLabelFilters,
 } from '@/components/metrics/LabelFilterBuilder'
+import {
+  labelFiltersToTuples,
+  tuplesToLabelFilters,
+} from '@/components/metrics/label-filters'
 import {
   AlertStateBadge,
   ANOMALY_ALGORITHMS,
@@ -92,7 +94,7 @@ import {
   SlidersHorizontal,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
@@ -293,14 +295,32 @@ function AlertFormBody({
   })
   // Drives which detector fields are shown. Hidden fields keep their values in
   // form state (RHF does not unregister), so `onSubmit` reads the right ones.
-  const detectionKind = form.watch('detection_kind')
-  const watchedMetric = form.watch('metric_name')
+  const detectionKind = useWatch({
+    control: form.control,
+    name: 'detection_kind',
+  })
+  const watchedMetric = useWatch({ control: form.control, name: 'metric_name' })
   const isAnomaly = detectionKind === 'anomaly'
-  const groupBy = form.watch('group_by')
-  const dynamicAlerts = form.watch('dynamic_alerts')
-  const maxSeries = form.watch('max_series')
+  const groupBy = useWatch({ control: form.control, name: 'group_by' })
+  const dynamicAlerts = useWatch({
+    control: form.control,
+    name: 'dynamic_alerts',
+  })
+  const maxSeries = useWatch({ control: form.control, name: 'max_series' })
   const hasGroupBy = groupBy.length > 0
-  const labelFilters = form.watch('label_filters')
+  const labelFilters = useWatch({
+    control: form.control,
+    name: 'label_filters',
+  })
+  const aggregation = useWatch({
+    control: form.control,
+    name: 'aggregation',
+  })
+  const windowSecs = useWatch({ control: form.control, name: 'window_secs' })
+  const algorithm = useWatch({ control: form.control, name: 'algorithm' })
+  const deviations = useWatch({ control: form.control, name: 'deviations' })
+  const direction = useWatch({ control: form.control, name: 'direction' })
+  const seasonality = useWatch({ control: form.control, name: 'seasonality' })
   const alarmsBasePath = '/monitoring/alarms'
 
   // "Scope" (label filters + break-down/per-series settings) is the least
@@ -365,13 +385,13 @@ function AlertFormBody({
   // History/eligibility for anomaly rules: a metric needs enough past data for a
   // trustworthy baseline, otherwise the rule sits at "unknown" and never alerts.
   // Bounds are memoised once so the query key is stable (no refetch loop).
-  const historyRange = useMemo(() => {
+  const [historyRange] = useState(() => {
     const now = Date.now()
     return {
       start: new Date(now - 90 * 86_400_000).toISOString(),
       end: new Date(now).toISOString(),
     }
-  }, [])
+  })
   const historyQuery = useQuery({
     ...queryMetricsOptions({
       query: {
@@ -391,8 +411,11 @@ function AlertFormBody({
     const earliest = Math.min(
       ...buckets.map((b) => new Date(b.bucket).getTime())
     )
-    return Math.max(0, Math.round((Date.now() - earliest) / 86_400_000))
-  }, [historyQuery.data])
+    return Math.max(
+      0,
+      Math.round((new Date(historyRange.end).getTime() - earliest) / 86_400_000)
+    )
+  }, [historyQuery.data, historyRange.end])
   const enoughHistory = historyDays >= ANOMALY_MIN_HISTORY_DAYS
 
   // Bounds for the label-filter autocomplete — mirrors LabelFilterBuilder's own
@@ -1149,14 +1172,14 @@ function AlertFormBody({
                     <AnomalyBacktest
                       projectId={project.id}
                       metricName={watchedMetric}
-                      aggregation={form.watch('aggregation')}
-                      windowSecs={form.watch('window_secs')}
+                      aggregation={aggregation}
+                      windowSecs={windowSecs}
                       detectionConfig={{
                         kind: 'anomaly',
-                        algorithm: form.watch('algorithm') as AnomalyAlgorithm,
-                        deviations: form.watch('deviations'),
-                        direction: form.watch('direction') as Direction,
-                        seasonality: form.watch('seasonality') as Seasonality,
+                        algorithm: algorithm as AnomalyAlgorithm,
+                        deviations,
+                        direction: direction as Direction,
+                        seasonality: seasonality as Seasonality,
                       }}
                     />
                   )}

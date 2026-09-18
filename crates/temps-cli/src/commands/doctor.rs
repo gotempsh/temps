@@ -167,6 +167,7 @@ impl DoctorCommand {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
             self.check_app_settings(db, &mut report).await;
+            self.check_geo_database_freshness(db, &mut report).await;
             self.check_git_providers(db, &mut report).await;
             report.print();
             report.checks.clear();
@@ -799,6 +800,121 @@ impl DoctorCommand {
         }
     }
 
+    /// Report how current the geolocation database is.
+    ///
+    /// The data-directory section above only answers "is the file there?" --
+    /// which is what an operator would check, and is exactly why a database
+    /// that has never been refreshed since install looks healthy while it
+    /// geolocates reassigned IPs to the city they used to be in.
+    async fn check_geo_database_freshness(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        report: &mut DiagnosticReport,
+    ) {
+        // Read the settings row directly rather than building a
+        // `ConfigService`: `temps doctor` is a read-only diagnostic holding a
+        // borrowed connection, and it only needs the geo section. The license
+        // key is never decrypted here -- whether one is *stored* is all an
+        // operator needs to see, and is all this reports.
+        let geo = match read_geo_settings(db).await {
+            Ok(geo) => geo,
+            Err(e) => {
+                report.add(
+                    "GeoLite2 freshness",
+                    CheckResult::Warn(format!("Could not read the geolocation settings: {}", e)),
+                );
+                return;
+            }
+        };
+
+        report.add(
+            "GeoLite2 source",
+            CheckResult::Info(format!(
+                "{} (MaxMind license key configured: {})",
+                geo.source.clone().unwrap_or_else(|| {
+                    "unknown (never downloaded by this instance)".to_string()
+                }),
+                geo.license_key_configured()
+            )),
+        );
+
+        let stale_after = i64::from(geo.effective_stale_lookup_days());
+        match geo.age_days(chrono::Utc::now()) {
+            Some(age) if age > stale_after => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(format!(
+                    "Database is {} (older than the {}-day threshold). \
+                     Add a MaxMind license key under Settings -> Metrics Monitoring so \
+                     refreshes fetch the latest build.",
+                    describe_age(age),
+                    stale_after
+                )),
+            ),
+            Some(age) => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Pass(format!("Database is {}", describe_age(age))),
+            ),
+            None if geo.license_key_configured() => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(format!(
+                    "No refresh has been recorded yet; the scheduled job runs every {} hours",
+                    geo.effective_refresh_interval_hours()
+                )),
+            ),
+            None => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(
+                    "No refresh has been recorded yet, and no MaxMind license key is \
+                     configured -- the scheduled job downloads nothing without one, so \
+                     lookups will keep using the database currently on disk. Add a key \
+                     under Settings -> Metrics Monitoring -> Geolocation database."
+                        .to_string(),
+                ),
+            ),
+        }
+
+        match (geo.last_check_status.as_deref(), geo.last_check_at) {
+            (Some(temps_core::GEO_CHECK_STATUS_ERROR), checked_at) => {
+                let when = checked_at
+                    .map(iso8601)
+                    .unwrap_or_else(|| "an unknown time".to_string());
+                report.add(
+                    "GeoLite2 last check",
+                    CheckResult::Warn(format!(
+                        "Failed at {}: {}",
+                        when,
+                        geo.last_error
+                            .clone()
+                            .unwrap_or_else(|| "no reason recorded".to_string())
+                    )),
+                );
+            }
+            (Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
+                let when = checked_at
+                    .map(iso8601)
+                    .unwrap_or_else(|| "an unknown time".to_string());
+                report.add(
+                    "GeoLite2 last check",
+                    CheckResult::Warn(format!(
+                        "Skipped at {}: no MaxMind license key is configured, so the scheduled \
+                         refresh does not download anything. Add a key (free MaxMind account) \
+                         under Settings -> Metrics Monitoring -> Geolocation database to keep \
+                         the database current.",
+                        when
+                    )),
+                );
+            }
+            (Some(_), Some(checked_at)) => report.add(
+                "GeoLite2 last check",
+                CheckResult::Pass(format!("Succeeded at {}", iso8601(checked_at))),
+            ),
+            (Some(_), None) | (None, _) => report.add(
+                "GeoLite2 last check",
+                CheckResult::Info("Never run on this instance".to_string()),
+            ),
+        }
+    }
+
     async fn check_multi_node_networking(
         &self,
         db: &sea_orm::DatabaseConnection,
@@ -1006,6 +1122,47 @@ fn default_data_dir(home: &Path) -> PathBuf {
     }
 }
 
+/// Read the geolocation section of the singleton settings row.
+///
+/// Returns the defaults when the row does not exist yet, which is a valid
+/// state on a fresh install and must read as "never refreshed" rather than as
+/// a failure.
+async fn read_geo_settings(
+    db: &sea_orm::DatabaseConnection,
+) -> anyhow::Result<temps_core::GeoSettings> {
+    use sea_orm::TryGetable;
+
+    let Some(row) = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT data FROM settings WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query the settings row: {}", e))?
+    else {
+        return Ok(temps_core::GeoSettings::default());
+    };
+
+    let data = serde_json::Value::try_get_by(&row, "data")
+        .map_err(|e| anyhow::anyhow!("Failed to read the settings 'data' column: {:?}", e))?;
+    Ok(temps_core::AppSettings::from_json(data).geo)
+}
+
+fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Render an age in days the way an operator reads it ("3 days old").
+fn describe_age(days: i64) -> String {
+    match days {
+        d if d <= 0 => "less than a day old".to_string(),
+        1 => "1 day old".to_string(),
+        d if d < 60 => format!("{} days old", d),
+        d if d < 365 => format!("{} days old (about {} months)", d, d / 30),
+        d => format!("{} days old (about {} years)", d, d / 365),
+    }
+}
+
 /// Check if a URL is reachable via HTTPS.
 async fn check_url_reachable(label: &'static str, url: &str, report: &mut DiagnosticReport) {
     let client = reqwest::Client::builder()
@@ -1180,6 +1337,16 @@ mod tests {
         assert_eq!(report.pass_count, 2);
         assert_eq!(report.warn_count, 1);
         assert_eq!(report.fail_count, 1);
+    }
+
+    #[test]
+    fn age_is_described_in_operator_terms() {
+        assert_eq!(describe_age(0), "less than a day old");
+        assert_eq!(describe_age(-1), "less than a day old");
+        assert_eq!(describe_age(1), "1 day old");
+        assert_eq!(describe_age(3), "3 days old");
+        assert_eq!(describe_age(90), "90 days old (about 3 months)");
+        assert_eq!(describe_age(800), "800 days old (about 2 years)");
     }
 
     #[test]

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, Select, Set, TransactionTrait,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use temps_entities::{
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use super::types::{validate_check_path, StatusPageError};
+use super::types::{normalize_check_interval_seconds, validate_check_path, StatusPageError};
 
 /// Grace period before the scheduler runs its first health check cycle.
 ///
@@ -32,6 +33,17 @@ use super::types::{validate_check_path, StatusPageError};
 /// observes the platform in its normal running state; every cycle after the
 /// first runs on the regular interval.
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
+/// How often the scheduler looks for monitors that have come due.
+///
+/// This is the *sweep* cadence, not the per-monitor check cadence — each
+/// monitor is probed on its own `check_interval_seconds`. The sweep only has
+/// to be fine-grained enough that a monitor is not checked much later than it
+/// asked for; at 15s a 30s monitor drifts by at most half an interval. The
+/// sweep itself is a single indexed query that usually returns nothing, so
+/// running it four times a minute costs far less than the old design, which
+/// probed every active monitor once a minute.
+const SCHEDULER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 fn probe_url(
     public_url: &str,
@@ -101,28 +113,176 @@ impl HealthCheckService {
         })
     }
 
-    /// Run health checks for all active monitors
+    /// Resolve a monitor's configured interval into the value the scheduler
+    /// actually uses.
+    ///
+    /// Shares [`normalize_check_interval_seconds`] with the write boundary in
+    /// `MonitorService::create_monitor`, so a stored row and the scheduler can
+    /// never disagree about what "every N seconds" means. This remains a
+    /// second line of defence for rows written before that validation existed
+    /// (or by a migration/import).
+    fn effective_check_interval_secs(check_interval_seconds: i32) -> i64 {
+        i64::from(normalize_check_interval_seconds(check_interval_seconds))
+    }
+
+    /// Select the active monitors that are due at `now`.
+    ///
+    /// `next_check_at IS NULL` means the monitor has never been scheduled
+    /// (rows predating the due column, or freshly created ones), so it is
+    /// treated as due — nothing needs a backfill to start being checked.
+    fn due_monitors_query(now: temps_core::UtcDateTime) -> Select<status_monitors::Entity> {
+        status_monitors::Entity::find()
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .filter(
+                Condition::any()
+                    .add(status_monitors::Column::NextCheckAt.is_null())
+                    .add(status_monitors::Column::NextCheckAt.lte(now)),
+            )
+    }
+
+    /// Stamp the monitor's next due time unconditionally.
+    ///
+    /// Used by the paths that probe a single known monitor outside the sweep
+    /// (`check_monitors_for_environment`, the `MonitorCreated` reaction):
+    /// there is no competing claimant there, but the probe still consumes the
+    /// monitor's slot and must push the due time out.
+    ///
+    /// Deliberately written through `update_many` + `col_expr` rather than an
+    /// `ActiveModel` save: `ActiveModelBehavior::before_save` bumps
+    /// `updated_at`, and `persist_check_if_current` uses `updated_at` as the
+    /// monitor's concurrency token. Saving an ActiveModel here would make
+    /// every check invalidate its own result.
+    ///
+    /// Called *before* the probe runs so that a probe which panics, times out
+    /// or exits early (paused deployment, missing environment) still yields
+    /// the slot instead of being re-selected by the very next sweep.
+    async fn schedule_next_check(db: &DatabaseConnection, monitor: &status_monitors::Model) {
+        let interval = Self::effective_check_interval_secs(monitor.check_interval_seconds);
+        let next_check_at = Utc::now() + chrono::Duration::seconds(interval);
+
+        if let Err(error) = status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(next_check_at),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .exec(db)
+            .await
+        {
+            // Non-fatal: the monitor stays due and is retried next sweep.
+            warn!(
+                monitor_id = monitor.id,
+                interval_secs = interval,
+                error = %error,
+                "Failed to stamp next_check_at for monitor; it will be re-selected next sweep"
+            );
+        }
+    }
+
+    /// Atomically claim a due monitor's slot.
+    ///
+    /// The sweep runs every [`SCHEDULER_SWEEP_INTERVAL`] and each cycle is
+    /// spawned without awaiting the previous one, so two sweeps can overlap
+    /// whenever a cycle takes longer than the sweep interval (easy: probes are
+    /// bounded to 10 at a time and each can take up to 4 HTTP attempts with
+    /// backoff). Stamping inside the probe therefore left the un-dispatched
+    /// tail of a large due set unstamped and the next sweep probed it again.
+    ///
+    /// The fix is a compare-and-swap: the `UPDATE` carries the exact
+    /// `next_check_at` value this sweep observed as a predicate, so the first
+    /// sweep to reach a row wins (`rows_affected == 1`) and every other
+    /// claimant sees `rows_affected == 0` and skips the monitor. Claiming
+    /// happens for the whole selected set **before** any probe is dispatched,
+    /// which is what makes the window airtight rather than merely smaller.
+    ///
+    /// Same `update_many` + `col_expr` shape as `schedule_next_check`, and for
+    /// the same reason: `updated_at` is the OCC token `persist_check_if_current`
+    /// reads, so an `ActiveModel` save here would invalidate every probe.
+    ///
+    /// Returns `true` when this caller owns the probe for this slot.
+    async fn claim_due_monitor(db: &DatabaseConnection, monitor: &status_monitors::Model) -> bool {
+        let interval = Self::effective_check_interval_secs(monitor.check_interval_seconds);
+        let next_check_at = Utc::now() + chrono::Duration::seconds(interval);
+
+        // CAS predicate on the observed value. NULL needs its own arm because
+        // `= NULL` is never true in SQL.
+        let observed = match monitor.next_check_at {
+            Some(observed) => status_monitors::Column::NextCheckAt.eq(observed),
+            None => status_monitors::Column::NextCheckAt.is_null(),
+        };
+
+        match status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(next_check_at),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .filter(observed)
+            .exec(db)
+            .await
+        {
+            Ok(result) if result.rows_affected == 1 => true,
+            Ok(_) => {
+                debug!(
+                    monitor_id = monitor.id,
+                    "Monitor already claimed by an overlapping sweep; skipping"
+                );
+                false
+            }
+            Err(error) => {
+                // Non-fatal: the monitor stays due and is retried next sweep.
+                // Not probing is the safe choice — probing without a stamp is
+                // exactly the duplicate-probe bug this guards against.
+                warn!(
+                    monitor_id = monitor.id,
+                    interval_secs = interval,
+                    error = %error,
+                    "Failed to claim monitor slot; it will be re-selected next sweep"
+                );
+                false
+            }
+        }
+    }
+
+    /// Run health checks for every monitor that is currently due
     pub async fn run_all_checks(&self) -> Result<(), StatusPageError> {
         debug!("Starting health check cycle");
 
         // Single query: join monitors with environments to skip on-demand ones.
         // Health checks go through the proxy, which resets the idle timer and
         // would prevent scale-to-zero from ever triggering.
-        let monitors_with_envs = status_monitors::Entity::find()
-            .filter(status_monitors::Column::IsActive.eq(true))
+        let monitors_with_envs = Self::due_monitors_query(Utc::now())
             .find_also_related(environments::Entity)
             .all(self.db.as_ref())
             .await?;
 
         let total_monitors = monitors_with_envs.len();
-        debug!("Found {} active monitors to check", total_monitors);
+        debug!("Found {} due monitors to check", total_monitors);
 
-        let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(monitors_with_envs);
+        // Claim every selected row *before* dispatching any probe.
+        //
+        // On-demand environments are claimed too even though they are never
+        // probed (a health check through the proxy resets the idle timer and
+        // would defeat scale-to-zero). Filtering them out without stamping
+        // left them permanently due, so the sweep re-fetched the entire
+        // on-demand set four times a minute — the exact full-scan cost this
+        // change exists to remove. Stamping them costs one write per interval
+        // and keeps them out of the next sweep's result set.
+        let mut claimed_with_envs = Vec::with_capacity(monitors_with_envs.len());
+        for (monitor, env) in monitors_with_envs {
+            if Self::claim_due_monitor(self.db.as_ref(), &monitor).await {
+                claimed_with_envs.push((monitor, env));
+            }
+        }
+
+        let claimed_monitors = claimed_with_envs.len();
+        let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(claimed_with_envs);
 
         debug!(
-            "Running checks for {} monitors ({} skipped as on-demand)",
+            "Running checks for {} monitors ({} skipped as on-demand, {} claimed by another sweep)",
             filtered_monitors.len(),
-            total_monitors - filtered_monitors.len()
+            claimed_monitors - filtered_monitors.len(),
+            total_monitors - claimed_monitors
         );
 
         // Run checks concurrently with a limit
@@ -189,6 +349,10 @@ impl HealthCheckService {
         let monitor_count = monitors.len();
 
         for monitor in monitors {
+            // Out-of-band probe: no sweep is racing for this row, but the
+            // probe still consumes the monitor's slot, so push the due time
+            // out before running it.
+            Self::schedule_next_check(self.db.as_ref(), &monitor).await;
             Self::check_monitor(
                 self.db.clone(),
                 self.http_client.clone(),
@@ -210,6 +374,18 @@ impl HealthCheckService {
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
+        // NOTE: the monitor's slot is claimed by the *caller*, before this is
+        // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
+        // also decides who probes), the single-monitor paths via
+        // `schedule_next_check`. Stamping here instead would have to happen
+        // after the probe was already in flight, which is what allowed two
+        // overlapping sweeps to probe the same monitor.
+        //
+        // The stamp is unconditional on the caller side so that every early
+        // return below (no environment, no current deployment, paused
+        // deployment) still yields the slot instead of leaving `next_check_at`
+        // in the past and being re-selected on every single sweep.
+
         // Check if environment_id is set
         let env_id = monitor.environment_id.ok_or_else(|| {
             warn!("Monitor {} has no environment_id", monitor.id);
@@ -702,7 +878,8 @@ impl HealthCheckService {
     ///
     /// This scheduler:
     /// 1. Initializes monitors for all existing environments at startup
-    /// 2. Runs health checks every 60 seconds for all active monitors
+    /// 2. Sweeps every 15 seconds and checks the monitors that are due,
+    ///    honouring each monitor's own `check_interval_seconds`
     /// 3. Listens for MonitorCreated events and immediately checks new monitors
     ///
     /// The job_receiver parameter allows the scheduler to react to monitor creation
@@ -726,7 +903,7 @@ impl HealthCheckService {
         // Start the periodic check cycle
         let service_for_interval = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(SCHEDULER_SWEEP_INTERVAL);
             loop {
                 interval.tick().await;
                 let service = service_for_interval.clone();
@@ -755,6 +932,10 @@ impl HealthCheckService {
                             .await
                         {
                             Ok(Some(monitor)) => {
+                                // Same reasoning as `check_monitors_for_environment`:
+                                // claim the slot before probing so the sweep
+                                // does not immediately re-probe this monitor.
+                                Self::schedule_next_check(service.db.as_ref(), &monitor).await;
                                 if let Err(e) = Self::check_monitor(
                                     service.db.clone(),
                                     service.http_client.clone(),
@@ -925,6 +1106,7 @@ mod tests {
             check_interval_seconds: 60,
             is_active: true,
             is_managed: false,
+            next_check_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -963,6 +1145,62 @@ mod tests {
             force_https: None,
             last_activity_at: None,
         }
+    }
+
+    #[test]
+    fn interval_below_floor_is_clamped() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(5),
+            i64::from(super::super::types::MIN_CHECK_INTERVAL_SECS)
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(29),
+            i64::from(super::super::types::MIN_CHECK_INTERVAL_SECS)
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(-120),
+            i64::from(super::super::types::DEFAULT_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn unset_interval_falls_back_to_default() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(0),
+            i64::from(super::super::types::DEFAULT_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn configured_interval_above_floor_is_preserved() {
+        assert_eq!(HealthCheckService::effective_check_interval_secs(30), 30);
+        assert_eq!(HealthCheckService::effective_check_interval_secs(600), 600);
+    }
+
+    /// The whole point of the due column: the sweep must ask the database for
+    /// the monitors whose turn it is, not for every active monitor. A
+    /// regression here is invisible at runtime (checks still happen, just far
+    /// too often), so the predicate is asserted directly.
+    #[test]
+    fn due_query_selects_only_active_monitors_that_are_due() {
+        use sea_orm::{DbBackend, QueryTrait};
+
+        let sql = HealthCheckService::due_monitors_query(Utc::now())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(
+            sql.contains("\"is_active\" = TRUE"),
+            "sweep must stay limited to active monitors: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" IS NULL"),
+            "never-scheduled monitors must be treated as due: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" <="),
+            "the sweep must filter on the due time in SQL: {sql}"
+        );
     }
 
     #[test]
@@ -1467,6 +1705,260 @@ mod tests {
         assert!(
             checks.is_empty(),
             "a result from a monitor path changed mid-probe must be discarded"
+        );
+    }
+
+    /// Helper: minimal project + environment for the claim tests below.
+    async fn seed_project_and_environment(
+        db: &Arc<DatabaseConnection>,
+        slug: &str,
+        on_demand: bool,
+    ) -> (temps_entities::projects::Model, environments::Model) {
+        let project = temps_entities::projects::ActiveModel {
+            name: Set(slug.to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set(slug.to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let deployment_config = if on_demand {
+            Some(temps_entities::deployment_config::DeploymentConfig {
+                on_demand: true,
+                idle_timeout_seconds: 60,
+                ..Default::default()
+            })
+        } else {
+            Some(temps_entities::deployment_config::DeploymentConfig::default())
+        };
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(format!("{slug}-production")),
+            host: Set(format!("{slug}-production.test.local")),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            deployment_config: Set(deployment_config),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        (project, environment)
+    }
+
+    /// The stamp itself: claiming a monitor pushes `next_check_at` out by the
+    /// monitor's **own** interval, so a 600s monitor drops out of the due
+    /// query for ten minutes instead of being re-selected by the next sweep.
+    #[tokio::test]
+    async fn claiming_a_monitor_stamps_its_own_interval_and_clears_the_due_query() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-stamp-test", false).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("slow monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(600),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        assert!(
+            monitor.next_check_at.is_none(),
+            "a fresh monitor starts unscheduled and therefore due"
+        );
+
+        let before = Utc::now();
+        assert!(
+            HealthCheckService::claim_due_monitor(db.as_ref(), &monitor).await,
+            "an unclaimed due monitor must be claimable"
+        );
+
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        let next = reloaded
+            .next_check_at
+            .expect("claiming must stamp a due time");
+        let delta = (next - before).num_seconds();
+        assert!(
+            (595..=610).contains(&delta),
+            "600s monitor must be pushed out by its own interval, got {delta}s"
+        );
+
+        assert!(
+            reloaded.updated_at == monitor.updated_at,
+            "claiming must not bump updated_at — it is the OCC token \
+             persist_check_if_current compares against"
+        );
+
+        // And it is genuinely out of the sweep's result set now.
+        let due_ids: Vec<i32> = HealthCheckService::due_monitors_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !due_ids.contains(&monitor.id),
+            "a claimed 600s monitor must not be due again on the next sweep"
+        );
+    }
+
+    /// Two overlapping sweeps observe the same due row (the sweep spawns each
+    /// cycle without awaiting the previous one, so this is the normal case
+    /// under load, not a pathology). Exactly one may probe it.
+    #[tokio::test]
+    async fn overlapping_sweeps_claim_a_due_monitor_exactly_once() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-overlap-test", false).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("contended monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Both sweeps selected the row before either wrote, so both hold the
+        // same observed snapshot — the exact race the CAS has to settle.
+        let sweep_one = monitor.clone();
+        let sweep_two = monitor.clone();
+
+        let first = HealthCheckService::claim_due_monitor(db.as_ref(), &sweep_one).await;
+        let second = HealthCheckService::claim_due_monitor(db.as_ref(), &sweep_two).await;
+
+        assert!(first, "the first sweep to reach the row wins the claim");
+        assert!(
+            !second,
+            "the second sweep must see rows_affected == 0 and skip the probe \
+             instead of duplicating it"
+        );
+
+        // A later sweep that re-reads the row observes the new value and must
+        // still be refused while the slot is in the future.
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        assert!(
+            HealthCheckService::claim_due_monitor(db.as_ref(), &reloaded).await,
+            "a fresh observation of the current value is a valid CAS and re-claims"
+        );
+    }
+
+    /// On-demand environments are excluded from probing (a health check
+    /// through the proxy resets the idle timer and defeats scale-to-zero) —
+    /// but they must still be stamped, or the sweep re-fetches the entire
+    /// on-demand set four times a minute forever.
+    #[tokio::test]
+    async fn run_all_checks_stamps_on_demand_monitors_instead_of_refetching_them() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-ondemand-test", true).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("on-demand monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let config_service = test_config_service(&db, &test_db.database_url);
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let service = HealthCheckService::new(db.clone(), config_service, job_queue)
+            .expect("test HTTP client should build");
+
+        service
+            .run_all_checks()
+            .await
+            .expect("sweep with only an on-demand monitor should succeed");
+
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        assert!(
+            reloaded.next_check_at.is_some(),
+            "an on-demand monitor must be stamped even though it is not probed"
+        );
+
+        // Not probed: no status_checks row was written for it.
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "on-demand environments must never be probed by the sweep"
+        );
+
+        let due_ids: Vec<i32> = HealthCheckService::due_monitors_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !due_ids.contains(&monitor.id),
+            "the on-demand monitor must drop out of the next sweep's result set"
         );
     }
 }

@@ -26,7 +26,7 @@ import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 
 interface EditResourceLimitsDialogProps {
@@ -99,41 +99,45 @@ export function EditResourceLimitsDialog({
   // this is create-time-only, so changing it recreates the container.
   const [shmEnabled, setShmEnabled] = useState(false)
   const [shmMb, setShmMb] = useState<string>(String(DEFAULT_SHM_MB))
+  const editKey = open
+    ? `${serviceId}\u0000${JSON.stringify(currentLimits)}`
+    : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(editKey)
 
   // Re-seed the form whenever the dialog opens (or current limits arrive).
   // Without this the user sees stale state from the previous service when
   // they switch services and re-open the dialog.
-  useEffect(() => {
-    if (!open) return
-    const memory = currentLimits?.memory_mb ?? null
-    const swap = currentLimits?.memory_swap_mb ?? null
-    const nano = currentLimits?.nano_cpus ?? null
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
+      const memory = currentLimits?.memory_mb ?? null
+      const swap = currentLimits?.memory_swap_mb ?? null
+      const nano = currentLimits?.nano_cpus ?? null
 
-    setMemoryEnabled(memory != null)
-    setMemoryMb(memory != null ? String(memory) : String(DEFAULT_MEMORY_MB))
+      setMemoryEnabled(memory != null)
+      setMemoryMb(memory != null ? String(memory) : String(DEFAULT_MEMORY_MB))
 
-    // The stored `swap` value is Docker's `memory_swap` total (memory + swap).
-    // Convert back to "extra swap" for the form so the input matches the
-    // label. swap == memory means no swap; swap > memory means the operator
-    // explicitly added some.
-    const extraSwap =
-      swap != null && memory != null && swap > memory ? swap - memory : 0
-    setSwapEnabled(extraSwap > 0)
-    setSwapMb(
-      extraSwap > 0 ? String(extraSwap) : String(memory ?? DEFAULT_MEMORY_MB),
-    )
+      // The stored `swap` value is Docker's `memory_swap` total (memory + swap).
+      // Convert back to "extra swap" for the form so the input matches the
+      // label. swap == memory means no swap; swap > memory means the operator
+      // explicitly added some.
+      const extraSwap =
+        swap != null && memory != null && swap > memory ? swap - memory : 0
+      setSwapEnabled(extraSwap > 0)
+      setSwapMb(
+        extraSwap > 0 ? String(extraSwap) : String(memory ?? DEFAULT_MEMORY_MB)
+      )
 
-    setCpuEnabled(nano != null)
-    setCpuCores(
-      nano != null
-        ? String(nanoCpusToCores(nano))
-        : String(DEFAULT_CPU_CORES),
-    )
+      setCpuEnabled(nano != null)
+      setCpuCores(
+        nano != null ? String(nanoCpusToCores(nano)) : String(DEFAULT_CPU_CORES)
+      )
 
-    const shm = currentLimits?.shm_size_mb ?? null
-    setShmEnabled(shm != null)
-    setShmMb(shm != null ? String(shm) : String(DEFAULT_SHM_MB))
-  }, [open, currentLimits])
+      const shm = currentLimits?.shm_size_mb ?? null
+      setShmEnabled(shm != null)
+      setShmMb(shm != null ? String(shm) : String(DEFAULT_SHM_MB))
+    }
+  }
 
   // Reset input to a sane default when toggling a limit back on, so a
   // previously typed invalid value (e.g. "-1") doesn't reappear.
@@ -223,7 +227,7 @@ export function EditResourceLimitsDialog({
       } else if (recreate.length > 0) {
         toast.warning('Limits saved — restart required', {
           description:
-            'Some changes (shared memory, or removing a memory cap) can\'t be applied live. Restart the service to recreate the container and apply them.',
+            "Some changes (shared memory, or removing a memory cap) can't be applied live. Restart the service to recreate the container and apply them.",
         })
       } else if (members.length === 0) {
         toast.success('Resource limits saved', {
@@ -273,8 +277,7 @@ export function EditResourceLimitsDialog({
       // it here so the user only enters the extra-swap amount they want.
       // When swap is off, total == memory == "swap fully disabled" (Docker:
       // memory_swap == memory means no swap).
-      memory_swap_mb:
-        memoryRounded != null ? memoryRounded + extraSwap : null,
+      memory_swap_mb: memoryRounded != null ? memoryRounded + extraSwap : null,
       nano_cpus: cpuEnabled ? coresToNanoCpus(Number(cpuCores)) : null,
       cpu_shares: null,
       // Create-time-only: the backend recreates the container to apply a
@@ -292,8 +295,7 @@ export function EditResourceLimitsDialog({
     const newMem = memoryEnabled ? Math.round(Number(memoryMb)) || null : null
     const newSwapTotal =
       newMem != null
-        ? newMem +
-          (swapEnabled ? Math.round(Number(swapMb)) || 0 : 0)
+        ? newMem + (swapEnabled ? Math.round(Number(swapMb)) || 0 : 0)
         : null
     const newNano = cpuEnabled ? coresToNanoCpus(Number(cpuCores)) : null
     const currentShm = currentLimits?.shm_size_mb ?? null
@@ -500,9 +502,7 @@ export function EditResourceLimitsDialog({
           <Button
             type="button"
             onClick={handleSubmit}
-            disabled={
-              mutation.isPending || validation != null || !isDirty
-            }
+            disabled={mutation.isPending || validation != null || !isDirty}
           >
             {mutation.isPending ? (
               <>
@@ -578,11 +578,7 @@ function LimitSection({
               : description}
           </p>
         </div>
-        <Switch
-          id={toggleId}
-          checked={enabled}
-          onCheckedChange={onToggle}
-        />
+        <Switch id={toggleId} checked={enabled} onCheckedChange={onToggle} />
       </div>
       {enabled && <div className="pl-0">{children}</div>}
     </section>
@@ -640,7 +636,7 @@ function PresetInput({
                 'rounded border px-2 py-0.5 text-xs tabular-nums transition-colors',
                 isActive
                   ? 'border-foreground/40 bg-foreground/5 text-foreground'
-                  : 'border-border text-muted-foreground hover:border-foreground/20 hover:text-foreground',
+                  : 'border-border text-muted-foreground hover:border-foreground/20 hover:text-foreground'
               )}
             >
               {decimal ? formatCores(preset) : preset}

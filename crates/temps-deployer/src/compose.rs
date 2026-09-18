@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Weak};
+use temps_core::{DockerHandle, DockerUnavailable};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -238,6 +239,15 @@ pub enum ComposeError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// This process has no local Docker daemon -- the control-plane serve
+    /// profile, which runs no local workloads. Every method that eventually
+    /// touches Docker (a `docker compose` CLI invocation or a bollard call)
+    /// resolves this as its very first step, before doing anything else, so
+    /// a caller sees this typed error rather than a raw CLI/connection
+    /// failure part-way through a deploy.
+    #[error(transparent)]
+    DockerUnavailable(#[from] DockerUnavailable),
 }
 
 /// A failed Compose startup together with every container Docker managed to
@@ -622,14 +632,56 @@ pub struct PreparedComposeDeploy {
 /// Docker Compose deployment executor.
 #[derive(Debug)]
 pub struct ComposeExecutor {
-    docker: Arc<Docker>,
+    /// The process-wide Docker client, which may be unavailable on a
+    /// control-plane node that runs no local workloads. Every method that
+    /// eventually needs the daemon calls [`Self::require_docker`] as late as
+    /// possible -- immediately before the first CLI/API call it makes --
+    /// so this executor can always be constructed, even with no daemon.
+    docker: Arc<DockerHandle>,
     /// Base directory for compose work dirs
     data_dir: PathBuf,
 }
 
 impl ComposeExecutor {
+    /// Construct from a concrete Docker client.
+    ///
+    /// Existing callers pass an `Arc<Docker>` directly; this wraps it into a
+    /// [`DockerHandle::available`] so their call sites need not change.
+    /// New call sites -- and any that must work in the control-plane serve
+    /// profile, where no client is ever constructed -- should use
+    /// [`Self::new_with_handle`] instead.
     pub fn new(docker: Arc<Docker>, data_dir: PathBuf) -> Self {
+        Self::new_with_handle(Arc::new(DockerHandle::available(docker)), data_dir)
+    }
+
+    /// Construct from the process-wide [`DockerHandle`], which may carry an
+    /// available client or a typed explanation of why none exists in this
+    /// process (e.g. the control-plane serve profile). Constructing this
+    /// executor never itself requires or probes a daemon; absence is only
+    /// surfaced the first time an operation actually needs one, via
+    /// [`Self::require_docker`].
+    pub fn new_with_handle(docker: Arc<DockerHandle>, data_dir: PathBuf) -> Self {
         Self { docker, data_dir }
+    }
+
+    /// Resolve the Docker client for an operation that cannot proceed
+    /// without it. Call this as late as possible -- immediately before the
+    /// first `docker compose` CLI invocation or bollard call an operation
+    /// makes, never after -- so a control-plane process with no daemon fails
+    /// with this typed, actionable error instead of a raw CLI/connection
+    /// failure part-way through.
+    fn require_docker(&self) -> Result<Arc<Docker>, ComposeError> {
+        self.docker.require().map_err(ComposeError::from)
+    }
+
+    /// Whether this executor was constructed with an available Docker
+    /// client. Callers that must refuse a whole deployment attempt before
+    /// writing any files or invoking `docker compose` -- e.g. `DeployComposeJob`,
+    /// which wants a job-level `LocalWorkloadsDisabled` failure rather than
+    /// this crate's `ComposeError::DockerUnavailable` surfacing partway
+    /// through -- should check this first.
+    pub fn docker_available(&self) -> bool {
+        self.docker.is_available()
     }
 
     /// Serialize prepare → teardown → start → compensation for one Compose
@@ -1236,6 +1288,13 @@ impl ComposeExecutor {
         request: &ComposeDeployRequest,
         generation: &str,
     ) -> Result<PreparedComposeDeploy, ComposeError> {
+        // Fail before any `docker compose` CLI invocation or bollard call --
+        // this deployment writes compose files, builds/pulls images, and
+        // inspects image entrypoints, none of which can succeed without a
+        // local daemon. Checking first means a control-plane process reports
+        // the actionable `DockerUnavailable` instead of a raw CLI failure
+        // after files are already written to disk.
+        self.require_docker()?;
         Self::validate_service_dir_name(generation)?;
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
@@ -1576,6 +1635,11 @@ impl ComposeExecutor {
             return Ok(());
         }
 
+        // Fail before spawning `docker compose down` -- a control-plane
+        // process with no daemon would otherwise see a raw CLI failure
+        // instead of this typed, actionable error.
+        self.require_docker()?;
+
         let compose_file = compose_path
             .map(ToString::to_string)
             .unwrap_or_else(|| self.find_compose_file(&project_dir));
@@ -1628,6 +1692,11 @@ impl ComposeExecutor {
     /// Fully destroy a compose stack including all volumes and data.
     /// Used when deleting a project/environment permanently.
     pub async fn destroy(&self, project_name: &str) -> Result<(), ComposeError> {
+        // Fail before any `docker compose down` CLI invocation or the
+        // bollard-based label sweep below -- a control-plane process with no
+        // daemon has nothing here to destroy.
+        self.require_docker()?;
+
         let project_dir = self.project_dir(project_name);
 
         // Secrets live outside `project_dir` (see `secrets_root`), so removing
@@ -1690,12 +1759,12 @@ impl ComposeExecutor {
     /// to already be removed by the caller (deployment_containers-driven
     /// cleanup); this only sweeps what that leaves behind.
     async fn destroy_labeled_resources(&self, project_name: &str) -> Result<(), ComposeError> {
+        let docker = self.require_docker()?;
         let label_filter = format!("{COMPOSE_PROJECT_LABEL}={project_name}");
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![label_filter]);
 
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(Some(
                 bollard::query_parameters::ListNetworksOptionsBuilder::new()
                     .filters(&filters)
@@ -1709,13 +1778,12 @@ impl ComposeExecutor {
             let Some(id) = network.id.or(network.name) else {
                 continue;
             };
-            if let Err(e) = self.docker.remove_network(&id).await {
+            if let Err(e) = docker.remove_network(&id).await {
                 warn!(project = %project_name, network = %id, error = %e, "Failed to remove Compose-managed network");
             }
         }
 
-        let volumes = self
-            .docker
+        let volumes = docker
             .list_volumes(Some(
                 bollard::query_parameters::ListVolumesOptionsBuilder::new()
                     .filters(&filters)
@@ -1724,8 +1792,7 @@ impl ComposeExecutor {
             .await
             .map_err(|e| ComposeError::Docker(format!("list_volumes for '{project_name}': {e}")))?;
         for volume in volumes.volumes.unwrap_or_default() {
-            if let Err(e) = self
-                .docker
+            if let Err(e) = docker
                 .remove_volume(
                     &volume.name,
                     Some(
@@ -1754,6 +1821,9 @@ impl ComposeExecutor {
         repo_dir: Option<&Path>,
         compose_path: Option<&str>,
     ) -> Result<(), ComposeError> {
+        // Fail before spawning `docker compose stop`.
+        self.require_docker()?;
+
         let project_dir = repo_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.project_dir(project_name));
@@ -4783,7 +4853,7 @@ impl ComposeExecutor {
                 .or_default()
                 .push(service.to_string());
         }
-        let docker = self.docker.clone();
+        let docker = self.require_docker()?;
         let inspections = futures::stream::iter(services_by_image)
             .map(|(image, services)| {
                 let docker = docker.clone();
@@ -4889,9 +4959,9 @@ impl ComposeExecutor {
     /// shared code path with either, so this is a small, deliberate
     /// duplication rather than a new cross-crate dependency for one function.
     async fn ensure_temps_network_exists(&self) -> Result<(), ComposeError> {
+        let docker = self.require_docker()?;
         let network_name = temps_core::NETWORK_NAME.as_str();
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| ComposeError::Docker(format!("Failed to list networks: {e}")))?;
@@ -4901,7 +4971,7 @@ impl ComposeExecutor {
         {
             return Ok(());
         }
-        self.docker
+        docker
             .create_network(bollard::models::NetworkCreateRequest {
                 name: network_name.to_string(),
                 driver: Some("bridge".to_string()),
@@ -5196,7 +5266,10 @@ impl ComposeExecutor {
     /// human-readable placeholder instead of an error so callers can always
     /// embed the result directly in a debug message.
     async fn container_log_tail(&self, container_id: &str) -> String {
-        let logs_stream = self.docker.logs(
+        let Some(docker) = self.docker.get().cloned() else {
+            return "(no log output: local Docker daemon unavailable)".to_string();
+        };
+        let logs_stream = docker.logs(
             container_id,
             Some(LogsOptions {
                 stdout: true,
@@ -5433,10 +5506,15 @@ impl ComposeExecutor {
             // Parse published ports
             let ports = self.parse_publishers(&ps_entry.publishers);
 
-            // Resolve full container ID via Docker inspect (compose ps returns short IDs)
-            let full_id = match self.docker.inspect_container(&ps_entry.id, None).await {
-                Ok(info) => info.id.unwrap_or(ps_entry.id.clone()),
-                Err(_) => ps_entry.id.clone(),
+            // Resolve full container ID via Docker inspect (compose ps returns short IDs).
+            // Best-effort: fall back to the short ID compose ps already gave us
+            // on any inspect failure, including a missing local daemon.
+            let full_id = match self.docker.get() {
+                Some(docker) => match docker.inspect_container(&ps_entry.id, None).await {
+                    Ok(info) => info.id.unwrap_or(ps_entry.id.clone()),
+                    Err(_) => ps_entry.id.clone(),
+                },
+                None => ps_entry.id.clone(),
             };
 
             results.push(ComposeServiceResult {
@@ -5565,8 +5643,8 @@ impl ComposeExecutor {
         base_labels: &HashMap<String, String>,
         service_name: &str,
     ) -> Result<(), ComposeError> {
-        let inspect = self
-            .docker
+        let docker = self.require_docker()?;
+        let inspect = docker
             .inspect_container(container_id, None)
             .await
             .map_err(|e| ComposeError::Docker(format!("inspect failed: {}", e)))?;
@@ -5618,8 +5696,8 @@ impl ComposeExecutor {
         container_id: &str,
         service_name: &str,
     ) -> Result<(), ComposeError> {
-        let inspect = self
-            .docker
+        let docker = self.require_docker()?;
+        let inspect = docker
             .inspect_container(container_id, None)
             .await
             .map_err(|error| {
@@ -5661,10 +5739,10 @@ impl ComposeExecutor {
         containers: &[ComposeServiceResult],
         expected_labels: &HashMap<String, String>,
     ) -> Result<(), ComposeError> {
+        let docker = self.require_docker()?;
         let mut failures = Vec::new();
         for container in containers {
-            match self
-                .docker
+            match docker
                 .inspect_container(&container.container_id, None)
                 .await
             {
@@ -5693,8 +5771,7 @@ impl ComposeExecutor {
                 continue;
             }
 
-            match self
-                .docker
+            match docker
                 .remove_container(
                     &container.container_id,
                     Some(RemoveContainerOptions {
@@ -7905,7 +7982,15 @@ services:
             .await
             .is_ok_and(|output| output.status.success());
         for image in ["ghcr.io/advplyr/audiobookshelf:2.34.0", "alpine:latest"] {
-            if !compose_available || executor.docker.inspect_image(image).await.is_err() {
+            if !compose_available
+                || executor
+                    .docker
+                    .require()
+                    .expect("test_executor only builds an available handle")
+                    .inspect_image(image)
+                    .await
+                    .is_err()
+            {
                 println!("Docker Compose or {image} is unavailable; skipping runtime test");
                 return;
             }
@@ -7991,6 +8076,8 @@ services:
         if !compose_available
             || executor
                 .docker
+                .require()
+                .expect("test_executor only builds an available handle")
                 .inspect_image("alpine:latest")
                 .await
                 .is_err()
@@ -8045,7 +8132,10 @@ services:
             String::from_utf8_lossy(&up.stderr)
         );
 
-        let docker = executor.docker.clone();
+        let docker = executor
+            .docker
+            .require()
+            .expect("test_executor only builds an available handle");
         let inspect_service = |service: &'static str| {
             let args = compose_args("ps");
             let docker = docker.clone();
@@ -8105,6 +8195,8 @@ services:
         if !compose_available
             || executor
                 .docker
+                .require()
+                .expect("test_executor only builds an available handle")
                 .inspect_image("alpine:latest")
                 .await
                 .is_err()
@@ -8189,6 +8281,8 @@ services:
         let retained_id = failure.containers[0].container_id.clone();
         let inspect = executor
             .docker
+            .require()
+            .expect("test_executor only builds an available handle")
             .inspect_container(&retained_id, None)
             .await
             .expect("failed candidate must still exist for log inspection");
@@ -8231,6 +8325,8 @@ services:
         if !compose_available
             || executor
                 .docker
+                .require()
+                .expect("test_executor only builds an available handle")
                 .inspect_image("alpine:latest")
                 .await
                 .is_err()
@@ -8330,6 +8426,8 @@ services:
         if !compose_available
             || executor
                 .docker
+                .require()
+                .expect("test_executor only builds an available handle")
                 .inspect_image("alpine:latest")
                 .await
                 .is_err()
@@ -8426,6 +8524,8 @@ services:
         assert!(matches!(
             executor
                 .docker
+                .require()
+                .expect("test_executor only builds an available handle")
                 .inspect_container(&unsafe_container_id, None)
                 .await,
             Err(bollard::errors::Error::DockerResponseServerError {
@@ -9585,6 +9685,20 @@ services:
             Arc::new(docker),
             PathBuf::from("/tmp/test"),
         ))
+    }
+
+    /// Build an executor with no Docker client at all -- the control-plane
+    /// serve profile. Never touches a real socket or daemon, so unlike
+    /// `test_executor()` this never needs to skip: it is deterministic on
+    /// every machine, CI included.
+    fn disabled_executor(data_dir: PathBuf) -> ComposeExecutor {
+        ComposeExecutor::new_with_handle(
+            Arc::new(DockerHandle::disabled(
+                temps_core::PROFILE_CONTROL_PLANE,
+                temps_core::CONTROL_PLANE_DOCKER_REASON,
+            )),
+            data_dir,
+        )
     }
 
     fn violation_field(err: ComposeError) -> String {
@@ -11243,6 +11357,152 @@ services:
         assert!(
             !secrets_dir.exists(),
             "secrets dir must be deleted after teardown_at with remove_secrets=true"
+        );
+    }
+
+    // --- Control-plane profile: no Docker client at all ---
+    //
+    // These tests build a `ComposeExecutor` from `DockerHandle::disabled`,
+    // never connecting to or even attempting to construct a real bollard
+    // client. They run unconditionally (no `test_executor()`/Docker skip),
+    // and assert both that the typed `DockerUnavailable` error surfaces and
+    // that it does so before any `docker compose` CLI invocation or bollard
+    // call -- a hang or a raw "command not found"/connection-refused error
+    // instead of this typed variant would mean a guard was bypassed.
+
+    #[test]
+    fn docker_available_is_false_for_a_disabled_handle_and_true_for_a_real_client() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        assert!(!disabled_executor(tmp.path().to_path_buf()).docker_available());
+
+        if let Ok(docker) = Docker::connect_with_defaults() {
+            let executor = ComposeExecutor::new(Arc::new(docker), tmp.path().to_path_buf());
+            assert!(executor.docker_available());
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_fails_prepare_and_pull_before_writing_any_compose_file() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = tmp.path().to_path_buf();
+        let executor = disabled_executor(data_dir.clone());
+
+        let request = secrets_test_request(
+            "disabled-handle-project",
+            "services:\n  web:\n    image: alpine:latest\n",
+            HashMap::new(),
+        );
+
+        let error = match executor.prepare_and_pull(&request).await {
+            Ok(_) => panic!("no Docker client exists in this process"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ComposeError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got {error:?}"
+        );
+        // The guard runs before `write_compose_files`: nothing should have
+        // been written to disk for a project that was never touched.
+        assert!(
+            !data_dir
+                .join("compose")
+                .join("disabled-handle-project")
+                .exists(),
+            "prepare_and_pull must fail before writing any compose files"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_fails_deploy_without_ever_shelling_out_to_docker_compose() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let executor = disabled_executor(tmp.path().to_path_buf());
+
+        let request = secrets_test_request(
+            "disabled-handle-deploy",
+            "services:\n  web:\n    image: alpine:latest\n",
+            HashMap::new(),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("no Docker client exists in this process");
+        assert!(
+            matches!(error, ComposeError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_fails_destroy() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let executor = disabled_executor(tmp.path().to_path_buf());
+
+        let error = executor
+            .destroy("disabled-handle-destroy")
+            .await
+            .expect_err("no Docker client exists in this process");
+        assert!(
+            matches!(error, ComposeError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_fails_stop() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let executor = disabled_executor(tmp.path().to_path_buf());
+
+        let error = executor
+            .stop("disabled-handle-stop")
+            .await
+            .expect_err("no Docker client exists in this process");
+        assert!(
+            matches!(error, ComposeError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_fails_teardown_at_when_a_project_directory_exists() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = tmp.path().to_path_buf();
+        let executor = disabled_executor(data_dir.clone());
+
+        // teardown_at() returns Ok(()) early when the project directory does
+        // not exist (no Docker call is needed for that path -- see the
+        // no-daemon-needed tests above). Create it so this test actually
+        // reaches the guard in front of `docker compose down`.
+        let project_name = "disabled-handle-teardown";
+        let project_dir = data_dir.join("compose").join(project_name);
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let error = executor
+            .teardown_at(project_name, None, None, &HashMap::new(), false)
+            .await
+            .expect_err("no Docker client exists in this process");
+        assert!(
+            matches!(error, ComposeError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_container_log_tail_is_a_placeholder_not_a_panic() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let executor = disabled_executor(tmp.path().to_path_buf());
+
+        // Best-effort diagnostic helper: never a Result, so absence of a
+        // daemon must degrade to a placeholder string instead of touching
+        // `self.docker` unconditionally (which would panic-free but still
+        // attempt a bollard call against nothing).
+        let logs = executor
+            .container_log_tail("nonexistent-container-id")
+            .await;
+        assert!(
+            logs.contains("Docker daemon unavailable"),
+            "logs were: {logs}"
         );
     }
 }

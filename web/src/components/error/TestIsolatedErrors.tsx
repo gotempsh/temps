@@ -67,7 +67,9 @@ export function TestIsolatedErrors() {
           <div>
             <h3 className="font-semibold mb-2">✅ When Page Crashes:</h3>
             <ul className="list-disc list-inside space-y-1 text-sm text-muted-foreground">
-              <li>Page content shows error UI with "Try Again" button</li>
+              <li>
+                Page content shows error UI with &quot;Try Again&quot; button
+              </li>
               <li>Sidebar remains functional and interactive</li>
               <li>Header remains functional and interactive</li>
               <li>You can navigate to other pages via sidebar</li>

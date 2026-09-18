@@ -2967,6 +2967,12 @@ impl From<NodeError> for Problem {
                     .with_title("Insufficient Compatible Nodes")
                     .with_detail(error.to_string())
             }
+            // 409, not 501: the capability exists in the product, it is this
+            // process that is configured not to provide it, and the fix
+            // (join a worker node) is stated in the error's own message.
+            NodeError::LocalWorkloadsDisabled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Local Workloads Disabled")
+                .with_detail(error.to_string()),
             NodeError::PlacementConstraintsUnsatisfied { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Placement Constraints Unsatisfied")

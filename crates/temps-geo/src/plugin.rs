@@ -6,6 +6,9 @@
 //! This plugin provides geolocation services including:
 //! - GeoIpService for IP geolocation
 //! - IpAddressService for IP address management and tracking
+//! - GeoSettingsService for the refresh policy, encrypted MaxMind key and
+//!   recorded freshness metadata, all read from `AppSettings::geo`
+//! - A scheduled job that re-downloads the database and hot-swaps it in
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,7 +19,8 @@ use temps_core::plugin::{
 };
 use utoipa::OpenApi;
 
-use crate::{handlers, AppState, GeoIpService, IpAddressService};
+use crate::settings_service::GeoSettingsService;
+use crate::{handlers, refresh, AppState, GeoIpService, IpAddressService};
 
 /// Geo Plugin for managing geolocation and IP address services
 pub struct GeoPlugin;
@@ -83,9 +87,69 @@ impl TempsPlugin for GeoPlugin {
             })?);
             context.register_service(geo_ip_service.clone());
 
-            // Create IpAddressService (depends on GeoIpService)
-            let ip_address_service =
-                Arc::new(IpAddressService::new(db.clone(), geo_ip_service.clone()));
+            // Unconditional, and deliberately outside the match below: this is
+            // the only thing that keeps a **split-role** deployment (ADR-017)
+            // current. There, `temps proxy` is its own OS process with its own
+            // reader, and it has no `EncryptionService`, so it never spawns the
+            // refresh job and never learns that the console process replaced
+            // the `.mmdb` -- it served the database it opened at boot until
+            // restarted. The watcher needs nothing but the filesystem: no
+            // license key, no network, no settings. In the monolith it is a
+            // no-op, because there the refresh already swapped the one reader
+            // both registries share. Skipped in mock mode, which has no file.
+            if !use_mock {
+                refresh::spawn_db_file_watcher(geo_ip_service.clone());
+            }
+
+            // Every geo knob lives on the settings row, so the refresh policy,
+            // the encrypted MaxMind key and the recorded freshness metadata
+            // are all reached through these two services rather than the
+            // environment. `EncryptionService` is genuinely optional here:
+            // `temps-proxy`'s `setup_proxy_plugins` registers only
+            // ConfigPlugin+GeoPlugin in a deliberately minimal context (the
+            // hot-path proxy never touches settings/encryption), so this
+            // plugin must keep working -- with plain GeoIpService lookups and
+            // no refresh job -- when it isn't present, rather than panicking
+            // the proxy on every startup. The full console context always has
+            // it, so `require_service` still applies wherever the settings
+            // service is actually used downstream.
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let encryption_service = context.get_service::<temps_core::EncryptionService>();
+
+            let ip_address_service = match encryption_service {
+                Some(encryption_service) => {
+                    let settings_service =
+                        Arc::new(GeoSettingsService::new(config_service, encryption_service));
+                    context.register_service(settings_service.clone());
+
+                    // Keep the database current without a restart. Skipped in
+                    // mock mode, which has no file to replace.
+                    // `spawn_refresh_job` is idempotent per process, so the
+                    // console API and proxy registries do not each start a
+                    // downloader. The job re-reads the settings each tick, so
+                    // nothing is captured here.
+                    if !use_mock {
+                        refresh::spawn_refresh_job(
+                            geo_ip_service.clone(),
+                            settings_service.clone(),
+                        );
+                    }
+
+                    Arc::new(IpAddressService::with_settings(
+                        db.clone(),
+                        geo_ip_service.clone(),
+                        settings_service,
+                    ))
+                }
+                None => {
+                    tracing::debug!(
+                        "EncryptionService not available in this plugin context; geo settings, \
+                         the scheduled MaxMind refresh and GeoSettingsService are disabled here \
+                         (expected in the proxy's minimal context, not the console's)"
+                    );
+                    Arc::new(IpAddressService::new(db.clone(), geo_ip_service.clone()))
+                }
+            };
             context.register_service(ip_address_service);
 
             tracing::debug!("Geo plugin services registered successfully");
@@ -96,10 +160,12 @@ impl TempsPlugin for GeoPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get GeoIpService from service registry
         let geo_ip_service = context.require_service::<GeoIpService>();
+        let geo_settings_service = context.require_service::<GeoSettingsService>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
             geo_ip_service: geo_ip_service.clone(),
+            geo_settings_service,
         });
 
         // Configure routes (plugin system adds /api prefix)

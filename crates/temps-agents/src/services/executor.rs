@@ -96,6 +96,8 @@ fn synthetic_agent_config(
         tools_config: None,
         webhook_id: None,
         webhook_token: None,
+        // Synthetic: never persisted, never scheduled.
+        cron_next_run_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -1791,6 +1793,8 @@ impl AgentExecutor {
             config_repo_branch: yaml.config_repo_branch.clone(),
             webhook_id: None,
             webhook_token: None,
+            // Ephemeral CLI run: manual trigger only, never scheduled.
+            cron_next_run_at: None,
             created_at: now,
             updated_at: now,
         })
@@ -4126,6 +4130,7 @@ mod tests {
             tools_config: None,
             webhook_id: None,
             webhook_token: None,
+            cron_next_run_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -37,6 +37,7 @@ syntax may have changed.
 - [`tokens`](tokens.md)
 - [`errors`](errors.md)
 - [`metrics`](metrics.md)
+- [`server`](server.md)
 - [`traces`](traces.md)
 - [`facets`](facets.md)
 - [`otel-forward`](otel-forward.md)
@@ -86,3 +87,5 @@ syntax may have changed.
 - [`exec`](exec.md)
 - [`dev`](dev.md)
 - [`cloud`](cloud.md)
+- [`plugin`](plugin.md)
+- [`setup`](setup.md)

@@ -19,6 +19,9 @@ pub enum SensitiveAction {
     InstallExternalPlugin {
         name: String,
     },
+    ChangeExternalPluginGrants {
+        name: String,
+    },
     UninstallExternalPlugin {
         name: String,
     },
@@ -93,6 +96,7 @@ impl SensitiveAction {
         match self {
             Self::CreateApiKey => "create_api_key",
             Self::InstallExternalPlugin { .. } => "install_external_plugin",
+            Self::ChangeExternalPluginGrants { .. } => "change_external_plugin_grants",
             Self::UninstallExternalPlugin { .. } => "uninstall_external_plugin",
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",

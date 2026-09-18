@@ -49,7 +49,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail ?? body.title ?? detail
     } catch {
       // fall through with statusText
@@ -66,7 +69,7 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
  * Throws when the parent backup does not exist (server returns 404).
  */
 export async function listBackupChildren(
-  parentBackupId: number,
+  parentBackupId: number
 ): Promise<ChildBackupListResponse> {
   const response = await fetch(`/api/backups/${parentBackupId}/children`, {
     credentials: 'include',

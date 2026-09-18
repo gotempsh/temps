@@ -402,7 +402,6 @@ function OtelSetupSection({
 }) {
   const navigate = useNavigate()
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
-  const [celebrate, setCelebrate] = useState(false)
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] =
     useState<string>('nextjs')
@@ -414,16 +413,12 @@ function OtelSetupSection({
     enabled: !!project.id,
   })
 
-  // Auto-select first environment
-  useEffect(() => {
-    if (environments && environments.length > 0 && !selectedEnvId) {
-      setSelectedEnvId(String(environments[0].id))
-    }
-  }, [environments, selectedEnvId])
+  const effectiveSelectedEnvId =
+    selectedEnvId || (environments?.[0] ? String(environments[0].id) : '')
 
   const selectedEnv = useMemo(
-    () => environments?.find((e) => String(e.id) === selectedEnvId),
-    [environments, selectedEnvId]
+    () => environments?.find((e) => String(e.id) === effectiveSelectedEnvId),
+    [environments, effectiveSelectedEnvId]
   )
 
   const baseUrl = window.location.origin
@@ -453,16 +448,16 @@ OTEL_SERVICE_NAME=${project.name}`
     refetchOnWindowFocus: false,
   })
   const hasTraceNow = !!waitingProbe?.has_traces
+  const celebrate = wizardStep === 'waiting' && hasTraceNow
 
   useEffect(() => {
-    if (wizardStep === 'waiting' && hasTraceNow && !celebrate) {
-      setCelebrate(true)
+    if (celebrate) {
       const timer = setTimeout(() => {
         onVerified?.()
       }, 1600)
       return () => clearTimeout(timer)
     }
-  }, [wizardStep, hasTraceNow, celebrate, onVerified])
+  }, [celebrate, onVerified])
 
   const steps = [
     { id: 'framework' as WizardStepId, label: 'Framework' },
@@ -602,7 +597,10 @@ OTEL_SERVICE_NAME=${project.name}`
                 <span className="text-xs text-muted-foreground shrink-0">
                   Environment:
                 </span>
-                <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
+                <Select
+                  value={effectiveSelectedEnvId}
+                  onValueChange={setSelectedEnvId}
+                >
                   <SelectTrigger className="w-[200px] h-8">
                     <SelectValue placeholder="Select environment" />
                   </SelectTrigger>
@@ -671,8 +669,8 @@ OTEL_SERVICE_NAME=${project.name}`
                       Waiting for your first trace…
                     </h3>
                     <p className="text-sm text-muted-foreground">
-                      Deploy or run your app and trigger a request. We'll pick
-                      it up as soon as it arrives.
+                      Deploy or run your app and trigger a request. We&apos;ll
+                      pick it up as soon as it arrives.
                     </p>
                   </div>
                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -741,7 +739,7 @@ export default function TracesList({ project }: TracesListProps) {
   // the FacetToggle in TraceDetail) — an unfaceted attribute would force a
   // JSON scan over every span in the project's whole retention window, which
   // is exactly the query this platform can't afford at 500M+ rows.
-  const [attrKey, setAttrKey] = useState(
+  const [rawAttrKey, setAttrKey] = useState(
     () => searchParams.get('attr_key') || ''
   )
   const [attrValue, setAttrValue] = useState(
@@ -769,10 +767,12 @@ export default function TracesList({ project }: TracesListProps) {
   const [refreshKey, setRefreshKey] = useState(0)
 
   // Compute time window (refreshKey forces a fresh "now" on Refresh)
-  const { startTime, endTime } = useMemo(
-    () => computeTracesTimeWindow(timeRange),
-    [timeRange, refreshKey]
-  )
+  const { startTime, endTime } = useMemo(() => {
+    // Reading the generation is intentional: Refresh recomputes relative
+    // ranges against a fresh current time even when the range label is unchanged.
+    void refreshKey
+    return computeTracesTimeWindow(timeRange)
+  }, [timeRange, refreshKey])
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -789,22 +789,14 @@ export default function TracesList({ project }: TracesListProps) {
     ...listFacetsOptions(),
     staleTime: 30_000,
   })
-  const facets = facetsData?.data ?? []
-
-  // If the URL names an attribute key (e.g. from a shared link, or one whose
-  // facet was since removed) that isn't a currently registered facet, drop
-  // it once the facet list has loaded. Otherwise the dropdown — which only
-  // lists registered facets — has no matching option to show, renders blank,
-  // and looks like "the selection disappeared" even though the filter is
-  // still silently applied underneath via the slow JSON-scan fallback.
-  useEffect(() => {
-    if (!facetsData || !attrKey) return
-    if (!facets.some((f) => f.attribute_key === attrKey)) {
-      setAttrKey('')
-      setAttrValue('')
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [facetsData])
+  const facets = useMemo(() => facetsData?.data ?? [], [facetsData?.data])
+  // Shared links can outlive a facet registration. Once facets load, derive
+  // an empty selection so the removed key cannot silently trigger a slow JSON
+  // scan while the dropdown appears blank.
+  const attrKey =
+    facetsData && !facets.some((facet) => facet.attribute_key === rawAttrKey)
+      ? ''
+      : rawAttrKey
 
   // Fetch deployments for the selected environment (or all)
   const { data: deploymentsData } = useQuery({
@@ -915,7 +907,7 @@ export default function TracesList({ project }: TracesListProps) {
     }),
   })
 
-  const traces: TraceSummary[] = data?.data ?? []
+  const traces = useMemo<TraceSummary[]>(() => data?.data ?? [], [data?.data])
   const totalCount = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 

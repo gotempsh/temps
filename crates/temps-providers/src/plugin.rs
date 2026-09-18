@@ -37,6 +37,15 @@ impl TempsPlugin for ProvidersPlugin {
         "providers"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_core::EncryptionService>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -46,17 +55,21 @@ impl TempsPlugin for ProvidersPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             // AuditService should already be registered by the audit plugin
-            let docker = context.require_service::<bollard::Docker>();
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
 
             // Create ExternalServiceManager. The DnsRegistry is constructed
             // here (not pulled from the registry) because it's a thin wrapper
             // over the same DatabaseConnection — going through the registry
             // would force a plugin-init ordering constraint with no benefit.
             let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
-            let external_service_manager = Arc::new(ExternalServiceManager::new(
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let external_service_manager = Arc::new(ExternalServiceManager::new_with_handle(
                 db.clone(),
                 encryption_service.clone(),
-                docker,
+                docker_handle,
+                local_workloads.local_workloads_enabled(),
                 dns_registry,
             ));
             context.register_service(external_service_manager.clone());
@@ -73,6 +86,22 @@ impl TempsPlugin for ProvidersPlugin {
                 ExternalServicesEnvProvider::new(external_service_manager.clone(), db.clone()),
             );
             context.register_service(env_vars_provider);
+
+            // Managed-service containers live on THIS host's Docker daemon.
+            // A process that runs no local workloads has none to reconcile, so
+            // both background sweeps below are skipped entirely rather than
+            // left to retry against an absent daemon. The HTTP surface stays
+            // registered so the console can still list what exists and explain
+            // why provisioning is unavailable here.
+            if !local_workloads.local_workloads_enabled() {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; not starting managed-service \
+                     cluster reconcilers or standalone-service DNS reconciliation"
+                );
+                tracing::debug!("Providers plugin services registered successfully");
+                return Ok(());
+            }
 
             // Spawn role reconcilers for every cluster that's already
             // running. Without this, after a control-plane restart no

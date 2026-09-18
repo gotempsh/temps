@@ -39,7 +39,9 @@ function getTooltipText(count: number, date: Date): string {
   }
 }
 
-export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphProps) {
+export function DeploymentActivityGraph({
+  projectId,
+}: DeploymentActivityGraphProps) {
   const [tooltip, setTooltip] = useState<{
     text: string
     x: number
@@ -80,7 +82,9 @@ export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphPr
 
     // If endDate is after the last week's end, we need to add one more week
     if (endDate > lastWeekEnd) {
-      const nextWeekStart = new Date(lastWeekEnd.getTime() + 24 * 60 * 60 * 1000)
+      const nextWeekStart = new Date(
+        lastWeekEnd.getTime() + 24 * 60 * 60 * 1000
+      )
       // Adjust to Sunday
       const dayOfWeek = nextWeekStart.getDay()
       if (dayOfWeek !== 0) {
@@ -162,7 +166,8 @@ export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphPr
     <div className="w-full space-y-3 rounded-lg border bg-card p-4 sm:p-6 lg:w-1/2">
       <div className="flex items-baseline justify-between mb-4">
         <h3 className="text-lg font-semibold">
-          {graphData.total} deployment{graphData.total !== 1 ? 's' : ''} in the last year
+          {graphData.total} deployment{graphData.total !== 1 ? 's' : ''} in the
+          last year
         </h3>
       </div>
 
@@ -213,16 +218,23 @@ export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphPr
               {/* Activity squares - all 7 days. Week columns flex to fill width. */}
               <div className="flex gap-0.5">
                 {graphData.weeks.map((week, weekIdx) => (
-                  <div key={weekIdx} className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <div
+                    key={weekIdx}
+                    className="flex min-w-0 flex-1 flex-col gap-0.5"
+                  >
                     {week.map((day, dayIdx) => {
                       // If day is outside the range, show it as invisible/empty (no background)
                       if (!day.isInRange) {
-                        return <div key={dayIdx} className="aspect-square w-full" />
+                        return (
+                          <div key={dayIdx} className="aspect-square w-full" />
+                        )
                       }
 
                       // Render all days in range with their intensity color (including 0 = muted)
                       const today = new Date()
-                      const isToday = format(day.day, 'yyyy-MM-dd') === format(today, 'yyyy-MM-dd')
+                      const isToday =
+                        format(day.day, 'yyyy-MM-dd') ===
+                        format(today, 'yyyy-MM-dd')
 
                       return (
                         <div

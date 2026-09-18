@@ -3,7 +3,10 @@
 
 'use client'
 
-import { listEmailDomains as listDomains2, listEmailProviders as listProviders2 } from '@/api/client'
+import {
+  listEmailDomains as listDomains2,
+  listEmailProviders as listProviders2,
+} from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -47,7 +50,6 @@ async function getEmailStatus(): Promise<{
   }
 }
 
-
 function SetupStatus() {
   const { data: status } = useQuery({
     queryKey: ['email-status'],
@@ -65,18 +67,26 @@ function SetupStatus() {
       ) : (
         <Info className="h-4 w-4" />
       )}
-      <AlertTitle>{isReady ? 'Ready to send emails' : 'Setup required'}</AlertTitle>
+      <AlertTitle>
+        {isReady ? 'Ready to send emails' : 'Setup required'}
+      </AlertTitle>
       <AlertDescription>
         {isReady ? (
           <>
             You have {status.verifiedDomains.length} verified domain
-            {status.verifiedDomains.length > 1 ? 's' : ''}: {status.verifiedDomains.join(', ')}
+            {status.verifiedDomains.length > 1 ? 's' : ''}:{' '}
+            {status.verifiedDomains.join(', ')}
           </>
         ) : (
           <>
-            {!status.hasProviders && 'You need to configure an email provider. '}
-            {status.hasProviders && !status.hasDomains && 'You need to add and verify a domain. '}
-            {status.hasDomains && status.verifiedDomains.length === 0 && 'Your domains are pending DNS verification. '}
+            {!status.hasProviders &&
+              'You need to configure an email provider. '}
+            {status.hasProviders &&
+              !status.hasDomains &&
+              'You need to add and verify a domain. '}
+            {status.hasDomains &&
+              status.verifiedDomains.length === 0 &&
+              'Your domains are pending DNS verification. '}
             Go to the Providers and Domains tabs to complete setup.
           </>
         )}
@@ -406,8 +416,8 @@ export function SdkDocumentation() {
       <div>
         <h2 className="text-2xl font-bold tracking-tight">SDK & Integration</h2>
         <p className="text-muted-foreground">
-          Learn how to send transactional emails from your applications using the
-          Temps SDK or direct API calls.
+          Learn how to send transactional emails from your applications using
+          the Temps SDK or direct API calls.
         </p>
       </div>
 
@@ -486,15 +496,20 @@ export function SdkDocumentation() {
       {/* Basic Usage */}
       <section className="space-y-4">
         <h3 className="text-xl font-semibold">Basic Usage</h3>
-        <CodeBlock code={basicUsageCode} language="typescript" title="Send a simple email" />
+        <CodeBlock
+          code={basicUsageCode}
+          language="typescript"
+          title="Send a simple email"
+        />
       </section>
 
       {/* Framework Integration */}
       <section className="space-y-6">
         <h3 className="text-xl font-semibold">Email Templates</h3>
         <p className="text-muted-foreground">
-          Build beautiful, type-safe email templates using React-based libraries.
-          Choose between react-email and jsx-email based on your preferences.
+          Build beautiful, type-safe email templates using React-based
+          libraries. Choose between react-email and jsx-email based on your
+          preferences.
         </p>
 
         <Tabs defaultValue="react-email" className="w-full">
@@ -556,7 +571,11 @@ export function SdkDocumentation() {
               title="Create email template (emails/welcome.tsx)"
             />
 
-            <CodeBlock code={jsxEmailSendCode} language="typescript" title="Send with Temps SDK" />
+            <CodeBlock
+              code={jsxEmailSendCode}
+              language="typescript"
+              title="Send with Temps SDK"
+            />
           </TabsContent>
         </Tabs>
       </section>
@@ -565,8 +584,8 @@ export function SdkDocumentation() {
       <section className="space-y-4">
         <h3 className="text-xl font-semibold">Direct API Usage</h3>
         <p className="text-muted-foreground">
-          If you prefer not to use the SDK, you can call the API directly from any
-          language.
+          If you prefer not to use the SDK, you can call the API directly from
+          any language.
         </p>
 
         <Tabs defaultValue="fetch" className="w-full">
@@ -577,11 +596,19 @@ export function SdkDocumentation() {
           </TabsList>
 
           <TabsContent value="fetch" className="mt-4">
-            <CodeBlock code={directApiCode} language="typescript" title="Using fetch" />
+            <CodeBlock
+              code={directApiCode}
+              language="typescript"
+              title="Using fetch"
+            />
           </TabsContent>
 
           <TabsContent value="python" className="mt-4">
-            <CodeBlock code={pythonCode} language="python" title="Using httpx" />
+            <CodeBlock
+              code={pythonCode}
+              language="python"
+              title="Using httpx"
+            />
           </TabsContent>
 
           <TabsContent value="go" className="mt-4">
@@ -602,8 +629,9 @@ export function SdkDocumentation() {
           </CardHeader>
           <CardContent className="space-y-4">
             <p className="text-sm text-muted-foreground">
-              Send an email. The domain is automatically extracted from the sender address.
-              If the domain is verified, the email is sent; otherwise, it's captured for viewing.
+              Send an email. The domain is automatically extracted from the
+              sender address. If the domain is verified, the email is sent;
+              otherwise, it&apos;s captured for viewing.
             </p>
 
             <div className="space-y-2">
@@ -623,73 +651,96 @@ export function SdkDocumentation() {
                       <td className="p-3 font-mono">from</td>
                       <td className="p-3">string</td>
                       <td className="p-3">Yes</td>
-                      <td className="p-3 text-muted-foreground">Sender email address (domain auto-extracted)</td>
+                      <td className="p-3 text-muted-foreground">
+                        Sender email address (domain auto-extracted)
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">from_name</td>
                       <td className="p-3">string</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">Sender display name</td>
+                      <td className="p-3 text-muted-foreground">
+                        Sender display name
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">to</td>
                       <td className="p-3">string[]</td>
                       <td className="p-3">Yes</td>
-                      <td className="p-3 text-muted-foreground">Recipient email addresses</td>
+                      <td className="p-3 text-muted-foreground">
+                        Recipient email addresses
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">cc</td>
                       <td className="p-3">string[]</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">CC recipients</td>
+                      <td className="p-3 text-muted-foreground">
+                        CC recipients
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">bcc</td>
                       <td className="p-3">string[]</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">BCC recipients</td>
+                      <td className="p-3 text-muted-foreground">
+                        BCC recipients
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">reply_to</td>
                       <td className="p-3">string</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">Reply-to address</td>
+                      <td className="p-3 text-muted-foreground">
+                        Reply-to address
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">subject</td>
                       <td className="p-3">string</td>
                       <td className="p-3">Yes</td>
-                      <td className="p-3 text-muted-foreground">Email subject line</td>
+                      <td className="p-3 text-muted-foreground">
+                        Email subject line
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">html</td>
                       <td className="p-3">string</td>
                       <td className="p-3">*</td>
-                      <td className="p-3 text-muted-foreground">HTML email body</td>
+                      <td className="p-3 text-muted-foreground">
+                        HTML email body
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">text</td>
                       <td className="p-3">string</td>
                       <td className="p-3">*</td>
-                      <td className="p-3 text-muted-foreground">Plain text email body</td>
+                      <td className="p-3 text-muted-foreground">
+                        Plain text email body
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">headers</td>
                       <td className="p-3">object</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">Custom email headers</td>
+                      <td className="p-3 text-muted-foreground">
+                        Custom email headers
+                      </td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">tags</td>
                       <td className="p-3">string[]</td>
                       <td className="p-3">No</td>
-                      <td className="p-3 text-muted-foreground">Tags for categorization</td>
+                      <td className="p-3 text-muted-foreground">
+                        Tags for categorization
+                      </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
               <p className="text-xs text-muted-foreground">
-                * At least one of <code>html</code> or <code>text</code> is required.
+                * At least one of <code>html</code> or <code>text</code> is
+                required.
               </p>
             </div>
           </CardContent>
