@@ -760,8 +760,12 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),
         )
-        .layer(axum::Extension(rate_limiter))
-        .layer(axum::middleware::from_fn(auth_rate_limit_middleware));
+        // `Extension` must be added last (outermost) so it runs before
+        // `auth_rate_limit_middleware` on the way in — Axum composes
+        // `.layer()` calls like an onion, and the layer added last wraps
+        // everything before it, seeing the request first.
+        .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
+        .layer(axum::Extension(rate_limiter));
 
     // Non-rate-limited routes (require authentication already)
     let authenticated_routes = Router::new()
@@ -3552,6 +3556,60 @@ mod tests {
         // This call panics if any route overlaps. Just performing the merge
         // is the assertion — no need to inspect the result.
         let _merged = auth_routes.merge(oidc_routes);
+    }
+
+    /// `configure_routes()` must register `Extension(rate_limiter)` as the
+    /// outermost layer, added after `auth_rate_limit_middleware` (see the
+    /// comment at the layer registration site). This test builds the real
+    /// router and drives requests through it end-to-end via
+    /// `tower::ServiceExt::oneshot`, asserting a 429 once the configured
+    /// limit is exceeded — unlike the `AuthRateLimiter::check()` unit tests
+    /// in `rate_limit.rs`, which exercise the limiter's own logic in
+    /// isolation, this one fails if the layer order regresses.
+    #[tokio::test]
+    async fn test_rate_limited_routes_actually_rate_limit() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+
+        // The body is deliberately invalid (missing required LoginRequest
+        // fields), so every allowed request fails fast in the JSON
+        // extractor, before ever touching the mock database. Only the
+        // rate-limit middleware's own decision (429 vs. anything else)
+        // is under test here.
+        // `ConnectInfo<SocketAddr>` is normally injected by
+        // `into_make_service_with_connect_info` on a real connection; a bare
+        // `Router::oneshot()` call doesn't provide it, so it must be
+        // inserted into the request's extensions manually here.
+        let peer: std::net::SocketAddr = "203.0.113.1:12345".parse().unwrap();
+        let send = |app: axum::Router| async move {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(request).await.unwrap().status()
+        };
+
+        for i in 0..10 {
+            let status = send(app.clone()).await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "request {i} (within the 10-per-window limit) was rate limited"
+            );
+        }
+
+        let status = send(app.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 11th request in the window should have been rate limited"
+        );
     }
 
     /// The login handler must return a constant 401 detail for both
