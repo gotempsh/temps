@@ -83,6 +83,12 @@ bunx --bun @temps-sdk/cli plugin dev grants set --session authoring --grant even
 bunx --bun @temps-sdk/cli plugin dev logs --session authoring --json
 ```
 
+The simulator supplies `database_url: null` and `host_data_dir: null`. Plugins whose
+manifest requires either capability cannot complete its handshake. Fixtures and host API
+grants do not supply these launch resources. For such plugins, retain unit/build evidence
+and perform runtime verification on a compatible real development host through that
+language's supported installation path; report simulator coverage as unavailable.
+
 Use the runner's printed loopback preview URL; do not invent a port or credentials.
 `--fixtures` supports host/mock-AI data; inspect its schema in the matching CLI source.
 Test `--role reader` as well as admin. Read the report/state after emitting an event:
@@ -97,7 +103,8 @@ runtime. Do not register duplicate SDK health routes or block a running Tokio ex
 with `block_on`. Follow the SDK's async initialization pattern. Use contextual `thiserror`
 errors, compile the UI before embedding, and check/test the affected crate.
 
-Build and test the crate, then supply the resulting executable to the same local simulator:
+Build and test the crate. If its manifest does not require a database URL or host-data
+path, supply the resulting executable to the same local simulator:
 
 ```sh
 cargo check -p your-plugin
@@ -108,7 +115,11 @@ bunx --bun @temps-sdk/cli plugin dev ./target/release/your-plugin --session rust
 
 Replace the package/binary names with the actual Cargo configuration. Build required UI
 assets first using that project's documented build process. Simulator verification is local
-runtime evidence, not installation or publication.
+runtime evidence, not installation or publication. For Rust plugins requiring database or
+host-data launch resources, this simulator cannot run them: use a compatible real development
+host after arranging the separate supported signed native-package installation. Do not
+remove required capabilities merely to make a simulator test pass, or claim runtime
+verification complete based on a failed handshake.
 
 Stop this Rust branch of the skill at a tested executable. The GitHub source installer only
 builds TypeScript with Bun; it does not build Cargo projects. Manual copying or symlinking
