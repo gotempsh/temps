@@ -880,10 +880,24 @@ impl AlertEvaluator {
     /// the overwhelmingly common case — a healthy rule evaluated every 30
     /// seconds — issues no write at all.
     async fn clear_breach(&self, rule_id: i32) {
-        let was_breaching = self.breach_start.write().await.remove(&rule_id).is_some();
-        if was_breaching {
-            self.clear_persisted_breach_start(rule_id).await;
-        }
+        self.breach_start.write().await.remove(&rule_id);
+        // Unconditional, not gated on whether the cache had an entry: the
+        // cache and the database can disagree whenever
+        // `load_breach_state_from_db` failed on startup (logged and
+        // swallowed there), which leaves the cache empty while the database
+        // can still hold a window from before the restart. Gating this call
+        // on the cache used to leave that stale row in place for a future
+        // breach to adopt -- `claim_breach_start` now guards against
+        // adopting a stale row too, but clearing it here as well means a
+        // recovered rule's database state actually reflects "recovered"
+        // instead of relying solely on that second check.
+        //
+        // This does not reintroduce a per-cycle write for the common healthy
+        // case: `clear_persisted_breach_start` filters on
+        // `breach_started_at IS NOT NULL`, so a rule that was never
+        // breaching in the database matches zero rows and costs no WAL
+        // write, only the round trip.
+        self.clear_persisted_breach_start(rule_id).await;
     }
 
     /// Resolve project/environment/deployment IDs for a FireAlarmRequest.
@@ -2431,15 +2445,40 @@ mod tests {
     /// instance into a steady stream of pointless database writes.
     #[tokio::test]
     async fn clearing_a_rule_that_was_not_breaching_writes_nothing() {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        // clear_breach no longer trusts the in-memory cache alone -- a
+        // failed startup restore can leave the cache empty while the
+        // database still holds a window from before the restart (see
+        // `a_stale_persisted_window_is_not_adopted_by_a_new_breach`), so it
+        // always issues the guarded clear. What must stay true is that the
+        // guard (`breach_started_at IS NOT NULL`) makes this a no-op write
+        // for the common case: zero rows match, so it costs a round trip but
+        // never a WAL write, and never touches any column but the one it
+        // owns.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
         let evaluator = evaluator_with_shared_db(db.clone());
 
         evaluator.clear_breach(42).await;
 
         let log = transaction_log(evaluator, db);
+        assert_eq!(
+            log.len(),
+            1,
+            "clearing must always attempt the guarded UPDATE, even when the \
+             cache had nothing cached, so a stale DB row from a failed \
+             startup restore cannot outlive a recovery: {log:?}"
+        );
+        let sql = format!("{:?}", log[0]);
         assert!(
-            log.is_empty(),
-            "a rule that was never breaching must not touch the database: {log:?}"
+            sql.contains("breach_started_at") && sql.contains("IS NOT NULL"),
+            "the guard must be present so this is a genuine no-op against a \
+             real database (zero rows matched, no WAL write): {sql}"
         );
     }
 
