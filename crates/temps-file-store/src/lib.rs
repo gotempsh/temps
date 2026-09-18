@@ -13,6 +13,7 @@ pub mod cache;
 pub mod fs_store;
 pub mod s3_client;
 pub mod s3_config;
+pub mod s3_store;
 
 use async_trait::async_trait;
 use bytes::Bytes;
