@@ -948,7 +948,15 @@ mod tests {
             Err(FileStoreError::Backend("unused test operation".to_string()))
         }
 
+        async fn open(&self, _path: &str) -> Result<OpenedBlob, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
         async fn exists(&self, _path: &str) -> Result<bool, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn open_raw(&self, _key: &str) -> Result<OpenedBlob, FileStoreError> {
             Err(FileStoreError::Backend("unused test operation".to_string()))
         }
     }

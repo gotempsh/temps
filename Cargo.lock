@@ -11650,8 +11650,11 @@ name = "temps-file-store"
 version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
+ "aws-sdk-s3",
  "bytes",
  "hex",
+ "moka",
+ "serial_test",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",

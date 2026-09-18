@@ -9,7 +9,10 @@
 //! URL path → content hash mapping stored in a database table
 //! (`static_asset_cache`), queried by the proxy with in-memory caching.
 
+pub mod cache;
 pub mod fs_store;
+pub mod s3_client;
+pub mod s3_config;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,6 +34,12 @@ pub enum FileStoreError {
 
     #[error("Backend error: {0}")]
     Backend(String),
+
+    /// A remote-backend operation (S3-compatible PUT/GET/HEAD/DELETE, or an
+    /// idle body-read stall) did not complete within its configured timeout.
+    /// Never surfaced by the filesystem backend, which has no network I/O.
+    #[error("Operation on '{path}' timed out after {timeout_secs}s")]
+    Timeout { path: String, timeout_secs: u64 },
 }
 
 /// An opened CAS blob whose body can be consumed with bounded async reads.
@@ -67,6 +76,36 @@ pub trait FileStore: Send + Sync {
     /// Retrieve data by path key (for non-CAS use cases like edge caching).
     async fn get(&self, path: &str) -> Result<Bytes, FileStoreError>;
 
+    /// Open data by path key without buffering its body, returning metadata
+    /// from the opened file/stream itself.
+    ///
+    /// Unlike [`FileStore::get`], this is safe to use for arbitrarily large
+    /// path-keyed content (e.g. static-site build output up to hundreds of
+    /// megabytes per file): callers stream the body in fixed-size chunks
+    /// instead of buffering it whole. Mirrors [`FileStore::open_blob`] for
+    /// the path-keyed namespace.
+    async fn open(&self, path: &str) -> Result<OpenedBlob, FileStoreError>;
+
     /// Check if a path key exists (for non-CAS use cases).
     async fn exists(&self, path: &str) -> Result<bool, FileStoreError>;
+
+    /// Open an object at exactly `key`, with none of [`FileStore::open`]'s
+    /// `path`-keyed namespacing or defensive traversal-sanitization applied
+    /// (only the backend's own storage root/prefix, e.g. an S3 bucket
+    /// prefix, is still applied).
+    ///
+    /// This is a distinct namespace from [`FileStore::open`]/[`FileStore::get`]:
+    /// those are for callers that hand this store an arbitrary path and want
+    /// it sanitized into a private "cache"/"paths" sub-namespace they don't
+    /// otherwise control the layout of. `open_raw` is for callers that
+    /// already fully own and validate the key themselves and need it opened
+    /// exactly as given, because something outside this trait wrote the
+    /// object at that exact key.
+    ///
+    /// The motivating caller is the proxy's static-site read path: an S3
+    /// static-site deployment is written key-for-key by
+    /// `temps_deployer::s3_static_deployer::S3StaticDeployer` (its own
+    /// `aws_sdk_s3::Client`, not this trait), so reading it back must use
+    /// the identical key — not a `path/`-namespaced derivative of it.
+    async fn open_raw(&self, key: &str) -> Result<OpenedBlob, FileStoreError>;
 }
