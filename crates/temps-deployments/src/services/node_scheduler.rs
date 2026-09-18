@@ -343,9 +343,19 @@ impl NodeScheduler {
         labels: Option<&serde_json::Value>,
         target_node_ids: Option<&[i32]>,
     ) -> Result<Vec<String>, NodeError> {
-        let Some(local) = self.local_platform() else {
+        let local = self.local_platform();
+
+        // With local workloads enabled, an unknown control-plane platform is
+        // the historical "build once, natively" case.
+        //
+        // With them DISABLED there is no local daemon to discover a platform
+        // from, so `local` is always `None` — and returning empty here would
+        // silently mean "build for the builder's architecture", which is the
+        // one architecture no replica will ever run on. The build set must
+        // come from the nodes that will actually run the image instead.
+        if local.is_none() && self.local_workloads_enabled {
             return Ok(Vec::new());
-        };
+        }
 
         let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
@@ -379,8 +389,17 @@ impl NodeScheduler {
             let Some(node_platform) = node.architecture.as_deref() else {
                 continue;
             };
-            if temps_deployer::platform::platforms_match(node_platform, &local) {
-                continue;
+            // Skip a node that shares the control plane's architecture: its
+            // image comes from the native build. Only meaningful when the
+            // control plane is itself a placement target — with local
+            // workloads disabled nothing lands here, so every target node's
+            // architecture has to be built for explicitly.
+            if let Some(local) = local.as_deref() {
+                if self.local_workloads_enabled
+                    && temps_deployer::platform::platforms_match(node_platform, local)
+                {
+                    continue;
+                }
             }
             // The architecture arrives over the network from the node itself,
             // and whatever lands here is handed to `docker build --platform`
@@ -406,13 +425,29 @@ impl NodeScheduler {
         }
 
         if platforms.is_empty() {
+            if !self.local_workloads_enabled {
+                // Nothing to build for, and no local slot to fall back on:
+                // either no node is eligible, or none has reported an
+                // architecture yet. Say so — a silent empty vec here becomes
+                // a native build producing an image no target can run.
+                tracing::warn!(
+                    "No eligible worker node reported an architecture, and this process runs no                      local workloads, so no build platform could be derived. The build will run                      for the builder's own architecture, which may not match any node. Check                      that a node is active and has completed a heartbeat (`temps join`)."
+                );
+            }
             return Ok(Vec::new());
         }
 
-        // Local first: it owns the unsuffixed tag, keeping image names stable
-        // for the machine that builds and stores them.
         platforms.sort();
-        platforms.insert(0, local);
+
+        // Local first: it owns the unsuffixed tag, keeping image names stable
+        // for the machine that builds and stores them. Only when the control
+        // plane is a placement target — otherwise it owns no replica, and
+        // prepending its architecture would pay for a build nothing runs.
+        if self.local_workloads_enabled {
+            if let Some(local) = local {
+                platforms.insert(0, local);
+            }
+        }
 
         // Every extra platform is a full image build on the control plane,
         // usually emulated. Cap the fan-out so a cluster reporting many
@@ -1111,10 +1146,22 @@ mod tests {
     }
 
     fn scheduler_with_nodes(nodes_list: Vec<nodes::Model>, local: &str) -> NodeScheduler {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(mock_db_with_nodes(
+            nodes_list,
+        )))))
+        .with_local_platform(local)
+    }
+
+    /// A connection whose single `list_active` query returns `nodes_list`.
+    ///
+    /// Separate from `scheduler_with_nodes` because the control-plane profile
+    /// tests need a scheduler with **no** local platform declared — that is
+    /// precisely the state a process with no Docker daemon is in, and
+    /// `with_local_platform` would paper over it.
+    fn mock_db_with_nodes(nodes_list: Vec<nodes::Model>) -> sea_orm::DatabaseConnection {
+        MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![nodes_list])
-            .into_connection();
-        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db)))).with_local_platform(local)
+            .into_connection()
     }
 
     // ── Architecture-aware scheduling ────────────────────────────────────
@@ -1278,6 +1325,126 @@ mod tests {
             matches!(result, Err(NodeError::LocalWorkloadsDisabled { .. })),
             "expected LocalWorkloadsDisabled for an explicit control-plane target"
         );
+    }
+
+    /// A mixed target list — the control plane (synthetic ID 0) plus a real
+    /// worker — is a legitimate request, and in this profile the control-plane
+    /// half of it cannot be honoured. The behaviour change (it used to fall
+    /// through to the worker) is deliberate and must stay pinned: silently
+    /// dropping half an explicit placement request would put replicas
+    /// somewhere the user did not ask for.
+    #[tokio::test]
+    async fn mixed_control_plane_and_worker_targets_are_refused() {
+        let scheduler =
+            control_plane_scheduler(vec![make_node_with_arch(5, "worker-e", "linux/amd64")]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 5]), false, &[], &[])
+            .await;
+
+        match result {
+            Err(NodeError::LocalWorkloadsDisabled { requested_replicas }) => {
+                assert_eq!(requested_replicas, 2);
+            }
+            other => panic!(
+                "a target list naming the control plane must be refused explicitly, got {:?}",
+                other.map(|o| o.assignments)
+            ),
+        }
+    }
+
+    /// The same list in the `full` profile still schedules, so the refusal
+    /// above is the profile talking and not a regression in target handling.
+    #[tokio::test]
+    async fn mixed_control_plane_and_worker_targets_still_work_in_the_full_profile() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(5, "worker-e", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 5]), false, &[], &[])
+            .await
+            .expect("control plane + worker is a valid target list in the full profile")
+            .assignments;
+
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            assignments.iter().any(|a| a.is_local()),
+            "the control plane was named explicitly: {assignments:?}"
+        );
+        assert!(
+            assignments.iter().any(|a| !a.is_local()),
+            "the worker was named explicitly: {assignments:?}"
+        );
+    }
+
+    // ── required_build_platforms with local workloads disabled ───────────
+
+    /// The regression this guards: with no local daemon the control plane has
+    /// no discovered platform, so the old early-return produced an empty vec
+    /// and the build silently ran for the builder's architecture — the one
+    /// architecture no replica ever runs on.
+    #[tokio::test]
+    async fn build_platforms_come_from_target_nodes_when_local_is_disabled() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![make_node_with_arch(1, "worker-a", "linux/arm64")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("an active node reported an architecture");
+
+        assert_eq!(
+            platforms,
+            vec!["linux/arm64".to_string()],
+            "the build must target the node that will run the image"
+        );
+    }
+
+    /// Several worker architectures, none of them local: every one is built
+    /// for, and the control plane's own architecture is never prepended
+    /// because no replica lands there.
+    #[tokio::test]
+    async fn build_platforms_cover_every_target_architecture_when_local_is_disabled() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![
+                make_node_with_arch(1, "worker-a", "linux/arm64"),
+                make_node_with_arch(2, "worker-b", "linux/amd64"),
+            ]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let mut platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("both nodes reported an architecture");
+        platforms.sort();
+
+        assert_eq!(
+            platforms,
+            vec!["linux/amd64".to_string(), "linux/arm64".to_string()]
+        );
+    }
+
+    /// No node has reported an architecture yet. Empty is the honest answer
+    /// (there is nothing to derive from), and the caller falls back to a
+    /// native build — but it must not be silent, so the code warns.
+    #[tokio::test]
+    async fn build_platforms_are_empty_when_no_node_reports_an_architecture() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![make_node(1, "worker-a")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("listing nodes succeeds even when none reported an architecture");
+
+        assert!(platforms.is_empty(), "{platforms:?}");
     }
 
     /// The default is unchanged: an install with no workers still deploys

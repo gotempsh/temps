@@ -593,6 +593,26 @@ impl DeployComposeJob {
             return Err(WorkflowError::WorkflowCancelled);
         }
 
+        // Refuse before touching the repo checkout, the compose file, or the
+        // executor at all: a control plane with no local Docker daemon can
+        // never run a Compose stack, and reaching `ComposeExecutor` first
+        // would surface a raw `ComposeError::DockerUnavailable` deep inside
+        // `prepare_and_pull` instead of a job failure naming the actual
+        // remedy up front. Mirrors `BuildImageJob::execute`'s
+        // `local_workloads_enabled` guard.
+        if !self.compose_executor.docker_available() {
+            let message = "This control plane runs no local Compose deployments; run the \
+                full profile on a node with Docker"
+                .to_string();
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_error(log_id, &format!("ERROR: {}", message))
+                    .await;
+            }
+            return Err(WorkflowError::LocalWorkloadsDisabled(message));
+        }
+
         // Log start
         if let Some(ref log_id) = self.log_id {
             let _ = self
@@ -1687,6 +1707,62 @@ mod tests {
             .log_service(Arc::new(LogService::new(std::env::temp_dir())))
             .build()
             .expect("complete builder should produce a deployment job")
+    }
+
+    /// A job whose `ComposeExecutor` was built from a `DockerHandle::disabled`
+    /// -- the control-plane serve profile, which never constructs a Docker
+    /// client at all. Never touches a real socket or daemon, so unlike
+    /// `test_job_with_db()` this needs no Docker skip and is deterministic
+    /// on every machine, CI included.
+    fn test_job_with_disabled_docker(db: Arc<DbConnection>) -> DeployComposeJob {
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        DeployComposeJobBuilder::new()
+            .job_id("deploy_compose".to_string())
+            .deployment_id(7)
+            .project_id(2)
+            .environment_id(3)
+            .db(db)
+            .compose_executor(Arc::new(ComposeExecutor::new_with_handle(
+                handle,
+                std::env::temp_dir(),
+            )))
+            .public_ports(vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 8080,
+                published: Some(18080),
+                health_check_path: None,
+            }])
+            .log_service(Arc::new(LogService::new(std::env::temp_dir())))
+            .build()
+            .expect("complete builder should produce a deployment job")
+    }
+
+    /// The control-plane profile (no Docker client constructed at all) must
+    /// refuse a Compose deployment with a typed, actionable
+    /// `LocalWorkloadsDisabled` error *before* reading the repo checkout,
+    /// resolving the compose file, or touching `ComposeExecutor` for
+    /// anything beyond the availability check -- reaching
+    /// `prepare_and_pull()` first would surface a raw
+    /// `ComposeError::DockerUnavailable` deep inside a deploy attempt
+    /// instead of an upfront job failure naming the remedy. Mirrors
+    /// `build_image.rs`'s `control_plane_profile_refuses_before_touching_the_image_builder`.
+    #[tokio::test]
+    async fn control_plane_profile_refuses_before_touching_the_compose_executor() {
+        let job = test_job_with_disabled_docker(test_db());
+        let context = crate::test_utils::create_test_context("wf".to_string(), 7, 2, 3);
+
+        let error = job.execute(context).await.unwrap_err();
+        match error {
+            WorkflowError::LocalWorkloadsDisabled(message) => {
+                assert!(message.contains("Compose"), "{message}");
+                assert!(message.contains("full profile"), "{message}");
+                assert!(message.contains("Docker"), "{message}");
+            }
+            other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
+        }
     }
 
     #[tokio::test]
