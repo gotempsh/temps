@@ -320,7 +320,6 @@ impl S3StaticDeployer {
         deployment_slug: &str,
     ) -> Result<(String, Vec<FileInfo>), StaticDeployError> {
         let scan_prefix = self.full_key(&format!("projects/{project_slug}/{environment_slug}/"));
-        let suffix = format!("/{deployment_slug}/");
 
         let mut storage_path: Option<String> = None;
         let mut continuation_token: Option<String> = None;
@@ -342,18 +341,20 @@ impl S3StaticDeployer {
 
             for object in response.contents() {
                 let Some(key) = object.key() else { continue };
-                if let Some(index) = key.find(&suffix) {
-                    let deployment_root_end = index + suffix.len();
-                    let full_deployment_prefix = &key[..deployment_root_end];
-                    let relative_to_bucket = match &self.prefix {
-                        Some(prefix) => full_deployment_prefix
-                            .strip_prefix(&format!("{}/", prefix.trim_end_matches('/')))
-                            .unwrap_or(full_deployment_prefix),
-                        None => full_deployment_prefix,
-                    };
-                    storage_path = Some(relative_to_bucket.trim_end_matches('/').to_string());
-                    break;
-                }
+                let Some(full_deployment_prefix) =
+                    match_deployment_root(&scan_prefix, key, deployment_slug)
+                else {
+                    continue;
+                };
+                let relative_to_bucket = match &self.prefix {
+                    Some(prefix) => full_deployment_prefix
+                        .strip_prefix(&format!("{}/", prefix.trim_end_matches('/')))
+                        .unwrap_or(&full_deployment_prefix)
+                        .to_string(),
+                    None => full_deployment_prefix,
+                };
+                storage_path = Some(relative_to_bucket.trim_end_matches('/').to_string());
+                break;
             }
 
             if storage_path.is_some() || !response.is_truncated().unwrap_or(false) {
@@ -409,6 +410,47 @@ impl S3StaticDeployer {
 
         Ok((storage_path, files))
     }
+}
+
+/// Whether `value` is exactly `width` ASCII digits — used to validate the
+/// `{year}/{month}/{day}` components of a key against `storage_relative_path`'s
+/// known format when resolving a deployment's storage path.
+fn is_fixed_width_digits(value: &str, width: usize) -> bool {
+    value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// If `key` is an object belonging to the `{deployment_slug}` deployment
+/// directly under `scan_prefix`, return that deployment's full key prefix
+/// (e.g. `{scan_prefix}2026/01/01/{deployment_slug}/`); otherwise `None`.
+///
+/// Anchored to `storage_relative_path`'s exact
+/// `{year}/{month}/{day}/{deployment_slug}` component structure rather than
+/// an unanchored substring search for `/{deployment_slug}/`: a deployment
+/// can contain an ordinary asset directory that happens to share a name
+/// with a later deployment's slug (e.g.
+/// `{scan_prefix}2026/01/01/other-deploy/{deployment_slug}/...`), and a
+/// substring match would incorrectly resolve to that nested directory
+/// instead of failing — `remove` would then delete assets belonging to the
+/// wrong deployment while leaving the requested one untouched.
+fn match_deployment_root(scan_prefix: &str, key: &str, deployment_slug: &str) -> Option<String> {
+    let remainder = key.strip_prefix(scan_prefix)?;
+    let mut components = remainder.splitn(5, '/');
+    let (Some(year), Some(month), Some(day), Some(slug)) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return None;
+    };
+    if slug != deployment_slug
+        || !is_fixed_width_digits(year, 4)
+        || !is_fixed_width_digits(month, 2)
+        || !is_fixed_width_digits(day, 2)
+    {
+        return None;
+    }
+    Some(format!("{scan_prefix}{year}/{month}/{day}/{slug}/"))
 }
 
 #[async_trait]
@@ -575,6 +617,52 @@ mod tests {
             deployer.object_key("projects/site/prod/2026/09/18/deploy-1", "index.html"),
             "prod/projects/site/prod/2026/09/18/deploy-1/index.html"
         );
+    }
+
+    #[test]
+    fn match_deployment_root_accepts_the_exact_date_partitioned_slug() {
+        let scan_prefix = "projects/site/production/";
+        let key = "projects/site/production/2026/09/18/deploy-1/assets/app.js";
+        assert_eq!(
+            match_deployment_root(scan_prefix, key, "deploy-1"),
+            Some("projects/site/production/2026/09/18/deploy-1/".to_string())
+        );
+    }
+
+    #[test]
+    fn match_deployment_root_rejects_an_unanchored_nested_directory_match() {
+        // Regression test: an earlier deployment ("other-deploy") can contain
+        // an ordinary asset directory that happens to be named after a later
+        // deployment's slug ("deploy-1"). An unanchored `contains
+        // "/deploy-1/"` search would have matched this nested path and
+        // resolved the wrong deployment's storage_path.
+        let scan_prefix = "projects/site/production/";
+        let key = "projects/site/production/2026/09/18/other-deploy/deploy-1/nested.js";
+        assert_eq!(match_deployment_root(scan_prefix, key, "deploy-1"), None);
+    }
+
+    #[test]
+    fn match_deployment_root_rejects_non_numeric_or_wrong_width_date_components() {
+        let scan_prefix = "projects/site/production/";
+        for key in [
+            "projects/site/production/26/09/18/deploy-1/index.html", // year too short
+            "projects/site/production/2026/9/18/deploy-1/index.html", // month too short
+            "projects/site/production/2026/09/1/deploy-1/index.html", // day too short
+            "projects/site/production/aaaa/09/18/deploy-1/index.html", // non-numeric year
+        ] {
+            assert_eq!(
+                match_deployment_root(scan_prefix, key, "deploy-1"),
+                None,
+                "key {key:?} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn match_deployment_root_rejects_a_different_deployment_slug() {
+        let scan_prefix = "projects/site/production/";
+        let key = "projects/site/production/2026/09/18/deploy-2/index.html";
+        assert_eq!(match_deployment_root(scan_prefix, key, "deploy-1"), None);
     }
 
     #[tokio::test]
