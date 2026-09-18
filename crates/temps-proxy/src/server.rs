@@ -492,10 +492,51 @@ pub fn setup_proxy_server(
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
-    // Create path-keyed file store for static asset serving
-    let cas_file_store: Arc<dyn temps_file_store::FileStore> = Arc::new(
-        temps_file_store::fs_store::FsFileStore::new(config_service.data_dir().join("cas")),
-    );
+    // Create the deployment-asset store for CAS blobs and (when configured)
+    // object-store-backed static-site files. `TEMPS_STATIC_STORAGE_BACKEND`
+    // is unset for every existing self-hosted install, so this resolves to
+    // `StaticStorageBackend::Filesystem` and reproduces today's exact
+    // behavior: an `FsFileStore` for the CAS fallback path, and no
+    // object-store-backed static serving at all (`static_object_store` stays
+    // `None`, so `serve_static_file` keeps reading straight off local disk).
+    //
+    // When `TEMPS_STATIC_STORAGE_BACKEND=s3`, the SAME S3-backed store,
+    // wrapped in one byte-level cache (`CachingFileStore`), backs both the
+    // CAS fallback path and static-site serving — both are read on every
+    // request to a deployed site, so a warm key must never re-hit S3. See
+    // `temps_file_store::cache` for why a plain size-bounded LRU with no TTL
+    // is safe for this content (immutable once written under a given key).
+    let static_storage_backend = temps_file_store::s3_config::resolve_static_storage_backend()
+        .map_err(|error| {
+            anyhow::anyhow!("❌ Static-site/CAS storage configuration is invalid\n\n{error}")
+        })?;
+    let (cas_file_store, static_object_store): (
+        Arc<dyn temps_file_store::FileStore>,
+        Option<Arc<dyn temps_file_store::FileStore>>,
+    ) = match static_storage_backend {
+        temps_file_store::s3_config::StaticStorageBackend::Filesystem => (
+            Arc::new(temps_file_store::fs_store::FsFileStore::new(
+                config_service.data_dir().join("cas"),
+            )),
+            None,
+        ),
+        temps_file_store::s3_config::StaticStorageBackend::S3(s3_config) => {
+            let byte_cache_max_bytes = temps_file_store::cache::byte_cache_max_bytes_from_env();
+            info!(
+                bucket = %s3_config.bucket,
+                region = %s3_config.region,
+                byte_cache_max_bytes,
+                "Static-site files and CAS assets are read from S3 \
+                 (TEMPS_STATIC_STORAGE_BACKEND=s3), through an in-process byte cache"
+            );
+            let backend: Arc<dyn temps_file_store::FileStore> =
+                Arc::new(temps_file_store::cache::CachingFileStore::new(
+                    Arc::new(temps_file_store::s3_store::S3FileStore::new(s3_config)),
+                    byte_cache_max_bytes,
+                ));
+            (backend.clone(), Some(backend))
+        }
+    };
 
     // Create the main load balancer
     let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
@@ -534,6 +575,9 @@ pub fn setup_proxy_server(
     // Wire path-keyed file store for static asset serving
     lb = lb.with_file_store(cas_file_store);
     info!("Path-keyed file store enabled");
+    if let Some(store) = static_object_store {
+        lb = lb.with_static_object_store(store);
+    }
 
     // Proxy hot-path metrics: a background sampler snapshots the lock-free
     // request counters on the monitoring scrape interval and writes deltas to

@@ -320,6 +320,88 @@ pub(crate) fn metadata_etag(path: &Path, metadata: &Metadata) -> String {
     format!("W/\"{}\"", &encoded[..32])
 }
 
+/// Ordered plan for resolving a static-site request against an
+/// object-store-backed deployment (S3-compatible `TEMPS_STATIC_STORAGE_BACKEND=s3`),
+/// mirroring [`open_static_file`]'s observable resolution order without any of
+/// its filesystem-specific machinery (canonicalization, symlink rejection —
+/// neither concept exists for object storage; path-traversal and
+/// sensitive-path protection is unaffected, since it happens in
+/// `validate_static_dir`/`normalize_static_request_path` before either
+/// backend ever sees a key).
+///
+/// `open_static_file` resolves in this order: the exact requested path; if
+/// that path is a real directory, its own `index.html`; otherwise (or if that
+/// index is itself missing) the deployment's root `index.html` for
+/// extensionless "SPA route" requests. An object store has no notion of "is a
+/// directory", so this collapses to trying each candidate key in turn and
+/// serving the first one found — behaviorally equivalent for every case that
+/// matters (a real per-directory `index.html`, a client-side route, a 404 for
+/// a genuinely missing asset).
+pub(crate) struct StaticObjectRequest {
+    pub relative_static_dir: PathBuf,
+    /// Candidate object keys (relative to `relative_static_dir`), most
+    /// specific first.
+    pub candidates: Vec<PathBuf>,
+}
+
+pub(crate) fn resolve_static_object_request(
+    stored_static_dir: &str,
+    raw_request_path: &str,
+) -> Result<StaticObjectRequest, StaticFileUnavailable> {
+    let relative_static_dir = validate_static_dir(stored_static_dir).map_err(|reason| {
+        StaticFileUnavailable::StaticDirectory {
+            path: bounded_log_value(stored_static_dir).to_owned(),
+            reason,
+        }
+    })?;
+    let relative_request_path =
+        normalize_static_request_path(raw_request_path).map_err(|reason| {
+            StaticFileUnavailable::RequestPath {
+                path: bounded_log_value(raw_request_path).to_owned(),
+                reason,
+            }
+        })?;
+
+    let mut candidates = Vec::with_capacity(2);
+    if relative_request_path.as_os_str().is_empty() {
+        candidates.push(PathBuf::from("index.html"));
+    } else {
+        candidates.push(relative_request_path.clone());
+        if is_spa_route(&relative_request_path) {
+            candidates.push(relative_request_path.join("index.html"));
+            candidates.push(PathBuf::from("index.html"));
+        }
+    }
+
+    Ok(StaticObjectRequest {
+        relative_static_dir,
+        candidates,
+    })
+}
+
+/// Build the object-store key for one candidate under a validated static
+/// directory. Always POSIX-style (`/`-joined): both `relative_static_dir` and
+/// `candidate` were built from validated components that never contain `\`
+/// (rejected by `validate_static_dir`/`normalize_static_request_path`), so
+/// this is safe even if this process ever ran on a non-Unix host.
+pub(crate) fn static_object_key(relative_static_dir: &Path, candidate: &Path) -> String {
+    format!("{}/{}", relative_static_dir.display(), candidate.display())
+}
+
+/// Build a weak validator for object-store-backed static content from its key
+/// and size. There is no mtime to fold in (no local filesystem), but none is
+/// needed: every object-store key is written exactly once by
+/// `StaticDeployer::deploy` under a fresh, date-partitioned deployment slug
+/// (see `temps_deployer::static_deployer::storage_relative_path`), so `(key,
+/// size)` already uniquely identifies one immutable version of one file.
+pub(crate) fn object_etag(key: &str, size_bytes: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(key.as_bytes());
+    digest.update(size_bytes.to_le_bytes());
+    let encoded = hex::encode(digest.finalize());
+    format!("W/\"{}\"", &encoded[..32])
+}
+
 pub(crate) fn if_none_match_matches(value: &str, etag: &str) -> bool {
     value
         .split(',')
@@ -841,6 +923,64 @@ mod tests {
         let other_deployment = metadata_etag(Path::new("/other/deploy/app.js"), &opened.metadata);
         assert_eq!(first, second);
         assert_ne!(first, other_deployment);
+        assert!(first.starts_with("W/\""));
+    }
+
+    #[test]
+    fn resolve_static_object_request_root_path_tries_only_index_html() {
+        let request = resolve_static_object_request(STORED_DIR, "/").unwrap();
+        assert_eq!(request.candidates, vec![PathBuf::from("index.html")]);
+    }
+
+    #[test]
+    fn resolve_static_object_request_ordinary_asset_has_a_single_candidate() {
+        let request = resolve_static_object_request(STORED_DIR, "/assets/app.js").unwrap();
+        assert_eq!(
+            request.candidates,
+            vec![PathBuf::from("assets/app.js")],
+            "a path with an extension is never treated as an SPA route"
+        );
+    }
+
+    #[test]
+    fn resolve_static_object_request_extensionless_path_falls_back_through_index_candidates() {
+        let request = resolve_static_object_request(STORED_DIR, "/docs").unwrap();
+        assert_eq!(
+            request.candidates,
+            vec![
+                PathBuf::from("docs"),
+                PathBuf::from("docs/index.html"),
+                PathBuf::from("index.html"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_static_object_request_rejects_traversal_and_sensitive_paths() {
+        for request in ["/../secret", "/.git/config", "/.env"] {
+            assert!(resolve_static_object_request(STORED_DIR, request).is_err());
+        }
+        assert!(resolve_static_object_request("../escape", "/app.js").is_err());
+    }
+
+    #[test]
+    fn static_object_key_joins_directory_and_candidate_with_a_forward_slash() {
+        let key = static_object_key(
+            Path::new("projects/site/production/deploy-1"),
+            Path::new("assets/app.js"),
+        );
+        assert_eq!(key, "projects/site/production/deploy-1/assets/app.js");
+    }
+
+    #[test]
+    fn object_etag_is_stable_and_distinguishes_key_or_size_changes() {
+        let first = object_etag("projects/a/deploy-1/index.html", 100);
+        let same = object_etag("projects/a/deploy-1/index.html", 100);
+        let different_size = object_etag("projects/a/deploy-1/index.html", 101);
+        let different_key = object_etag("projects/a/deploy-2/index.html", 100);
+        assert_eq!(first, same);
+        assert_ne!(first, different_size);
+        assert_ne!(first, different_key);
         assert!(first.starts_with("W/\""));
     }
 

@@ -44,7 +44,8 @@ use crate::service::proxy_log_batch_writer::{
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
     bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    open_static_file, opened_cas_size_matches, read_static_chunk, static_not_found_contract,
+    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
+    resolve_static_object_request, static_not_found_contract, static_object_key,
     unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
@@ -850,6 +851,17 @@ pub struct LoadBalancer {
     /// `deployment_url_mode` handling (serves HTTP as before).
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
+    /// Object-store-backed static-site file serving. `None` for every
+    /// existing self-hosted install (the default, unset
+    /// `TEMPS_STATIC_STORAGE_BACKEND`): `serve_static_file` then behaves
+    /// exactly as before this field existed, reading straight off local disk.
+    /// `Some` only when an operator opts into `TEMPS_STATIC_STORAGE_BACKEND=s3`,
+    /// in which case this is the same S3-backed, byte-cached `FileStore` as
+    /// `file_store` above (see `temps-proxy/src/server.rs`) — the two fields
+    /// exist separately because they address disjoint key namespaces (path
+    /// keys for static-site files here, content-hash keys for CAS blobs in
+    /// `file_store`), not because they can point at different backends.
+    static_object_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
     /// `(project_id, environment_id, deployment_id, url_path)`; values are `Option<content_hash>` so that
     /// **negative results (no row found) are cached too** — the miss case is
@@ -922,6 +934,7 @@ impl LoadBalancer {
             on_demand_cert_manager: None,
             route_table: None,
             file_store: None,
+            static_object_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
@@ -961,6 +974,16 @@ impl LoadBalancer {
     /// Set the file store for path-keyed static asset serving.
     pub fn with_file_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
         self.file_store = Some(store);
+        self
+    }
+
+    /// Enable object-store-backed static-site serving (`serve_static_file`
+    /// reads through this instead of local disk). Only called when
+    /// `TEMPS_STATIC_STORAGE_BACKEND=s3` resolves to an S3 backend — leaving
+    /// this unset keeps every existing self-hosted install on the disk-only
+    /// path. See the field doc on `static_object_store`.
+    pub fn with_static_object_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
+        self.static_object_store = Some(store);
         self
     }
 
@@ -2178,6 +2201,16 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         static_dir: &str,
     ) -> Result<StaticFileServeOutcome> {
+        // `static_object_store` is only `Some` when an operator has explicitly
+        // set `TEMPS_STATIC_STORAGE_BACKEND=s3` — every existing self-hosted
+        // install (the field defaults to `None`) falls through to the
+        // disk-based path below completely unchanged.
+        if let Some(store) = self.static_object_store.clone() {
+            return self
+                .serve_static_file_from_store(session, ctx, static_dir, &store)
+                .await;
+        }
+
         let mut opened = match open_static_file(
             &self.config_service.static_dir(),
             static_dir,
@@ -2296,6 +2329,165 @@ impl LoadBalancer {
                     std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "static file shrank while streaming",
+                    ),
+                ));
+            }
+            remaining -= cap_static_chunk(&mut chunk, remaining);
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        session.write_response_body(None, true).await?;
+
+        Ok(StaticFileServeOutcome::Served)
+    }
+
+    /// Serve a static file from an object-store-backed deployment
+    /// (`TEMPS_STATIC_STORAGE_BACKEND=s3`), through the same byte-level cache
+    /// as CAS blobs so a warm request never touches the backend.
+    ///
+    /// Mirrors `serve_static_file`'s disk-based ETag/304/HEAD/streaming
+    /// contract exactly — only key resolution differs (no filesystem
+    /// canonicalization or symlink defense, since neither concept exists for
+    /// an object store; path-traversal and sensitive-path protection is
+    /// identical, applied by `resolve_static_object_request` before any
+    /// candidate key is built). Every resolution failure — not found, or a
+    /// genuine backend error/timeout — maps to the same uniform not-found
+    /// response as the disk path, so the two backends are indistinguishable
+    /// to a client and neither leaks backend-specific error detail.
+    async fn serve_static_file_from_store(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        static_dir: &str,
+        store: &Arc<dyn temps_file_store::FileStore>,
+    ) -> Result<StaticFileServeOutcome> {
+        let request = match resolve_static_object_request(static_dir, &ctx.path) {
+            Ok(request) => request,
+            Err(error) => {
+                debug!(
+                    request_path = %bounded_log_value(&ctx.path),
+                    stored_static_dir = %bounded_log_value(static_dir),
+                    failure = error.category(),
+                    "Static object-store request resolved to the uniform not-found response"
+                );
+                return Ok(unavailable_outcome(&error));
+            }
+        };
+
+        let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
+        for candidate in &request.candidates {
+            let key = static_object_key(&request.relative_static_dir, candidate);
+            match store.open_raw(&key).await {
+                Ok(opened) => {
+                    resolved = Some((key, opened));
+                    break;
+                }
+                Err(temps_file_store::FileStoreError::NotFound { .. }) => continue,
+                Err(error) => {
+                    // A real backend problem (timeout, S3 error) — trying the
+                    // remaining candidates against the same struggling
+                    // backend is unlikely to help, so stop here rather than
+                    // pile on more latency. Still folds into the same
+                    // uniform not-found response as every other resolution
+                    // failure.
+                    warn!(
+                        key = %bounded_log_value(&key),
+                        error = %error,
+                        "Static object-store lookup failed"
+                    );
+                    break;
+                }
+            }
+        }
+        let Some((resolved_key, mut opened)) = resolved else {
+            debug!(
+                request_path = %bounded_log_value(&ctx.path),
+                stored_static_dir = %bounded_log_value(static_dir),
+                "Static object-store request found no matching candidate"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+
+        // Resolve the actual response MIME before creating analytics state,
+        // from the resolved key (e.g. an SPA fallback's `index.html`) rather
+        // than the original request path — identical to the disk-backed path.
+        let content_type = Self::infer_content_type(&resolved_key);
+        self.ensure_static_visitor_session(session, ctx, content_type)
+            .await;
+
+        let etag = object_etag(&resolved_key, opened.size_bytes);
+
+        if let Some(if_none_match) = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+        {
+            if if_none_match_matches(if_none_match, &etag) {
+                let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
+                resp.insert_header("ETag", &etag)?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                if Self::is_cacheable_static_asset(&ctx.path) {
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    )?;
+                } else {
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=0, must-revalidate",
+                    )?;
+                }
+                self.set_tracking_cookies(session, &mut resp, ctx).await?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(None, true).await?;
+                return Ok(StaticFileServeOutcome::Served);
+            }
+        }
+
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header(header::CONTENT_TYPE, content_type)?;
+        resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        resp.insert_header("ETag", &etag)?;
+        if Self::is_cacheable_static_asset(&ctx.path) {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+        } else {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
+        }
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
+        session.write_response_header(Box::new(resp), false).await?;
+        if ctx.method == "HEAD" {
+            session.write_response_body(None, true).await?;
+            return Ok(StaticFileServeOutcome::Served);
+        }
+
+        let mut remaining = opened.size_bytes;
+        while remaining > 0 {
+            let mut chunk = read_static_chunk(opened.reader.as_mut())
+                .await
+                .map_err(|error| {
+                    Error::because(
+                        pingora::ErrorType::FileOpenError,
+                        format!(
+                            "Failed to stream static object '{}' for request '{}'",
+                            bounded_log_value(&resolved_key),
+                            bounded_log_value(&ctx.path)
+                        ),
+                        error,
+                    )
+                })?;
+            if chunk.is_empty() {
+                return Err(Error::because(
+                    pingora::ErrorType::FileOpenError,
+                    format!(
+                        "Static object '{}' ended before its opened length for request '{}'",
+                        bounded_log_value(&resolved_key),
+                        bounded_log_value(&ctx.path)
+                    ),
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "static object shrank while streaming",
                     ),
                 ));
             }

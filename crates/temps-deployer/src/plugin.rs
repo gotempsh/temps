@@ -14,9 +14,11 @@ use utoipa::openapi::OpenApi;
 
 use crate::{
     docker::DockerRuntime,
+    s3_static_deployer::S3StaticDeployer,
     static_deployer::{FilesystemStaticDeployer, StaticDeployer},
     ContainerDeployer,
 };
+use temps_file_store::s3_config::{resolve_static_storage_backend, StaticStorageBackend};
 
 /// Deployer Plugin for managing container deployment operations
 pub struct DeployerPlugin;
@@ -457,11 +459,30 @@ impl TempsPlugin for DeployerPlugin {
             let image_builder: Arc<dyn crate::ImageBuilder> = docker_runtime;
             context.register_service(image_builder);
 
-            // Create and register StaticDeployer
-            let static_files_dir = config_service.get_server_config().data_dir.join("static");
-            let filesystem_static_deployer =
-                Arc::new(FilesystemStaticDeployer::new(static_files_dir));
-            let static_deployer: Arc<dyn StaticDeployer> = filesystem_static_deployer;
+            // Create and register StaticDeployer. `TEMPS_STATIC_STORAGE_BACKEND`
+            // is unset for every existing self-hosted install, so this resolves
+            // to `StaticStorageBackend::Filesystem` and reproduces today's
+            // behavior exactly (local disk under `TEMPS_DATA_DIR/static`).
+            let static_storage_backend = resolve_static_storage_backend().map_err(|error| {
+                PluginError::InitializationFailed(format!(
+                    "❌ Static-site storage configuration is invalid\n\n{error}"
+                ))
+            })?;
+            let static_deployer: Arc<dyn StaticDeployer> = match static_storage_backend {
+                StaticStorageBackend::Filesystem => {
+                    let static_files_dir =
+                        config_service.get_server_config().data_dir.join("static");
+                    Arc::new(FilesystemStaticDeployer::new(static_files_dir))
+                }
+                StaticStorageBackend::S3(s3_config) => {
+                    tracing::info!(
+                        bucket = %s3_config.bucket,
+                        region = %s3_config.region,
+                        "Static-site deployments will be stored in S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
+                    );
+                    Arc::new(S3StaticDeployer::new(s3_config))
+                }
+            };
             context.register_service(static_deployer);
 
             tracing::debug!("Deployer plugin services registered successfully");

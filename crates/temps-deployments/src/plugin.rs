@@ -201,10 +201,36 @@ impl TempsPlugin for DeploymentsPlugin {
                 scheduler_service.start_cron_scheduler().await;
             });
 
+            // Resolve the CAS asset store backend once and share it across every
+            // write-side consumer in this plugin (the cleanup service below, and
+            // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
+            // is unset for every existing self-hosted install, so this resolves to
+            // the same `FsFileStore` under `TEMPS_DATA_DIR/cas` as before this change.
+            // No byte cache here: caching only matters for the proxy's *read* path
+            // (see `temps-proxy/src/server.rs`), never for these write-side uses.
+            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
+                match temps_file_store::s3_config::resolve_static_storage_backend().map_err(
+                    |error| PluginError::PluginRegistrationFailed {
+                        plugin_name: "deployments".to_string(),
+                        error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
+                    },
+                )? {
+                    temps_file_store::s3_config::StaticStorageBackend::Filesystem => {
+                        let cas_dir = config_service.data_dir().join("cas");
+                        Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir))
+                    }
+                    temps_file_store::s3_config::StaticStorageBackend::S3(s3_config) => {
+                        tracing::info!(
+                            bucket = %s3_config.bucket,
+                            region = %s3_config.region,
+                            "CAS assets will be persisted to S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
+                        );
+                        Arc::new(temps_file_store::s3_store::S3FileStore::new(s3_config))
+                    }
+                };
+
             // Start Docker cleanup scheduler in background (nightly cleanup at 2 AM UTC)
-            let cas_dir = config_service.data_dir().join("cas");
-            let cleanup_file_store: Arc<dyn temps_file_store::FileStore> =
-                Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
+            let cleanup_file_store = cas_file_store.clone();
             // Operator-configured image retention (settings row, not an env
             // var). Falls back to the built-in default when settings cannot be
             // read so a transient DB hiccup at boot cannot silently disable or
@@ -328,13 +354,10 @@ impl TempsPlugin for DeploymentsPlugin {
             tracing::debug!("Node scheduler wired into workflow execution service");
 
             // Wire content-addressable file store for static asset deduplication
-            {
-                let cas_dir = config_service.data_dir().join("cas");
-                let file_store: Arc<dyn temps_file_store::FileStore> =
-                    Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
-                workflow_execution_service.set_file_store(file_store);
-                tracing::debug!("File store wired into workflow execution service");
-            }
+            // (same shared instance resolved once above — filesystem by default,
+            // S3 when TEMPS_STATIC_STORAGE_BACKEND=s3).
+            workflow_execution_service.set_file_store(cas_file_store.clone());
+            tracing::debug!("File store wired into workflow execution service");
 
             // Wire telemetry for deploy-funnel events (deploy_attempted,
             // deploy_succeeded, deploy_failed, first_deploy_succeeded).
