@@ -313,6 +313,22 @@ impl TempsPlugin for ErrorTrackingPlugin {
                         }
                     }
                 });
+            } else {
+                // Deliberately soft, matching the identical trade-off already
+                // made for the autopilot-trigger listener just below: the
+                // plugin's core function (envelope ingestion, dashboards,
+                // alerts) does not depend on `JobQueue`, so failing plugin
+                // registration over its absence would take down all of
+                // error tracking for the sake of one resilience feature.
+                // Without it, a DSN cached immediately before its project's
+                // deletion still stops resolving on its own -- within
+                // `RESOLVE_CACHE_TTL`, the documented backstop -- just not
+                // immediately. Logged, not silent, so the degradation is
+                // visible to an operator debugging "why did this deleted
+                // project's DSN keep working for a few seconds".
+                tracing::warn!(
+                    "error-tracking: JobQueue not found — DSN cache invalidation on project deletion will fall back to RESOLVE_CACHE_TTL instead of firing immediately"
+                );
             }
 
             // Start job listener for project lifecycle events (auto-create default alert rules)

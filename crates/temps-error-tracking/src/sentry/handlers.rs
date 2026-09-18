@@ -532,7 +532,19 @@ async fn ingest_tunneled_envelope(
 
     let decompressed_body = match decompress_if_needed(&headers, &body) {
         Ok(data) => data,
-        Err(e) => return decompression_failed_response(&e),
+        Err(e) => {
+            // A malformed body still fails after a slot was reserved above —
+            // release it so a burst of bad gzip against project X cannot
+            // quietly exhaust X's tunnel allowance without ever ingesting an
+            // event.
+            if let Some((reserved_project_id, Admission::Reserved(marker))) = host_reservation {
+                state
+                    .rate_limiter
+                    .release(reserved_project_id, marker)
+                    .await;
+            }
+            return decompression_failed_response(&e);
+        }
     };
 
     let embedded = resolve_embedded_envelope_dsn(&state, &headers, &decompressed_body).await;
@@ -2555,6 +2567,72 @@ mod tests {
                 .peek(ctx.project_id, Some(1))
                 .await,
             "project A must not have been charged for a request it never received"
+        );
+    }
+
+    /// A `Host`-resolved request that reserves a rate-limit slot and then
+    /// fails to decompress must release that slot rather than leaking it — a
+    /// regression test for a bug where the decompression-error return path
+    /// bypassed the only release call, so repeated malformed-gzip requests
+    /// against a project could exhaust its tunnel allowance without a single
+    /// event ever landing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_decompression_failure_releases_the_host_reservation() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+
+        temps_entities::project_dsns::Entity::update_many()
+            .col_expr(
+                temps_entities::project_dsns::Column::RateLimitPerMinute,
+                sea_orm::sea_query::Expr::value(1),
+            )
+            .filter(temps_entities::project_dsns::Column::PublicKey.eq(ctx.dsn_key.clone()))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        ctx.route_table
+            .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(SENTRY_TUNNEL_ROUTE_PATH)
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.example.com"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://app.example.com"),
+            )
+            .add_header(
+                HeaderName::from_static("content-encoding"),
+                HeaderValue::from_static("gzip"),
+            )
+            .bytes(Bytes::from_static(b"not actually gzip data"))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            response.text()
+        );
+
+        // The 1-request budget must still be fully available: the reservation
+        // made before decompression was tried must have been released when
+        // decompression failed.
+        assert!(
+            ctx.app_state
+                .rate_limiter
+                .peek(ctx.project_id, Some(1))
+                .await,
+            "a failed decompression must release its rate-limit reservation"
         );
     }
 
