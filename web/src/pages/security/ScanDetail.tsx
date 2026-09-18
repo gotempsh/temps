@@ -9,6 +9,7 @@ import {
   getEnvironmentOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VulnerabilityResponse } from '@/api/client'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -17,8 +18,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-  DropdownMenuSeparator,
-  DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VulnerabilityList } from '@/components/vulnerabilities/VulnerabilityList'
@@ -26,6 +25,7 @@ import { Input } from '@/components/ui/input'
 import {
   Button,
   Callout,
+  CopyAction,
   Detail,
   PageState,
   Status,
@@ -45,7 +45,6 @@ import {
   Code,
   Filter,
   Sparkles,
-  Copy,
 } from 'lucide-react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -552,58 +551,43 @@ function ScanDetailContent() {
             </DropdownMenu>
           )}
 
-          {/* AI Prompt dropdown - only show if vulnerabilities exist */}
           {totalVulnerabilities > 0 && vulnerabilities.length > 0 && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
+            <Popover>
+              <PopoverTrigger asChild>
                 <Button variant="outline" size="sm">
                   <Sparkles className="h-4 w-4 mr-2" />
                   Copy AI Prompt
                 </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                <DropdownMenuLabel>Generate fix prompt</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onClick={() => {
-                    navigator.clipboard.writeText(
-                      generateVulnerabilityPrompt(vulnerabilities)
-                    )
-                    toast.success('AI prompt copied for all vulnerabilities')
-                  }}
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-64 space-y-2" aria-label="Copy vulnerability fix prompt">
+                <p className="text-sm font-medium">Copy fix prompt</p>
+                <CopyAction
+                  value={generateVulnerabilityPrompt(vulnerabilities)}
+                  label="Copy prompt for all vulnerabilities"
+                  className="w-full justify-between text-left"
                 >
-                  <Copy className="h-4 w-4 mr-2" />
                   All vulnerabilities ({vulnerabilities.length})
-                </DropdownMenuItem>
+                </CopyAction>
                 {vulnerabilityTypes.length > 1 && (
                   <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuLabel>By type</DropdownMenuLabel>
+                    <p className="pt-2 text-xs text-muted-foreground">By type</p>
                     {vulnerabilityTypes.map((type) => {
-                      const typeVulns = vulnerabilities.filter(
-                        (v) => v.type === type
-                      )
+                      const typeVulns = vulnerabilities.filter((v) => v.type === type)
                       return (
-                        <DropdownMenuItem
+                        <CopyAction
                           key={type}
-                          onClick={() => {
-                            navigator.clipboard.writeText(
-                              generateVulnerabilityPrompt(typeVulns, type)
-                            )
-                            toast.success(
-                              `AI prompt copied for ${type} vulnerabilities`
-                            )
-                          }}
+                          value={generateVulnerabilityPrompt(typeVulns, type)}
+                          label={`Copy prompt for ${type} vulnerabilities`}
+                          className="w-full justify-between text-left"
                         >
-                          <Copy className="h-4 w-4 mr-2" />
                           {type} ({typeVulns.length})
-                        </DropdownMenuItem>
+                        </CopyAction>
                       )
                     })}
                   </>
                 )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+              </PopoverContent>
+            </Popover>
           )}
         </>
       }
