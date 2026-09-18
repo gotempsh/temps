@@ -571,16 +571,23 @@ async fn claim_local_image(
             .with_detail("Platform-owned local image references cannot be claimed by name"));
     }
 
-    let inspected = state
-        .docker
-        .inspect_image(source_ref)
-        .await
-        .map_err(|error| {
-            warn!(image = %source_ref, %error, "Could not inspect claimed local image");
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Local Image Not Found")
-                .with_detail(format!("Local image '{source_ref}' was not found"))
-        })?;
+    // Claiming a local image is inherently a local-workload operation (it
+    // inspects and retags an image in THIS host's daemon), so a
+    // control-plane process (no local Docker daemon) must refuse it typed
+    // rather than reach `inspect_image` on a client that was never
+    // constructed.
+    let docker = state.docker.require().map_err(|error| {
+        problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Docker Unavailable")
+            .with_detail(error.to_string())
+    })?;
+
+    let inspected = docker.inspect_image(source_ref).await.map_err(|error| {
+        warn!(image = %source_ref, %error, "Could not inspect claimed local image");
+        problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Local Image Not Found")
+            .with_detail(format!("Local image '{source_ref}' was not found"))
+    })?;
     let image_id = inspected.id.filter(|id| !id.is_empty()).ok_or_else(|| {
         problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
             .with_title("Local Image Has No Immutable ID")
@@ -595,8 +602,7 @@ async fn claim_local_image(
             .with_title("Internal Image Reference Error")
             .with_detail("Temps generated an invalid internal image reference")
     })?;
-    state
-        .docker
+    docker
         .tag_image(
             &image_id,
             Some(

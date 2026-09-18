@@ -113,23 +113,30 @@ impl TempsPlugin for InfraPlugin {
                 context.get_service::<temps_core::LocalWorkloadPolicy>(),
             );
 
-            // Build a conservative capability set from what we can observe.
-            // The serve bootstrap will call `.with_features()` with accurate
-            // values for subsystems it knows are configured (e.g. backups_remote,
-            // kv, log_aggregation) before wrapping the service in Arc — these
-            // defaults are intentionally conservative (false) to avoid lying.
+            // Build the capability set from what this profile guarantees.
             let docker_reachable = docker_handle.is_available() && policy.docker_available();
             let features = if policy.local_workloads_enabled() {
                 crate::types::PlatformFeatures::full(docker_reachable)
             } else {
-                // control-plane profile: local-workload fields are always false.
-                // Caller-supplied fields (backups_remote, kv, log_aggregation)
-                // default to false here; the bootstrap overrides them.
+                // control-plane profile: local-workload fields are always false
+                // (see `PlatformFeatures::control_plane`'s own doc).
+                //
+                // `backups_remote` and `log_aggregation` are `true`, not
+                // caller-supplied placeholders: `BackupPlugin` and
+                // `LogAggregatorPlugin` are registered in EVERY serve profile
+                // specifically so worker backup orchestration and remote log
+                // collection/search keep working here (see the serve
+                // bootstrap's registration comments for both). Reporting them
+                // as unavailable would tell the CLI/console to hide or disable
+                // capabilities that actually work. `kv` stays tied to
+                // `local_workloads_enabled` because `KvPlugin` itself is
+                // gated on it (managed Redis needs a local container), so it
+                // is always `false` on this branch.
                 crate::types::PlatformFeatures::control_plane(
                     docker_reachable,
-                    false, // backups_remote — bootstrap sets this
-                    false, // kv — bootstrap sets this
-                    false, // log_aggregation — bootstrap sets this
+                    true,  // backups_remote — BackupPlugin always registers
+                    false, // kv — KvPlugin only registers when local_workloads_enabled
+                    true,  // log_aggregation — LogAggregatorPlugin always registers
                 )
             };
 
@@ -197,5 +204,48 @@ mod tests {
     async fn test_infra_plugin_default() {
         let infra_plugin = InfraPlugin;
         assert_eq!(infra_plugin.name(), "infra");
+    }
+
+    /// Regression test for a Greptile finding on PR #1031: `BackupPlugin` and
+    /// `LogAggregatorPlugin` are registered in EVERY serve profile (worker
+    /// backup orchestration and remote log collection/search keep running
+    /// with no local Docker daemon), but `InfraPlugin::register_services` was
+    /// reporting `backups_remote` and `log_aggregation` as `false` in the
+    /// control-plane profile regardless -- a placeholder left for a bootstrap
+    /// override (`.with_features()`) that console.rs never actually called.
+    /// `GET /platform/features` would therefore tell the CLI/console those
+    /// working capabilities were unavailable. `kv` must stay `false`: unlike
+    /// the other two, `KvPlugin` really is gated on `local_workloads_enabled`.
+    #[tokio::test]
+    async fn control_plane_profile_reports_remote_backups_and_log_aggregation_as_available() {
+        let context = ServiceRegistrationContext::new();
+        context.register_service(Arc::new(temps_core::LocalWorkloadPolicy::control_plane(
+            false, // no Docker daemon in this test
+        )));
+
+        let infra_plugin = InfraPlugin::new();
+        infra_plugin
+            .register_services(&context)
+            .await
+            .expect("register_services must succeed with no Docker daemon registered");
+
+        let infra_state = context
+            .get_service::<InfraState>()
+            .expect("InfraPlugin must register InfraState");
+        let features = infra_state.platform_info_service().features();
+
+        assert_eq!(features.profile, temps_core::PROFILE_CONTROL_PLANE);
+        assert!(
+            features.backups_remote,
+            "BackupPlugin runs in every profile; backups_remote must not be reported as unavailable"
+        );
+        assert!(
+            features.log_aggregation,
+            "LogAggregatorPlugin runs in every profile; log_aggregation must not be reported as unavailable"
+        );
+        assert!(
+            !features.kv,
+            "KvPlugin is gated on local_workloads_enabled and never registers in this profile"
+        );
     }
 }

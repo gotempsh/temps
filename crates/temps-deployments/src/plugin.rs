@@ -603,11 +603,11 @@ impl TempsPlugin for DeploymentsPlugin {
         // Re-fetch encryption service for AppState (the first ref was moved into WorkflowPlanner)
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
-        // Docker client for container exec/terminal
-        let docker_for_exec = Arc::new(
-            bollard::Docker::connect_with_local_defaults()
-                .expect("Failed to connect to Docker for container exec"),
-        );
+        // Docker handle for container exec/terminal and claiming local images.
+        // Always registered by the serve bootstrap (see `console.rs`); resolved
+        // lazily via `.require()` at point of use, never dialed here, so a
+        // control-plane process (no local daemon) never panics at boot.
+        let docker_for_exec = context.require_service::<temps_core::DockerHandle>();
 
         // Resolves the per-managed-domain public hostname strategy. Falls back to
         // the Standard resolver when no DNS provider plugin registered one.

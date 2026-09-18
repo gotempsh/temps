@@ -39,8 +39,10 @@ pub struct AppState {
     /// Config service — gives drain/exit-facing handlers access to the cluster
     /// CA so CP→agent calls to `https://` nodes use mutual TLS (ADR-020 WS-2.1)
     pub config_service: Arc<temps_config::ConfigService>,
-    /// Docker client for container exec/terminal
-    pub docker: Arc<bollard::Docker>,
+    /// Docker handle for container exec/terminal and claiming local images.
+    /// Resolved lazily via `.require()` at point of use so a control-plane
+    /// process (no local daemon) fails typed rather than panicking at boot.
+    pub docker: Arc<temps_core::DockerHandle>,
     /// On-demand `docker system df` for the control-plane host (server
     /// monitoring page). See [`crate::services::DockerDiskUsageService`].
     pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,

@@ -4566,10 +4566,10 @@ mod tests {
                 ),
                 db.clone(),
             )),
-            docker: Arc::new(
+            docker: Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
-            ),
+            ))),
             docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
             deployment_gate: None,
             project_access_checker: None,
