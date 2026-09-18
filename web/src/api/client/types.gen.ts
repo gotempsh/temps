@@ -5180,6 +5180,14 @@ export type CreateMetricAlertRequest = {
 };
 
 export type CreateMonitorRequest = {
+    /**
+     * How often to probe, in seconds. Defaults to 60 when omitted.
+     *
+     * **Clamped, not rejected**: values below 30 are stored as 30 and
+     * non-positive values as 60, and the created monitor comes back with the
+     * clamped value — so the response always reports the interval the
+     * scheduler will actually use.
+     */
     check_interval_seconds?: number | null;
     check_path?: string | null;
     environment_id: number;
@@ -12921,6 +12929,13 @@ export type MonitorResponse = {
     monitor_type: string;
     monitor_url: string;
     name: string;
+    /**
+     * When the scheduler will next probe this monitor. Read-only: it is
+     * maintained by the health-check scheduler, never accepted on write.
+     * `null` means the monitor has not been scheduled yet and is due on the
+     * next sweep.
+     */
+    next_check_at?: string | null;
     project_id: number;
     updated_at: string;
 };

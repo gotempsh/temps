@@ -10998,6 +10998,7 @@
       "CreateMonitorRequest": {
         "properties": {
           "check_interval_seconds": {
+            "description": "How often to probe, in seconds. Defaults to 60 when omitted.\n\n**Clamped, not rejected**: values below 30 are stored as 30 and\nnon-positive values as 60, and the created monitor comes back with the\nclamped value — so the response always reports the interval the\nscheduler will actually use.",
             "format": "int32",
             "type": [
               "integer",
@@ -28446,6 +28447,14 @@
           },
           "name": {
             "type": "string"
+          },
+          "next_check_at": {
+            "description": "When the scheduler will next probe this monitor. Read-only: it is\nmaintained by the health-check scheduler, never accepted on write.\n`null` means the monitor has not been scheduled yet and is due on the\nnext sweep.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "project_id": {
             "format": "int32",
