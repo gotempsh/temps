@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, test, expect } from "bun:test";
 import {
   createEvent,
@@ -103,14 +105,14 @@ describe("mock host", () => {
     expect(
       await host.call("get_last_deployment", { project_id: 1 }),
     ).toMatchObject({ id: 42 });
-    await await expect(
+    await expect(
       host.call("get_project", { project_id: 5 }),
     ).rejects.toMatchObject({ code: "not_found" });
-    await await expect(
+    await expect(
       host.call("get_project", { project_id: -1 }),
     ).rejects.toMatchObject({ code: "invalid_params" });
     host.permissions = [];
-    await await expect(
+    await expect(
       host.call("get_project", { project_id: 1 }),
     ).rejects.toMatchObject({ code: "permission_denied" });
   });
@@ -181,4 +183,36 @@ describe("mock host", () => {
       host.call("generate_ai", { purpose: "test", prompt: "test" }),
     ).rejects.toMatchObject({ code: "internal" });
   });
+});
+
+
+test("project and environment lists are complete; deployment lists are ordered and bounded", async () => {
+  const defaults = parseFixtures();
+  const fixtures = parseFixtures({
+    projects: Array.from({ length: 125 }, (_, i) => ({ ...defaults.projects[0], id: i + 1 })),
+    environments: Array.from({ length: 125 }, (_, i) => ({ ...defaults.environments[0], id: i + 1 })),
+    deployments: Array.from({ length: 125 }, (_, i) => ({ ...defaults.deployments[0], id: i + 1, created_at: new Date(Date.UTC(2026, 0, i + 1)).toISOString() })),
+  });
+  const host = new MockHost("example", "actor", ["projects_read", "environments_read", "deployments_read"], fixtures);
+  expect(await host.call("list_projects", {})).toHaveLength(125);
+  expect(await host.call("list_environments", { project_id: 1 })).toHaveLength(125);
+  expect(await host.call("list_environments", { project_id: 2 })).toEqual([]);
+  const deployments = await host.call("list_deployments", { project_id: 1 }) as Record<string, unknown>[];
+  expect(deployments).toHaveLength(20);
+  expect(deployments[0]!.id).toBe(125);
+  expect(await host.call("list_deployments", { project_id: 1, limit: 200 })).toHaveLength(100);
+  expect(await host.call("list_deployments", { project_id: 1, limit: 0 })).toEqual([]);
+});
+
+test("preview permission snapshot matches production role permissions and wire names", async () => {
+  const { previewPermissions } = await import("./preview-permissions.js");
+  const source = await Bun.file(new URL("../../../../../../crates/temps-auth/src/permissions.rs", import.meta.url)).text();
+  const names = new Map([...source.matchAll(/Permission::(\w+) => "([^"]+)"/g)].map(m => [m[1], m[2]]));
+  for (const role of ["Admin", "Reader"] as const) {
+    const block = source.match(new RegExp(String.raw`Role::${role} => &\[([\s\S]*?)\]`))?.[1];
+    expect(block).toBeDefined();
+    const expected = [...block!.matchAll(/Permission::(\w+)/g)].map(m => names.get(m[1]));
+    const actual: (string | undefined)[] = [...previewPermissions[role.toLowerCase() as "admin" | "reader"]];
+    expect(actual.sort()).toEqual(expected.sort());
+  }
 });

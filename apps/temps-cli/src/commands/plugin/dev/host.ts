@@ -249,7 +249,10 @@ export class MockHost {
         );
       return latest;
     }
-    return rows.slice(0, integer(params.limit ?? 20, "limit", 1, 100));
+    if (method !== "list_deployments") return rows;
+    return [...rows]
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .slice(0, Math.min(integer(params.limit ?? 20, "limit", 0), 100));
   }
   private async generate(params: Record<string, unknown>) {
     const ai = this.fixtures.ai;

@@ -268,3 +268,10 @@ Implementation decisions relative to the proposal:
   and UI WebSocket upgrades require testing against a full Temps instance.
 - No npm package publication is part of this change. The README explains how
   to use the source checkout before release.
+
+### PR review corrections (2026-09-18)
+
+- Project/environment fixture lists return all matching rows. Deployments retain the production default of 20, maximum of 100, zero-limit behavior, and newest-first ordering. Regression uses 125 records.
+- Preview requests include resolved caller permissions, independently of plugin grants. Admin/reader snapshots are checked against the Rust source; compiled/source plugin tests cover valid permissions and rejection of spoofed reader permissions.
+- Test file attribution and Bun file APIs corrected. Repository-wide source-attribution check passes.
+- Verification: CLI typecheck/build, 1,186 tests (32 runner/model tests), and packed bunx native-plugin end-to-end test passed. AI remains mocked. Security review approved the permissions change.

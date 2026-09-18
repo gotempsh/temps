@@ -19,6 +19,7 @@ import type {
   PluginHostPermission,
   PluginManifest,
 } from "./model.js";
+import { previewPermissions } from "./preview-permissions.js";
 import { MockHost, parseFixtures } from "./host.js";
 import {
   loadState,
@@ -316,6 +317,7 @@ export async function startRunner(options: RunnerOptions) {
       "x-temps-plugin": m.name,
       "x-temps-request-id": crypto.randomUUID(),
       "x-temps-user-role": role,
+      "x-temps-user-permissions": previewPermissions[role as "admin" | "reader"].join(","),
       "x-temps-user-id": "1",
       "x-temps-user-email": "developer@example.invalid",
     });

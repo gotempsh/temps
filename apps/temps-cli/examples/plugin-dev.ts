@@ -62,6 +62,7 @@ await runPlugin({
             events,
             capabilities: await ctx.permissions(),
             role: req.headers["x-temps-user-role"],
+            permissions: String(req.headers["x-temps-user-permissions"] ?? "").split(",").filter(Boolean),
           };
         else if (path === "/api/ai" && req.method === "POST")
           data = await ctx.ai.generate({

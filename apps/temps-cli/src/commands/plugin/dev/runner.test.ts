@@ -1,7 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { beforeAll, afterAll, test, expect } from "bun:test";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { startRunner } from "./runner.js";
 import { createEvent } from "./model.js";
@@ -71,6 +72,8 @@ test("compiled plugin: UI, discovery, events, duplicates, HTTP fallback, revocat
     "events_read",
     "ai_generate",
   ]);
+  expect(first.permissions).toContain("projects:write");
+  expect(first.permissions).toContain("projects:read");
   const page = await fetch(r.url + "/");
   expect(await page.text()).toContain("Deployment journal");
   const event = createEvent("deployment.succeeded", {
@@ -132,10 +135,14 @@ test("source plugin and preview reject spoofing, cross-site writes and reserved 
   const spoof = await fetch(r.url + "/x/deployment-journal/api/state", {
     headers: {
       "x-temps-user-role": "admin",
+      "x-temps-user-permissions": "projects:write",
       "x-temps-auth-signature": "attacker",
     },
   });
-  expect((await spoof.json()).role).toBe("reader");
+  const identity = await spoof.json();
+  expect(identity.role).toBe("reader");
+  expect(identity.permissions).toContain("projects:read");
+  expect(identity.permissions).not.toContain("projects:write");
   expect(
     (await fetch(r.url + "/", { headers: { host: "attacker.example" } }))
       .status,
@@ -220,7 +227,7 @@ test("CLI parsing routes emit/status/grants to the named session", async () => {
 test("proxy isolates browser cookies and strips plugin-set cookies", async () => {
   const source = join(temp, "cookie-plugin.ts");
   const sdk = resolve("../../sdks/node/packages/plugin-sdk/src/runtime.ts");
-  await writeFile(
+  await Bun.write(
     source,
     `import {runPlugin} from ${JSON.stringify(sdk)}; await runPlugin({ manifest:()=>({name:'cookie-test',version:'1',nav:[],requires_db:false,health_path:'/health',events:[]}), handler:()=> (req,res)=>{res.writeHead(200,{'content-type':'application/json','set-cookie':'other_app=hijacked; Path=/'});res.end(JSON.stringify({cookie:req.headers.cookie??null}));} });`,
   );
@@ -241,15 +248,15 @@ test("proxy isolates browser cookies and strips plugin-set cookies", async () =>
 test("shutdown kills descendants launched through a wrapper", async () => {
   const script = join(temp, "wrapper.sh");
   const pidFile = join(temp, "descendant.pid");
-  await writeFile(
+  await Bun.write(
     script,
     `#!/bin/sh\nsleep 120 &\necho $! > '${pidFile}'\nexec '${binary}' "$@"\n`,
-    { mode: 0o700 },
   );
+  await chmod(script, 0o700);
   const r = await startRunner({ session: session(), command: [script] });
   active.push(r);
   await state(r);
-  const pid = Number(await readFile(pidFile, "utf8"));
+  const pid = Number(await Bun.file(pidFile).text());
   expect(pid).toBeGreaterThan(1);
   process.kill(pid, 0);
   await r.stop();
@@ -283,7 +290,7 @@ test("interrupted startup cleans the child and session lock", async () => {
 // Build first with: cargo build -p temps-plugin-sdk --example plugin-dev-probe
 // CLI-only contributors need no Rust toolchain. The release verification runs both.
 const rustProbe = resolve("../../target/debug/examples/plugin-dev-probe");
-test.skipIf(!existsSync(rustProbe))(
+test.skipIf(!(await Bun.file(rustProbe).exists()))(
   "Rust SDK decodes host responses and receives authenticated events",
   async () => {
     const name = session();
