@@ -32,8 +32,13 @@ thiserror = { workspace = true }
 sysinfo = { workspace = true }
 num_cpus = "1.16"
 sea-orm = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
+# Shared S3-client-construction helper and backend-selection config for the
+# S3-compatible StaticDeployer, so it can never disagree with S3FileStore
+# (used for the CAS store) about how to build a client.
+temps-file-store = { path = "../temps-file-store" }
 # Traefik label discovery persists its routes as `traefik_discovered_routes`
 # rows so the existing route-table NOTIFY machinery propagates them.
 temps-entities = { path = "../temps-entities" }

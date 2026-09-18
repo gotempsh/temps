@@ -37,6 +37,7 @@ pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod s3_static_deployer;
 pub mod static_deployer;
 pub mod static_ingestion;
 pub mod traefik_discovery;

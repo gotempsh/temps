@@ -136,6 +136,58 @@ type ListFilesFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Vec<FileInfo>, StaticDeployError>> + Send + 'a>,
 >;
 
+/// Build the relative storage path with date partitioning, shared by every
+/// `StaticDeployer` backend so a given `(project, environment, deployment)`
+/// resolves to the same identifier regardless of which backend wrote it.
+/// Format: `projects/{project}/{env}/{year}/{month}/{day}/{deployment}`.
+///
+/// A `String` with explicit `/` joins (not a `PathBuf` built via `.join()`
+/// per component) so the result is always POSIX-style, including when this
+/// process itself runs on a non-Unix host — S3 keys are never OS paths.
+pub(crate) fn storage_relative_path(
+    project_slug: &str,
+    environment_slug: &str,
+    deployment_slug: &str,
+) -> String {
+    let now = Utc::now();
+    format!(
+        "projects/{project_slug}/{environment_slug}/{}/{}/{}/{deployment_slug}",
+        now.format("%Y"),
+        now.format("%m"),
+        now.format("%d"),
+    )
+}
+
+pub(crate) fn validate_storage_component(name: &str, value: &str) -> Result<(), StaticDeployError> {
+    if value.is_empty() || value.contains(['/', '\\']) {
+        return Err(StaticDeployError::InvalidPath(format!(
+            "{name} must be a single non-empty relative path component, got '{value}'"
+        )));
+    }
+
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == value => Ok(()),
+        _ => Err(StaticDeployError::InvalidPath(format!(
+            "{name} must be a clean relative path component, got '{value}'"
+        ))),
+    }
+}
+
+/// Validate the three identifiers every `StaticDeployer` backend uses to
+/// build its storage location. Shared (rather than duplicated per backend)
+/// because this is the security boundary that keeps a deployment identifier
+/// from ever becoming a path-traversal or cross-tenant key.
+pub(crate) fn validate_storage_identifiers(
+    project_slug: &str,
+    environment_slug: &str,
+    deployment_slug: &str,
+) -> Result<(), StaticDeployError> {
+    validate_storage_component("project_slug", project_slug)?;
+    validate_storage_component("environment_slug", environment_slug)?;
+    validate_storage_component("deployment_slug", deployment_slug)
+}
+
 impl FilesystemStaticDeployer {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
@@ -144,45 +196,11 @@ impl FilesystemStaticDeployer {
     /// Build the storage path with date partitioning
     /// Format: {base_dir}/projects/{project}/{env}/{year}/{month}/{day}/{deployment}/
     fn build_storage_path(&self, request: &StaticDeployRequest) -> PathBuf {
-        let now = Utc::now();
-        let year = now.format("%Y").to_string();
-        let month = now.format("%m").to_string();
-        let day = now.format("%d").to_string();
-
-        self.base_dir
-            .join("projects")
-            .join(&request.project_slug)
-            .join(&request.environment_slug)
-            .join(year)
-            .join(month)
-            .join(day)
-            .join(&request.deployment_slug)
-    }
-
-    fn validate_storage_component(name: &str, value: &str) -> Result<(), StaticDeployError> {
-        if value.is_empty() || value.contains(['/', '\\']) {
-            return Err(StaticDeployError::InvalidPath(format!(
-                "{name} must be a single non-empty relative path component, got '{value}'"
-            )));
-        }
-
-        let mut components = Path::new(value).components();
-        match (components.next(), components.next()) {
-            (Some(Component::Normal(component)), None) if component == value => Ok(()),
-            _ => Err(StaticDeployError::InvalidPath(format!(
-                "{name} must be a clean relative path component, got '{value}'"
-            ))),
-        }
-    }
-
-    fn validate_storage_identifiers(
-        project_slug: &str,
-        environment_slug: &str,
-        deployment_slug: &str,
-    ) -> Result<(), StaticDeployError> {
-        Self::validate_storage_component("project_slug", project_slug)?;
-        Self::validate_storage_component("environment_slug", environment_slug)?;
-        Self::validate_storage_component("deployment_slug", deployment_slug)
+        self.base_dir.join(storage_relative_path(
+            &request.project_slug,
+            &request.environment_slug,
+            &request.deployment_slug,
+        ))
     }
 
     async fn copy_file_bounded(
@@ -439,7 +457,7 @@ impl StaticDeployer for FilesystemStaticDeployer {
         &self,
         request: StaticDeployRequest,
     ) -> Result<StaticDeployResult, StaticDeployError> {
-        Self::validate_storage_identifiers(
+        validate_storage_identifiers(
             &request.project_slug,
             &request.environment_slug,
             &request.deployment_slug,
@@ -555,7 +573,7 @@ impl StaticDeployer for FilesystemStaticDeployer {
         environment_slug: &str,
         deployment_slug: &str,
     ) -> Result<StaticDeploymentInfo, StaticDeployError> {
-        Self::validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
+        validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
 
         // Search for deployment across all date partitions
         let project_env_path = self
@@ -648,7 +666,7 @@ impl StaticDeployer for FilesystemStaticDeployer {
         environment_slug: &str,
         deployment_slug: &str,
     ) -> Result<Vec<FileInfo>, StaticDeployError> {
-        Self::validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
+        validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
         let deployment_info = self
             .get_deployment(project_slug, environment_slug, deployment_slug)
             .await?;
@@ -663,7 +681,7 @@ impl StaticDeployer for FilesystemStaticDeployer {
         environment_slug: &str,
         deployment_slug: &str,
     ) -> Result<(), StaticDeployError> {
-        Self::validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
+        validate_storage_identifiers(project_slug, environment_slug, deployment_slug)?;
         let deployment_info = self
             .get_deployment(project_slug, environment_slug, deployment_slug)
             .await?;
@@ -983,12 +1001,9 @@ mod tests {
                 ("project", invalid, "deploy"),
                 ("project", "production", invalid),
             ] {
-                let error = FilesystemStaticDeployer::validate_storage_identifiers(
-                    identifiers.0,
-                    identifiers.1,
-                    identifiers.2,
-                )
-                .expect_err("unclean storage identifier must fail");
+                let error =
+                    validate_storage_identifiers(identifiers.0, identifiers.1, identifiers.2)
+                        .expect_err("unclean storage identifier must fail");
                 assert!(
                     matches!(error, StaticDeployError::InvalidPath(_)),
                     "identifier tuple {identifiers:?} must be rejected"
