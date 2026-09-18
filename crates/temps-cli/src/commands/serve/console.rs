@@ -1501,12 +1501,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_health",
         "get_quota",
         "get_pipeline_stats",
-        // ── Platform capabilities: which subsystems this process actually
-        //    runs (profile, docker, local workloads, kv, imports, log
-        //    aggregation, vulnerability scanning, backups). No secrets — lets
-        //    the AI tell the user "not available in this profile" instead of
-        //    proposing an action that will fail.
-        "get_platform_features",
         // ── Container runtime: logs + metrics (no secrets) ──
         "get_container_metrics",
         "get_container_logs",
