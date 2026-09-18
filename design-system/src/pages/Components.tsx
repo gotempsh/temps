@@ -8,6 +8,7 @@ import {
   Button,
   Callout,
   CopyAction,
+  DataTable,
   Field,
   FormErrors,
   Kbd,
@@ -32,7 +33,7 @@ import {
   type StatusTone,
 } from '@temps-sdk/ds'
 import { Input } from '@temps-sdk/ui'
-import { DEPLOYMENT_METRICS } from '../fixtures'
+import { DEPLOYMENT_METRICS, DEPLOYMENTS, type DeploymentFixture } from '../fixtures'
 
 function Block({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -223,6 +224,25 @@ export default function Components() {
           value={picked}
           onValueChange={setPicked}
         />
+      </Block>
+
+      <Block title="DataTable">
+        <p className="w-full text-sm text-muted-foreground">
+          The table + skeleton + pagination footer `Ledger` composes — usable
+          standalone for an embedded table (a settings sub-panel, a
+          `Detail`'s `main` column) that doesn't want a second page header.
+        </p>
+        <div className="w-full">
+          <DataTable<DeploymentFixture>
+            columns={[
+              { key: 'service', header: 'Service', render: (d) => <span className="font-medium">{d.service}</span> },
+              { key: 'status', header: 'Status', render: (d) => <Status tone={d.status} label={d.statusLabel} /> },
+              { key: 'duration', header: 'Duration', render: (d) => fmtDuration(d.durationMs) },
+            ]}
+            rows={DEPLOYMENTS.slice(0, 3)}
+            rowKey={(d) => d.id}
+          />
+        </div>
       </Block>
 
       <Block title="TimeChart">

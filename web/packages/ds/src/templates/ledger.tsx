@@ -2,25 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ReactNode } from 'react'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-  Skeleton,
-} from '@temps-sdk/ui'
 import { PageContainer, PageHeader } from '../page-header'
-import { Button } from '../button'
-import { cn } from '../lib/cn'
+import { DataTable, type DataTableColumn } from './data-table'
 
-export interface LedgerColumn<T> {
-  key: string
-  header: ReactNode
-  render: (row: T) => ReactNode
-  className?: string
-}
+export type LedgerColumn<T> = DataTableColumn<T>
 
 export interface LedgerProps<T> {
   title: ReactNode
@@ -48,6 +33,11 @@ export interface LedgerProps<T> {
  * Pairs with `useUrlState` for the toolbar's filters and `pagination.page`
  * so a filtered, paginated list survives a refresh or a shared link — see
  * RULES.md § "the URL is the state".
+ *
+ * The table itself is `DataTable` — `Ledger` only adds the full-page shell
+ * (`PageContainer`/`PageHeader`) and the empty-state branch around it. Reach
+ * for `DataTable` directly for an embedded table (a settings sub-panel, a
+ * `Detail`'s `main` column) that doesn't want a second page header.
  */
 export function Ledger<T>({
   title,
@@ -72,74 +62,15 @@ export function Ledger<T>({
       {showEmpty ? (
         empty
       ) : (
-        <div className="rounded-md border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                {columns.map((column) => (
-                  <TableHead key={column.key} className={column.className}>
-                    {column.header}
-                  </TableHead>
-                ))}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading
-                ? Array.from({ length: 5 }).map((_, i) => (
-                    <TableRow key={i}>
-                      {columns.map((column) => (
-                        <TableCell key={column.key}>
-                          <Skeleton className="h-4 w-24" />
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                  ))
-                : rows.map((row) => (
-                    <TableRow
-                      key={rowKey(row)}
-                      className={cn(onRowClick && 'cursor-pointer')}
-                      onClick={() => onRowClick?.(row)}
-                    >
-                      {columns.map((column) => (
-                        <TableCell key={column.key} className={column.className}>
-                          {column.render(row)}
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                  ))}
-            </TableBody>
-          </Table>
-        </div>
+        <DataTable
+          columns={columns}
+          rows={rows}
+          rowKey={rowKey}
+          onRowClick={onRowClick}
+          isLoading={isLoading}
+          pagination={pagination}
+        />
       )}
-      {pagination && pagination.pageCount > 1 ? (
-        <div className="flex items-center justify-between text-sm text-muted-foreground">
-          <span>
-            Page {pagination.page} of {pagination.pageCount}
-          </span>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page <= 1}
-              className={cn(pagination.page <= 1 && 'pointer-events-none opacity-50')}
-              onClick={() => pagination.onPageChange(pagination.page - 1)}
-            >
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page >= pagination.pageCount}
-              className={cn(
-                pagination.page >= pagination.pageCount && 'pointer-events-none opacity-50',
-              )}
-              onClick={() => pagination.onPageChange(pagination.page + 1)}
-            >
-              Next
-            </Button>
-          </div>
-        </div>
-      ) : null}
     </PageContainer>
   )
 }

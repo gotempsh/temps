@@ -39,5 +39,6 @@ export { notify } from './notify'
 export * from './fmt'
 
 export { Ledger, type LedgerColumn, type LedgerProps } from './templates/ledger'
+export { DataTable, type DataTableColumn, type DataTableProps } from './templates/data-table'
 export { Detail, type DetailFact, type DetailProps } from './templates/detail'
 export { Settings, type SettingsProps } from './templates/settings'
