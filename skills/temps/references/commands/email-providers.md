@@ -15,6 +15,7 @@ Manage email providers (SES, Scaleway) for transactional email
 - `show` - Show email provider details
 - `remove` (`rm`) - Remove an email provider
 - `test` - Test an email provider by sending a test email
+- `discoverable-domains` (`discover-domains`) - List domain identities already registered on the provider's side, for importing
 
 ### `email-providers list` (alias: `ls`)
 
@@ -77,3 +78,14 @@ Test an email provider by sending a test email
 | `--id <id>` | Provider ID | - | Yes |
 | `--from <email>` | Sender email address (must be verified) | - | No |
 | `--from-name <name>` | Sender display name | - | No |
+
+### `email-providers discoverable-domains` (alias: `discover-domains`)
+
+List domain identities already registered on the provider's side, for importing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |

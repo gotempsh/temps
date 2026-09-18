@@ -32,6 +32,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`services restore`](#services-restore)
 - [`services restore-runs`](#services-restore-runs)
 - [`services restore-run`](#services-restore-run)
+- [`services wal-health`](#services-wal-health)
 
 ## `services` (alias: `svc`)
 
@@ -65,6 +66,7 @@ Manage external services (databases, caches, storage)
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
 - `restore-runs` - List recent restore runs for a service
 - `restore-run` - Show a single restore run
+- `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
 
 ### `services list` (alias: `ls`)
 
@@ -529,4 +531,15 @@ Show a single restore run
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services wal-health`
+
+Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
 | `--json` | Output in JSON format | - | No |

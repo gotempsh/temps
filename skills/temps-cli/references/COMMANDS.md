@@ -74,6 +74,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
+- [`server`](#server) - Resource usage of the machine running the Temps control plane (what /monitoring/server shows)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
@@ -123,6 +124,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`exec`](#exec) - Execute a command in a running container (coming soon)
 - [`dev`](#dev) - Start a local development tunnel (coming soon)
 - [`cloud`](#cloud) - Temps Cloud
+- [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
+- [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
 
 ## Commands
 
@@ -2036,6 +2039,7 @@ Manage external services (databases, caches, storage)
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
 - `restore-runs` - List recent restore runs for a service
 - `restore-run` - Show a single restore run
+- `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
 
 ### `services list` (alias: `ls`)
 
@@ -2500,6 +2504,17 @@ Show a single restore run
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services wal-health`
+
+Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `settings`
@@ -3677,6 +3692,51 @@ List the distinct values seen for a label key on a metric
 | `--label-key <key>` | Label key whose values to list | - | Yes |
 | `--start-time <iso>` | Window start (RFC 3339); defaults to 24h before end | - | No |
 | `--end-time <iso>` | Window end (RFC 3339); defaults to now | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `server`
+
+Resource usage of the machine running the Temps control plane (what /monitoring/server shows)
+
+**Subcommands:**
+
+- `status` - Latest CPU, memory, disk, block I/O and network I/O sample for the control-plane host
+- `metrics` - Time series of one control-plane host metric, e.g. node.cpu_percent or node.network_rx_bytes_total
+- `docker-disk-usage` (`df`) - Docker disk usage by images, containers, volumes and build cache (docker system df) on the control-plane host
+
+### `server status`
+
+Latest CPU, memory, disk, block I/O and network I/O sample for the control-plane host
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server metrics`
+
+Time series of one control-plane host metric, e.g. node.cpu_percent or node.network_rx_bytes_total
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--metric <name>` | Metric name (node.cpu_percent, node.memory_used_bytes, node.disk_used_bytes, node.disk_read_bytes_total, node.network_tx_bytes_total, ...) | - | Yes |
+| `--range <range>` | Time window: 1h, 6h, 24h, 7d | `1h` | No |
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server docker-disk-usage` (alias: `df`)
+
+Docker disk usage by images, containers, volumes and build cache (docker system df) on the control-plane host
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `traces` (alias: `trace`)
@@ -5150,6 +5210,7 @@ Manage email domains for transactional email
 
 - `list` (`ls`) - List all email domains
 - `create` (`add`) - Create a new email domain
+- `import` - Import an existing domain identity that was already provisioned in the provider console. Fetches the current verification state without re-creating the identity.
 - `show` - Show email domain details
 - `remove` (`rm`) - Remove an email domain
 - `by-name` - Look up an email domain by domain name
@@ -5180,6 +5241,19 @@ Create a new email domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | No |
 | `--provider-id <id>` | Email provider ID | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `email-domains import`
+
+Import an existing domain identity that was already provisioned in the provider console. Fetches the current verification state without re-creating the identity.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | No |
+| `--provider-id <id>` | Email provider ID | - | No |
+| `--provider-identity-id <id>` | Provider-internal identity UUID (required for Scaleway; omit for SES) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `email-domains show`
@@ -5294,6 +5368,7 @@ Manage email providers (SES, Scaleway) for transactional email
 - `show` - Show email provider details
 - `remove` (`rm`) - Remove an email provider
 - `test` - Test an email provider by sending a test email
+- `discoverable-domains` (`discover-domains`) - List domain identities already registered on the provider's side, for importing
 
 ### `email-providers list` (alias: `ls`)
 
@@ -5356,6 +5431,17 @@ Test an email provider by sending a test email
 | `--id <id>` | Provider ID | - | Yes |
 | `--from <email>` | Sender email address (must be verified) | - | No |
 | `--from-name <name>` | Sender display name | - | No |
+
+### `email-providers discoverable-domains` (alias: `discover-domains`)
+
+List domain identities already registered on the provider's side, for importing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ## `incidents` (alias: `incident`)
 
@@ -7375,6 +7461,7 @@ Temps Cloud
 - `status` - Show this self-hosted instance's Temps Cloud link
 - `connect` - Connect this self-hosted instance using an enrollment code
 - `disconnect` - Disconnect this self-hosted instance from Temps Cloud
+- `backup-schedule` - The backup schedule that writes to the Temps Cloud destination
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
@@ -7421,6 +7508,24 @@ Disconnect this self-hosted instance from Temps Cloud
 |------|-------------|---------|----------|
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `cloud backup-schedule`
+
+The backup schedule that writes to the Temps Cloud destination
+
+**Subcommands:**
+
+- `ensure` - Create the nightly default schedule unless one already targets Temps Cloud
+
+#### `cloud backup-schedule ensure`
+
+Create the nightly default schedule unless one already targets Temps Cloud
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
 
 ### `cloud vps`
 
@@ -7654,6 +7759,213 @@ Stop a Temps Cloud activation at its next chunk boundary
 |------|-------------|---------|----------|
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
+
+## `plugin`
+
+Create, install, update and build TypeScript plugins
+
+**Subcommands:**
+
+- `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
+- `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+- `grants` - Inspect or replace a plugin's host API permissions and AI limits
+- `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+- `init` - Create a TypeScript plugin project
+- `build` - Build every platform selected in package.json; --all selects all six supported targets
+- `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+
+### `plugin install`
+
+Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
+| `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
+| `-y, --yes` | Trust the repository and allow installation without prompting | - | No |
+| `--grant <permissions...>` | Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read | - | No |
+| `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | No |
+| `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | No |
+
+### `plugin update`
+
+Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ref <ref>` | Use a different branch, tag, or commit | - | No |
+| `-y, --yes` | Trust the update without prompting | - | No |
+
+### `plugin grants`
+
+Inspect or replace a plugin's host API permissions and AI limits
+
+**Subcommands:**
+
+- `get` - Show current grants, actor identity, and AI availability
+- `set` - Replace all host grants; --clear revokes all permissions immediately
+
+#### `plugin grants get`
+
+Show current grants, actor identity, and AI availability
+
+#### `plugin grants set`
+
+Replace all host grants; --clear revokes all permissions immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--grant <permissions...>` | Complete list of permissions to grant | - | No |
+| `--ai-daily-calls <count>` | Daily AI call limit (0–10000) | - | No |
+| `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | No |
+| `--clear` | Revoke all host permissions | - | No |
+
+### `plugin dev`
+
+Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Local session name | `default` | No |
+| `--exec <command>` | Run a command with arguments after -- | - | No |
+| `--port <port>` | Loopback port (0 selects a free port) | `0` | No |
+| `--data-dir <path>` | Persistent plugin data directory | - | No |
+| `--grant <permission...>` | Explicit host grants; defaults to none or saved session grants | - | No |
+| `--fixtures <file>` | Version-1 JSON host fixtures and mock AI settings | - | No |
+| `--role <role>` | Synthetic preview role: admin or reader | `admin` | No |
+| `--startup-timeout <ms>` | Handshake deadline | `10000` | No |
+
+**Subcommands:**
+
+- `events` - List host event fixtures and example payloads
+- `status` - Show local plugin state
+- `logs` - Show the last 200 redacted simulator records
+- `emit` - Deliver an event; sent does not mean handler completed
+- `grants` - Change simulated host permissions immediately
+
+#### `plugin dev events`
+
+List host event fixtures and example payloads
+
+#### `plugin dev status`
+
+Show local plugin state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | No |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev logs`
+
+Show the last 200 redacted simulator records
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | No |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev emit`
+
+Deliver an event; sent does not mean handler completed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | No |
+| `--file <path>` | Full JSON event envelope with a stable ID | - | No |
+| `--project-id <id>` | Project ID | `1` | No |
+| `--environment-id <id>` | Environment ID | `1` | No |
+| `--deployment-id <id>` | Deployment ID | `42` | No |
+| `--environment <name>` | Environment | `production` | No |
+| `--url <url>` | Deployment URL | - | No |
+| `--repeat <n>` | Repeat the same event ID, up to 1000 | - | No |
+| `--count <n>` | Deliver distinct IDs, up to 1000 | - | No |
+| `--transport <transport>` | auto or http | `auto` | No |
+| `--json` | Machine-readable receipts and envelope | - | No |
+
+#### `plugin dev grants`
+
+Change simulated host permissions immediately
+
+**Subcommands:**
+
+- `set` - Replace all grants or revoke all with --clear
+
+##### `plugin dev grants set`
+
+Replace all grants or revoke all with --clear
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | No |
+| `--grant <permission...>` | Complete replacement grant set | - | No |
+| `--clear` | Revoke every grant | - | No |
+
+### `plugin init`
+
+Create a TypeScript plugin project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Scoped npm name, e.g. @your-scope/my-plugin | - | Yes |
+
+### `plugin build`
+
+Build every platform selected in package.json; --all selects all six supported targets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Build all supported targets | - | No |
+
+### `plugin publish`
+
+Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Confirm public npm publication non-interactively | - | No |
+
+## `setup`
+
+PoC: install Temps on an existing Linux VPS over SSH and save a client context
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ssh <destination>` | SSH alias or user@hostname (trusted host key required) | - | Yes |
+| `--email <email>` | Admin email and certificate contact | - | No |
+| `--context <name>` | New local context name | `production` | No |
+| `--port <port>` | SSH port | `22` | No |
+| `--identity <path>` | SSH private key path (otherwise use your SSH agent/config) | - | No |
+| `--channel <channel>` | Runtime release channel: stable, beta, nightly | `stable` | No |
+| `--runtime-version <tag>` | Pin the runtime release | - | No |
+| `--dry-run` | Show the plan without connecting, changing files or sending telemetry | - | No |
+| `--telemetry` | Opt in to coarse setup-step analytics for this attempt only | - | No |
+| `--no-telemetry` | Do not send setup analytics (default) | - | No |
+| `-y, --yes` | Approve the installation plan without prompting | - | No |
 
 
 ---

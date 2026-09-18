@@ -3579,7 +3579,8 @@ Create, install, update and build TypeScript plugins
 - `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 - `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
-- `init`
+- `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+- `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
 
@@ -3635,7 +3636,100 @@ Replace all host grants; --clear revokes all permissions immediately
 | `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | Yes |
 | `--clear` | Revoke all host permissions | - | No |
 
+### `plugin dev`
+
+Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Local session name | `default` | Yes |
+| `--exec <command>` | Run a command with arguments after -- | - | Yes |
+| `--port <port>` | Loopback port (0 selects a free port) | `0` | Yes |
+| `--data-dir <path>` | Persistent plugin data directory | - | Yes |
+| `--grant <permission...>` | Explicit host grants; defaults to none or saved session grants | - | Yes |
+| `--fixtures <file>` | Version-1 JSON host fixtures and mock AI settings | - | Yes |
+| `--role <role>` | Synthetic preview role: admin or reader | `admin` | Yes |
+| `--startup-timeout <ms>` | Handshake deadline | `10000` | Yes |
+
+**Subcommands:**
+
+- `events` - List host event fixtures and example payloads
+- `status` - Show local plugin state
+- `logs` - Show the last 200 redacted simulator records
+- `emit` - Deliver an event; sent does not mean handler completed
+- `grants` - Change simulated host permissions immediately
+
+#### `plugin dev events`
+
+List host event fixtures and example payloads
+
+#### `plugin dev status`
+
+Show local plugin state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev logs`
+
+Show the last 200 redacted simulator records
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev emit`
+
+Deliver an event; sent does not mean handler completed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--file <path>` | Full JSON event envelope with a stable ID | - | Yes |
+| `--project-id <id>` | Project ID | `1` | Yes |
+| `--environment-id <id>` | Environment ID | `1` | Yes |
+| `--deployment-id <id>` | Deployment ID | `42` | Yes |
+| `--environment <name>` | Environment | `production` | Yes |
+| `--url <url>` | Deployment URL | - | Yes |
+| `--repeat <n>` | Repeat the same event ID, up to 1000 | - | Yes |
+| `--count <n>` | Deliver distinct IDs, up to 1000 | - | Yes |
+| `--transport <transport>` | auto or http | `auto` | Yes |
+| `--json` | Machine-readable receipts and envelope | - | No |
+
+#### `plugin dev grants`
+
+Change simulated host permissions immediately
+
+**Subcommands:**
+
+- `set` - Replace all grants or revoke all with --clear
+
+##### `plugin dev grants set`
+
+Replace all grants or revoke all with --clear
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--grant <permission...>` | Complete replacement grant set | - | Yes |
+| `--clear` | Revoke every grant | - | No |
+
 ### `plugin init`
+
+Create a TypeScript plugin project
 
 **Options:**
 

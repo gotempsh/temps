@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "ai": {
+    "mode": "success",
+    "text": "Your example deployment succeeded. This is a local mock response.",
+    "dailyCallLimit": 3,
+    "concurrency": 1
+  }
+}

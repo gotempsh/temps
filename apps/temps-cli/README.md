@@ -16,6 +16,106 @@
 
 ---
 
+## Develop and test a plugin locally
+
+Run a compiled plugin with a simulated Temps host on macOS or Linux:
+
+```bash
+bunx @temps-sdk/cli plugin dev ./my-plugin --session demo --grant events_read
+```
+
+`./my-plugin` is an executable, not a directory. Open the printed loopback URL
+to preview its UI. No Temps server, login, Docker, database, or provider key is
+required. The CLI starts Bun automatically for these commands. Native plugins
+execute with your OS permissions: this is a development host, not a sandbox.
+
+To run source without compiling, pass an executable and arguments separately:
+
+```bash
+bunx @temps-sdk/cli plugin dev --session demo --exec bun -- run src/index.ts
+```
+
+In another terminal:
+
+```bash
+bunx @temps-sdk/cli plugin dev events
+bunx @temps-sdk/cli plugin dev emit deployment.succeeded --session demo \
+  --project-id 1 --environment-id 1 --environment production \
+  --deployment-id 42 --url https://example.com --json
+bunx @temps-sdk/cli plugin dev status --session demo --json
+bunx @temps-sdk/cli plugin dev logs --session demo --json
+bunx @temps-sdk/cli plugin dev grants set --session demo --clear
+```
+
+The plugin must subscribe to the event and declare `events_read`, and the runner
+must grant it. New sessions have no grants. `grants set --grant events_read
+ai_generate` replaces the complete set; `--clear` revokes everything immediately.
+Manifest declarations limit effective permissions even when a grant is saved.
+Use different session names to run multiple plugins. Ctrl-C stops the plugin and
+its process group. Plugin data and grants persist under `~/.temps/plugin-dev/`;
+`--data-dir` overrides the plugin data location. Stale session locks fail with
+recovery instructions rather than risking stopping another process.
+
+Use `emit --file event.json --repeat 2` to test duplicate delivery of the same
+ID, or `--count 5` for distinct IDs. Counts are bounded at 1,000. Emission is
+sequential; separate commands can deliver concurrently (maximum eight in
+flight). `--transport http` exercises the authenticated fallback endpoint.
+`sent` and `http_accepted` confirm transmission, **not completion of the plugin's
+async handler**. Check the plugin's state to prove the resulting work completed.
+There is no implicit event replay. Custom event envelopes are supported with
+`--file`; listing a custom type does not mean the production host emits it.
+
+For mock AI, supply `--fixtures fixtures.json` and explicitly grant `ai_generate`:
+
+```json
+{
+  "version": 1,
+  "ai": {
+    "mode": "success",
+    "text": "Local mock response",
+    "dailyCallLimit": 3,
+    "concurrency": 1,
+    "delayMs": 100,
+    "maxOutputTokens": 1024
+  }
+}
+```
+
+AI modes are `unconfigured` (default), `success`, `error`, and `timeout`. Timeout
+mode returns a simulated provider-timeout error after `delayMs`; it does not
+wait for a real provider. Quota counters reset when the runner restarts; they do
+not emulate production database persistence or a full calendar-day rollover.
+The fixture file can also supply `projects`, `environments`, and `deployments`
+arrays matching the SDK DTOs; IDs and references are validated. Default fixtures
+contain project 1, production environment 1, and deployment 42. Host API calls
+outside discovery, these read methods, and mock AI return explicit unsupported
+errors; no request is forwarded to a real Temps instance.
+
+`--role admin|reader` changes the synthetic preview user, independently of plugin
+grants. Browser cookies are intentionally isolated from the plugin; plugins
+requiring cookie authentication need full-instance testing. Preview writes need
+the local session cookie (open `/` first) and a same-origin Origin header.
+Control/event endpoints are available only through the private local socket.
+Payloads are bounded to 1 MiB, logs to 200 records, and host calls to 32 in flight.
+
+A runnable deployment-journal example and mock AI fixtures live in
+[`examples/plugin-dev.ts`](examples/plugin-dev.ts) and
+[`examples/plugin-dev-fixtures.json`](examples/plugin-dev-fixtures.json).
+From this repository's `apps/temps-cli` directory, run the development CLI with
+`bun run src/index.ts` in place of `bunx @temps-sdk/cli` before the feature is
+released. Compile the example with:
+
+```bash
+bun build --compile examples/plugin-dev.ts --outfile /tmp/temps-example-plugin
+```
+
+The example uses the repository SDK source, stores unique events across
+restarts, previews its event journal, and can call mock AI. A small Rust
+conformance example lives at `crates/temps-plugin-sdk/examples/plugin-dev-probe.rs`.
+Run `bun run build` followed by `bun run scripts/test-plugin-dev-package.ts`
+to repeat the packed-CLI end-to-end test. Simulator verification does not replace
+installation testing against Temps.
+
 ## SSH setup proof of concept
 
 From this checkout, install dependencies with `bun install` in `apps/temps-cli`.

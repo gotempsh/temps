@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import type { Command } from "commander";
+import { spawn } from "node:child_process";
+import { registerPluginDevCommands } from "./dev/index.js";
 import { mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { promptConfirm } from "../../ui/prompts.js";
@@ -15,7 +17,44 @@ export function registerPluginCommands(program: Command) {
     .description("Create, install, update and build TypeScript plugins");
   registerPluginInstallCommands(plugin);
   registerPluginGrantCommands(plugin);
-  plugin.hook("preAction", () => {
+  registerPluginDevCommands(plugin);
+  plugin.hook("preAction", async (_command, action) => {
+    let current: Command | null = action;
+    let localDev = false;
+    while (current && current !== plugin) {
+      if (current.name() === "dev") localDev = true;
+      current = current.parent;
+    }
+    if (typeof Bun === "undefined" && localDev) {
+      const child = spawn("bun", [process.argv[1]!, ...process.argv.slice(2)], {
+        stdio: "inherit",
+      });
+      const interrupt = () => {
+        child.kill("SIGINT");
+      };
+      const terminate = () => {
+        child.kill("SIGTERM");
+      };
+      process.on("SIGINT", interrupt);
+      process.on("SIGTERM", terminate);
+      let code: number;
+      try {
+        code = await new Promise<number>((resolve, reject) => {
+          child.once("error", () =>
+            reject(
+              new PluginPublishError(
+                "Plugin dev requires Bun. Install Bun, then run bunx --bun @temps-sdk/cli plugin dev <binary>.",
+              ),
+            ),
+          );
+          child.once("exit", (code) => resolve(code ?? 1));
+        });
+      } finally {
+        process.removeListener("SIGINT", interrupt);
+        process.removeListener("SIGTERM", terminate);
+      }
+      process.exit(code);
+    }
     if (typeof Bun === "undefined")
       throw new PluginPublishError(
         "Plugin commands require Bun. Run bunx --bun @temps-sdk/cli plugin <command>.",
@@ -23,6 +62,7 @@ export function registerPluginCommands(program: Command) {
   });
   plugin
     .command("init")
+    .description("Create a TypeScript plugin project")
     .argument("<directory>", "New plugin directory")
     .requiredOption(
       "--name <name>",
@@ -150,7 +190,7 @@ export function page(title: string): string {
 `,
       );
       console.log(
-        `Created ${path}. Edit package.json metadata, run bun install there, then temps plugin build --all.`,
+        `Created ${path}. Edit package.json metadata, run bun install there, then bunx @temps-sdk/cli plugin build --all.`,
       );
     });
   plugin
