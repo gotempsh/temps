@@ -375,10 +375,10 @@ Deploy a prebuilt image from a registry instead, or run the full profile on a
 node with Docker.
 ```
 
-Moving the build onto the worker node that will run the image is designed in
-[ADR-045](https://github.com/gotempsh/temps/blob/main/docs/adr/045-worker-side-image-builds.md)
-and tracked separately — it moves application source and build secrets across
-the control-plane → worker trust boundary, so it needs its own security review.
+Moving the build onto the worker node that will run the image is tracked in
+[issue #1034](https://github.com/gotempsh/temps/issues/1034) — it moves
+application source and build secrets across the control-plane → worker trust
+boundary, so it needs its own security review before implementation starts.
 
 ---
 
