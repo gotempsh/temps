@@ -9,6 +9,7 @@
 @plugin '@tailwindcss/typography';
 
 @source '.';
+@source '../packages/ds/src';
 
 @custom-variant dark (&:is(.dark *));
 

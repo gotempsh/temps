@@ -55,3 +55,7 @@ test('preserves literal messages and quoted environment values', () => {
   })
   expect(parseLogQuery('', []).patch).toEqual({ q: undefined })
 })
+
+test('preserves an environment slug for the global search contract', () => {
+  expect(parseLogQuery('env:production', []).patch?.env).toBe('production')
+})

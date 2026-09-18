@@ -139,19 +139,6 @@ export function LogQueryInput({
       setError(result.error)
       return
     }
-    const environment = result.patch.env
-    if (environment && !environmentLabels[environment]) {
-      const matches = Object.entries(environmentLabels).filter(
-        ([, slug]) => slug === environment
-      )
-      if (matches.length > 1) {
-        setError(
-          'This environment exists in multiple projects. Choose a project first.'
-        )
-        return
-      }
-      if (matches.length === 1) result.patch.env = matches[0][0]
-    }
     onChange(result.patch)
     setDraft(result.patch.q ?? '')
     setError('')
