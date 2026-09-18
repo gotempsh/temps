@@ -5,7 +5,6 @@ import { useId, useState, type ReactNode } from 'react'
 import { X } from 'lucide-react'
 import {
   AlertDialog,
-  AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
   AlertDialogFooter,
@@ -59,28 +58,27 @@ export function EchoDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={close}>
-      <AlertDialogContent>
-        <AlertDialogCancel asChild>
+      <AlertDialogContent className="max-h-[90dvh] w-[calc(100%-2rem)] overflow-y-auto rounded-lg">
           <button
             type="button"
             aria-label="Close"
-            className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none"
+            onClick={() => close(false)}
+            className="absolute right-4 top-4 inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
           >
             <X className="size-4" aria-hidden />
           </button>
-        </AlertDialogCancel>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{title}</AlertDialogTitle>
+        <AlertDialogHeader className="text-left">
+          <AlertDialogTitle className="break-words pr-10">{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
         <div className="space-y-2">
           <div className="text-sm text-muted-foreground">
             Type{' '}
-            <span className="inline-flex items-center gap-1 align-middle">
-              <span className="rounded border border-dashed bg-muted/40 px-1 font-mono font-semibold text-foreground">
+            <span className="inline-flex max-w-full items-center gap-1 align-middle">
+              <span className="min-w-0 break-all rounded border border-dashed bg-muted/40 px-1 font-mono font-semibold text-foreground">
                 {phrase}
               </span>
-              <CopyAction value={phrase} label="Copy confirmation name" />
+              <CopyAction value={phrase} label="Copy confirmation name" className="shrink-0" />
             </span>{' '}
             to confirm.
           </div>
@@ -93,7 +91,7 @@ export function EchoDialog({
             spellCheck={false}
           />
         </div>
-        <AlertDialogFooter>
+        <AlertDialogFooter className="gap-2">
           <Button variant="outline" onClick={() => close(false)}>
             Cancel
           </Button>

@@ -24,6 +24,7 @@ import Guide from './pages/Guide'
 import Iconography from './pages/Iconography'
 import TableStates from './pages/TableStates'
 import Components from './pages/Components'
+import Controls from './pages/Controls'
 import DeploymentsLedger from './pages/DeploymentsLedger'
 import DeploymentDetail from './pages/DeploymentDetail'
 import ProjectSettings from './pages/ProjectSettings'
@@ -39,6 +40,7 @@ const NAV_SECTIONS = [
       { to: '/guide', label: 'Guide' },
       { to: '/components', label: 'Components' },
       { to: '/iconography', label: 'Iconography' },
+      { to: '/controls', label: 'Forms and selection' },
     ],
   },
   {
@@ -139,6 +141,7 @@ export default function App() {
           <Route path="/guide" element={<Guide />} />
           <Route path="/iconography" element={<Iconography />} />
           <Route path="/components" element={<Components />} />
+          <Route path="/controls" element={<Controls />} />
           <Route path="/table-states" element={<TableStates />} />
           <Route path="/ledger" element={<DeploymentsLedger />} />
           <Route path="/detail" element={<DeploymentDetail />} />

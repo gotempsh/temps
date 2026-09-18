@@ -95,7 +95,9 @@ optional; `main` is not.
 ## Forms
 
 `Field` for every control (label + control + description + error, wired
-`aria-describedby`). `FormErrors` above the sticky save bar, not only inline.
+`aria-describedby`). `FormErrors` above the sticky save bar, not only inline. Error summaries identify
+the field as well as the problem. Pass Field props through `Picker inputProps`
+so searchable controls retain label/help/error associations.
 `Settings`'s save bar is always mounted — it doesn't appear/disappear with
 `dirty`, so its position never jumps.
 

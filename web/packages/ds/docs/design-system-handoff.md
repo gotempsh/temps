@@ -373,3 +373,23 @@ to every example and its toast surfaces. The settings example demonstrates
 validation, unsaved changes, saving, and a new saved baseline without real API calls.
 See [rendered-app-audit.md](./rendered-app-audit.md) for the source measurements
 and the scope of browser verification.
+
+### Form controls and confirmation reference
+
+Sandbox `/controls` combines Input, Select, Picker, Field, FormErrors, Callout,
+Status, and EchoDialog in a working sample. Try empty-name validation, service
+label/keyword searches, no matches, disabled options, keyboard selection, and
+a long confirmation name. No API requests or real mutations occur.
+
+Pass `Field` render props to `Picker inputProps`; the input preserves the field
+ID, label, help, and validation references through cmdk's slot. String item
+labels are searchable automatically; supply `keywords` for rich React labels.
+`PickerItem.disabled` keeps unavailable options visible with an explanatory
+description. Selection keeps cmdk keyboard navigation and adds a separate
+selected indicator. Error summaries include field names. Input and Select
+triggers use the destructive border token when `aria-invalid` is true.
+
+EchoDialog has mobile gutters, a bounded scrollable surface, a compact close
+control, wrapping confirmation names, and space between stacked actions.
+Browser checks covered label and keyword selection, no matches, dark mode,
+and long-name confirmation at 390px without document overflow.
