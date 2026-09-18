@@ -17,6 +17,7 @@ export const sections = [
   { title: 'Verifying nodes', id: 'verifying-nodes' },
   { title: 'How scheduling works', id: 'scheduling' },
   { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
+  { title: 'Building from source', id: 'control-plane-builds' },
   { title: 'Mixed architectures', id: 'mixed-architectures' },
   { title: 'Current limitations', id: 'limitations' },
 ]
@@ -268,10 +269,15 @@ own disk, which is why `temps serve` requires a reachable Docker daemon.
 `--profile control-plane` separates the two roles. The process keeps the
 console, API, proxy, analytics, session replay, error tracking, OpenTelemetry,
 monitoring, status pages, alerts, domains and ACME, auth, teams,
-notifications, email, webhooks, feature flags, the job queue and the AI
-gateway — but it runs **no workloads of its own**. Applications run on worker
-nodes joined with `temps join`. **Docker is not required**, so this profile can
-run in a container with no Docker socket mounted.
+notifications, email, webhooks, feature flags, the job queue, log aggregation,
+backup orchestration and the AI gateway — but it runs **no workloads of its
+own**. Applications run on worker nodes joined with `temps join`.
+
+**No Docker daemon is required, and none is contacted.** The process
+constructs no Docker client at all in this profile, so it runs in a container
+with no socket mounted and no `DOCKER_HOST` set. Every path that would need a
+daemon fails with a typed error naming the remedy, rather than panicking or
+quietly running a container here.
 
 ```bash
 temps serve --profile control-plane
@@ -287,17 +293,25 @@ else in these docs and is unchanged.
 These plugins are not constructed at all — they hold no memory and start no
 background tasks:
 
-| Not started | Why | Where it happens instead |
+| Not available here | Why | Where it happens instead |
 | --- | --- | --- |
 | Deployer local runtime setup | No app network, overlay or cluster-DNS reconciliation against a local daemon | The worker node's agent |
-| Managed-service reconcilers | Managed PostgreSQL/Redis/MariaDB run as containers on a host | A worker node, or an external database |
+| Local managed-service provisioning | Managed PostgreSQL/Redis/MariaDB run as containers on a host | A worker node (`node_id`), or an external database |
 | Key-value store (`kv`) | Managed Redis is a local container | A worker node |
-| Backups | Backup engines exec into containers on this host | The node that owns the service |
-| Log aggregator | Its collector tails containers on the local daemon | Worker-node logs reach the console through the deployments plugin's remote log source |
-| Vulnerability scanner | Scans images in the local image store | The node that builds the image |
+| Local backup execution | Backup engines exec into containers on this host | The node that owns the service. Backup scheduling, retention, listing and restore orchestration keep running here |
+| Local container log tailing | The local collector tails containers on this host's daemon | Worker-node logs are collected over the agent. `/logs/search` and `/logs/tail` keep working |
+| Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
 | Agent sandboxes and the sandbox API | Sandboxes are local containers | A `full`-profile host |
 | Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
+| Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
 | On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
+
+<Note>
+Vulnerability scanning is **off** in this profile and honestly reported as
+such. It is not silently delegated to a worker: the scanner needs the image in
+a local image store, and in this profile no application image is ever stored on
+the control plane. Run the `full` profile if image scanning is a requirement.
+</Note>
 
 Deployments, projects, environments and the whole console API keep working —
 they target worker nodes. The node scheduler will not produce a local
@@ -324,17 +338,47 @@ curl -H "Authorization: Bearer $TEMPS_API_KEY" https://your-temps/api/platform/f
 ```json
 {
   "profile": "control-plane",
+  "docker": false,
   "deployments_local": false,
+  "image_builds_local": false,
   "managed_services": false,
   "backups_local": false,
+  "backups_remote": true,
   "sandboxes": false,
-  "docker": false
+  "kv": false,
+  "imports": false,
+  "log_aggregation": true,
+  "vulnerability_scanning": false
 }
 ```
 
-`docker` reports whether a daemon actually answered a ping at startup, which is
-deliberately separate from `profile`: mounting a socket into a control-plane
-container for diagnostics does not turn it into a worker.
+`docker` reports whether a Docker client exists in this process *and* a daemon
+answered a ping at startup. It is deliberately separate from `profile`:
+mounting a socket into a control-plane container does not turn it into a
+worker, and the profile's refusals are enforced on the profile, not on whether
+a socket happens to be present.
+
+## Building from source {{ anchor: true, id: 'control-plane-builds' }}
+
+Deployments of a **prebuilt image from a registry** work in this profile: the
+control plane tells the target worker to pull the image, and the worker pulls
+it directly from the registry. No image data passes through the control plane
+and no local daemon is involved.
+
+Deployments that **build from source** do not work in this profile yet. The
+build path runs against a local daemon, and this process has none. A build is
+refused with an explicit error rather than being attempted:
+
+```
+This control plane runs no image builds (serve profile 'control-plane').
+Deploy a prebuilt image from a registry instead, or run the full profile on a
+node with Docker.
+```
+
+Moving the build onto the worker node that will run the image is designed in
+[ADR-045](https://github.com/gotempsh/temps/blob/main/docs/adr/045-worker-side-image-builds.md)
+and tracked separately — it moves application source and build secrets across
+the control-plane → worker trust boundary, so it needs its own security review.
 
 ---
 
