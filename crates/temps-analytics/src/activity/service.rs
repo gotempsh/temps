@@ -8,6 +8,7 @@ use sea_orm::{
     QuerySelect, Statement,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex},
@@ -36,9 +37,11 @@ struct Stored {
     last_started_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     report: Option<serde_json::Value>,
+    run_history: serde_json::Value,
+    visitor_checkpoints: serde_json::Value,
 }
 
-#[derive(Debug, FromQueryResult)]
+#[derive(Debug, Clone, FromQueryResult)]
 struct EventRow {
     visitor_id: i32,
     timestamp: DateTime<Utc>,
@@ -46,6 +49,29 @@ struct EventRow {
     title: Option<String>,
     event: String,
     properties: serde_json::Value,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+struct VisitorCheckpoints(BTreeMap<String, VisitorCheckpoint>);
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct VisitorCheckpoint {
+    revision: i32,
+    fingerprint: String,
+}
+
+struct AnalysisOutcome {
+    report: ActivityReport,
+    checkpoints: VisitorCheckpoints,
+}
+
+struct PreparedVisitors {
+    visitors: Vec<VisitorInput>,
+    sampled: bool,
+    skipped_low_activity: usize,
+    skipped_unchanged: usize,
+    checkpoints: VisitorCheckpoints,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -332,12 +358,21 @@ impl ActivityService {
             next_run_at: None,
             last_error: None,
             report: None,
+            recent_runs: Vec::new(),
         };
         if let Some(row) = row {
             status.settings_revision = row.revision;
             status.running = row.locked_until.is_some_and(|until| until > Utc::now());
             status.next_run_at = row.daily_enabled.then_some(row.next_run_at);
             status.last_error = row.last_error;
+            status.recent_runs = decode::<Vec<ActivityRunSummary>>(project_id, row.run_history)?
+                .into_iter()
+                .filter(|run| {
+                    run.environment_id.is_some()
+                        && run.environment_id == status.selected_environment_id
+                })
+                .take(20)
+                .collect();
             status.report = row
                 .report
                 .map(|value| decode::<ActivityReport>(project_id, value))
@@ -434,6 +469,8 @@ impl ActivityService {
             environment_id: request.environment_id,
             source_url: request.source_url,
             source_domain: request.source_domain,
+            min_sessions: request.min_sessions,
+            min_page_paths: request.min_page_paths,
             ..Default::default()
         };
         validate_settings(project_id, &settings)?;
@@ -486,8 +523,8 @@ impl ActivityService {
             settings.categories = suggested.categories;
             validate_settings(project_id, &settings)
                 .map_err(|e| analysis_error(project_id, format!("Invalid generated categories: {e}")))?;
-            let report = self.analyze(project_id, &settings, 0, Utc::now()).await?;
-            Ok(ActivityPreview { settings, report })
+            let outcome = self.analyze(project_id, &settings, 0, Utc::now(), &VisitorCheckpoints::default()).await?;
+            Ok(ActivityPreview { settings, report: outcome.report })
         }).await.unwrap_or_else(|_| Err(analysis_error(project_id, "Preview timed out after 120 seconds")))
     }
 
@@ -580,9 +617,17 @@ impl ActivityService {
         let started = claimed
             .last_started_at
             .ok_or_else(|| analysis_error(project_id, "Missing run timestamp"))?;
+        let previous_checkpoints: VisitorCheckpoints =
+            decode(project_id, claimed.visitor_checkpoints.clone())?;
         let result = tokio::time::timeout(
             Duration::from_secs(120),
-            self.analyze(project_id, &settings, saved.revision, started),
+            self.analyze(
+                project_id,
+                &settings,
+                saved.revision,
+                started,
+                &previous_checkpoints,
+            ),
         )
         .await
         .unwrap_or_else(|_| {
@@ -591,22 +636,66 @@ impl ActivityService {
                 "Analysis timed out after 120 seconds",
             ))
         });
-        let (report, error) = match &result {
-            Ok(report) => (
-                Some(serde_json::to_value(report).map_err(|e| analysis_error(project_id, e))?),
+        let (report, checkpoints, error) = match &result {
+            Ok(outcome) => (
+                (!outcome.report.visitors.is_empty())
+                    .then(|| serde_json::to_value(&outcome.report))
+                    .transpose()
+                    .map_err(|e| analysis_error(project_id, e))?,
+                serde_json::to_value(&outcome.checkpoints)
+                    .map_err(|e| analysis_error(project_id, e))?,
                 None,
             ),
             Err(error) => {
                 tracing::warn!(project_id, error = %error, "Visitor activity analysis failed");
-                (None, Some("Analysis failed. Check the AI provider and retry; the previous report is preserved.".to_string()))
+                (None, claimed.visitor_checkpoints.clone(), Some("Analysis failed. Check the AI provider and retry; the previous report is preserved.".to_string()))
             }
         };
+        let mut history: Vec<ActivityRunSummary> = decode(project_id, claimed.run_history)?;
+        let summary = match &result {
+            Ok(outcome) => ActivityRunSummary {
+                trigger: if scheduled { "scheduled" } else { "manual" }.into(),
+                status: if outcome.report.visitors.is_empty() {
+                    "skipped"
+                } else {
+                    "success"
+                }
+                .into(),
+                started_at: started,
+                completed_at: Some(Utc::now()),
+                environment_id: settings.environment_id,
+                analyzed_visitors: outcome.report.visitors.len(),
+                skipped_visitors: outcome.report.skipped_low_activity
+                    + outcome.report.skipped_unchanged,
+                skipped_low_activity: outcome.report.skipped_low_activity,
+                skipped_unchanged: outcome.report.skipped_unchanged,
+                model: outcome.report.model.clone(),
+                error: None,
+            },
+            Err(_) => ActivityRunSummary {
+                trigger: if scheduled { "scheduled" } else { "manual" }.into(),
+                status: "failed".into(),
+                started_at: started,
+                completed_at: Some(Utc::now()),
+                environment_id: settings.environment_id,
+                analyzed_visitors: 0,
+                skipped_visitors: 0,
+                skipped_low_activity: 0,
+                skipped_unchanged: 0,
+                model: None,
+                error: error.clone(),
+            },
+        };
+        history.insert(0, summary);
+        history.truncate(20);
+        let history = serde_json::to_value(history).map_err(|e| analysis_error(project_id, e))?;
         let finalized = self
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE visitor_activity_reports SET locked_until = NULL, last_error = $4,
-                report = COALESCE($5, report), next_run_at = NOW() + INTERVAL '24 hours'
+                report = COALESCE($5, report), visitor_checkpoints = $6, run_history = $7,
+                next_run_at = NOW() + INTERVAL '24 hours'
                 WHERE project_id = $1 AND revision = $2 AND last_started_at = $3
                     AND locked_until > NOW()",
                 [
@@ -615,6 +704,8 @@ impl ActivityService {
                     started.into(),
                     error.into(),
                     report.into(),
+                    checkpoints.into(),
+                    history.into(),
                 ],
             ))
             .await
@@ -622,7 +713,7 @@ impl ActivityService {
         if finalized.rows_affected() == 0 {
             return Err(ActivityError::Busy { project_id });
         }
-        result
+        result.map(|outcome| outcome.report)
     }
 
     async fn analyze(
@@ -631,7 +722,8 @@ impl ActivityService {
         settings: &ActivitySettings,
         revision: i32,
         started: DateTime<Utc>,
-    ) -> Result<ActivityReport, ActivityError> {
+        checkpoints: &VisitorCheckpoints,
+    ) -> Result<AnalysisOutcome, ActivityError> {
         let environment_id = settings
             .environment_id
             .ok_or_else(|| ActivityError::Validation {
@@ -644,6 +736,7 @@ impl ActivityService {
         // Paths, titles and selected values may still identify a person; sharing is opt-in.
         let rows = EventRow::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "SELECT e.visitor_id, e.timestamp, LEFT(e.pathname, 300) AS path,
+                md5(NULLIF(BTRIM(e.session_id), '')) AS session_id,
                 LEFT(e.page_title, 200) AS title, LEFT(COALESCE(e.event_name, e.event_type), 100) AS event,
                 COALESCE((SELECT jsonb_object_agg(p.key, LEFT(p.value #>> '{}', 200))
                     FROM jsonb_each(
@@ -657,7 +750,15 @@ impl ActivityService {
             [project_id.into(), environment_id.into(), window_start.into(), started.into(), serde_json::json!(settings.property_keys).into()]))
             .all(self.db.as_ref()).await.map_err(|e| Self::db_error(project_id, "load recent activity", e))?;
         let events_considered = rows.len().min(MAX_EVENTS);
-        let (visitors, sampled) = prepare_visitors(rows);
+        let prepared = prepare_eligible_visitors(
+            rows,
+            settings.min_sessions,
+            settings.min_page_paths,
+            environment_id,
+            revision,
+            checkpoints,
+        );
+        let visitors = prepared.visitors;
         let mut report = ActivityReport {
             environment_id: Some(environment_id),
             started_at: started,
@@ -668,12 +769,26 @@ impl ActivityService {
             categories: settings.categories.clone(),
             model: None,
             summary: "No tracked human visitor activity in the last 24 hours.".into(),
-            sampled,
+            sampled: prepared.sampled,
             events_considered,
+            skipped_low_activity: prepared.skipped_low_activity,
+            skipped_unchanged: prepared.skipped_unchanged,
             visitors: Vec::new(),
         };
         if visitors.is_empty() {
-            return Ok(report);
+            report.summary = if report.skipped_unchanged > 0 && report.skipped_low_activity > 0 {
+                "No new eligible activity: some visitors were unchanged and others did not meet the activity thresholds.".into()
+            } else if report.skipped_unchanged > 0 {
+                "No eligible visitor activity changed since the last successful analysis.".into()
+            } else if report.skipped_low_activity > 0 {
+                "No visitors met the configured session or page-path activity thresholds.".into()
+            } else {
+                "No tracked human visitor activity in the last 24 hours.".into()
+            };
+            return Ok(AnalysisOutcome {
+                report,
+                checkpoints: prepared.checkpoints,
+            });
         }
         let input = serde_json::json!({ "application_context": settings.application_context,
             "categories": settings.categories, "visitors": visitors });
@@ -693,7 +808,10 @@ impl ActivityService {
         report.summary = output.summary;
         report.model = Some(response.model);
         report.completed_at = Utc::now();
-        Ok(report)
+        Ok(AnalysisOutcome {
+            report,
+            checkpoints: prepared.checkpoints,
+        })
     }
 
     /// Bounded due-project polling; indexed by next_run_at. No work on ingest paths.
@@ -765,6 +883,9 @@ fn validate_settings(project_id: i32, settings: &ActivitySettings) -> Result<(),
     if settings.daily_enabled && !settings.share_activity_with_ai {
         return Err(invalid("Enable sharing of the selected activity fields with the AI provider before running analysis"));
     }
+    if !(1..=20).contains(&settings.min_sessions) || !(1..=20).contains(&settings.min_page_paths) {
+        return Err(invalid("Activity thresholds must be between 1 and 20"));
+    }
     if settings.application_context.trim().is_empty() || settings.application_context.len() > 4000 {
         return Err(invalid("Application context must contain 1–4000 bytes"));
     }
@@ -800,14 +921,48 @@ fn validate_settings(project_id: i32, settings: &ActivitySettings) -> Result<(),
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_visitors(rows: Vec<EventRow>) -> (Vec<VisitorInput>, bool) {
+    let prepared = prepare_eligible_visitors(rows, 1, 1, 0, 0, &VisitorCheckpoints::default());
+    (prepared.visitors, prepared.sampled)
+}
+
+fn prepare_eligible_visitors(
+    rows: Vec<EventRow>,
+    min_sessions: u32,
+    min_paths: u32,
+    environment_id: i32,
+    revision: i32,
+    previous: &VisitorCheckpoints,
+) -> PreparedVisitors {
     let mut sampled = rows.len() > MAX_EVENTS;
     let mut visitors: BTreeMap<i32, VisitorInput> = BTreeMap::new();
-    let mut evidence_bytes = 0;
+    let mut sessions: BTreeMap<i32, HashSet<String>> = BTreeMap::new();
+    let mut paths: BTreeMap<i32, HashSet<String>> = BTreeMap::new();
     for (index, row) in rows.into_iter().take(MAX_EVENTS).enumerate() {
-        if !visitors.contains_key(&row.visitor_id) && visitors.len() >= MAX_VISITORS {
-            sampled = true;
-            continue;
+        let visitor_id = row.visitor_id;
+        let normalized_path = row
+            .path
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(session) = row
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sessions
+                .entry(visitor_id)
+                .or_default()
+                .insert(session.to_string());
+        }
+        if !normalized_path.is_empty() {
+            paths
+                .entry(visitor_id)
+                .or_default()
+                .insert(normalized_path.clone());
         }
         if visitors
             .get(&row.visitor_id)
@@ -833,22 +988,11 @@ fn prepare_visitors(rows: Vec<EventRow>) -> (Vec<VisitorInput>, bool) {
         let evidence = ActivityEvidence {
             reference: index as u32 + 1,
             timestamp: row.timestamp,
-            path: row.path.split(['?', '#']).next().unwrap_or_default().into(),
+            path: normalized_path,
             title: row.title,
             event: row.event,
             properties,
         };
-        // Bound input cost too, including JSON escaping and selected properties.
-        // Serialization of these scalar fields is infallible in practice; a
-        // failed serialization must still exclude the event rather than bypass the cap.
-        let size = serde_json::to_vec(&evidence)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        if size > 48 * 1024 - evidence_bytes {
-            sampled = true;
-            break;
-        }
-        evidence_bytes += size;
         let visitor_ref = visitors.len() as u32 + 1;
         let visitor = visitors
             .entry(row.visitor_id)
@@ -862,7 +1006,74 @@ fn prepare_visitors(rows: Vec<EventRow>) -> (Vec<VisitorInput>, bool) {
     for visitor in visitors.values_mut() {
         visitor.events.reverse();
     }
-    (visitors.into_values().collect(), sampled)
+    let mut eligible = Vec::new();
+    let mut skipped_low_activity = 0;
+    let mut skipped_unchanged = 0;
+    let mut checkpoints = previous.clone();
+    let mut evidence_bytes = 0;
+    for visitor in visitors.into_values() {
+        let active = sessions.get(&visitor.visitor_id).map_or(0, HashSet::len)
+            >= min_sessions as usize
+            || paths.get(&visitor.visitor_id).map_or(0, HashSet::len) >= min_paths as usize;
+        if !active {
+            skipped_low_activity += 1;
+            continue;
+        }
+        let canonical: Vec<_> = visitor
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "timestamp": event.timestamp, "path": event.path, "title": event.title,
+                    "event": event.event, "properties": event.properties,
+                })
+            })
+            .collect();
+        let fingerprint = hex::encode(Sha256::digest(
+            serde_json::to_vec(&canonical).unwrap_or_default(),
+        ));
+        let key = format!("{environment_id}:{}", visitor.visitor_id);
+        if previous
+            .0
+            .get(&key)
+            .is_some_and(|value| value.revision == revision && value.fingerprint == fingerprint)
+        {
+            skipped_unchanged += 1;
+            continue;
+        }
+        if eligible.len() == MAX_VISITORS {
+            sampled = true;
+            continue;
+        }
+        let size = serde_json::to_vec(&visitor.events).map_or(usize::MAX, |value| value.len());
+        if size > 48 * 1024 - evidence_bytes {
+            sampled = true;
+            continue;
+        }
+        evidence_bytes += size;
+        checkpoints.0.insert(
+            key,
+            VisitorCheckpoint {
+                revision,
+                fingerprint,
+            },
+        );
+        eligible.push(visitor);
+    }
+    while checkpoints.0.len() > 500 {
+        if let Some(key) = checkpoints.0.keys().next().cloned() {
+            checkpoints.0.remove(&key);
+        } else {
+            break;
+        }
+    }
+    PreparedVisitors {
+        visitors: eligible,
+        sampled,
+        skipped_low_activity,
+        skipped_unchanged,
+        checkpoints,
+    }
 }
 
 fn validate_output(
@@ -1064,6 +1275,7 @@ mod tests {
             title: Some("Install".into()),
             event: "pageview".into(),
             properties: serde_json::json!({}),
+            session_id: Some(format!("session-{visitor_id}")),
         }
     }
     fn stored() -> BTreeMap<String, sea_orm::Value> {
@@ -1080,6 +1292,8 @@ mod tests {
             ("locked_until".into(), Option::<DateTime<Utc>>::None.into()),
             ("last_error".into(), Option::<String>::None.into()),
             ("report".into(), Option::<serde_json::Value>::None.into()),
+            ("run_history".into(), serde_json::json!([]).into()),
+            ("visitor_checkpoints".into(), serde_json::json!({}).into()),
         ])
     }
     fn project(project_id: i32) -> BTreeMap<String, sea_orm::Value> {
@@ -1107,6 +1321,14 @@ mod tests {
         assert!(validate_settings(1, &config).is_err());
         config = settings();
         config.property_keys = vec!["x".into(); 11];
+        assert!(validate_settings(1, &config).is_err());
+        config = settings();
+        config.min_sessions = 0;
+        assert!(validate_settings(1, &config).is_err());
+        config.min_sessions = 20;
+        config.min_page_paths = 20;
+        assert!(validate_settings(1, &config).is_ok());
+        config.min_page_paths = 21;
         assert!(validate_settings(1, &config).is_err());
     }
 
@@ -1166,6 +1388,64 @@ mod tests {
             .map(|e| serde_json::to_vec(e).unwrap().len())
             .sum();
         assert!(bytes <= 48 * 1024);
+    }
+
+    #[test]
+    fn eligibility_and_checkpoints_skip_low_activity_and_stable_unchanged_visitors() {
+        let timestamp = Utc::now();
+        let mut first = event(1);
+        first.timestamp = timestamp;
+        first.path = "/docs".into();
+        first.session_id = Some("session-a".into());
+        let mut second = event(1);
+        second.timestamp = timestamp + chrono::Duration::seconds(1);
+        second.path = "/docs?step=2".into();
+        second.session_id = Some("session-b".into());
+        let prepared = prepare_eligible_visitors(
+            vec![second.clone(), first.clone()],
+            2,
+            2,
+            7,
+            3,
+            &VisitorCheckpoints::default(),
+        );
+        assert_eq!(prepared.visitors.len(), 1);
+
+        let mut path_first = event(3);
+        path_first.timestamp = timestamp;
+        path_first.path = "/docs".into();
+        path_first.session_id = Some("one-session".into());
+        let mut path_second = event(3);
+        path_second.timestamp = timestamp + chrono::Duration::seconds(1);
+        path_second.path = "/pricing".into();
+        path_second.session_id = Some("one-session".into());
+        assert_eq!(
+            prepare_eligible_visitors(
+                vec![path_second, path_first],
+                2,
+                2,
+                7,
+                3,
+                &VisitorCheckpoints::default(),
+            )
+            .visitors
+            .len(),
+            1
+        );
+
+        let mut unrelated = event(2);
+        unrelated.timestamp = timestamp + chrono::Duration::seconds(2);
+        let unchanged = prepare_eligible_visitors(
+            vec![unrelated, second, first],
+            2,
+            2,
+            7,
+            3,
+            &prepared.checkpoints,
+        );
+        assert!(unchanged.visitors.is_empty());
+        assert_eq!(unchanged.skipped_unchanged, 1);
+        assert_eq!(unchanged.skipped_low_activity, 1);
     }
 
     #[tokio::test]
@@ -1446,6 +1726,8 @@ mod tests {
             environment_id: None,
             source_url: None,
             source_domain: None,
+            min_sessions: 2,
+            min_page_paths: 2,
         }
     }
 
@@ -1683,10 +1965,11 @@ mod tests {
                 (3, 'bot', 1, 1, NOW(), NOW(), TRUE), (4, 'ghost', 1, 1, NOW(), NOW(), FALSE),
                 (5, 'staging-visitor', 1, 3, NOW(), NOW(), FALSE);
             INSERT INTO request_sessions (session_id, visitor_id, started_at, last_accessed_at, data)
-            VALUES ('activity-1', 1, NOW(), NOW(), '{}'), ('activity-2', 2, NOW(), NOW(), '{}'),
+            VALUES ('activity-1', 1, NOW(), NOW(), '{}'), ('activity-1b', 1, NOW(), NOW(), '{}'), ('activity-2', 2, NOW(), NOW(), '{}'),
                    ('activity-3', 3, NOW(), NOW(), '{}'), ('activity-5', 5, NOW(), NOW(), '{}');
             INSERT INTO events (timestamp, project_id, environment_id, visitor_id, session_id, hostname, pathname, page_path, href, event_type, is_crawler, props)
             VALUES (NOW() - INTERVAL '1 minute', 1, 1, 1, 'activity-1', 'example.test', '/docs/install', '/docs/install', 'https://example.test/?token=secret-token', 'pageview', FALSE, '{\"email\":\"secret@example.test\",\"plan\":\"trial\"}'),
+                   (NOW() - INTERVAL '2 minutes', 1, 1, 1, 'activity-1b', 'example.test', '/pricing', '/pricing', 'https://example.test/pricing', 'pageview', FALSE, '{\"plan\":\"trial\"}'),
                    (NOW() - INTERVAL '1 minute', 2, 2, 2, 'activity-2', 'example.test', '/private', '/private', 'https://example.test/', 'pageview', FALSE, '{}'),
                    (NOW() - INTERVAL '1 minute', 1, 1, 3, 'activity-3', 'example.test', '/bot', '/bot', 'https://example.test/', 'pageview', FALSE, '{}'),
                    (NOW() - INTERVAL '1 minute', 1, 3, 5, 'activity-5', 'stage.example.test', '/staging', '/staging', 'https://stage.example.test/', 'pageview', FALSE, '{}');").await.unwrap();
@@ -1778,12 +2061,25 @@ mod tests {
         let retry_started_at = Utc::now();
         svc.run_due().await.unwrap();
         let report = svc.status(1, None).await.unwrap().report.unwrap();
-        assert!(svc.status(1, Some(3)).await.unwrap().report.is_none());
+        let success_status = svc.status(1, None).await.unwrap();
+        assert_eq!(success_status.recent_runs.len(), 1);
+        assert_eq!(success_status.recent_runs[0].trigger, "scheduled");
+        assert_eq!(success_status.recent_runs[0].status, "success");
+        assert_eq!(success_status.recent_runs[0].environment_id, Some(1));
+        let other_environment_status = svc.status(1, Some(3)).await.unwrap();
+        assert!(other_environment_status.report.is_none());
+        assert!(other_environment_status.recent_runs.is_empty());
         assert_eq!(report.visitors.len(), 1);
         assert_eq!(report.visitors[0].visitor_id, 1);
-        assert_eq!(report.visitors[0].evidence[0].properties[0].key, "plan");
+        assert!(report.visitors[0]
+            .evidence
+            .iter()
+            .flat_map(|event| &event.properties)
+            .any(|property| property.key == "plan"));
         assert_eq!(report.model.as_deref(), Some("test-model"));
         let after_success = svc.stored(1).await.unwrap().unwrap();
+        let successful_checkpoints = after_success.visitor_checkpoints.clone();
+        assert_ne!(successful_checkpoints, serde_json::json!({}));
         assert!(after_success.next_run_at > retry_started_at + chrono::Duration::hours(23));
         assert!(after_success.next_run_at < Utc::now() + chrono::Duration::hours(25));
         assert!(matches!(
@@ -1848,6 +2144,12 @@ mod tests {
         )
         .await
         .unwrap();
+        db.execute_unprepared(
+            "UPDATE events SET page_title = 'Changed after checkpoint' \
+             WHERE project_id = 1 AND visitor_id = 1 AND pathname = '/docs/install'",
+        )
+        .await
+        .unwrap();
         let failing = ActivityService::new(
             db.clone(),
             Arc::new(FakeAi {
@@ -1863,6 +2165,50 @@ mod tests {
         assert!(status.last_error.is_some());
         assert!(!status.running);
         assert!(status.report.is_some());
+        assert_eq!(status.recent_runs[0].trigger, "manual");
+        assert_eq!(status.recent_runs[0].status, "failed");
+        assert_eq!(
+            svc.stored(1).await.unwrap().unwrap().visitor_checkpoints,
+            successful_checkpoints
+        );
+
+        // Returning the event to its checkpointed form proves unchanged runs
+        // skip the provider even when that provider would fail if called.
+        db.execute_unprepared(
+            "UPDATE events SET page_title = NULL
+             WHERE project_id = 1 AND visitor_id = 1 AND pathname = '/docs/install';
+             UPDATE visitor_activity_reports
+             SET last_started_at = NOW() - INTERVAL '10 minutes' WHERE project_id = 1",
+        )
+        .await
+        .unwrap();
+        let unchanged = ActivityService::new(
+            db.clone(),
+            Arc::new(FakeAi {
+                available: true,
+                fail: true,
+            }),
+        );
+        unchanged.run(1, false).await.unwrap();
+        let skipped = svc.status(1, None).await.unwrap();
+        assert_eq!(skipped.recent_runs[0].status, "skipped");
+        assert_eq!(skipped.recent_runs[0].skipped_unchanged, 1);
+        assert_eq!(skipped.recent_runs[1].status, "failed");
+        assert!(skipped.report.is_some());
+        assert_eq!(
+            svc.stored(1).await.unwrap().unwrap().visitor_checkpoints,
+            successful_checkpoints
+        );
+
+        // Legacy history had no environment provenance and must fail closed.
+        db.execute_unprepared(
+            "UPDATE visitor_activity_reports SET run_history =
+             (SELECT COALESCE(jsonb_agg(item - 'environment_id'), '[]'::jsonb)
+              FROM jsonb_array_elements(run_history) item) WHERE project_id = 1",
+        )
+        .await
+        .unwrap();
+        assert!(svc.status(1, None).await.unwrap().recent_runs.is_empty());
         svc.save(1, config).await.unwrap();
         assert_eq!(svc.status(1, None).await.unwrap().settings_revision, 2);
         db.execute_unprepared("UPDATE environments SET deleted_at = NOW() WHERE id = 1")
@@ -1871,5 +2217,6 @@ mod tests {
         let after_delete = svc.status(1, None).await.unwrap();
         assert_eq!(after_delete.selected_environment_id, Some(3));
         assert!(after_delete.report.is_none());
+        assert!(after_delete.recent_runs.is_empty());
     }
 }

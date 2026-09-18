@@ -85,7 +85,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
     onSuccess: () => {
       setCategory(null)
       setPreview(null)
-      toast.success('Activity report ready')
+      toast.success('Activity run completed')
     },
     onError: (error) => toast.error(errorMessage(error)),
     onSettled: () =>
@@ -181,7 +181,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                         ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
                     </p>
                   </div>
-                  {data.has_recent_activity && (
+                  {data.settings_revision > 0 && (
                     <Button
                       disabled={
                         !data.configured ||
@@ -202,7 +202,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                       ) : (
                         <Sparkles className="mr-2 h-4 w-4" />
                       )}
-                      {running ? 'Analyzing…' : 'Run saved settings'}
+                      {running ? 'Analyzing…' : 'Run now'}
                     </Button>
                   )}
                 </div>
@@ -353,6 +353,69 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               </div>
             </section>
           )}
+          {data.settings_revision > 0 && (
+            <section
+              aria-label="Recent runs"
+              className="space-y-3 border-t pt-6"
+            >
+              <h2 className="text-lg font-semibold">Recent runs</h2>
+              {running && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  Analysis is running…
+                </p>
+              )}
+              {!data.recent_runs?.length ? (
+                <p className="text-sm text-muted-foreground">
+                  No runs yet. Run now to check eligible visitors.
+                </p>
+              ) : (
+                <div className="divide-y rounded-lg border">
+                  {data.recent_runs.map((item) => (
+                    <div key={item.started_at} className="space-y-2 p-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2 text-sm">
+                          <time dateTime={item.started_at}>
+                            {new Date(item.started_at).toLocaleString()}
+                          </time>
+                          <span className="text-muted-foreground">
+                            {item.trigger === 'scheduled' ? 'Daily' : 'Manual'}
+                          </span>
+                        </div>
+                        <Badge
+                          variant={
+                            item.status === 'failed'
+                              ? 'destructive'
+                              : 'secondary'
+                          }
+                        >
+                          {item.status === 'failed'
+                            ? 'Failed'
+                            : item.status === 'skipped'
+                              ? 'Nothing new to analyze'
+                              : 'Completed'}
+                        </Badge>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        {item.analyzed_visitors} analyzed ·{' '}
+                        {item.skipped_visitors} skipped
+                        {item.model ? ` · ${item.model}` : ''}
+                      </p>
+                      {(item.skipped_low_activity > 0 ||
+                        item.skipped_unchanged > 0) && (
+                        <p className="text-xs text-muted-foreground">
+                          {item.skipped_low_activity} below threshold ·{' '}
+                          {item.skipped_unchanged} unchanged
+                        </p>
+                      )}
+                      {item.error && (
+                        <p className="text-sm text-destructive">{item.error}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
         </>
       )}
     </div>
@@ -369,6 +432,8 @@ const setupSchema = z.object({
     .min(1, 'Describe your application and what you want to understand.')
     .max(4000),
   categories: z.array(z.object({ name: z.string(), description: z.string() })),
+  min_sessions: z.number().int().min(1).max(20),
+  min_page_paths: z.number().int().min(1).max(20),
   propertyKeys: z.string(),
   share_activity_with_ai: z.boolean(),
   daily_enabled: z.boolean(),
@@ -402,6 +467,8 @@ function ActivitySettingsForm({
     resolver: zodResolver(setupSchema),
     defaultValues: {
       ...status.settings,
+      min_sessions: status.settings.min_sessions ?? 2,
+      min_page_paths: status.settings.min_page_paths ?? 2,
       environment_id: status.selected_environment_id ?? null,
       source_url: status.settings.source_url ?? null,
       source_domain: status.settings.source_domain ?? null,
@@ -445,6 +512,8 @@ function ActivitySettingsForm({
     onSuccess: (result) => {
       form.reset({
         ...result.settings,
+        min_sessions: form.getValues('min_sessions'),
+        min_page_paths: form.getValues('min_page_paths'),
         // A preview suggests classification settings, not a scheduling change.
         daily_enabled: form.getValues('daily_enabled'),
         environment_id: form.getValues('environment_id'),
@@ -481,6 +550,8 @@ function ActivitySettingsForm({
           source_domain: data.source_domain,
           application_context: data.application_context,
           categories: data.categories,
+          min_sessions: data.min_sessions,
+          min_page_paths: data.min_page_paths,
           property_keys: properties(data.propertyKeys),
           share_activity_with_ai: data.share_activity_with_ai,
           daily_enabled: daily && data.share_activity_with_ai,
@@ -563,6 +634,8 @@ function ActivitySettingsForm({
                 source_url: data.source_url,
                 source_domain: data.source_domain,
                 goal: data.application_context,
+                min_sessions: data.min_sessions,
+                min_page_paths: data.min_page_paths,
                 property_keys: properties(data.propertyKeys),
                 share_activity_with_ai: data.share_activity_with_ai,
               },
@@ -685,6 +758,53 @@ function ActivitySettingsForm({
                 </div>
               )}
               <div className="mt-4 space-y-4">
+                <div className="space-y-3">
+                  <p className="text-sm font-medium">Visitor eligibility</p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="activity-min-sessions">
+                        Minimum sessions
+                      </Label>
+                      <Input
+                        id="activity-min-sessions"
+                        type="number"
+                        min={1}
+                        max={20}
+                        {...form.register('min_sessions', {
+                          valueAsNumber: true,
+                        })}
+                      />
+                      {form.formState.errors.min_sessions && (
+                        <p role="alert" className="text-sm text-destructive">
+                          Choose 1–20 sessions.
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="activity-min-paths">
+                        Minimum distinct pages
+                      </Label>
+                      <Input
+                        id="activity-min-paths"
+                        type="number"
+                        min={1}
+                        max={20}
+                        {...form.register('min_page_paths', {
+                          valueAsNumber: true,
+                        })}
+                      />
+                      {form.formState.errors.min_page_paths && (
+                        <p role="alert" className="text-sm text-destructive">
+                          Choose 1–20 pages.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Either threshold qualifies a visitor within the last 24
+                    hours. Unchanged journeys are skipped.
+                  </p>
+                </div>
                 <div className="space-y-2">
                   <Label htmlFor="activity-properties">
                     Custom event property keys (optional)

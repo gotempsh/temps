@@ -24,6 +24,7 @@ temps-migrations = { path = "../temps-migrations" }
 schemars = { workspace = true }
 reqwest = { workspace = true }
 scraper = "0.27"
+sha2 = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"

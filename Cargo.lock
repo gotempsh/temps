@@ -10491,6 +10491,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "temps-ai",
  "temps-auth",
  "temps-core",

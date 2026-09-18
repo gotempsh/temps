@@ -124,6 +124,21 @@ for (const width of [390, 1280]) {
               next_run_at: null,
               last_error: null,
               report: completed ? report : null,
+              recent_runs: completed
+                ? [
+                    {
+                      trigger: 'manual',
+                      status: 'success',
+                      environment_id: 1,
+                      started_at: report.started_at,
+                      completed_at: report.completed_at,
+                      analyzed_visitors: 1,
+                      skipped_visitors: 3,
+                      model: 'test-model',
+                      error: null,
+                    },
+                  ]
+                : [],
             },
           })
         }
@@ -144,6 +159,8 @@ for (const width of [390, 1280]) {
         expect(request.share_activity_with_ai).toBe(true)
         expect(request.goal).toContain('application hosting')
         expect(request.property_keys).toEqual(['topic'])
+        expect(request.min_sessions).toBe(2)
+        expect(request.min_page_paths).toBe(2)
         previewCalls += 1
         if (previewCalls === 2) {
           await route.fulfill({
@@ -212,9 +229,7 @@ for (const width of [390, 1280]) {
       await expect(
         page.getByRole('link', { name: 'Activity report', exact: true })
       ).toHaveAttribute('aria-current', 'page')
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Run now' })).toHaveCount(0)
     await expect(
       page.getByRole('textbox', {
         name: 'What do you want to understand?',
@@ -282,9 +297,7 @@ for (const width of [390, 1280]) {
     await expect(page.getByText(report.summary)).toBeVisible()
     expect(saved).toBe(false)
     expect(completed).toBe(false)
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Run now' })).toHaveCount(0)
     await expect(page.getByText('Categories', { exact: true })).toBeVisible()
     await page.getByRole('button', { name: 'Preview my visitors' }).click()
     await expect(
@@ -296,9 +309,7 @@ for (const width of [390, 1280]) {
     await page
       .getByRole('button', { name: 'Enable daily reports', exact: true })
       .click()
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Run now' })).toBeEnabled()
     expect(settings.property_keys).toEqual(['topic'])
     expect(settings.share_activity_with_ai).toBe(true)
     expect(settings.daily_enabled).toBe(true)
@@ -346,9 +357,14 @@ for (const width of [390, 1280]) {
       )
       expect(settings.daily_enabled).toBe(dailyEnabled)
     }
-    await page.getByRole('button', { name: 'Run saved settings' }).click()
+    await page.getByRole('button', { name: 'Run now' }).click()
     await expect(page.getByText(report.summary)).toBeVisible()
     await expect(page.getByText(/Sampled report:/)).toBeVisible()
+    const history = page.getByRole('region', { name: 'Recent runs' })
+    await expect(history.getByText('Completed', { exact: true })).toBeVisible()
+    await expect(
+      history.getByText('1 analyzed · 3 skipped · test-model')
+    ).toBeVisible()
     await page
       .getByRole('button', { name: 'Learning (1)', exact: true })
       .click()
@@ -373,9 +389,7 @@ for (const width of [390, 1280]) {
     await page
       .getByRole('button', { name: 'Save settings', exact: true })
       .click()
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Run now' })).toBeDisabled()
     expect(settings.share_activity_with_ai).toBe(false)
     expect(settings.daily_enabled).toBe(false)
   })
@@ -426,13 +440,11 @@ test('activity analysis is discoverable before an AI provider is configured', as
       exact: true,
     })
   ).toBeVisible()
-  await expect(
-    page.getByRole('button', { name: 'Run saved settings' })
-  ).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Run now' })).toHaveCount(0)
 })
 
 for (const width of [390, 1280]) {
-  test(`empty activity explains the wait and hides analysis actions at ${width}px`, async ({
+  test(`empty activity hides preview and keeps manual runs available at ${width}px`, async ({
     page,
   }) => {
     const { projects } = await (await page.request.get('/api/projects')).json()
@@ -575,9 +587,7 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
     ).toHaveCount(0)
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Run now' })).toBeEnabled()
     await expect(
       page.getByRole('textbox', {
         name: 'What do you want to understand?',
@@ -601,9 +611,7 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
     ).toBeEnabled()
-    await expect(
-      page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Run now' })).toBeEnabled()
     await expect(
       page.getByText('No visitor activity in the last 24 hours.', {
         exact: true,
@@ -829,4 +837,109 @@ test('website analysis shows the actual failure and allows retry', async ({
   await expect(
     page.getByRole('button', { name: 'Analyze website', exact: true })
   ).toBeEnabled()
+})
+
+test('manual runs record skipped work and keep history after reload', async ({
+  page,
+}) => {
+  const { projects } = await (await page.request.get('/api/projects')).json()
+  test.skip(!projects[0], 'Requires a test project')
+  const project = projects[0]
+  let ran = false
+  let revision = 1
+  let settings = {
+    environment_id: 1,
+    application_context: 'Understand documentation readers',
+    categories: [{ name: 'Learning', description: 'Reading guides' }],
+    property_keys: [],
+    daily_enabled: false,
+    share_activity_with_ai: true,
+    min_sessions: 2,
+    min_page_paths: 2,
+  }
+  const skipped = {
+    trigger: 'manual',
+    status: 'skipped',
+    environment_id: 1,
+    started_at: '2026-09-18T10:00:00Z',
+    completed_at: '2026-09-18T10:00:01Z',
+    analyzed_visitors: 0,
+    skipped_visitors: 4,
+    skipped_low_activity: 3,
+    skipped_unchanged: 1,
+    model: null,
+    error: null,
+  }
+  await page.route(
+    `**/api/projects/${project.id}/analytics/activity`,
+    async (route) => {
+      if (route.request().method() === 'PUT') {
+        settings = route.request().postDataJSON()
+        revision += 1
+        return route.fulfill({ status: 204 })
+      }
+      return route.fulfill({
+        json: {
+          configured: true,
+          selected_environment_id: 1,
+          settings_revision: revision,
+          settings,
+          has_recent_activity: false,
+          running: false,
+          report: null,
+          setup_url: '/settings/ai-providers',
+          recent_runs: [
+            ...(ran ? [skipped] : []),
+            {
+              ...skipped,
+              trigger: 'scheduled',
+              status: 'failed',
+              started_at: '2026-09-17T10:00:00Z',
+              skipped_visitors: 0,
+              skipped_low_activity: 0,
+              skipped_unchanged: 0,
+              error: 'The AI provider was unavailable.',
+            },
+          ],
+        },
+      })
+    }
+  )
+  await page.route(
+    `**/api/projects/${project.id}/analytics/activity/run`,
+    async (route) => {
+      ran = true
+      await route.fulfill({ json: {} })
+    }
+  )
+  await page.goto(`/projects/${project.slug}/analytics/activity`)
+  const history = page.getByRole('region', { name: 'Recent runs' })
+  await expect(history.getByText('Failed', { exact: true })).toBeVisible()
+  await expect(
+    history.getByText('The AI provider was unavailable.')
+  ).toBeVisible()
+  await page.getByRole('button', { name: 'Run now', exact: true }).click()
+  await expect(
+    history.getByText('Nothing new to analyze', { exact: true })
+  ).toBeVisible()
+  await expect(
+    history.getByText('0 analyzed · 4 skipped', { exact: true })
+  ).toBeVisible()
+  await expect(
+    history.getByText('3 below threshold · 1 unchanged')
+  ).toBeVisible()
+  await page.reload()
+  await expect(
+    history.getByText('Nothing new to analyze', { exact: true })
+  ).toBeVisible()
+  await openSettings(page)
+  await page.getByText('Advanced settings', { exact: true }).click()
+  await page.getByLabel('Minimum sessions', { exact: true }).fill('3')
+  await page.getByLabel('Minimum distinct pages', { exact: true }).fill('4')
+  await page.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await expect(
+    page.getByText('Activity report setup saved', { exact: true }).first()
+  ).toBeVisible()
+  expect(settings.min_sessions).toBe(3)
+  expect(settings.min_page_paths).toBe(4)
 })

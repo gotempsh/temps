@@ -585,6 +585,16 @@
           "goal": {
             "type": "string"
           },
+          "min_page_paths": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "min_sessions": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "property_keys": {
             "items": {
               "type": "string"
@@ -664,6 +674,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "skipped_low_activity": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          },
           "started_at": {
             "format": "date-time",
             "type": "string"
@@ -700,6 +718,70 @@
         ],
         "type": "object"
       },
+      "ActivityRunSummary": {
+        "properties": {
+          "analyzed_visitors": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skipped_low_activity": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_visitors": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "trigger": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "trigger",
+          "status",
+          "started_at",
+          "completed_at",
+          "analyzed_visitors",
+          "skipped_visitors",
+          "skipped_low_activity",
+          "skipped_unchanged"
+        ],
+        "type": "object"
+      },
       "ActivitySettings": {
         "properties": {
           "application_context": {
@@ -720,6 +802,16 @@
               "integer",
               "null"
             ]
+          },
+          "min_page_paths": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "min_sessions": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "property_keys": {
             "description": "Only these event-property keys may be sent to the provider.",
@@ -788,6 +880,12 @@
               "null"
             ]
           },
+          "recent_runs": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityRunSummary"
+            },
+            "type": "array"
+          },
           "report": {
             "oneOf": [
               {
@@ -825,7 +923,8 @@
           "setup_url",
           "settings",
           "settings_revision",
-          "running"
+          "running",
+          "recent_runs"
         ],
         "type": "object"
       },

@@ -27,7 +27,7 @@ pub struct ActivityState {
 
 #[derive(OpenApi)]
 #[openapi(paths(get_activity_status, save_activity_settings, run_activity_report, preview_activity_report, suggest_activity_goals), components(schemas(
-    ActivityGoalsRequest, ActivityGoals, ActivityGoal, ActivityPreviewRequest, ActivityPreview, ActivitySettings, ActivityCategory, ActivityStatus, ActivityReport, VisitorActivityAssessment, ActivityEvidence, ActivityProperty
+    ActivityGoalsRequest, ActivityGoals, ActivityGoal, ActivityPreviewRequest, ActivityPreview, ActivitySettings, ActivityCategory, ActivityStatus, ActivityRunSummary, ActivityReport, VisitorActivityAssessment, ActivityEvidence, ActivityProperty
 )), tags((name = "Visitor Activity", description = "AI interpretation of recent visitor activity")))]
 pub struct ActivityApiDoc;
 
@@ -349,6 +349,8 @@ mod tests {
                 environment_id: None,
                 source_url: None,
                 source_domain: None,
+                min_sessions: 2,
+                min_page_paths: 2,
             }),
         )
         .await

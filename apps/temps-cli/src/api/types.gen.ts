@@ -242,6 +242,8 @@ export type ActivityPreview = {
 export type ActivityPreviewRequest = {
     environment_id?: number | null;
     goal: string;
+    min_page_paths?: number;
+    min_sessions?: number;
     property_keys?: Array<string>;
     share_activity_with_ai: boolean;
     source_domain?: string | null;
@@ -261,6 +263,8 @@ export type ActivityReport = {
     model?: string | null;
     sampled: boolean;
     settings_revision: number;
+    skipped_low_activity?: number;
+    skipped_unchanged?: number;
     started_at: string;
     summary: string;
     visitors: Array<VisitorActivityAssessment>;
@@ -268,11 +272,27 @@ export type ActivityReport = {
     window_start: string;
 };
 
+export type ActivityRunSummary = {
+    analyzed_visitors: number;
+    completed_at: string;
+    environment_id?: number | null;
+    error?: string | null;
+    model?: string | null;
+    skipped_low_activity: number;
+    skipped_unchanged: number;
+    skipped_visitors: number;
+    started_at: string;
+    status: string;
+    trigger: string;
+};
+
 export type ActivitySettings = {
     application_context: string;
     categories: Array<ActivityCategory>;
     daily_enabled: boolean;
     environment_id?: number | null;
+    min_page_paths?: number;
+    min_sessions?: number;
     /**
      * Only these event-property keys may be sent to the provider.
      */
@@ -295,6 +315,7 @@ export type ActivityStatus = {
     has_recent_activity: boolean;
     last_error?: string | null;
     next_run_at?: string | null;
+    recent_runs: Array<ActivityRunSummary>;
     report?: null | ActivityReport;
     running: boolean;
     selected_environment_id?: number | null;

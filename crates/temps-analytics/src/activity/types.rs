@@ -27,6 +27,10 @@ pub struct ActivitySettings {
     pub source_url: Option<String>,
     #[serde(default)]
     pub source_domain: Option<String>,
+    #[serde(default = "default_activity_threshold")]
+    pub min_sessions: u32,
+    #[serde(default = "default_activity_threshold")]
+    pub min_page_paths: u32,
 }
 
 impl Default for ActivitySettings {
@@ -45,6 +49,8 @@ impl Default for ActivitySettings {
             environment_id: None,
             source_url: None,
             source_domain: None,
+            min_sessions: default_activity_threshold(),
+            min_page_paths: default_activity_threshold(),
         }
     }
 }
@@ -92,6 +98,10 @@ pub struct ActivityPreviewRequest {
     pub source_url: Option<String>,
     #[serde(default)]
     pub source_domain: Option<String>,
+    #[serde(default = "default_activity_threshold")]
+    pub min_sessions: u32,
+    #[serde(default = "default_activity_threshold")]
+    pub min_page_paths: u32,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -150,6 +160,10 @@ pub struct ActivityReport {
     pub summary: String,
     pub sampled: bool,
     pub events_considered: usize,
+    #[serde(default)]
+    pub skipped_low_activity: usize,
+    #[serde(default)]
+    pub skipped_unchanged: usize,
     pub visitors: Vec<VisitorActivityAssessment>,
 }
 
@@ -169,6 +183,28 @@ pub struct ActivityStatus {
     pub next_run_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub report: Option<ActivityReport>,
+    pub recent_runs: Vec<ActivityRunSummary>,
+}
+
+pub const fn default_activity_threshold() -> u32 {
+    2
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ActivityRunSummary {
+    pub trigger: String,
+    pub status: String,
+    #[schema(value_type = String, format = DateTime)]
+    pub started_at: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub environment_id: Option<i32>,
+    pub analyzed_visitors: usize,
+    pub skipped_visitors: usize,
+    pub skipped_low_activity: usize,
+    pub skipped_unchanged: usize,
+    pub model: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
