@@ -542,6 +542,10 @@ impl ActivityService {
         project_id: i32,
         mut settings: ActivitySettings,
     ) -> Result<(), ActivityError> {
+        settings.goal_title = settings
+            .goal_title
+            .take()
+            .map(|title| title.trim().to_string());
         validate_settings(project_id, &settings)?;
         self.project_exists(project_id).await?;
         let environment_id = self
@@ -897,6 +901,13 @@ fn validate_settings(project_id: i32, settings: &ActivitySettings) -> Result<(),
     }
     if settings.application_context.trim().is_empty() || settings.application_context.len() > 4000 {
         return Err(invalid("Application context must contain 1–4000 bytes"));
+    }
+    if settings
+        .goal_title
+        .as_ref()
+        .is_some_and(|title| title.trim().is_empty() || title.trim().chars().count() > 100)
+    {
+        return Err(invalid("Goal title must contain 1–100 characters"));
     }
     if settings.categories.is_empty() || settings.categories.len() > 8 {
         return Err(invalid("Choose 1–8 categories"));
@@ -1331,6 +1342,13 @@ mod tests {
         assert!(validate_settings(1, &config).is_ok());
         config.min_page_paths = 21;
         assert!(validate_settings(1, &config).is_err());
+        config = settings();
+        config.goal_title = Some(" ".into());
+        assert!(validate_settings(1, &config).is_err());
+        config.goal_title = Some("x".repeat(100));
+        assert!(validate_settings(1, &config).is_ok());
+        config.goal_title = Some("x".repeat(101));
+        assert!(validate_settings(1, &config).is_err());
     }
 
     #[test]
@@ -1364,6 +1382,7 @@ mod tests {
         assert_eq!(settings.environment_id, None);
         assert_eq!(settings.source_url, None);
         assert_eq!(settings.source_domain, None);
+        assert_eq!(settings.goal_title, None);
     }
 
     #[test]
@@ -1998,6 +2017,7 @@ mod tests {
             }),
         );
         let mut config = settings();
+        config.goal_title = Some("  Improve activation  ".into());
         config.property_keys = vec!["plan".into()];
         config.daily_enabled = true;
         config.source_url = Some("https://example.com/docs".into());
@@ -2011,6 +2031,10 @@ mod tests {
         assert_eq!(initial.settings.environment_id, Some(1));
         assert_eq!(initial.settings.source_url, config.source_url);
         assert_eq!(initial.settings.source_domain, config.source_domain);
+        assert_eq!(
+            initial.settings.goal_title.as_deref(),
+            Some("Improve activation")
+        );
         assert_eq!(
             svc.status(1, Some(3))
                 .await

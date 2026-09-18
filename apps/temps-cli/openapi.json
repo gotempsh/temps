@@ -803,6 +803,13 @@
               "null"
             ]
           },
+          "goal_title": {
+            "description": "Short operator-facing label for the selected analysis goal.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "min_page_paths": {
             "format": "int32",
             "minimum": 0,

@@ -326,6 +326,9 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: 'Analyze website', exact: true })
     ).toHaveCount(0)
+    await expect(
+      page.getByText('Understand documentation readers', { exact: true })
+    ).toBeVisible()
     // Preview-generated settings must not change the operator's schedule choice.
     const dailySwitch = page.getByRole('switch', {
       name: 'Run automatically every 24 hours',
@@ -849,6 +852,7 @@ test('manual runs record skipped work and keep history after reload', async ({
   let revision = 1
   let settings = {
     environment_id: 1,
+    goal_title: 'Documentation engagement',
     application_context: 'Understand documentation readers',
     categories: [{ name: 'Learning', description: 'Reading guides' }],
     property_keys: [],
@@ -886,7 +890,19 @@ test('manual runs record skipped work and keep history after reload', async ({
           settings,
           has_recent_activity: false,
           running: false,
-          report: null,
+          report: {
+            started_at: '2026-09-16T10:00:00Z',
+            completed_at: '2026-09-16T10:00:05Z',
+            window_start: '2026-09-15T10:00:00Z',
+            window_end: '2026-09-16T10:00:00Z',
+            settings_revision: 1,
+            categories: settings.categories,
+            model: 'test-model',
+            summary: 'Earlier visitors read the documentation.',
+            sampled: false,
+            events_considered: 4,
+            visitors: [],
+          },
           setup_url: '/settings/ai-providers',
           recent_runs: [
             ...(ran ? [skipped] : []),
@@ -913,6 +929,22 @@ test('manual runs record skipped work and keep history after reload', async ({
     }
   )
   await page.goto(`/projects/${project.slug}/analytics/activity`)
+  await expect(
+    page.getByText('Documentation engagement', { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText('Understand documentation readers', { exact: true })
+  ).not.toBeVisible()
+  await page.getByText('Documentation engagement', { exact: true }).click()
+  await expect(
+    page.getByText('Understand documentation readers', { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByRole('heading', { name: 'Latest report', exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText('The latest run failed. Showing the last available report.')
+  ).toBeVisible()
   const history = page.getByRole('region', { name: 'Recent runs' })
   await expect(history.getByText('Failed', { exact: true })).toBeVisible()
   await expect(
@@ -928,11 +960,24 @@ test('manual runs record skipped work and keep history after reload', async ({
   await expect(
     history.getByText('3 below threshold · 1 unchanged')
   ).toBeVisible()
+  await expect(
+    page.getByText(
+      'The latest run found nothing new to analyze. Showing the last available report.'
+    )
+  ).toBeVisible()
+  await expect(
+    page.getByText('Last 24 hours · Up to 20 visitors', { exact: true })
+  ).toHaveCount(0)
   await page.reload()
   await expect(
     history.getByText('Nothing new to analyze', { exact: true })
   ).toBeVisible()
   await openSettings(page)
+  const dailySwitch = page.getByRole('switch', {
+    name: 'Run automatically every 24 hours',
+  })
+  await expect(dailySwitch).toBeVisible()
+  await dailySwitch.check()
   await page.getByText('Advanced settings', { exact: true }).click()
   await page.getByLabel('Minimum sessions', { exact: true }).fill('3')
   await page.getByLabel('Minimum distinct pages', { exact: true }).fill('4')
@@ -940,6 +985,8 @@ test('manual runs record skipped work and keep history after reload', async ({
   await expect(
     page.getByText('Activity report setup saved', { exact: true }).first()
   ).toBeVisible()
+  expect(settings.daily_enabled).toBe(true)
+  expect(settings.goal_title).toBe('Documentation engagement')
   expect(settings.min_sessions).toBe(3)
   expect(settings.min_page_paths).toBe(4)
 })

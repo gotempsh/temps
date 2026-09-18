@@ -291,6 +291,10 @@ export type ActivitySettings = {
     categories: Array<ActivityCategory>;
     daily_enabled: boolean;
     environment_id?: number | null;
+    /**
+     * Short operator-facing label for the selected analysis goal.
+     */
+    goal_title?: string | null;
     min_page_paths?: number;
     min_sessions?: number;
     /**

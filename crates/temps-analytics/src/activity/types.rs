@@ -15,6 +15,9 @@ pub struct ActivityCategory {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct ActivitySettings {
     pub application_context: String,
+    /// Short operator-facing label for the selected analysis goal.
+    #[serde(default)]
+    pub goal_title: Option<String>,
     pub categories: Vec<ActivityCategory>,
     /// Only these event-property keys may be sent to the provider.
     pub property_keys: Vec<String>,
@@ -37,6 +40,7 @@ impl Default for ActivitySettings {
     fn default() -> Self {
         Self {
             application_context: String::new(),
+            goal_title: None,
             categories: vec![
                 ActivityCategory { name: "Learning".into(), description: "Reading educational content without clear evidence of evaluation.".into() },
                 ActivityCategory { name: "Evaluating".into(), description: "Exploring pricing, comparisons, compatibility or migration.".into() },

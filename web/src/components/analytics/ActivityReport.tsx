@@ -173,10 +173,14 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                     <h2 className="text-lg font-semibold">
                       {preview
                         ? 'Preview of visitor activity'
-                        : 'Recent visitor activity'}
+                        : report
+                          ? 'Latest report'
+                          : 'Recent visitor activity'}
                     </h2>
                     <p className="text-sm text-muted-foreground">
-                      Last 24 hours · Up to 20 visitors
+                      {report
+                        ? `${preview ? 'Preview generated' : 'Generated'} ${new Date(report.completed_at).toLocaleString()}`
+                        : 'Last 24 hours · Up to 20 eligible visitors'}
                       {report?.environment_id &&
                         ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
                     </p>
@@ -208,6 +212,18 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                 </div>
               </div>
               <div className="space-y-5">
+                {!preview &&
+                  report &&
+                  data.recent_runs?.[0] &&
+                  new Date(data.recent_runs[0].completed_at).getTime() >
+                    new Date(report.completed_at).getTime() &&
+                  data.recent_runs[0].status !== 'success' && (
+                    <p className="text-sm text-muted-foreground">
+                      {data.recent_runs[0].status === 'failed'
+                        ? 'The latest run failed. Showing the last available report.'
+                        : 'The latest run found nothing new to analyze. Showing the last available report.'}
+                    </p>
+                  )}
                 {data.selected_environment_id !==
                   data.settings.environment_id && (
                   <p className="text-sm text-muted-foreground">
@@ -426,6 +442,7 @@ const setupSchema = z.object({
   environment_id: z.number().int().positive().nullable(),
   source_url: z.string().nullable(),
   source_domain: z.string().nullable(),
+  goal_title: z.string().nullable().optional(),
   application_context: z
     .string()
     .trim()
@@ -516,6 +533,7 @@ function ActivitySettingsForm({
         min_page_paths: form.getValues('min_page_paths'),
         // A preview suggests classification settings, not a scheduling change.
         daily_enabled: form.getValues('daily_enabled'),
+        goal_title: form.getValues('goal_title'),
         environment_id: form.getValues('environment_id'),
         source_url: form.getValues('source_url'),
         source_domain: form.getValues('source_domain'),
@@ -549,6 +567,7 @@ function ActivitySettingsForm({
           source_url: data.source_url,
           source_domain: data.source_domain,
           application_context: data.application_context,
+          goal_title: data.goal_title,
           categories: data.categories,
           min_sessions: data.min_sessions,
           min_page_paths: data.min_page_paths,
@@ -582,9 +601,17 @@ function ActivitySettingsForm({
               Change goal
             </Button>
           </div>
-          <p className="text-sm whitespace-pre-wrap">
-            {status.settings.application_context}
-          </p>
+          <details className="text-sm">
+            <summary className="cursor-pointer font-medium">
+              {status.settings.goal_title ||
+                (status.settings.application_context.length > 80
+                  ? `${status.settings.application_context.slice(0, 80).trimEnd()}…`
+                  : status.settings.application_context)}
+            </summary>
+            <p className="mt-2 whitespace-pre-wrap text-muted-foreground">
+              {status.settings.application_context}
+            </p>
+          </details>
         </div>
       )}
       {discovering && (
@@ -604,6 +631,7 @@ function ActivitySettingsForm({
           disabled={busy}
           onResultsChange={setChoosingGoal}
           onSelect={(goal) => {
+            form.setValue('goal_title', goal.title, { shouldDirty: true })
             form.setValue('application_context', goal.goal, {
               shouldDirty: true,
             })
@@ -656,7 +684,10 @@ function ActivitySettingsForm({
                 rows={4}
                 maxLength={4000}
                 {...form.register('application_context', {
-                  onChange: () => setHasSetup(false),
+                  onChange: () => {
+                    setHasSetup(false)
+                    form.setValue('goal_title', null)
+                  },
                 })}
                 placeholder="e.g. Which visitors are exploring our product, and who needs help?"
                 aria-invalid={!!form.formState.errors.application_context}
@@ -870,24 +901,6 @@ function ActivitySettingsForm({
                     </Button>
                   </div>
                 )}
-                {status.settings_revision > 0 && (
-                  <label className="flex items-center gap-3 text-sm">
-                    <Controller
-                      control={form.control}
-                      name="daily_enabled"
-                      render={({ field }) => (
-                        <Switch
-                          checked={field.value}
-                          onCheckedChange={field.onChange}
-                          onBlur={field.onBlur}
-                          ref={field.ref}
-                          disabled={!values.share_activity_with_ai}
-                        />
-                      )}
-                    />
-                    Run automatically every 24 hours
-                  </label>
-                )}
               </div>
             </details>
             <div className="space-y-2">
@@ -922,6 +935,24 @@ function ActivitySettingsForm({
                 </p>
               </details>
             </div>
+            {status.settings_revision > 0 && (
+              <label className="flex items-center gap-3 text-sm">
+                <Controller
+                  control={form.control}
+                  name="daily_enabled"
+                  render={({ field }) => (
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      onBlur={field.onBlur}
+                      ref={field.ref}
+                      disabled={!values.share_activity_with_ai}
+                    />
+                  )}
+                />
+                Run automatically every 24 hours
+              </label>
+            )}
             {preview.isError && (
               <Alert variant="destructive">
                 <AlertDescription>
