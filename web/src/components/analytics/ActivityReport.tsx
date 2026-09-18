@@ -820,7 +820,7 @@ function ActivitySettingsForm({
                 )}
               <Button
                 type="button"
-                variant="ghost"
+                variant="default"
                 disabled={selectedEnvironment == null}
                 onClick={() =>
                   saveSetup(
@@ -1045,7 +1045,7 @@ function GoalSuggestions({
             </div>
             <Button
               type="button"
-              variant="ghost"
+              variant="default"
               disabled={disabled}
               onClick={() => setStep('goals')}
             >
