@@ -254,6 +254,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
             />
           ) : (
             <DataTable
+              aria-label="Recent cron job executions"
               columns={executionColumns}
               rows={executions ?? []}
               rowKey={(execution) => execution.id}

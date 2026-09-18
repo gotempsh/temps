@@ -27,6 +27,8 @@ export interface DataTableProps<T> {
   rowKey: (row: T) => string | number
   onRowClick?: (row: T) => void
   isLoading?: boolean
+  /** Accessible name when the surrounding heading does not label the table. */
+  'aria-label'?: string
   pagination?: {
     page: number
     pageCount: number
@@ -50,13 +52,19 @@ export function DataTable<T>({
   rowKey,
   onRowClick,
   isLoading = false,
+  'aria-label': ariaLabel,
   pagination,
   className,
 }: DataTableProps<T>) {
   return (
     <div className={cn('space-y-6', className)}>
+      {isLoading ? (
+        <p role="status" className="sr-only">
+          Loading rows…
+        </p>
+      ) : null}
       <div className="rounded-md border">
-        <Table>
+        <Table aria-label={ariaLabel} aria-busy={isLoading}>
           <TableHeader>
             <TableRow>
               {columns.map((column) => (
@@ -71,7 +79,7 @@ export function DataTable<T>({
               ? Array.from({ length: 5 }).map((_, i) => (
                   <TableRow key={i}>
                     {columns.map((column) => (
-                      <TableCell key={column.key}>
+                      <TableCell key={column.key} className={column.className}>
                         <Skeleton className="h-4 w-24" />
                       </TableCell>
                     ))}
@@ -81,7 +89,7 @@ export function DataTable<T>({
                   <TableRow
                     key={rowKey(row)}
                     className={cn(onRowClick && 'cursor-pointer')}
-                    onClick={() => onRowClick?.(row)}
+                    onClick={onRowClick ? () => onRowClick(row) : undefined}
                   >
                     {columns.map((column) => (
                       <TableCell key={column.key} className={column.className}>
@@ -103,8 +111,13 @@ export function DataTable<T>({
               variant="outline"
               size="sm"
               aria-disabled={pagination.page <= 1}
-              className={cn(pagination.page <= 1 && 'pointer-events-none opacity-50')}
-              onClick={() => pagination.onPageChange(pagination.page - 1)}
+              className={cn(
+                pagination.page <= 1 && 'pointer-events-none opacity-50'
+              )}
+              onClick={() => {
+                if (pagination.page > 1)
+                  pagination.onPageChange(pagination.page - 1)
+              }}
             >
               Previous
             </Button>
@@ -113,9 +126,13 @@ export function DataTable<T>({
               size="sm"
               aria-disabled={pagination.page >= pagination.pageCount}
               className={cn(
-                pagination.page >= pagination.pageCount && 'pointer-events-none opacity-50',
+                pagination.page >= pagination.pageCount &&
+                  'pointer-events-none opacity-50'
               )}
-              onClick={() => pagination.onPageChange(pagination.page + 1)}
+              onClick={() => {
+                if (pagination.page < pagination.pageCount)
+                  pagination.onPageChange(pagination.page + 1)
+              }}
             >
               Next
             </Button>
