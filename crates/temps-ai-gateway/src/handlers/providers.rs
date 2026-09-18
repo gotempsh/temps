@@ -363,6 +363,7 @@ async fn create_provider_key(
             &request.provider,
             &request.api_key,
             request.base_url.as_deref(),
+            request.default_model.as_deref(),
         )
         .await
         .map_err(|e| AiGatewayError::Validation {
@@ -600,6 +601,7 @@ async fn test_provider_key_inline(
             &request.provider,
             &request.api_key,
             request.base_url.as_deref(),
+            None,
         )
         .await;
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -656,6 +658,7 @@ async fn test_provider_key_by_id(
             &key_record.provider,
             &decrypted_key,
             key_record.base_url.as_deref(),
+            key_record.default_model.as_deref(),
         )
         .await;
     let latency_ms = start.elapsed().as_millis() as u64;

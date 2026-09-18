@@ -459,12 +459,13 @@ impl GatewayService {
     }
 
     /// Send a minimal chat completion to verify a provider API key works.
-    /// Uses the cheapest model for the provider and a small `max_tokens`.
+    /// Uses the configured model when supplied, otherwise the provider's test default.
     pub async fn test_provider(
         &self,
         provider_id: &str,
         api_key: &str,
         base_url: Option<&str>,
+        configured_model: Option<&str>,
     ) -> Result<(), AiGatewayError> {
         if let Some(base_url) = base_url {
             temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
@@ -479,8 +480,7 @@ impl GatewayService {
             }
         })?;
 
-        // Pick the cheapest/smallest model for the test
-        let test_model = match provider_id {
+        let fallback_model = match provider_id {
             "openai" => "gpt-5-nano",
             "anthropic" => "claude-haiku-4-5",
             "xai" => "grok-4.5",
@@ -494,7 +494,7 @@ impl GatewayService {
         };
 
         let request = ChatCompletionRequest {
-            model: test_model.to_string(),
+            model: provider_test_model(configured_model, fallback_model).to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("Say ok".to_string())),
@@ -548,9 +548,26 @@ impl GatewayService {
     }
 }
 
+fn provider_test_model<'a>(configured: Option<&'a str>, fallback: &'a str) -> &'a str {
+    configured
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn connection_test_honors_configured_model() {
+        assert_eq!(
+            provider_test_model(Some("deepseek/deepseek-v4-flash"), "openai/gpt-4o-mini"),
+            "deepseek/deepseek-v4-flash"
+        );
+        assert_eq!(provider_test_model(None, "fallback"), "fallback");
+        assert_eq!(provider_test_model(Some(" "), "fallback"), "fallback");
+    }
+
     use axum::{http::StatusCode, routing::post, Json, Router};
     use futures_util::StreamExt;
     use sea_orm::{DatabaseBackend, MockDatabase};
