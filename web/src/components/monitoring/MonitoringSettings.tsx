@@ -47,7 +47,6 @@ import {
 } from './schemas'
 import { AlertRulesManagement } from './AlertRulesManagement'
 import { NodeAlertRules } from './NodeAlertRules'
-import { ServerMonitoring } from './ServerMonitoring'
 import { Alarms } from '@/pages/Alarms'
 import {
   MONITORING_SECTIONS,
@@ -1025,10 +1024,6 @@ export function MonitoringSettings() {
   }
 
   const renderContent = () => {
-    if (currentSection === 'server') {
-      return <ServerMonitoring />
-    }
-
     if (currentSection === 'rules') {
       return (
         <div className="space-y-8">

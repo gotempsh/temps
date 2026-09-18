@@ -51,6 +51,7 @@ import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
 import { NotificationRouteForm } from './pages/NotificationRouteForm'
 import { Monitoring } from './pages/Monitoring'
+import { Server } from './pages/Server'
 import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
 const Account = lazy(() =>
@@ -612,6 +613,7 @@ const FullAppRoutes = () => {
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}
                     />
+                    <Route path="/monitoring/server" element={<Server />} />
                     <Route path="/monitoring" element={<Monitoring />}>
                       <Route index element={<Navigate to="alerts" replace />} />
                       <Route
