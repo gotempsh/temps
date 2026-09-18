@@ -87,3 +87,27 @@ describe('DataTable', () => {
     }
   )
 })
+
+test('custom rows retain expansion rows inside the shared table', () => {
+  const markup = renderToStaticMarkup(
+    <DataTable
+      columns={columns}
+      rows={[{ name: 'Event' }]}
+      rowKey={(row) => row.name}
+      renderRow={(row) => (
+        <>
+          <tr>
+            <td>{row.name}</td>
+            <td>Actor</td>
+          </tr>
+          <tr>
+            <td colSpan={2}>Expanded metadata</td>
+          </tr>
+        </>
+      )}
+    />
+  )
+  expect(markup).toContain('Expanded metadata')
+  expect(markup).toContain('colSpan="2"')
+  expect(markup.match(/<tr/g)).toHaveLength(3)
+})

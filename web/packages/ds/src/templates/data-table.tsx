@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ReactNode } from 'react'
+import { Fragment, type ReactNode } from 'react'
 import {
   Table,
   TableBody,
@@ -26,6 +26,8 @@ export interface DataTableProps<T> {
   rows: T[]
   rowKey: (row: T) => string | number
   onRowClick?: (row: T) => void
+  /** Advanced rows own their cells, expansion and interactions; return table rows only. */
+  renderRow?: (row: T) => ReactNode
   isLoading?: boolean
   /** Accessible name when the surrounding heading does not label the table. */
   'aria-label'?: string
@@ -51,6 +53,7 @@ export function DataTable<T>({
   rows,
   rowKey,
   onRowClick,
+  renderRow,
   isLoading = false,
   'aria-label': ariaLabel,
   pagination,
@@ -85,19 +88,26 @@ export function DataTable<T>({
                     ))}
                   </TableRow>
                 ))
-              : rows.map((row) => (
-                  <TableRow
-                    key={rowKey(row)}
-                    className={cn(onRowClick && 'cursor-pointer')}
-                    onClick={onRowClick ? () => onRowClick(row) : undefined}
-                  >
-                    {columns.map((column) => (
-                      <TableCell key={column.key} className={column.className}>
-                        {column.render(row)}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))}
+              : rows.map((row) =>
+                  renderRow ? (
+                    <Fragment key={rowKey(row)}>{renderRow(row)}</Fragment>
+                  ) : (
+                    <TableRow
+                      key={rowKey(row)}
+                      className={cn(onRowClick && 'cursor-pointer')}
+                      onClick={onRowClick ? () => onRowClick(row) : undefined}
+                    >
+                      {columns.map((column) => (
+                        <TableCell
+                          key={column.key}
+                          className={column.className}
+                        >
+                          {column.render(row)}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  )
+                )}
           </TableBody>
         </Table>
       </div>

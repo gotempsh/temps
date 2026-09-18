@@ -84,7 +84,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `Article` | `children` | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail` | Honour-system |
 | `GitProviderMark` | `provider`, `variant?`, `className?`, `label?` | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers | Label and fallback unit tests |
 | `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
-| `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
+| `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
 | `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
 | `Wizard` | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
 
@@ -279,7 +279,7 @@ this phase needs):
       whole page, not embedded — worth a full `Ledger` migration rather
       than a bare `DataTable` swap, similar in spirit to follow-up 9's
       `Detail` migrations): `pages/AiGateway.tsx`, `pages/Alarms.tsx`,
-      `pages/AuditLogs.tsx`, `pages/Certificates.tsx`,
+      `pages/Certificates.tsx`,
       `pages/MetricAlertForm.tsx`, `pages/ProxyMetrics.tsx`,
       `pages/Revenue.tsx`, `pages/ServiceMonitoring.tsx`,
       `pages/ServiceQueryPerformance.tsx`, `pages/ServiceRestore.tsx`,
@@ -342,3 +342,11 @@ footer, and inline mutation errors. Credentials stay in the form.
 Transactional email setup (`AddEmailProvider.tsx`) now uses the shared wizard
 and footer. Its SES/Scaleway/SMTP forms and validation remain intact; non-secret
 step/provider state is in the URL, while credentials remain local.
+
+Audit history (`AuditLogs.tsx`) now uses `DataTable` with the existing expandable
+`AuditLogItemRow` through `renderRow`. This advanced slot returns table rows and
+owns row interactions; normal consumers should keep column renderers. Audit
+filters use URL state, date/time presets and custom ranges, with an all-time
+option. Filter changes reset pagination. Failures have retries and cached rows
+remain visible after refresh errors. Counts describe only the loaded page;
+the API does not supply an aggregate total or overview time series.
