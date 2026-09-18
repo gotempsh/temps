@@ -10,7 +10,6 @@ import {
 describe('monitoring sections', () => {
   test('keeps project alert rules separate from global alert settings', () => {
     expect(MONITORING_SECTIONS.map((section) => section.id)).toEqual([
-      'server',
       'alerts',
       'rules',
       'alarms',
@@ -18,7 +17,7 @@ describe('monitoring sections', () => {
     ])
   })
 
-  test('exposes the control-plane server monitoring section', () => {
+  test('retains the label for the dedicated Server route', () => {
     expect(monitoringSectionLabel('server')).toBe('Server')
   })
 
