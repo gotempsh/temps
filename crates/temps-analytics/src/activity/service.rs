@@ -4,10 +4,10 @@
 use super::types::*;
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult,
-    QuerySelect, Statement,
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromJsonQueryResult,
+    FromQueryResult, QuerySelect, Statement,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -29,17 +29,26 @@ pub const UNKNOWN: &str = "Insufficient evidence";
 
 #[derive(Debug, FromQueryResult)]
 struct Stored {
-    settings: serde_json::Value,
+    settings: StoredSettings,
     revision: i32,
     daily_enabled: bool,
     next_run_at: DateTime<Utc>,
     locked_until: Option<DateTime<Utc>>,
     last_started_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
-    report: Option<serde_json::Value>,
-    run_history: serde_json::Value,
-    visitor_checkpoints: serde_json::Value,
+    report: Option<StoredReport>,
+    run_history: RunHistory,
+    visitor_checkpoints: VisitorCheckpoints,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromJsonQueryResult)]
+struct StoredSettings(ActivitySettings);
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromJsonQueryResult)]
+struct StoredReport(ActivityReport);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, FromJsonQueryResult)]
+struct RunHistory(Vec<ActivityRunSummary>);
 
 #[derive(Debug, Clone, FromQueryResult)]
 struct EventRow {
@@ -48,14 +57,17 @@ struct EventRow {
     path: String,
     title: Option<String>,
     event: String,
-    properties: serde_json::Value,
+    properties: EventProperties,
     session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
 struct VisitorCheckpoints(BTreeMap<String, VisitorCheckpoint>);
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, FromJsonQueryResult)]
+struct EventProperties(BTreeMap<String, String>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VisitorCheckpoint {
     revision: i32,
     fingerprint: String,
@@ -317,8 +329,7 @@ impl ActivityService {
         let row = self.stored(project_id).await?;
         let mut saved_settings: ActivitySettings = row
             .as_ref()
-            .map(|row| decode(project_id, row.settings.clone()))
-            .transpose()?
+            .map(|row| row.settings.0.clone())
             .unwrap_or_default();
         let saved_environment_id = match self
             .resolve_environment(project_id, saved_settings.environment_id, false)
@@ -365,7 +376,9 @@ impl ActivityService {
             status.running = row.locked_until.is_some_and(|until| until > Utc::now());
             status.next_run_at = row.daily_enabled.then_some(row.next_run_at);
             status.last_error = row.last_error;
-            status.recent_runs = decode::<Vec<ActivityRunSummary>>(project_id, row.run_history)?
+            status.recent_runs = row
+                .run_history
+                .0
                 .into_iter()
                 .filter(|run| {
                     run.environment_id.is_some()
@@ -373,14 +386,10 @@ impl ActivityService {
                 })
                 .take(20)
                 .collect();
-            status.report = row
-                .report
-                .map(|value| decode::<ActivityReport>(project_id, value))
-                .transpose()?
-                .filter(|report| {
-                    report.environment_id.is_some()
-                        && report.environment_id == status.selected_environment_id
-                });
+            status.report = row.report.map(|value| value.0).filter(|report| {
+                report.environment_id.is_some()
+                    && report.environment_id == status.selected_environment_id
+            });
         }
         Ok(status)
     }
@@ -581,7 +590,7 @@ impl ActivityService {
                 project_id,
                 reason: "Save application context and categories first".into(),
             })?;
-        let mut settings: ActivitySettings = decode(project_id, saved.settings)?;
+        let mut settings = saved.settings.0;
         let environment_id = self
             .resolve_environment(project_id, settings.environment_id, true)
             .await?
@@ -617,8 +626,7 @@ impl ActivityService {
         let started = claimed
             .last_started_at
             .ok_or_else(|| analysis_error(project_id, "Missing run timestamp"))?;
-        let previous_checkpoints: VisitorCheckpoints =
-            decode(project_id, claimed.visitor_checkpoints.clone())?;
+        let previous_checkpoints = claimed.visitor_checkpoints.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(120),
             self.analyze(
@@ -642,8 +650,7 @@ impl ActivityService {
                     .then(|| serde_json::to_value(&outcome.report))
                     .transpose()
                     .map_err(|e| analysis_error(project_id, e))?,
-                serde_json::to_value(&outcome.checkpoints)
-                    .map_err(|e| analysis_error(project_id, e))?,
+                outcome.checkpoints.clone(),
                 None,
             ),
             Err(error) => {
@@ -651,7 +658,7 @@ impl ActivityService {
                 (None, claimed.visitor_checkpoints.clone(), Some("Analysis failed. Check the AI provider and retry; the previous report is preserved.".to_string()))
             }
         };
-        let mut history: Vec<ActivityRunSummary> = decode(project_id, claimed.run_history)?;
+        let mut history = claimed.run_history.0;
         let summary = match &result {
             Ok(outcome) => ActivityRunSummary {
                 trigger: if scheduled { "scheduled" } else { "manual" }.into(),
@@ -689,6 +696,8 @@ impl ActivityService {
         history.insert(0, summary);
         history.truncate(20);
         let history = serde_json::to_value(history).map_err(|e| analysis_error(project_id, e))?;
+        let checkpoints =
+            serde_json::to_value(checkpoints).map_err(|e| analysis_error(project_id, e))?;
         let finalized = self
             .db
             .execute(Statement::from_sql_and_values(
@@ -973,18 +982,10 @@ fn prepare_eligible_visitors(
         }
         let properties = row
             .properties
-            .as_object()
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| ActivityProperty {
-                            key: key.clone(),
-                            value: value.into(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .0
+            .into_iter()
+            .map(|(key, value)| ActivityProperty { key, value })
+            .collect();
         let evidence = ActivityEvidence {
             reference: index as u32 + 1,
             timestamp: row.timestamp,
@@ -1274,7 +1275,7 @@ mod tests {
             path: "/docs/install?token=secret-token".into(),
             title: Some("Install".into()),
             event: "pageview".into(),
-            properties: serde_json::json!({}),
+            properties: EventProperties::default(),
             session_id: Some(format!("session-{visitor_id}")),
         }
     }
@@ -1370,9 +1371,9 @@ mod tests {
         let rows = (0..500)
             .map(|index| {
                 let mut row = event(index / 20 + 1);
-                row.properties = serde_json::Value::Object(
+                row.properties = EventProperties(
                     (0..10)
-                        .map(|key| (format!("field-{key}"), serde_json::json!("x".repeat(200))))
+                        .map(|key| (format!("field-{key}"), "x".repeat(200)))
                         .collect(),
                 );
                 row
@@ -1827,6 +1828,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_persisted_json_fails_at_the_query_boundary() {
+        let mut malformed = stored();
+        malformed.insert("settings".into(), serde_json::json!("not settings").into());
+        let db =
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![malformed]]);
+        assert!(matches!(
+            service(db, false, false).stored(1).await,
+            Err(ActivityError::Database {
+                project_id: 1,
+                operation: "read settings",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn save_validates_before_database_access() {
         let db = MockDatabase::new(DatabaseBackend::Postgres);
         assert!(matches!(
@@ -2079,7 +2096,7 @@ mod tests {
         assert_eq!(report.model.as_deref(), Some("test-model"));
         let after_success = svc.stored(1).await.unwrap().unwrap();
         let successful_checkpoints = after_success.visitor_checkpoints.clone();
-        assert_ne!(successful_checkpoints, serde_json::json!({}));
+        assert!(!successful_checkpoints.0.is_empty());
         assert!(after_success.next_run_at > retry_started_at + chrono::Duration::hours(23));
         assert!(after_success.next_run_at < Utc::now() + chrono::Duration::hours(25));
         assert!(matches!(
