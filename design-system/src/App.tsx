@@ -19,6 +19,7 @@ import {
   SelectValue,
 } from '@temps-sdk/ui'
 import Guide from './pages/Guide'
+import Iconography from './pages/Iconography'
 import TableStates from './pages/TableStates'
 import Components from './pages/Components'
 import DeploymentsLedger from './pages/DeploymentsLedger'
@@ -35,6 +36,7 @@ const NAV_SECTIONS = [
     items: [
       { to: '/guide', label: 'Guide' },
       { to: '/components', label: 'Components' },
+      { to: '/iconography', label: 'Iconography' },
     ],
   },
   {
@@ -119,6 +121,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/guide" replace />} />
           <Route path="/guide" element={<Guide />} />
+          <Route path="/iconography" element={<Iconography />} />
           <Route path="/components" element={<Components />} />
           <Route path="/table-states" element={<TableStates />} />
           <Route path="/ledger" element={<DeploymentsLedger />} />

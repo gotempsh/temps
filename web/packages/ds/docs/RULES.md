@@ -63,9 +63,20 @@ in the same change if the app genuinely distinguishes a new state.
 
 ## Icons
 
-`lucide-react` only, sized via the Tailwind scale (`size-4`, `size-10`), never
-a raw `width`/`height`. Icons pair with text/Status — they never carry
-meaning alone.
+Use `lucide-react` for interface actions and resource types. Use the existing
+provider logos through `GitProviderMark` for Git provider identity — a branch
+icon describes a branch, not GitHub or GitLab. Provider marks are monochrome
+and inherit the current text color; color remains reserved for state.
+
+Use `size-4` in controls, `size-5` for provider identity, and `size-3.5` for
+dense metadata. No raw dimensions. Pair icons with visible text; hide redundant
+icons from assistive technology. Icon-only controls need an accessible action
+name on the button. A standalone provider mark needs its `label` prop.
+
+Use `Status` for outcomes. Wizard numbers show sequence, a neutral check means
+completed, and selection uses a check plus a visible border and `aria-pressed`.
+Do not give providers status colors or use decorative icons as step numbers.
+See sandbox `/iconography` for examples.
 
 ## Page structure
 

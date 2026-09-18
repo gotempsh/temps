@@ -14,6 +14,7 @@ import { Link } from 'react-router'
 import {
   Button,
   Field,
+  GitProviderMark,
   PageContainer,
   Status,
   Wizard,
@@ -164,7 +165,7 @@ export default function ConnectRepoWizard() {
                       )}
                     >
                       <span className="flex size-10 shrink-0 items-center justify-center rounded-md border bg-background">
-                        <GitBranch className="size-5" />
+                        <GitProviderMark provider={item.name} />
                       </span>
                       <span className="min-w-0 flex-1">
                         <span className="block font-medium">{item.name}</span>

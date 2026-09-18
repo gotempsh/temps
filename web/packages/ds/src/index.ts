@@ -54,3 +54,5 @@ export {
   type DateTimeRangeValue,
 } from './date-time-range'
 export { ResponsivePagination, type ResponsivePaginationProps } from '../../../src/components/ui/responsive-pagination'
+
+export { GitProviderMark, type GitProviderMarkProps } from './git-provider-mark'
