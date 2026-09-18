@@ -202,6 +202,9 @@ for (const width of [390, 1280]) {
     ).toBeDisabled()
     await expect(page.getByLabel('Public application URL')).toHaveCount(0)
     await expect(
+      page.getByRole('combobox', { name: 'Environment', exact: true })
+    ).toHaveCount(0)
+    await expect(
       page.getByRole('list', { name: 'Activity report setup steps' })
     ).toHaveCount(0)
     await page.getByRole('switch', { name: /Share public pages/ }).check()
@@ -520,6 +523,8 @@ for (const width of [390, 1280]) {
       name: 'Public application URL',
       exact: true,
     })
+    await expect(environment).toBeHidden()
+    await page.getByText('Advanced settings', { exact: true }).click()
     await expect(environment).toContainText('Production')
     await expect(url).toHaveCount(0)
     await expect(website).toContainText('https://app-production.example.com')
@@ -598,7 +603,7 @@ for (const width of [390, 1280]) {
     await expect(website).toContainText(
       'https://renamed-production.example.com'
     )
-    await environment.scrollIntoViewIfNeeded()
+    await website.scrollIntoViewIfNeeded()
     await page.screenshot({
       path: `/tmp/temps-environment-onboarding-${width}.png`,
     })
