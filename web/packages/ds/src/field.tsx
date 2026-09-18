@@ -13,7 +13,7 @@ export interface FieldProps {
   description?: ReactNode
   /** A single field-level validation message (e.g. `formState.errors.name?.message`). */
   error?: string
-  children: (props: { id: string; 'aria-describedby'?: string; 'aria-invalid'?: boolean }) => ReactNode
+  children: (props: { id: string; 'aria-labelledby'?: string; 'aria-describedby'?: string; 'aria-invalid'?: boolean }) => ReactNode
   className?: string
 }
 
@@ -31,11 +31,11 @@ export function Field({ label, optional, description, error, children, className
 
   return (
     <div className={cn('space-y-1.5', className)}>
-      <div className="flex items-baseline justify-between">
-        <Label htmlFor={id}>{label}</Label>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <Label id={`${id}-label`} htmlFor={id}>{label}</Label>
         {optional ? <span className="text-xs text-muted-foreground">Optional</span> : null}
       </div>
-      {children({ id, 'aria-describedby': describedBy, 'aria-invalid': !!error })}
+      {children({ id, 'aria-labelledby': `${id}-label`, 'aria-describedby': describedBy, 'aria-invalid': !!error })}
       {description ? (
         <p id={descId} className="text-xs text-muted-foreground">
           {description}
@@ -64,7 +64,7 @@ export function FormErrors({ errors, className }: FormErrorsProps) {
     <Callout tone="error" title={`Fix ${entries.length} field${entries.length === 1 ? '' : 's'} before saving`} className={className}>
       <ul className="list-inside list-disc space-y-0.5">
         {entries.map(([field, message]) => (
-          <li key={field}>{message}</li>
+          <li key={field}><span className="font-medium">{field}:</span> {message}</li>
         ))}
       </ul>
     </Callout>
