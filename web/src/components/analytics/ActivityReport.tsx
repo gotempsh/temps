@@ -1034,10 +1034,7 @@ function GoalSuggestions({
         )}
         {suggest.isError && (
           <Alert variant="destructive">
-            <AlertDescription>
-              Could not analyze this website. Try its final public URL, or enter
-              a goal in Report settings.
-            </AlertDescription>
+            <AlertDescription>{errorMessage(suggest.error)}</AlertDescription>
           </Alert>
         )}
         {step === 'selected' && selectedGoal && (

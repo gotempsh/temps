@@ -734,3 +734,68 @@ for (const width of [390, 1280]) {
     })
   })
 }
+
+test('website analysis shows the actual failure and allows retry', async ({
+  page,
+}) => {
+  const { projects } = await (await page.request.get('/api/projects')).json()
+  test.skip(!projects[0], 'Requires a test project')
+  const project = projects[0]
+  await page.route(
+    `**/api/projects/${project.id}/analytics/activity`,
+    (route) =>
+      route.fulfill({
+        json: {
+          configured: true,
+          selected_environment_id: 1,
+          settings_revision: 0,
+          has_recent_activity: false,
+          running: false,
+          report: null,
+          setup_url: '/settings/ai-providers',
+          settings: {
+            environment_id: 1,
+            application_context: '',
+            categories: [],
+            property_keys: [],
+            daily_enabled: false,
+            share_activity_with_ai: false,
+          },
+        },
+      })
+  )
+  await page.route(
+    '**/api/projects/*/analytics/activity/goals',
+    async (route) => {
+      await route.fulfill({
+        status: 409,
+        contentType: 'application/problem+json',
+        json: {
+          title: 'Visitor activity analysis',
+          detail:
+            'Please wait 30 seconds before requesting more goal suggestions.',
+        },
+      })
+    }
+  )
+  await page.goto(`/projects/${project.slug}/analytics/activity`)
+  await page.getByLabel('Website', { exact: true }).click()
+  await page
+    .getByRole('option', { name: 'Use another URL', exact: true })
+    .click()
+  await page.getByLabel('Public application URL').fill('https://example.com')
+  await page
+    .getByRole('button', { name: 'Analyze website', exact: true })
+    .click()
+  await expect(
+    page
+      .getByRole('alert')
+      .filter({
+        hasText:
+          'Please wait 30 seconds before requesting more goal suggestions.',
+      })
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Analyze website', exact: true })
+  ).toBeEnabled()
+})
