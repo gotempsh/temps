@@ -20,6 +20,7 @@ export interface WizardProps {
   steps: WizardStep[]
   children: ReactNode
   celebrate?: boolean
+  /** Expand a standalone step surface when its content needs more room. */
   fullWidth?: boolean
   headerActions?: ReactNode
   /** Adds a bordered step surface with a persistent, separate action footer. */
@@ -46,7 +47,13 @@ export function Wizard({
   const currentIndex = steps.findIndex((step) => step.id === currentStep)
 
   return (
-    <div className={cn('w-full min-w-0 space-y-6', !fullWidth && 'py-4')}>
+    <div
+      className={cn(
+        'w-full min-w-0 space-y-6',
+        !fullWidth && 'py-4',
+        footer && !fullWidth && 'mx-auto max-w-3xl'
+      )}
+    >
       <div className="motion-reduce:hidden">
         <Confetti active={celebrate} duration={2500} particleCount={80} />
       </div>
@@ -109,7 +116,7 @@ export function Wizard({
       {footer ? (
         <section className="min-w-0 overflow-hidden rounded-lg border bg-card text-card-foreground">
           <div className="p-4 sm:p-6">{children}</div>
-          <div className="flex flex-col gap-3 border-t bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div className="flex flex-col gap-3 border-t bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-start sm:px-6">
             {footer}
           </div>
         </section>

@@ -170,12 +170,17 @@ keyboard-only entry point. `Picker` is filterable by keyboard from focus.
 ## Wizards
 
 Use `Wizard` for a sequence of decisions. Its `PageHeader` stays aligned
-with the page; progress labels remain readable on small screens. Put the
+with the step surface; progress labels remain readable on small screens. Put the
 current step in a defined surface and actions in the `footer` slot. Each
 step needs a descriptive heading, labeled inputs or choices, and a clear
 next action. Explain what is missing before Continue can act. Allow Back
 without discarding selections. Completion names the outcome and offers a
 useful next step; sample flows must not imply a real resource was created.
+
+`Wizard` with a footer defaults to a focused `max-w-3xl` column. Keep
+context beside the relevant input vertically, and group Back and the primary
+action beneath the form. Do not stretch a short form, summary, and actions
+across the viewport. Use `fullWidth` only for steps whose content needs it.
 
 `Wizard` does not own gutters: wrap standalone pages in `PageContainer`.
 Keep existing embedded consumers' surrounding containers. Celebration is

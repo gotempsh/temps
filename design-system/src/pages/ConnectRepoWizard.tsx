@@ -7,7 +7,6 @@ import {
   ArrowRight,
   Check,
   GitBranch,
-  GitPullRequest,
   LockKeyhole,
 } from 'lucide-react'
 import { Link } from 'react-router'
@@ -73,7 +72,7 @@ export default function ConnectRepoWizard() {
   const footer =
     step === 'provider' ? (
       <>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-muted-foreground sm:mr-auto">
           {provider
             ? `${provider.name} selected. Continue to choose a repository.`
             : 'Choose a provider to continue.'}
@@ -128,7 +127,6 @@ export default function ConnectRepoWizard() {
   return (
     <PageContainer>
       <Wizard
-        fullWidth
         title="Connect a repository"
         description="Choose your Git provider and the repository you want to deploy."
         currentStep={step}
@@ -141,8 +139,8 @@ export default function ConnectRepoWizard() {
         footer={footer}
       >
         {step === 'provider' && (
-          <div className="grid gap-8 lg:grid-cols-3">
-            <fieldset className="min-w-0 space-y-5 lg:col-span-2">
+          <div className="space-y-6">
+            <fieldset className="min-w-0 space-y-5">
               <legend className="text-lg font-semibold">
                 Where is your repository hosted?
               </legend>
@@ -188,24 +186,11 @@ export default function ConnectRepoWizard() {
                 })}
               </div>
             </fieldset>
-            <aside className="space-y-5 border-t pt-6 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
-              <h2 className="text-sm font-semibold">Before you connect</h2>
-              <div className="flex gap-3">
-                <LockKeyhole className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                <p className="text-sm text-muted-foreground">
-                  In the console, use an account with access to the repository
-                  you want to deploy.
-                </p>
-              </div>
-              <div className="flex gap-3">
-                <GitPullRequest className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                <p className="text-sm text-muted-foreground">
-                  Next, choose a repository and review its deployment branch.
-                </p>
-              </div>
-              <p className="border-t pt-4 text-xs text-muted-foreground">
-                This example uses sample data. It does not sign in to a provider
-                or change any repositories.
+            <aside className="flex gap-3 border-t pt-4">
+              <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">
+                Use an account with access to your repository. This example uses
+                sample data and does not sign in to a provider.
               </p>
             </aside>
           </div>
@@ -218,9 +203,9 @@ export default function ConnectRepoWizard() {
               event.preventDefault()
               connect()
             }}
-            className="grid gap-8 lg:grid-cols-3"
+            className="space-y-6"
           >
-            <div className="min-w-0 space-y-6 lg:col-span-2">
+            <div className="min-w-0 space-y-6">
               <div>
                 <h2 className="text-lg font-semibold">Select a repository</h2>
                 <p className="mt-1 text-sm text-muted-foreground">
@@ -269,25 +254,10 @@ export default function ConnectRepoWizard() {
                 </div>
               </div>
             </div>
-            <aside className="space-y-3 border-t pt-6 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
-              <h2 className="text-sm font-semibold">Connection summary</h2>
-              <dl className="space-y-3 text-sm">
-                <div>
-                  <dt className="text-muted-foreground">Git provider</dt>
-                  <dd className="mt-1 font-medium">{provider?.name}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Access</dt>
-                  <dd className="mt-1">
-                    Sample only — no authorization required
-                  </dd>
-                </div>
-              </dl>
-              <p className="border-t pt-3 text-xs text-muted-foreground">
-                Connecting here only advances the example. No webhook or
-                deployment will be created.
-              </p>
-            </aside>
+            <p className="border-t pt-4 text-sm text-muted-foreground">
+              Sample only. No authorization is required, and no webhook or
+              deployment will be created.
+            </p>
           </form>
         )}
 
