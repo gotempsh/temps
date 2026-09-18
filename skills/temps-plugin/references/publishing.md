@@ -17,6 +17,12 @@ subdirectory paths nor installing a plugin folder inside another repository are 
 supported. Extract a monorepo example to its own repository before presenting it as
 GitHub-installable.
 
+For an existing monorepo example, copy only its source, lockfile, build tooling,
+license/attribution and required assets into a clean dedicated repository; remove workspace
+and local `file:` dependencies. Preserve history with a reviewed subtree/history extraction
+only if requested; do not rewrite the original repository. Choose one canonical source
+repository and link the old example to it so releases do not drift between two copies.
+
 Keep the template's current metadata shape. Example fields to customize:
 
 ```json
@@ -30,7 +36,7 @@ Keep the template's current metadata shape. Example fields to customize:
   "temps": {
     "name": "route-checker",
     "title": "Route Checker",
-    "category": "SEO",
+    "category": "Development",
     "entrypoint": "src/index.ts",
     "platforms": ["linux-amd64-gnu"],
     "screenshots": [
@@ -42,7 +48,9 @@ Keep the template's current metadata shape. Example fields to customize:
 
 Merge these fields into the real package, retaining dependencies and scripts. Scoped npm
 naming does not require npm publication. Runtime manifest identity/version must match.
-Advertise only compatible tested targets. README covers purpose, prerequisites, permissions,
+Advertise only compatible tested targets. Package `temps.category` and catalog `categories`
+are separate schemas: this example uses the CLI-compatible package value `Development`
+and the catalog slug `seo`. Check each validator; do not lowercase one into the other. README covers purpose, prerequisites, permissions,
 installation, configuration, examples, resource limits, data retention, update/uninstall,
 license and support. Add real screenshot files before referencing them.
 
@@ -61,11 +69,15 @@ bun install --frozen-lockfile --ignore-scripts
 bun build --compile src/index.ts --outfile /tmp/route-checker-validation
 ```
 
-Use a unique temporary output path for actual runs. This local command tests clean-checkout
+Use a unique temporary output path for actual runs. Then compile for each advertised
+host target using the CLI's current target map, for example
+`--target=bun-linux-x64-baseline` for `linux-amd64-gnu`. Cross-target builds can need a
+Bun runtime download; the real installer prefetches it before the offline compile phase. This local command tests clean-checkout
 completeness; it is not a substitute for the host's container/platform test. Missing
-`web/dist` or a generated asset module is a release blocker. Generate and commit the needed
-UI assets (or use a self-contained source embedding approach) and verify reproducible
-regeneration. Do not rely on ignored files left by a developer's prior UI build.
+`web/dist` or a generated asset module is a release blocker. Prefer generating and committing a self-contained embedded module such as
+`src/embedded-ui.ts`, with a checked-in generation script. Alternatively commit the static
+bundle the entrypoint imports. Verify reproducible regeneration and inspect the proposed
+commit in a fresh checkout; removing an ignore rule alone does not add missing artifacts. Do not rely on ignored files left by a developer's prior UI build.
 
 Run the normal tests/typecheck/build and CI as well. Do not introduce install-time scripts
 requiring secrets or network access during compilation. Building a repository executes

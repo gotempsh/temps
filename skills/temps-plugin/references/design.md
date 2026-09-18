@@ -21,6 +21,26 @@ runtime/build paths to a developer's worktree. Keep React deduplicated and inclu
 component source in Tailwind scanning. Do not rebuild Radix controls as styled native
 lookalikes just to avoid integrating their dependencies.
 
+### Standalone integration recipe
+
+1. Select only used primitives from the chosen revision (for example Button, Input,
+   Checkbox, Table, Dialog, PageContainer) and recursively inspect their imports. Copy
+   their local helpers and preserve notices; rewrite console aliases into plugin-local
+   imports. Do not copy authentication contexts or console API clients into the UI kit.
+2. Pin their actual React/Radix/Lucide and utility dependencies. Copy the theme variables
+   and required Tailwind mappings from the same revision; include its CSS plugins if used.
+3. Import Tailwind before the local theme CSS, add an explicit `@source` for the copied
+   component directory when outside automatic scanning, and deduplicate React in Vite.
+   Self-host the selected font or keep its documented fallback; do not silently load a
+   different design-system font.
+4. Add a provenance file with upstream commit, paths, license and import-only adaptations.
+   Build from a clean checkout and inspect button, checkbox, table and dialog states in
+   both themes before designing the rest of the screen.
+5. Inspect the host's plugin iframe wrapper and SDK for an actual theme API. If none exists,
+   use `prefers-color-scheme` plus an explicit plugin toggle. If a message bridge exists,
+   match its schema and validate sender origin/source. Test host theme changes through the
+   real iframe before claiming automatic synchronization.
+
 ## Screen design
 
 Start with the primary user outcome. Choose a collection, record/detail, or settings
