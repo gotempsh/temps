@@ -2373,10 +2373,31 @@ impl LoadBalancer {
             }
         };
 
+        // HEAD only ever needs `Content-Length`/`ETag`, never the body (see
+        // the `ctx.method == "HEAD"` short-circuit below, which returns
+        // before `opened.reader` is ever touched). Looking up size via
+        // `stat_raw` instead of `open_raw` matters specifically for a
+        // caching decorator: `open_raw` on a cacheable, not-yet-warm key
+        // downloads and buffers the *entire* body just to answer a request
+        // that sends no body at all, while `stat_raw` costs nothing extra
+        // for an already-cached key and a metadata-only backend call
+        // (e.g. S3 `HeadObject`) otherwise.
+        let is_head = ctx.method == "HEAD";
         let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
         for candidate in &request.candidates {
             let key = static_object_key(&request.relative_static_dir, candidate);
-            match store.open_raw(&key).await {
+            let lookup = if is_head {
+                store
+                    .stat_raw(&key)
+                    .await
+                    .map(|size_bytes| temps_file_store::OpenedBlob {
+                        reader: Box::new(tokio::io::empty()),
+                        size_bytes,
+                    })
+            } else {
+                store.open_raw(&key).await
+            };
+            match lookup {
                 Ok(opened) => {
                     resolved = Some((key, opened));
                     break;
