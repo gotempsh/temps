@@ -369,9 +369,11 @@ impl AlertEvaluator {
     /// then **not** cache anything, so the next tick retries.
     async fn claim_breach_start(
         &self,
-        rule_id: i32,
+        rule: &monitoring_alert_rules::Model,
         now: temps_core::UtcDateTime,
     ) -> Result<temps_core::UtcDateTime, sea_orm::DbErr> {
+        let rule_id = rule.id;
+
         monitoring_alert_rules::Entity::update_many()
             .col_expr(
                 monitoring_alert_rules::Column::BreachStartedAt,
@@ -393,7 +395,32 @@ impl AlertEvaluator {
             .and_then(|rule| rule.breach_started_at);
 
         match persisted {
-            Some(started_at) => Ok(started_at),
+            // The COALESCE can adopt a timestamp this process never wrote:
+            // if `load_breach_state_from_db` failed on startup, the in-memory
+            // cache comes up empty while the database can still hold a
+            // window from before the restart (a healthy recovery tick only
+            // clears the persisted column when the cache had an entry for
+            // the rule — see `clear_breach` — so a failed restore leaves it
+            // behind). Blindly adopting it here would let a breach that
+            // *just started* claim a window that has actually been stale for
+            // hours, firing on an old clock instead of observing a fresh
+            // `for_duration_secs`. Reuse the same age/enabled/silenced bound
+            // the startup restore applies, and treat a window that fails it
+            // as if nothing had been persisted at all.
+            Some(started_at) if Self::breach_window_is_restorable(rule, started_at, now) => {
+                Ok(started_at)
+            }
+            Some(_stale) => {
+                monitoring_alert_rules::Entity::update_many()
+                    .col_expr(
+                        monitoring_alert_rules::Column::BreachStartedAt,
+                        Expr::value(now),
+                    )
+                    .filter(monitoring_alert_rules::Column::Id.eq(rule_id))
+                    .exec(self.db.as_ref())
+                    .await?;
+                Ok(now)
+            }
             // The row vanished (rule deleted mid-cycle) or the column is still
             // NULL. Either way there is nothing to cache — treat it as a
             // failed claim so the next tick re-evaluates from a fresh read
@@ -405,6 +432,18 @@ impl AlertEvaluator {
     }
 
     /// Clear the persisted breach window for `rule_id`.
+    ///
+    /// Filtered on `breach_started_at IS NOT NULL` so this is safe (and
+    /// cheap — zero rows matched, no WAL write) to call unconditionally on
+    /// every recovery, regardless of what the in-memory cache thinks. That
+    /// matters because the cache and the database can disagree: if
+    /// `load_breach_state_from_db` failed on startup, the cache comes up
+    /// empty while the database can still hold a breach window from before
+    /// the restart. `clear_breach` used to trust the cache and skip this
+    /// call whenever the cache had no entry for the rule, which left that
+    /// stale timestamp behind — the next breach would then adopt it via
+    /// `claim_breach_start`'s `COALESCE` and could fire immediately on an
+    /// old clock instead of observing a fresh `for_duration_secs` window.
     async fn clear_persisted_breach_start(&self, rule_id: i32) {
         if let Err(e) = monitoring_alert_rules::Entity::update_many()
             .col_expr(
@@ -412,6 +451,7 @@ impl AlertEvaluator {
                 Expr::value(Option::<temps_core::UtcDateTime>::None),
             )
             .filter(monitoring_alert_rules::Column::Id.eq(rule_id))
+            .filter(monitoring_alert_rules::Column::BreachStartedAt.is_not_null())
             .exec(self.db.as_ref())
             .await
         {
@@ -694,7 +734,7 @@ impl AlertEvaluator {
 
         let started_at = match cached {
             Some(existing) => existing,
-            None => match self.claim_breach_start(rule_id, now).await {
+            None => match self.claim_breach_start(rule, now).await {
                 Ok(effective) => {
                     self.breach_start.write().await.insert(rule_id, effective);
                     effective
@@ -2039,8 +2079,12 @@ mod tests {
                 .into_connection(),
         );
         let writer = evaluator_with_shared_db(write_db.clone());
+        let rule = monitoring_alert_rules::Model {
+            id: 42,
+            ..make_rule(Some(1), None)
+        };
         let claimed = writer
-            .claim_breach_start(42, started_at)
+            .claim_breach_start(&rule, started_at)
             .await
             .expect("claiming a breach window on a healthy DB must succeed");
         assert_eq!(claimed, started_at);
@@ -2184,6 +2228,65 @@ mod tests {
             evaluator.breach_start.read().await.get(&rule.id).copied(),
             Some(persisted_start),
             "the persisted window must be adopted, not replaced with now"
+        );
+    }
+
+    /// The regression this fixes: `load_breach_state_from_db` failing on
+    /// startup leaves the cache empty while the database can still hold a
+    /// breach window from before the restart (`clear_breach` only clears the
+    /// persisted column when the cache had an entry, so a failed restore
+    /// leaves stale rows behind). A new breach must not blindly adopt that
+    /// stale timestamp via `claim_breach_start`'s `COALESCE` — doing so would
+    /// fire an alarm immediately on an old clock instead of observing a
+    /// fresh `for_duration_secs` window.
+    #[tokio::test]
+    async fn a_stale_persisted_window_is_not_adopted_by_a_new_breach() {
+        let rule = monitoring_alert_rules::Model {
+            id: 42,
+            for_duration_secs: 60, // -> 15-minute floor on the restorable bound
+            ..make_rule(Some(1), None)
+        };
+        // Four hours old: far past the bound, so this must be treated as if
+        // nothing had ever been persisted.
+        let stale_start = Utc::now() - chrono::Duration::hours(4);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // First exec: the COALESCE claim (adopts the stale row as-is,
+                // since COALESCE only fills in NULLs).
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![monitoring_alert_rules::Model {
+                    breach_started_at: Some(stale_start),
+                    ..rule.clone()
+                }]])
+                // Second exec: the corrective overwrite once staleness is detected.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+
+        let before = Utc::now();
+        evaluator
+            .handle_breach(&rule, 99.0, (Some(1), None, None, Some(1)))
+            .await;
+        let after = Utc::now();
+
+        let cached = evaluator.breach_start.read().await.get(&rule.id).copied();
+        let cached = cached.expect("a successful claim must populate the cache");
+        assert!(
+            cached >= before && cached <= after,
+            "a stale window must be discarded in favour of a fresh start time, \
+             got {cached}, expected between {before} and {after}"
+        );
+        assert_ne!(
+            cached, stale_start,
+            "the four-hour-old timestamp must never be cached as the breach start"
         );
     }
 
