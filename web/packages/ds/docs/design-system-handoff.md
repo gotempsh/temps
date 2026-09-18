@@ -329,8 +329,12 @@ this phase needs):
     logic worth reviewing individually rather than a mechanical swap):
     `AddDomain.tsx`, `ApiKeyCreate.tsx`, `AddDnsProvider.tsx`,
     `AddEmailProvider.tsx`, `AddClusterMember.tsx`,
-    `AddNotificationProvider.tsx`, `CreateServiceNew.tsx`,
+    `CreateServiceNew.tsx`,
     `NewProject.tsx`, `Setup.tsx`. `EmailDomainNew.tsx` also hand-rolls its
     own step indicator (a comment there says it took the visual pattern
     from `SetupWizardShell` without importing it) — worth folding into
     `Wizard` alongside the other 9 when this is picked up.
+
+Notification setup (`AddNotificationProvider.tsx`) now uses `Wizard`, native
+provider buttons, URL-restored non-secret step/provider selection, a grouped
+footer, and inline mutation errors. Credentials stay in the form.
