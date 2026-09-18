@@ -200,9 +200,10 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: 'Run saved settings' })
     ).toBeDisabled()
-    await expect(page.getByLabel('Public application URL')).toHaveValue(
-      'https://example.com/'
-    )
+    await expect(page.getByLabel('Public application URL')).toHaveCount(0)
+    await expect(
+      page.getByRole('list', { name: 'Activity report setup steps' })
+    ).toHaveCount(0)
     await page
       .getByRole('switch', { name: /Allow sending public page content/ })
       .check()
@@ -522,10 +523,12 @@ for (const width of [390, 1280]) {
       exact: true,
     })
     await expect(environment).toContainText('Production')
-    await expect(url).toHaveValue('https://app-production.example.com')
+    await expect(url).toHaveCount(0)
+    await expect(website).toContainText('https://app-production.example.com')
     await environment.click()
     await page.getByRole('option', { name: 'Staging', exact: true }).click()
-    await expect(url).toHaveValue('https://app-staging.example.com')
+    await expect(url).toHaveCount(0)
+    await expect(website).toContainText('https://app-staging.example.com')
     await expect(
       page.getByText(
         'No tracked visitor activity in this environment in the last 24 hours.',
@@ -569,12 +572,14 @@ for (const width of [390, 1280]) {
     await page
       .getByRole('option', { name: 'www.example.com', exact: true })
       .click()
-    await expect(url).toHaveValue('https://www.example.com')
+    await expect(url).toHaveCount(0)
+    await expect(website).toContainText('www.example.com')
     await save()
     expect(settings.source_url).toBeNull()
     expect(settings.source_domain).toBe('www.example.com')
     await page.reload()
-    await expect(url).toHaveValue('https://www.example.com')
+    await expect(url).toHaveCount(0)
+    await expect(website).toContainText('www.example.com')
     await website.click()
     await page.getByRole('option', { name: /Temps subdomain/ }).click()
     await save()
@@ -592,7 +597,10 @@ for (const width of [390, 1280]) {
       })
     )
     await page.reload()
-    await expect(url).toHaveValue('https://renamed-production.example.com')
+    await expect(url).toHaveCount(0)
+    await expect(website).toContainText(
+      'https://renamed-production.example.com'
+    )
     await environment.scrollIntoViewIfNeeded()
     await page.screenshot({
       path: `/tmp/temps-environment-onboarding-${width}.png`,

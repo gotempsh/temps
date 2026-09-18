@@ -434,14 +434,9 @@ function ActivitySettingsForm({
     control: form.control,
     name: 'categories',
   })
-  const [categories, shareActivity, dailyEnabled, goalText] = useWatch({
+  const [categories, shareActivity, dailyEnabled] = useWatch({
     control: form.control,
-    name: [
-      'categories',
-      'share_activity_with_ai',
-      'daily_enabled',
-      'application_context',
-    ],
+    name: ['categories', 'share_activity_with_ai', 'daily_enabled'],
   })
   const values = {
     categories,
@@ -510,36 +505,6 @@ function ActivitySettingsForm({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        <ol
-          aria-label="Activity report setup steps"
-          className="flex flex-wrap gap-2 text-sm"
-        >
-          {[
-            'Discover goals',
-            'Adapt your goal',
-            'Preview visitors',
-            'Enable reports',
-          ].map((step, index) => (
-            <li
-              key={step}
-              className="min-w-0 flex-1 basis-36 rounded-md border px-3 py-2"
-              aria-current={
-                (status.settings_revision > 0
-                  ? 3
-                  : hasSetup
-                    ? 2
-                    : goalText.trim()
-                      ? 1
-                      : 0) === index
-                  ? 'step'
-                  : undefined
-              }
-            >
-              <span className="mr-2 text-muted-foreground">{index + 1}.</span>
-              {step}
-            </li>
-          ))}
-        </ol>
         <div className="space-y-2">
           <Label htmlFor="activity-environment">Analyze activity from</Label>
           {environmentLoading ? (
@@ -945,7 +910,7 @@ function GoalSuggestions({
       className="rounded-lg border p-4"
     >
       <summary className="cursor-pointer font-medium">
-        1. Discover goals from your app
+        Discover goals from your app
         {selectedGoal ? ` · ${selectedGoal}` : ''}
       </summary>
       <div className="mt-4 space-y-4">
@@ -1022,28 +987,29 @@ function GoalSuggestions({
                 </p>
               )}
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="activity-source-url">
-                Public application URL
-              </Label>
-              <Input
-                id="activity-source-url"
-                type="url"
-                placeholder="https://your-app.example"
-                readOnly={sourceUrl === null}
-                {...form.register('url', {
-                  onChange: (event) => {
-                    onSourceChange(event.target.value, null)
-                    suggest.reset()
-                  },
-                })}
-              />
-              {form.formState.errors.url && (
-                <p role="alert" className="text-sm text-destructive">
-                  {form.formState.errors.url.message}
-                </p>
-              )}
-            </div>
+            {sourceUrl !== null && (
+              <div className="space-y-2">
+                <Label htmlFor="activity-source-url">
+                  Public application URL
+                </Label>
+                <Input
+                  id="activity-source-url"
+                  type="url"
+                  placeholder="https://your-app.example"
+                  {...form.register('url', {
+                    onChange: (event) => {
+                      onSourceChange(event.target.value, null)
+                      suggest.reset()
+                    },
+                  })}
+                />
+                {form.formState.errors.url && (
+                  <p role="alert" className="text-sm text-destructive">
+                    {form.formState.errors.url.message}
+                  </p>
+                )}
+              </div>
+            )}
             <label className="flex items-start gap-3 text-sm">
               <Controller
                 control={form.control}
