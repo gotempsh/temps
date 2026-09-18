@@ -21,6 +21,12 @@ pub struct ActivitySettings {
     pub daily_enabled: bool,
     /// Explicit permission to send the selected analytics fields to the configured AI provider.
     pub share_activity_with_ai: bool,
+    #[serde(default)]
+    pub environment_id: Option<i32>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_domain: Option<String>,
 }
 
 impl Default for ActivitySettings {
@@ -36,6 +42,9 @@ impl Default for ActivitySettings {
             property_keys: Vec::new(),
             daily_enabled: false,
             share_activity_with_ai: false,
+            environment_id: None,
+            source_url: None,
+            source_domain: None,
         }
     }
 }
@@ -44,6 +53,8 @@ impl Default for ActivitySettings {
 pub struct ActivityGoalsRequest {
     pub url: String,
     pub share_with_ai: bool,
+    #[serde(default)]
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -75,6 +86,12 @@ pub struct ActivityPreviewRequest {
     pub share_activity_with_ai: bool,
     #[serde(default)]
     pub property_keys: Vec<String>,
+    #[serde(default)]
+    pub environment_id: Option<i32>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_domain: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -117,6 +134,8 @@ pub struct VisitorActivityAssessment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActivityReport {
+    #[serde(default)]
+    pub environment_id: Option<i32>,
     #[schema(value_type = String, format = DateTime)]
     pub started_at: DateTime<Utc>,
     #[schema(value_type = String, format = DateTime)]
@@ -138,6 +157,7 @@ pub struct ActivityReport {
 pub struct ActivityStatus {
     /// Whether tracked non-crawler visitor events exist in the previous 24 hours.
     pub has_recent_activity: bool,
+    pub selected_environment_id: Option<i32>,
     pub configured: bool,
     pub setup_url: String,
     pub settings: ActivitySettings,

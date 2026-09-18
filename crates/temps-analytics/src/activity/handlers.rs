@@ -3,12 +3,12 @@
 
 use super::{service::ActivityService, types::*};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Extension, Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
@@ -51,6 +51,11 @@ pub fn routes() -> Router<Arc<ActivityState>> {
         )
 }
 
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+struct ActivityStatusQuery {
+    environment_id: Option<i32>,
+}
+
 impl From<ActivityError> for Problem {
     fn from(error: ActivityError) -> Self {
         let status = match &error {
@@ -79,17 +84,23 @@ impl From<ActivityError> for Problem {
 }
 
 #[utoipa::path(get, path = "/projects/{project_id}/analytics/activity", tag = "Visitor Activity",
-    params(("project_id" = i32, Path)), responses((status = 200, body = ActivityStatus)), security(("bearer_auth" = [])))]
+    params(("project_id" = i32, Path), ActivityStatusQuery), responses((status = 200, body = ActivityStatus)), security(("bearer_auth" = [])))]
 async fn get_activity_status(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<ActivityState>>,
     Path(project_id): Path<i32>,
+    Query(query): Query<ActivityStatusQuery>,
 ) -> Result<Json<ActivityStatus>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
-    Ok(Json(state.service.status(project_id).await?))
+    Ok(Json(
+        state
+            .service
+            .status(project_id, query.environment_id)
+            .await?,
+    ))
 }
 
 #[utoipa::path(put, path = "/projects/{project_id}/analytics/activity", tag = "Visitor Activity",
@@ -306,9 +317,14 @@ mod tests {
     }
     #[tokio::test]
     async fn deployment_tokens_cannot_read_configure_or_spend_on_ai() {
-        let read = get_activity_status(auth(), state(), Path(1))
-            .await
-            .unwrap_err();
+        let read = get_activity_status(
+            auth(),
+            state(),
+            Path(1),
+            Query(ActivityStatusQuery::default()),
+        )
+        .await
+        .unwrap_err();
         let write = save_activity_settings(
             auth(),
             state(),
@@ -330,6 +346,9 @@ mod tests {
                 goal: "Understand readers".into(),
                 share_activity_with_ai: true,
                 property_keys: vec![],
+                environment_id: None,
+                source_url: None,
+                source_domain: None,
             }),
         )
         .await
@@ -342,6 +361,7 @@ mod tests {
             Json(ActivityGoalsRequest {
                 url: "https://example.com".into(),
                 share_with_ai: true,
+                environment_id: None,
             }),
         )
         .await

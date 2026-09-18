@@ -476,6 +476,13 @@
       },
       "ActivityGoalsRequest": {
         "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "share_with_ai": {
             "type": "boolean"
           },
@@ -568,6 +575,13 @@
       "ActivityPreviewRequest": {
         "description": "An unsaved onboarding preview. Sharing is explicit and scheduling is never inferred.",
         "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "goal": {
             "type": "string"
           },
@@ -579,6 +593,18 @@
           },
           "share_activity_with_ai": {
             "type": "boolean"
+          },
+          "source_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -613,6 +639,13 @@
           "completed_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "events_considered": {
             "minimum": 0,
@@ -681,6 +714,13 @@
           "daily_enabled": {
             "type": "boolean"
           },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "property_keys": {
             "description": "Only these event-property keys may be sent to the provider.",
             "items": {
@@ -691,6 +731,18 @@
           "share_activity_with_ai": {
             "description": "Explicit permission to send the selected analytics fields to the configured AI provider.",
             "type": "boolean"
+          },
+          "source_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -736,6 +788,13 @@
           },
           "running": {
             "type": "boolean"
+          },
+          "selected_environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "settings": {
             "$ref": "#/components/schemas/ActivitySettings"
@@ -93258,6 +93317,18 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           }
         ],

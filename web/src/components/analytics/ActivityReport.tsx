@@ -12,6 +12,7 @@ import { toast } from 'sonner'
 import {
   getActivityStatusOptions,
   getEnvironmentsOptions,
+  getEnvironmentDomainsOptions,
   suggestActivityGoalsMutation,
   previewActivityReportMutation,
   runActivityReportMutation,
@@ -22,6 +23,7 @@ import type {
   ActivityPreview,
   ActivityStatus,
   ProjectResponse,
+  EnvironmentResponse,
 } from '@/api/client/types.gen'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -39,6 +41,13 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 
 function errorMessage(error: unknown): string {
   if (
@@ -53,9 +62,18 @@ function errorMessage(error: unknown): string {
 
 export function ActivityReportPage({ project }: { project: ProjectResponse }) {
   const queryClient = useQueryClient()
-  const options = getActivityStatusOptions({ path: { project_id: project.id } })
+  const [environmentId, setEnvironmentId] = useState<number | null>(null)
+  const environments = useQuery(
+    getEnvironmentsOptions({ path: { project_id: project.id } })
+  )
+  const options = getActivityStatusOptions({
+    path: { project_id: project.id },
+    query:
+      environmentId == null ? undefined : { environment_id: environmentId },
+  })
   const status = useQuery({
     ...options,
+    placeholderData: (previous) => previous,
     refetchInterval: (query) => (query.state.data?.running ? 3000 : 30_000),
   })
   const [preview, setPreview] = useState<ActivityPreview | null>(null)
@@ -124,11 +142,12 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               </AlertDescription>
             </Alert>
           )}
-          {!data.has_recent_activity && (
+          {!status.isFetching && !data.has_recent_activity && (
             <Alert>
               <AlertDescription>
                 <strong>
-                  No tracked visitor activity in the last 24 hours.
+                  No tracked visitor activity in this environment in the last 24
+                  hours.
                 </strong>{' '}
                 There is nothing to analyze yet. You can discover goals and edit
                 your setup now. Preview becomes available after a visitor
@@ -141,6 +160,11 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
             key={data.settings_revision}
             projectId={project.id}
             status={data}
+            environments={environments.data ?? []}
+            environmentLoading={environments.isPending}
+            environmentError={environments.isError}
+            activityLoading={status.isFetching || status.isError}
+            onEnvironmentChange={setEnvironmentId}
             disabled={!!running}
             onPreview={(value) => {
               setPreview(value)
@@ -160,8 +184,10 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                       : 'Recent visitor activity'}
                   </CardTitle>
                   <CardDescription>
-                    Analyzes the previous 24 hours across this project’s
-                    environments. Anonymous visitors are included.
+                    Analyzes the previous 24 hours in the selected environment.
+                    Anonymous visitors are included.
+                    {report?.environment_id &&
+                      ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
                   </CardDescription>
                 </div>
                 {data.has_recent_activity && (
@@ -170,7 +196,11 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                       !data.configured ||
                       !data.settings_revision ||
                       !data.settings.share_activity_with_ai ||
-                      !!running
+                      !!running ||
+                      status.isFetching ||
+                      status.isError ||
+                      data.selected_environment_id !==
+                        data.settings.environment_id
                     }
                     onClick={() =>
                       run.mutate({ path: { project_id: project.id } })
@@ -191,6 +221,13 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                 A sample of up to 20 recently active visitors from the last 24
                 hours. Each category links back to observed activity.
               </p>
+              {data.selected_environment_id !==
+                data.settings.environment_id && (
+                <p className="text-sm text-muted-foreground">
+                  Save your environment selection before running the saved
+                  report.
+                </p>
+              )}
               {data.next_run_at && (
                 <p className="text-sm">
                   Next daily run: {new Date(data.next_run_at).toLocaleString()}{' '}
@@ -333,6 +370,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
 }
 
 const setupSchema = z.object({
+  environment_id: z.number().int().positive().nullable(),
+  source_url: z.string().nullable(),
+  source_domain: z.string().nullable(),
   application_context: z
     .string()
     .trim()
@@ -348,12 +388,22 @@ type SetupForm = z.infer<typeof setupSchema>
 function ActivitySettingsForm({
   projectId,
   status,
+  environments,
+  environmentLoading,
+  environmentError,
+  activityLoading,
+  onEnvironmentChange,
   disabled,
   onSaved,
   onPreview,
 }: {
   projectId: number
   status: ActivityStatus
+  environments: EnvironmentResponse[]
+  environmentLoading: boolean
+  environmentError: boolean
+  activityLoading: boolean
+  onEnvironmentChange: (id: number) => void
   disabled: boolean
   onSaved: () => Promise<unknown>
   onPreview: (preview: ActivityPreview | null) => void
@@ -362,9 +412,24 @@ function ActivitySettingsForm({
     resolver: zodResolver(setupSchema),
     defaultValues: {
       ...status.settings,
+      environment_id: status.selected_environment_id ?? null,
+      source_url: status.settings.source_url ?? null,
+      source_domain: status.settings.source_domain ?? null,
       propertyKeys: status.settings.property_keys.join(', '),
     },
   })
+  const [selectedEnvironment, sourceUrl, sourceDomain] = useWatch({
+    control: form.control,
+    name: ['environment_id', 'source_url', 'source_domain'],
+  })
+  const environment = environments.find(
+    (item) => item.id === selectedEnvironment
+  )
+  const canPreview =
+    !activityLoading &&
+    selectedEnvironment != null &&
+    status.selected_environment_id === selectedEnvironment &&
+    status.has_recent_activity
   const { fields, append, remove } = useFieldArray({
     control: form.control,
     name: 'categories',
@@ -391,6 +456,9 @@ function ActivitySettingsForm({
         ...result.settings,
         // A preview suggests classification settings, not a scheduling change.
         daily_enabled: form.getValues('daily_enabled'),
+        environment_id: form.getValues('environment_id'),
+        source_url: form.getValues('source_url'),
+        source_domain: form.getValues('source_domain'),
         propertyKeys: result.settings.property_keys.join(', '),
       })
       setHasSetup(true)
@@ -417,6 +485,9 @@ function ActivitySettingsForm({
       save.mutate({
         path: { project_id: projectId },
         body: {
+          environment_id: data.environment_id,
+          source_url: data.source_url,
+          source_domain: data.source_domain,
           application_context: data.application_context,
           categories: data.categories,
           property_keys: properties(data.propertyKeys),
@@ -469,8 +540,67 @@ function ActivitySettingsForm({
             </li>
           ))}
         </ol>
+        <div className="space-y-2">
+          <Label htmlFor="activity-environment">Analyze activity from</Label>
+          {environmentLoading ? (
+            <Skeleton className="h-10 w-full" />
+          ) : (
+            <Select
+              value={selectedEnvironment?.toString() ?? ''}
+              disabled={busy || environments.length === 0}
+              onValueChange={(value) => {
+                const id = Number(value)
+                form.setValue('environment_id', id, { shouldDirty: true })
+                form.setValue('source_domain', null, { shouldDirty: true })
+                onPreview(null)
+                preview.reset()
+                onEnvironmentChange(id)
+              }}
+            >
+              <SelectTrigger id="activity-environment">
+                <SelectValue placeholder="Choose an environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environments.map((item) => (
+                  <SelectItem key={item.id} value={String(item.id)}>
+                    {item.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <p className="text-sm text-muted-foreground">
+            Only this environment’s visitors and events are analyzed. Daily
+            reports use your saved selection.
+          </p>
+          {environmentError && (
+            <p role="alert" className="text-sm text-destructive">
+              Could not load environments. Refresh the page to try again.
+            </p>
+          )}
+          {!environmentLoading &&
+            !environmentError &&
+            environments.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                Create an environment before setting up an activity report.
+              </p>
+            )}
+          {activityLoading && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Checking recent activity…
+            </p>
+          )}
+        </div>
         <GoalSuggestions
+          key={selectedEnvironment ?? 'none'}
           projectId={projectId}
+          environment={environment}
+          sourceUrl={sourceUrl}
+          sourceDomain={sourceDomain}
+          onSourceChange={(url, domain) => {
+            form.setValue('source_url', url, { shouldDirty: true })
+            form.setValue('source_domain', domain, { shouldDirty: true })
+          }}
           configured={status.configured}
           disabled={busy}
           onSelect={(goal) => {
@@ -486,11 +616,14 @@ function ActivitySettingsForm({
         <form
           className="space-y-5"
           onSubmit={form.handleSubmit((data) => {
-            if (!status.has_recent_activity) return
+            if (!canPreview) return
             onPreview(null)
             preview.mutate({
               path: { project_id: projectId },
               body: {
+                environment_id: data.environment_id,
+                source_url: data.source_url,
+                source_domain: data.source_domain,
                 goal: data.application_context,
                 property_keys: properties(data.propertyKeys),
                 share_activity_with_ai: data.share_activity_with_ai,
@@ -675,7 +808,7 @@ function ActivitySettingsForm({
               </Alert>
             )}
             <div className="flex flex-wrap gap-2">
-              {status.has_recent_activity && (
+              {canPreview && (
                 <Button
                   type="submit"
                   disabled={
@@ -693,34 +826,37 @@ function ActivitySettingsForm({
                 </Button>
               )}
               {hasSetup && (
-                <>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={
-                      !status.configured || !values.share_activity_with_ai
-                    }
-                    onClick={() => saveSetup(true)}
-                  >
-                    Enable daily reports
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() =>
-                      saveSetup(
-                        status.settings_revision > 0 && values.daily_enabled
-                      )
-                    }
-                  >
-                    {save.isPending
-                      ? 'Saving…'
-                      : status.settings_revision > 0
-                        ? 'Save settings'
-                        : 'Save for manual reports'}
-                  </Button>
-                </>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={
+                    !status.configured ||
+                    !values.share_activity_with_ai ||
+                    selectedEnvironment == null
+                  }
+                  onClick={() => saveSetup(true)}
+                >
+                  Enable daily reports
+                </Button>
               )}
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={selectedEnvironment == null}
+                onClick={() =>
+                  saveSetup(
+                    status.settings_revision > 0 && values.daily_enabled
+                  )
+                }
+              >
+                {save.isPending
+                  ? 'Saving…'
+                  : status.settings_revision > 0
+                    ? 'Save settings'
+                    : hasSetup
+                      ? 'Save for manual reports'
+                      : 'Save setup'}
+              </Button>
             </div>
             {preview.isPending && (
               <p role="status" className="text-sm text-muted-foreground">
@@ -754,41 +890,46 @@ type DiscoveryForm = z.infer<typeof discoverySchema>
 
 function GoalSuggestions({
   projectId,
+  environment,
+  sourceUrl,
+  sourceDomain,
+  onSourceChange,
   configured,
   disabled,
   onSelect,
 }: {
   projectId: number
+  environment?: EnvironmentResponse
+  sourceUrl: string | null
+  sourceDomain: string | null
+  onSourceChange: (url: string | null, domain: string | null) => void
   configured: boolean
   disabled: boolean
   onSelect: (goal: ActivityGoal) => void
 }) {
-  const environments = useQuery(
-    getEnvironmentsOptions({ path: { project_id: projectId } })
-  )
+  const domains = useQuery({
+    ...getEnvironmentDomainsOptions({
+      path: { project_id: projectId, env_id: environment?.id ?? 0 },
+    }),
+    enabled: environment != null,
+  })
   const form = useForm<DiscoveryForm>({
     resolver: zodResolver(discoverySchema),
     defaultValues: { url: '', share: false },
   })
-  const url = useWatch({ control: form.control, name: 'url' })
   const [selectedGoal, setSelectedGoal] = useState<string | null>(null)
   const [open, setOpen] = useState(true)
-  const [sourceUrl, setSourceUrl] = useState<string | null>(null)
-  const deployed =
-    environments.data?.filter(
-      (environment) => environment.current_deployment_id != null
-    ) ?? []
+  const [requestedUrl, setRequestedUrl] = useState<string | null>(null)
+  const selectedDomain = domains.data?.find(
+    (domain) => domain.domain === sourceDomain
+  )
+  const resolvedUrl =
+    sourceUrl ??
+    selectedDomain?.url ??
+    (sourceDomain ? '' : (environment?.main_url ?? ''))
   useEffect(() => {
-    if (form.getValues('url')) return
-    const deployed =
-      environments.data?.filter(
-        (environment) => environment.current_deployment_id != null
-      ) ?? []
-    const production =
-      deployed.find((environment) => environment.slug === 'production') ??
-      deployed[0]
-    if (production) form.setValue('url', production.main_url)
-  }, [environments.data, form])
+    form.setValue('url', resolvedUrl)
+  }, [resolvedUrl, form])
   const suggest = useMutation({
     ...suggestActivityGoalsMutation(),
     onSuccess: () => {
@@ -816,10 +957,14 @@ function GoalSuggestions({
         <form
           className="space-y-3"
           onSubmit={form.handleSubmit((data) => {
-            setSourceUrl(data.url)
+            setRequestedUrl(data.url)
             suggest.mutate({
               path: { project_id: projectId },
-              body: { url: data.url, share_with_ai: data.share },
+              body: {
+                url: data.url,
+                share_with_ai: data.share,
+                environment_id: environment?.id,
+              },
             })
           })}
         >
@@ -827,42 +972,56 @@ function GoalSuggestions({
             disabled={disabled || suggest.isPending}
             className="space-y-3"
           >
-            {environments.isPending && <Skeleton className="h-10 w-full" />}
-            {environments.isError && (
-              <p className="text-sm text-muted-foreground">
-                Could not load environments. Enter a public URL below or
-                describe your app manually.
-              </p>
-            )}
-            {deployed.length > 0 && (
-              <div className="space-y-2">
-                <Label htmlFor="activity-environment">
-                  Deployed environment
-                </Label>
-                <select
-                  id="activity-environment"
-                  className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                  value={
-                    deployed.find((environment) => environment.main_url === url)
-                      ?.id ?? ''
-                  }
-                  onChange={(event) => {
-                    const environment = deployed.find(
-                      (item) => item.id === Number(event.target.value)
-                    )
-                    if (environment) form.setValue('url', environment.main_url)
-                    suggest.reset()
-                  }}
-                >
-                  <option value="">Custom public URL</option>
-                  {deployed.map((environment) => (
-                    <option key={environment.id} value={environment.id}>
-                      {environment.name}
-                    </option>
+            <div className="space-y-2">
+              <Label htmlFor="activity-website">
+                Website used to suggest goals
+              </Label>
+              <Select
+                value={
+                  sourceUrl !== null ? 'custom' : (sourceDomain ?? 'primary')
+                }
+                onValueChange={(value) => {
+                  onSourceChange(
+                    value === 'custom' ? '' : null,
+                    value !== 'primary' && value !== 'custom' ? value : null
+                  )
+                  suggest.reset()
+                  setSelectedGoal(null)
+                }}
+              >
+                <SelectTrigger id="activity-website">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="primary">
+                    Temps subdomain
+                    {environment?.main_url ? ` · ${environment.main_url}` : ''}
+                  </SelectItem>
+                  {domains.data?.map((domain) => (
+                    <SelectItem key={domain.id} value={domain.domain}>
+                      {domain.domain}
+                    </SelectItem>
                   ))}
-                </select>
-              </div>
-            )}
+                  <SelectItem value="custom">Use another URL</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                This website supplies context for goal suggestions. Visitor
+                activity still comes from the selected environment.
+              </p>
+              {domains.isError && (
+                <p className="text-sm text-muted-foreground">
+                  Could not load attached domains. You can use the primary URL
+                  or enter another URL.
+                </p>
+              )}
+              {sourceDomain && !domains.isPending && !selectedDomain && (
+                <p role="alert" className="text-sm text-destructive">
+                  The selected domain is no longer attached. Choose another
+                  website.
+                </p>
+              )}
+            </div>
             <div className="space-y-2">
               <Label htmlFor="activity-source-url">
                 Public application URL
@@ -871,7 +1030,13 @@ function GoalSuggestions({
                 id="activity-source-url"
                 type="url"
                 placeholder="https://your-app.example"
-                {...form.register('url', { onChange: () => suggest.reset() })}
+                readOnly={sourceUrl === null}
+                {...form.register('url', {
+                  onChange: (event) => {
+                    onSourceChange(event.target.value, null)
+                    suggest.reset()
+                  },
+                })}
               />
               {form.formState.errors.url && (
                 <p role="alert" className="text-sm text-destructive">
@@ -904,7 +1069,10 @@ function GoalSuggestions({
               </p>
             )}
             <div className="flex flex-wrap gap-2">
-              <Button type="submit" disabled={!configured}>
+              <Button
+                type="submit"
+                disabled={!configured || !environment || !resolvedUrl}
+              >
                 {suggest.isPending
                   ? 'Reading your app…'
                   : 'Suggest goals from my app'}
@@ -945,7 +1113,7 @@ function GoalSuggestions({
           <div className="space-y-3">
             <p className="text-sm font-medium">Choose a starting point</p>
             <p className="break-all text-xs text-muted-foreground">
-              Suggestions for {sourceUrl}
+              Suggestions for {requestedUrl}
             </p>
             {suggest.data.goals.map((goal) => (
               <button

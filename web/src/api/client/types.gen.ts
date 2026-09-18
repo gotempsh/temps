@@ -186,6 +186,7 @@ export type ActivityGoals = {
 };
 
 export type ActivityGoalsRequest = {
+    environment_id?: number | null;
     share_with_ai: boolean;
     url: string;
 };
@@ -239,9 +240,12 @@ export type ActivityPreview = {
  * An unsaved onboarding preview. Sharing is explicit and scheduling is never inferred.
  */
 export type ActivityPreviewRequest = {
+    environment_id?: number | null;
     goal: string;
     property_keys?: Array<string>;
     share_activity_with_ai: boolean;
+    source_domain?: string | null;
+    source_url?: string | null;
 };
 
 export type ActivityProperty = {
@@ -252,6 +256,7 @@ export type ActivityProperty = {
 export type ActivityReport = {
     categories: Array<ActivityCategory>;
     completed_at: string;
+    environment_id?: number | null;
     events_considered: number;
     model?: string | null;
     sampled: boolean;
@@ -267,6 +272,7 @@ export type ActivitySettings = {
     application_context: string;
     categories: Array<ActivityCategory>;
     daily_enabled: boolean;
+    environment_id?: number | null;
     /**
      * Only these event-property keys may be sent to the provider.
      */
@@ -275,6 +281,8 @@ export type ActivitySettings = {
      * Explicit permission to send the selected analytics fields to the configured AI provider.
      */
     share_activity_with_ai: boolean;
+    source_domain?: string | null;
+    source_url?: string | null;
 };
 
 export type ActivityStatus = {
@@ -287,6 +295,7 @@ export type ActivityStatus = {
     next_run_at?: string | null;
     report?: null | ActivityReport;
     running: boolean;
+    selected_environment_id?: number | null;
     settings: ActivitySettings;
     settings_revision: number;
     setup_url: string;
@@ -47879,7 +47888,9 @@ export type GetActivityStatusData = {
     path: {
         project_id: number;
     };
-    query?: never;
+    query?: {
+        environment_id?: number | null;
+    };
     url: '/projects/{project_id}/analytics/activity';
 };
 

@@ -48,6 +48,11 @@ struct EventRow {
     properties: serde_json::Value,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct EnvironmentScope {
+    id: i32,
+}
+
 #[derive(Debug, Serialize)]
 struct VisitorInput {
     #[serde(skip_serializing)]
@@ -179,17 +184,95 @@ impl ActivityService {
         .map_err(|e| Self::db_error(project_id, "read settings", e))
     }
 
-    async fn has_recent_activity(&self, project_id: i32) -> Result<bool, ActivityError> {
+    async fn resolve_environment(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        required: bool,
+    ) -> Result<Option<i32>, ActivityError> {
+        let (sql, values) = if let Some(environment_id) = environment_id {
+            (
+                "SELECT id FROM environments WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+                vec![environment_id.into(), project_id.into()],
+            )
+        } else {
+            (
+                "SELECT id FROM environments WHERE project_id = $1 AND deleted_at IS NULL
+                 ORDER BY (slug = 'production') DESC, is_preview ASC, id ASC LIMIT 1",
+                vec![project_id.into()],
+            )
+        };
+        let resolved = EnvironmentScope::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|e| Self::db_error(project_id, "resolve activity environment", e))?
+        .map(|environment| environment.id);
+        if (required || environment_id.is_some()) && resolved.is_none() {
+            return Err(ActivityError::Validation {
+                project_id,
+                reason: environment_id.map_or_else(
+                    || "Create a production environment before configuring visitor activity".into(),
+                    |id| format!("Environment {id} does not belong to project {project_id} or was deleted"),
+                ),
+            });
+        }
+        Ok(resolved)
+    }
+
+    async fn validate_source(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        settings: &ActivitySettings,
+    ) -> Result<(), ActivityError> {
+        if let Some(url) = settings.source_url.as_deref() {
+            super::site_context::public_url(project_id, url)?;
+        }
+        if let Some(domain) = settings.source_domain.as_deref() {
+            let domain = domain.trim().to_ascii_lowercase();
+            let attached = self
+                .db
+                .query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT 1 FROM environments e
+                 WHERE e.id = $1 AND e.project_id = $2 AND e.deleted_at IS NULL
+                   AND (LOWER(e.subdomain) = $3 OR LOWER(e.host) = $3 OR EXISTS (
+                     SELECT 1 FROM environment_domains d
+                     WHERE d.environment_id = e.id AND LOWER(d.domain) = $3)) LIMIT 1",
+                    [environment_id.into(), project_id.into(), domain.into()],
+                ))
+                .await
+                .map_err(|e| Self::db_error(project_id, "validate activity source domain", e))?;
+            if attached.is_none() {
+                return Err(ActivityError::Validation {
+                    project_id,
+                    reason: "Source domain must be attached to the selected environment".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn has_recent_activity(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<bool, ActivityError> {
         let end = Utc::now();
         self.db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT 1 FROM events e
              JOIN visitor v ON v.id = e.visitor_id AND v.project_id = e.project_id
-             WHERE e.project_id = $1 AND e.timestamp >= $2 AND e.timestamp < $3
+             WHERE e.project_id = $1 AND e.environment_id = $2 AND e.timestamp >= $3 AND e.timestamp < $4
                AND NOT e.is_crawler AND NOT v.is_crawler LIMIT 1",
                 [
                     project_id.into(),
+                    environment_id.into(),
                     (end - chrono::Duration::hours(24)).into(),
                     end.into(),
                 ],
@@ -199,14 +282,45 @@ impl ActivityService {
             .map_err(|e| Self::db_error(project_id, "check recent visitor activity", e))
     }
 
-    pub async fn status(&self, project_id: i32) -> Result<ActivityStatus, ActivityError> {
+    pub async fn status(
+        &self,
+        project_id: i32,
+        requested_environment_id: Option<i32>,
+    ) -> Result<ActivityStatus, ActivityError> {
         self.project_exists(project_id).await?;
         let row = self.stored(project_id).await?;
+        let mut saved_settings: ActivitySettings = row
+            .as_ref()
+            .map(|row| decode(project_id, row.settings.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let saved_environment_id = match self
+            .resolve_environment(project_id, saved_settings.environment_id, false)
+            .await
+        {
+            Ok(environment_id) => environment_id,
+            Err(ActivityError::Validation { .. }) if saved_settings.environment_id.is_some() => {
+                self.resolve_environment(project_id, None, false).await?
+            }
+            Err(error) => return Err(error),
+        };
+        saved_settings.environment_id = saved_environment_id;
+        let selected_environment_id = self
+            .resolve_environment(
+                project_id,
+                requested_environment_id.or(saved_environment_id),
+                false,
+            )
+            .await?;
         let mut status = ActivityStatus {
-            has_recent_activity: self.has_recent_activity(project_id).await?,
+            has_recent_activity: match selected_environment_id {
+                Some(id) => self.has_recent_activity(project_id, id).await?,
+                None => false,
+            },
+            selected_environment_id,
             configured: self.ai.is_available_for(Some("gateway")).await,
             setup_url: "/settings/ai-providers".into(),
-            settings: ActivitySettings::default(),
+            settings: saved_settings,
             settings_revision: 0,
             running: false,
             next_run_at: None,
@@ -214,12 +328,18 @@ impl ActivityService {
             report: None,
         };
         if let Some(row) = row {
-            status.settings = decode(project_id, row.settings)?;
             status.settings_revision = row.revision;
             status.running = row.locked_until.is_some_and(|until| until > Utc::now());
             status.next_run_at = row.daily_enabled.then_some(row.next_run_at);
             status.last_error = row.last_error;
-            status.report = row.report.map(|v| decode(project_id, v)).transpose()?;
+            status.report = row
+                .report
+                .map(|value| decode::<ActivityReport>(project_id, value))
+                .transpose()?
+                .filter(|report| {
+                    report.environment_id.is_some()
+                        && report.environment_id == status.selected_environment_id
+                });
         }
         Ok(status)
     }
@@ -234,6 +354,10 @@ impl ActivityService {
         }
         let url = super::site_context::public_url(project_id, &request.url)?;
         self.project_exists(project_id).await?;
+        let environment_id = self
+            .resolve_environment(project_id, request.environment_id, true)
+            .await?
+            .ok_or_else(|| analysis_error(project_id, "Missing resolved environment"))?;
         if !self.ai.is_available_for(Some("gateway")).await {
             return Err(ActivityError::Unavailable { project_id });
         }
@@ -244,7 +368,7 @@ impl ActivityService {
         Self::check_cooldown(&self.last_goals, project_id).await?;
         tokio::time::timeout(Duration::from_secs(90), async {
             let pages = super::site_context::read_site(project_id, &url).await?;
-            self.generate_goals(project_id, pages).await
+            self.generate_goals(project_id, environment_id, pages).await
         })
         .await
         .unwrap_or_else(|_| {
@@ -258,6 +382,7 @@ impl ActivityService {
     async fn generate_goals(
         &self,
         project_id: i32,
+        environment_id: i32,
         pages: Vec<super::site_context::SitePage>,
     ) -> Result<ActivityGoals, ActivityError> {
         #[derive(FromQueryResult, Serialize)]
@@ -265,7 +390,7 @@ impl ActivityService {
             name: String,
         }
         let events = EventName::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                "SELECT DISTINCT name FROM (SELECT LEFT(COALESCE(event_name, event_type), 100) AS name FROM events WHERE project_id = $1 AND timestamp > NOW() - INTERVAL '7 days' AND NOT is_crawler ORDER BY timestamp DESC LIMIT 500) recent ORDER BY name LIMIT 30", [project_id.into()]))
+                "SELECT DISTINCT name FROM (SELECT LEFT(COALESCE(event_name, event_type), 100) AS name FROM events WHERE project_id = $1 AND environment_id = $2 AND timestamp > NOW() - INTERVAL '7 days' AND NOT is_crawler ORDER BY timestamp DESC LIMIT 500) recent ORDER BY name LIMIT 30", [project_id.into(), environment_id.into()]))
                 .all(self.db.as_ref()).await.map_err(|e| Self::db_error(project_id, "load event names for goal suggestions", e))?;
         let response = self.ai.complete(AiRequest {
                 purpose: "analytics.activity_goals".into(), project_id: Some(project_id), provider: Some("gateway".into()),
@@ -300,6 +425,9 @@ impl ActivityService {
             application_context: request.goal.trim().to_string(),
             property_keys: request.property_keys,
             share_activity_with_ai: request.share_activity_with_ai,
+            environment_id: request.environment_id,
+            source_url: request.source_url,
+            source_domain: request.source_domain,
             ..Default::default()
         };
         validate_settings(project_id, &settings)?;
@@ -311,10 +439,17 @@ impl ActivityService {
             });
         }
         self.project_exists(project_id).await?;
+        let environment_id = self
+            .resolve_environment(project_id, settings.environment_id, true)
+            .await?
+            .ok_or_else(|| analysis_error(project_id, "Missing resolved environment"))?;
+        settings.environment_id = Some(environment_id);
+        self.validate_source(project_id, environment_id, &settings)
+            .await?;
         if !self.ai.is_available_for(Some("gateway")).await {
             return Err(ActivityError::Unavailable { project_id });
         }
-        if !self.has_recent_activity(project_id).await? {
+        if !self.has_recent_activity(project_id, environment_id).await? {
             return Err(ActivityError::Validation {
                 project_id,
                 reason: "No tracked visitor activity in the last 24 hours. Preview becomes available after a visitor records a page view or event.".into(),
@@ -353,10 +488,17 @@ impl ActivityService {
     pub async fn save(
         &self,
         project_id: i32,
-        settings: ActivitySettings,
+        mut settings: ActivitySettings,
     ) -> Result<(), ActivityError> {
         validate_settings(project_id, &settings)?;
         self.project_exists(project_id).await?;
+        let environment_id = self
+            .resolve_environment(project_id, settings.environment_id, true)
+            .await?
+            .ok_or_else(|| analysis_error(project_id, "Missing resolved environment"))?;
+        settings.environment_id = Some(environment_id);
+        self.validate_source(project_id, environment_id, &settings)
+            .await?;
         let json = serde_json::to_value(&settings).map_err(|e| analysis_error(project_id, e))?;
         let result = self.db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "INSERT INTO visitor_activity_reports (project_id, settings, daily_enabled)
@@ -396,7 +538,12 @@ impl ActivityService {
                 project_id,
                 reason: "Save application context and categories first".into(),
             })?;
-        let settings: ActivitySettings = decode(project_id, saved.settings)?;
+        let mut settings: ActivitySettings = decode(project_id, saved.settings)?;
+        let environment_id = self
+            .resolve_environment(project_id, settings.environment_id, true)
+            .await?
+            .ok_or_else(|| analysis_error(project_id, "Missing resolved environment"))?;
+        settings.environment_id = Some(environment_id);
         validate_settings(project_id, &settings)?;
         if !settings.share_activity_with_ai {
             return Err(ActivityError::Validation {
@@ -479,6 +626,12 @@ impl ActivityService {
         revision: i32,
         started: DateTime<Utc>,
     ) -> Result<ActivityReport, ActivityError> {
+        let environment_id = settings
+            .environment_id
+            .ok_or_else(|| ActivityError::Validation {
+                project_id,
+                reason: "Select an environment before analyzing visitor activity".into(),
+            })?;
         let window_start = started - chrono::Duration::hours(24);
         // Hard input bounds, project isolation, no proxy-only visitors, no bots.
         // No explicit identity fields, IP addresses, query strings or unselected properties.
@@ -490,16 +643,17 @@ impl ActivityService {
                     FROM jsonb_each(
                         (CASE WHEN jsonb_typeof(e.custom_properties::jsonb) = 'object' THEN e.custom_properties::jsonb ELSE '{}'::jsonb END)
                         || (CASE WHEN jsonb_typeof(e.props::jsonb) = 'object' THEN e.props::jsonb ELSE '{}'::jsonb END)) p
-                    WHERE $4::jsonb ? p.key AND jsonb_typeof(p.value) IN ('string','number','boolean')), '{}'::jsonb) AS properties
+                    WHERE $5::jsonb ? p.key AND jsonb_typeof(p.value) IN ('string','number','boolean')), '{}'::jsonb) AS properties
              FROM events e JOIN visitor v ON v.id = e.visitor_id AND v.project_id = e.project_id
-             WHERE e.project_id = $1 AND e.timestamp >= $2 AND e.timestamp < $3
+             WHERE e.project_id = $1 AND e.environment_id = $2 AND e.timestamp >= $3 AND e.timestamp < $4
                 AND NOT e.is_crawler AND NOT v.is_crawler
              ORDER BY e.timestamp DESC, e.id DESC LIMIT 501",
-            [project_id.into(), window_start.into(), started.into(), serde_json::json!(settings.property_keys).into()]))
+            [project_id.into(), environment_id.into(), window_start.into(), started.into(), serde_json::json!(settings.property_keys).into()]))
             .all(self.db.as_ref()).await.map_err(|e| Self::db_error(project_id, "load recent activity", e))?;
         let events_considered = rows.len().min(MAX_EVENTS);
         let (visitors, sampled) = prepare_visitors(rows);
         let mut report = ActivityReport {
+            environment_id: Some(environment_id),
             started_at: started,
             completed_at: Utc::now(),
             window_start,
@@ -909,6 +1063,9 @@ mod tests {
     fn project(project_id: i32) -> BTreeMap<String, sea_orm::Value> {
         BTreeMap::from([("id".into(), project_id.into())])
     }
+    fn environment(environment_id: i32) -> BTreeMap<String, sea_orm::Value> {
+        BTreeMap::from([("id".into(), environment_id.into())])
+    }
     fn service(db: MockDatabase, available: bool, fail: bool) -> ActivityService {
         ActivityService::new(
             Arc::new(db.into_connection()),
@@ -949,6 +1106,19 @@ mod tests {
         assert!(validate_settings(1, &config).is_ok());
         config.daily_enabled = true;
         assert!(validate_settings(1, &config).is_err());
+    }
+
+    #[test]
+    fn old_settings_deserialize_without_environment_or_source_fields() {
+        let settings: ActivitySettings = serde_json::from_value(serde_json::json!({
+            "application_context": "A hosting service",
+            "categories": [{"name": "Learning", "description": "Reading docs"}],
+            "property_keys": [], "daily_enabled": false, "share_activity_with_ai": true
+        }))
+        .unwrap();
+        assert_eq!(settings.environment_id, None);
+        assert_eq!(settings.source_url, None);
+        assert_eq!(settings.source_domain, None);
     }
 
     #[test]
@@ -1181,10 +1351,12 @@ mod tests {
             ActivityGoalsRequest {
                 url: "https://example.com".into(),
                 share_with_ai: false,
+                environment_id: None,
             },
             ActivityGoalsRequest {
                 url: "http://localhost".into(),
                 share_with_ai: true,
+                environment_id: None,
             },
         ] {
             assert!(matches!(
@@ -1202,7 +1374,8 @@ mod tests {
                     1,
                     ActivityGoalsRequest {
                         url: "https://example.com".into(),
-                        share_with_ai: true
+                        share_with_ai: true,
+                        environment_id: None,
                     }
                 )
                 .await,
@@ -1215,7 +1388,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]);
         let result = service(db, true, false)
-            .generate_goals(1, goal_pages())
+            .generate_goals(1, 1, goal_pages())
             .await
             .unwrap();
         assert_eq!(result.goals.len(), 3);
@@ -1229,7 +1402,7 @@ mod tests {
             .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]);
         assert!(matches!(
             service(db, true, true)
-                .generate_goals(1, goal_pages())
+                .generate_goals(1, 1, goal_pages())
                 .await,
             Err(ActivityError::Analysis { .. })
         ));
@@ -1237,7 +1410,7 @@ mod tests {
             .append_query_errors([sea_orm::DbErr::Custom("offline".into())]);
         assert!(matches!(
             service(db, true, false)
-                .generate_goals(1, goal_pages())
+                .generate_goals(1, 1, goal_pages())
                 .await,
             Err(ActivityError::Database { .. })
         ));
@@ -1248,6 +1421,9 @@ mod tests {
             goal: "Understand readers of an application hosting service".into(),
             share_activity_with_ai: true,
             property_keys: vec![],
+            environment_id: None,
+            source_url: None,
+            source_domain: None,
         }
     }
 
@@ -1315,19 +1491,19 @@ mod tests {
             BTreeMap::from([("present".to_string(), sea_orm::Value::Int(Some(1)))]),
         ]]);
         assert!(service(db, false, false)
-            .has_recent_activity(1)
+            .has_recent_activity(1, 1)
             .await
             .unwrap());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]);
         assert!(!service(db, false, false)
-            .has_recent_activity(1)
+            .has_recent_activity(1, 1)
             .await
             .unwrap());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_errors([sea_orm::DbErr::Custom("offline".into())]);
         assert!(matches!(
-            service(db, false, false).has_recent_activity(1).await,
+            service(db, false, false).has_recent_activity(1, 1).await,
             Err(ActivityError::Database {
                 project_id: 1,
                 operation: "check recent visitor activity",
@@ -1341,7 +1517,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<temps_entities::projects::Model>::new()]);
         assert!(matches!(
-            service(db, false, false).status(42).await,
+            service(db, false, false).status(42, None).await,
             Err(ActivityError::NotFound { project_id: 42 })
         ));
     }
@@ -1365,8 +1541,11 @@ mod tests {
             service(db, true, false).run(1, false).await,
             Err(ActivityError::NotFound { project_id: 1 })
         ));
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![project(1)], vec![stored()]]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+            vec![project(1)],
+            vec![stored()],
+            vec![environment(1)],
+        ]);
         assert!(matches!(
             service(db, false, false).run(1, false).await,
             Err(ActivityError::Unavailable { .. })
@@ -1378,6 +1557,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
             vec![project(1)],
             vec![stored()],
+            vec![environment(1)],
             vec![],
         ]);
         assert!(matches!(
@@ -1389,7 +1569,13 @@ mod tests {
     #[tokio::test]
     async fn run_empty_activity_saves_report_without_calling_provider() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![project(1)], vec![stored()], vec![stored()], vec![]])
+            .append_query_results([
+                vec![project(1)],
+                vec![stored()],
+                vec![environment(1)],
+                vec![stored()],
+                vec![],
+            ])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
@@ -1402,7 +1588,13 @@ mod tests {
     #[tokio::test]
     async fn run_rejects_finalization_after_lease_ownership_is_lost() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![project(1)], vec![stored()], vec![stored()], vec![]])
+            .append_query_results([
+                vec![project(1)],
+                vec![stored()],
+                vec![environment(1)],
+                vec![stored()],
+                vec![],
+            ])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
@@ -1462,16 +1654,20 @@ mod tests {
         }
         db.execute_unprepared("INSERT INTO environments (id, name, slug, subdomain, host, project_id, upstreams, created_at, updated_at)
             VALUES (1, 'production', 'production', 'activity-one', 'activity-one.example.test', 1, '[]', NOW(), NOW()),
-                   (2, 'production', 'production', 'activity-two', 'activity-two.example.test', 2, '[]', NOW(), NOW());
+                   (2, 'production', 'production', 'activity-two', 'activity-two.example.test', 2, '[]', NOW(), NOW()),
+                   (3, 'staging', 'staging', 'activity-stage', 'activity-stage.example.test', 1, '[]', NOW(), NOW());
             INSERT INTO visitor (id, visitor_id, project_id, environment_id, first_seen, last_seen, is_crawler)
             VALUES (1, 'anonymous-1', 1, 1, NOW(), NOW(), FALSE), (2, 'other-project', 2, 2, NOW(), NOW(), FALSE),
-                (3, 'bot', 1, 1, NOW(), NOW(), TRUE), (4, 'ghost', 1, 1, NOW(), NOW(), FALSE);
+                (3, 'bot', 1, 1, NOW(), NOW(), TRUE), (4, 'ghost', 1, 1, NOW(), NOW(), FALSE),
+                (5, 'staging-visitor', 1, 3, NOW(), NOW(), FALSE);
             INSERT INTO request_sessions (session_id, visitor_id, started_at, last_accessed_at, data)
-            VALUES ('activity-1', 1, NOW(), NOW(), '{}'), ('activity-2', 2, NOW(), NOW(), '{}'), ('activity-3', 3, NOW(), NOW(), '{}');
+            VALUES ('activity-1', 1, NOW(), NOW(), '{}'), ('activity-2', 2, NOW(), NOW(), '{}'),
+                   ('activity-3', 3, NOW(), NOW(), '{}'), ('activity-5', 5, NOW(), NOW(), '{}');
             INSERT INTO events (timestamp, project_id, environment_id, visitor_id, session_id, hostname, pathname, page_path, href, event_type, is_crawler, props)
             VALUES (NOW() - INTERVAL '1 minute', 1, 1, 1, 'activity-1', 'example.test', '/docs/install', '/docs/install', 'https://example.test/?token=secret-token', 'pageview', FALSE, '{\"email\":\"secret@example.test\",\"plan\":\"trial\"}'),
                    (NOW() - INTERVAL '1 minute', 2, 2, 2, 'activity-2', 'example.test', '/private', '/private', 'https://example.test/', 'pageview', FALSE, '{}'),
-                   (NOW() - INTERVAL '1 minute', 1, 1, 3, 'activity-3', 'example.test', '/bot', '/bot', 'https://example.test/', 'pageview', FALSE, '{}');").await.unwrap();
+                   (NOW() - INTERVAL '1 minute', 1, 1, 3, 'activity-3', 'example.test', '/bot', '/bot', 'https://example.test/', 'pageview', FALSE, '{}'),
+                   (NOW() - INTERVAL '1 minute', 1, 3, 5, 'activity-5', 'stage.example.test', '/staging', '/staging', 'https://stage.example.test/', 'pageview', FALSE, '{}');").await.unwrap();
         let svc = ActivityService::new(
             db.clone(),
             Arc::new(FakeAi {
@@ -1482,15 +1678,33 @@ mod tests {
         let mut config = settings();
         config.property_keys = vec!["plan".into()];
         config.daily_enabled = true;
+        config.source_url = Some("https://example.com/docs".into());
+        config.source_domain = Some("activity-one".into());
         svc.save(1, config.clone()).await.unwrap();
-        let initial = svc.status(1).await.unwrap();
+        let initial = svc.status(1, None).await.unwrap();
         assert!(initial.configured);
         assert!(initial.has_recent_activity);
+        assert_eq!(initial.settings.environment_id, Some(1));
+        assert_eq!(initial.settings.source_url, config.source_url);
+        assert_eq!(initial.settings.source_domain, config.source_domain);
+        assert_eq!(
+            svc.status(1, Some(3))
+                .await
+                .unwrap()
+                .selected_environment_id,
+            Some(3)
+        );
+        let mut foreign = config.clone();
+        foreign.environment_id = Some(2);
+        assert!(matches!(
+            svc.save(1, foreign).await,
+            Err(ActivityError::Validation { .. })
+        ));
         // Old, crawler, ghost and other-project activity cannot unlock preview.
         db.execute_unprepared("UPDATE events SET is_crawler = TRUE WHERE project_id = 1 AND visitor_id = 1;
             INSERT INTO events (timestamp, project_id, environment_id, visitor_id, session_id, hostname, pathname, page_path, href, event_type, is_crawler)
             VALUES (NOW() - INTERVAL '25 hours', 1, 1, 1, 'activity-1', 'example.test', '/old', '/old', 'https://example.test/old', 'pageview', FALSE)").await.unwrap();
-        assert!(!svc.status(1).await.unwrap().has_recent_activity);
+        assert!(!svc.status(1, None).await.unwrap().has_recent_activity);
         assert!(matches!(
             svc.preview(1, preview_request()).await,
             Err(ActivityError::Validation { .. })
@@ -1539,7 +1753,8 @@ mod tests {
 
         let retry_started_at = Utc::now();
         svc.run_due().await.unwrap();
-        let report = svc.status(1).await.unwrap().report.unwrap();
+        let report = svc.status(1, None).await.unwrap().report.unwrap();
+        assert!(svc.status(1, Some(3)).await.unwrap().report.is_none());
         assert_eq!(report.visitors.len(), 1);
         assert_eq!(report.visitors[0].visitor_id, 1);
         assert_eq!(report.visitors[0].evidence[0].properties[0].key, "plan");
@@ -1552,11 +1767,17 @@ mod tests {
             Err(ActivityError::Busy { .. })
         ));
         assert_eq!(
-            svc.status(1).await.unwrap().report.unwrap().visitors.len(),
+            svc.status(1, None)
+                .await
+                .unwrap()
+                .report
+                .unwrap()
+                .visitors
+                .len(),
             1
         );
         // A preview uses unsaved categories without replacing a report, revision or schedule.
-        let before = serde_json::to_value(svc.status(1).await.unwrap()).unwrap();
+        let before = serde_json::to_value(svc.status(1, None).await.unwrap()).unwrap();
         let preview = svc.preview(1, preview_request()).await.unwrap();
         assert_eq!(preview.settings.categories.len(), 1);
         assert!(!preview.settings.daily_enabled);
@@ -1565,7 +1786,7 @@ mod tests {
         assert!(preview.report.visitors[0].evidence[0].properties.is_empty());
         assert_eq!(preview.report.settings_revision, 0);
         assert_eq!(
-            serde_json::to_value(svc.status(1).await.unwrap()).unwrap(),
+            serde_json::to_value(svc.status(1, None).await.unwrap()).unwrap(),
             before
         );
         assert!(matches!(
@@ -1595,7 +1816,7 @@ mod tests {
             Err(ActivityError::Analysis { .. })
         ));
         assert_eq!(
-            serde_json::to_value(svc.status(1).await.unwrap()).unwrap(),
+            serde_json::to_value(svc.status(1, None).await.unwrap()).unwrap(),
             before
         );
         db.execute_unprepared(
@@ -1614,11 +1835,17 @@ mod tests {
             failing.run(1, false).await,
             Err(ActivityError::Analysis { .. })
         ));
-        let status = svc.status(1).await.unwrap();
+        let status = svc.status(1, None).await.unwrap();
         assert!(status.last_error.is_some());
         assert!(!status.running);
         assert!(status.report.is_some());
         svc.save(1, config).await.unwrap();
-        assert_eq!(svc.status(1).await.unwrap().settings_revision, 2);
+        assert_eq!(svc.status(1, None).await.unwrap().settings_revision, 2);
+        db.execute_unprepared("UPDATE environments SET deleted_at = NOW() WHERE id = 1")
+            .await
+            .unwrap();
+        let after_delete = svc.status(1, None).await.unwrap();
+        assert_eq!(after_delete.selected_environment_id, Some(3));
+        assert!(after_delete.report.is_none());
     }
 }

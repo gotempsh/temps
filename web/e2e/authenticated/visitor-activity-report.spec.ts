@@ -3,6 +3,41 @@
 
 import { expect, test } from '@playwright/test'
 
+const environmentFixtures = [
+  {
+    id: 1,
+    name: 'Production',
+    slug: 'production',
+    main_url: 'https://app-production.example.com',
+    current_deployment_id: 10,
+  },
+  {
+    id: 2,
+    name: 'Staging',
+    slug: 'staging',
+    main_url: 'https://app-staging.example.com',
+    current_deployment_id: 20,
+  },
+]
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/projects/*/environments', (route) =>
+    route.fulfill({ json: environmentFixtures })
+  )
+  await page.route('**/api/projects/*/environments/*/domains', (route) =>
+    route.fulfill({
+      json: [
+        {
+          id: 3,
+          environment_id: 1,
+          domain: 'www.example.com',
+          url: 'https://www.example.com',
+          created_at: 0,
+        },
+      ],
+    })
+  )
+})
+
 for (const width of [390, 1280]) {
   test(`activity report configures, categorizes and preserves evidence at ${width}px`, async ({
     page,
@@ -12,6 +47,9 @@ for (const width of [390, 1280]) {
     const project = projects[0]
     await page.setViewportSize({ width, height: 1000 })
     let settings = {
+      environment_id: 1,
+      source_url: null as string | null,
+      source_domain: null as string | null,
       application_context: '',
       categories: [
         { name: 'Learning', description: 'Reading educational content.' },
@@ -63,6 +101,7 @@ for (const width of [390, 1280]) {
             json: {
               configured: true,
               has_recent_activity: true,
+              selected_environment_id: 1,
               setup_url: '/settings/ai-providers',
               settings,
               settings_revision: saved ? 1 : 0,
@@ -132,6 +171,7 @@ for (const width of [390, 1280]) {
         expect(route.request().postDataJSON()).toEqual({
           url: 'https://example.com/',
           share_with_ai: true,
+          environment_id: 1,
         })
         await route.fulfill({
           json: {
@@ -244,7 +284,7 @@ for (const width of [390, 1280]) {
           response.request().method() === 'PUT'
       )
       await page
-        .getByRole('button', { name: 'Save settings', exact: true })
+        .getByRole('button', { name: /^(Save settings|Save setup)$/ })
         .click()
       expect((await persisted).request().postDataJSON().daily_enabled).toBe(
         dailyEnabled
@@ -298,6 +338,7 @@ test('activity analysis is discoverable before an AI provider is configured', as
         json: {
           configured: false,
           has_recent_activity: true,
+          selected_environment_id: 1,
           setup_url: '/settings/ai-providers',
           settings_revision: 0,
           running: false,
@@ -305,6 +346,7 @@ test('activity analysis is discoverable before an AI provider is configured', as
           last_error: null,
           report: null,
           settings: {
+            environment_id: 1,
             application_context: '',
             categories: [{ name: 'Learning', description: 'Reading' }],
             property_keys: [],
@@ -346,6 +388,7 @@ for (const width of [390, 1280]) {
           json: {
             configured: true,
             has_recent_activity: hasActivity,
+            selected_environment_id: 1,
             setup_url: '/settings/ai-providers',
             settings_revision: 1,
             running: false,
@@ -353,6 +396,7 @@ for (const width of [390, 1280]) {
             last_error: null,
             report: null,
             settings: {
+              environment_id: 1,
               application_context: 'Understand readers of our documentation',
               categories: [
                 { name: 'Learning', description: 'Reading documentation' },
@@ -373,9 +417,12 @@ for (const width of [390, 1280]) {
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
     await expect(
-      page.getByText('No tracked visitor activity in the last 24 hours.', {
-        exact: true,
-      })
+      page.getByText(
+        'No tracked visitor activity in this environment in the last 24 hours.',
+        {
+          exact: true,
+        }
+      )
     ).toBeVisible()
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
@@ -406,9 +453,149 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: 'Run saved settings' })
     ).toBeEnabled()
     await expect(
-      page.getByText('No tracked visitor activity in the last 24 hours.', {
-        exact: true,
-      })
+      page.getByText(
+        'No tracked visitor activity in this environment in the last 24 hours.',
+        {
+          exact: true,
+        }
+      )
     ).toHaveCount(0)
+  })
+}
+
+for (const width of [390, 1280]) {
+  test(`environment scope and website choices persist at ${width}px`, async ({
+    page,
+  }) => {
+    const { projects } = await (await page.request.get('/api/projects')).json()
+    test.skip(!projects[0], 'Requires a test project')
+    const project = projects[0]
+    await page.setViewportSize({ width, height: 1000 })
+    let settings = {
+      environment_id: 1,
+      source_url: null as string | null,
+      source_domain: null as string | null,
+      application_context: 'Understand readers of our documentation',
+      categories: [{ name: 'Learning', description: 'Reading documentation' }],
+      property_keys: [],
+      daily_enabled: false,
+      share_activity_with_ai: true,
+    }
+    let revision = 0
+    await page.route(
+      /\/api\/projects\/[^/]+\/analytics\/activity(?:\?.*)?$/,
+      async (route) => {
+        if (route.request().method() === 'PUT') {
+          settings = route.request().postDataJSON()
+          revision += 1
+          return route.fulfill({ status: 204 })
+        }
+        const id = Number(
+          new URL(route.request().url()).searchParams.get('environment_id') ??
+            settings.environment_id
+        )
+        await route.fulfill({
+          json: {
+            configured: true,
+            has_recent_activity: id === 1,
+            selected_environment_id: id,
+            setup_url: '/settings/ai-providers',
+            settings,
+            settings_revision: revision,
+            running: false,
+            next_run_at: null,
+            last_error: null,
+            report: null,
+          },
+        })
+      }
+    )
+    await page.goto(`/projects/${project.slug}/analytics/activity`)
+    const environment = page.getByRole('combobox', {
+      name: 'Analyze activity from',
+    })
+    const website = page.getByRole('combobox', {
+      name: 'Website used to suggest goals',
+    })
+    const url = page.getByRole('textbox', {
+      name: 'Public application URL',
+      exact: true,
+    })
+    await expect(environment).toContainText('Production')
+    await expect(url).toHaveValue('https://app-production.example.com')
+    await environment.click()
+    await page.getByRole('option', { name: 'Staging', exact: true }).click()
+    await expect(url).toHaveValue('https://app-staging.example.com')
+    await expect(
+      page.getByText(
+        'No tracked visitor activity in this environment in the last 24 hours.',
+        { exact: true }
+      )
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Preview my visitors' })
+    ).toHaveCount(0)
+    await website.click()
+    await page
+      .getByRole('option', { name: 'Use another URL', exact: true })
+      .click()
+    await url.fill('https://docs.example.com')
+    await environment.click()
+    await page.getByRole('option', { name: 'Production', exact: true }).click()
+    await expect(url).toHaveValue('https://docs.example.com')
+    await expect(
+      page.getByRole('button', { name: 'Preview my visitors' })
+    ).toBeEnabled()
+    const save = async () => {
+      const response = page.waitForResponse(
+        (r) =>
+          r.url().endsWith('/analytics/activity') &&
+          r.request().method() === 'PUT'
+      )
+      await page
+        .getByRole('button', { name: /^(Save settings|Save setup)$/ })
+        .click()
+      await response
+      await expect(
+        page.getByText('Activity report setup saved', { exact: true }).first()
+      ).toBeVisible()
+    }
+    await save()
+    expect(settings.environment_id).toBe(1)
+    expect(settings.source_url).toBe('https://docs.example.com')
+    await page.reload()
+    await expect(url).toHaveValue('https://docs.example.com')
+    await website.click()
+    await page
+      .getByRole('option', { name: 'www.example.com', exact: true })
+      .click()
+    await expect(url).toHaveValue('https://www.example.com')
+    await save()
+    expect(settings.source_url).toBeNull()
+    expect(settings.source_domain).toBe('www.example.com')
+    await page.reload()
+    await expect(url).toHaveValue('https://www.example.com')
+    await website.click()
+    await page.getByRole('option', { name: /Temps subdomain/ }).click()
+    await save()
+    expect(settings.source_url).toBeNull()
+    expect(settings.source_domain).toBeNull()
+    await page.route('**/api/projects/*/environments', (route) =>
+      route.fulfill({
+        json: [
+          {
+            ...environmentFixtures[0],
+            main_url: 'https://renamed-production.example.com',
+          },
+          environmentFixtures[1],
+        ],
+      })
+    )
+    await page.reload()
+    await expect(url).toHaveValue('https://renamed-production.example.com')
+    await environment.scrollIntoViewIfNeeded()
+    await page.screenshot({
+      path: `/tmp/temps-environment-onboarding-${width}.png`,
+    })
   })
 }
