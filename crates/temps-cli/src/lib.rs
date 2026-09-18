@@ -117,6 +117,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
+             temps_file_store={level},\
              temps_core={level},\
              temps_git={level},\
              temps_projects={level},\
