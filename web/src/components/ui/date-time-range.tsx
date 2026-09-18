@@ -99,7 +99,7 @@ export function DateTimeRange({
             onChange(quickTimeRange(preset))
           }}
         >
-          {preset}
+          {preset === '1d' ? '24h' : preset}
         </Button>
       ))}
       <Popover open={open} onOpenChange={changeOpen}>

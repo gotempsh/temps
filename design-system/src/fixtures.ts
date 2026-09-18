@@ -171,3 +171,21 @@ export const CRON_EXECUTIONS: CronExecutionFixture[] = [
     durationMs: 180,
   },
 ]
+
+/** Deterministic sample runs across seven days, anchored when the example opens. */
+export function createExecutionFixtures(now: number): CronExecutionFixture[] {
+  const paths = [
+    '/tasks/cleanup',
+    '/tasks/digest',
+    '/tasks/sync',
+    '/tasks/reports',
+  ]
+  return Array.from({ length: 672 }, (_, index) => ({
+    id: `sample-run-${index}`,
+    path: paths[index % paths.length],
+    executedAt: new Date(now - (index * 15 + 5) * 60_000).toISOString(),
+    statusCode: index % 17 === 0 ? 503 : 200,
+    durationMs: index % 17 === 0 ? 1200 : 140 + ((index * 37) % 680),
+    error: index % 17 === 0 ? 'Service unavailable' : undefined,
+  }))
+}

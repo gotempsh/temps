@@ -41,7 +41,7 @@ const NAV_SECTIONS = [
     label: 'Reference screens',
     items: [
       { to: '/ledger', label: 'Ledger — Deployments' },
-      { to: '/table-states', label: 'DataTable — Request states' },
+      { to: '/table-states', label: 'Overview — Executions' },
       { to: '/detail', label: 'Detail — Deployment' },
       { to: '/settings', label: 'Settings — Project' },
       { to: '/card-grid', label: 'CardGrid — Projects' },

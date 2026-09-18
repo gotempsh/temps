@@ -122,6 +122,21 @@ it or sit inside an existing surface without adding another border.
 Example: sandbox `/table-states` has shareable scenarios, working retries,
 and filtering. Production reference: `CronJobDetail.tsx`.
 
+## Overview filters
+
+Keep search, result selectors and date-time controls in one compact, wrapping
+row above the overview. Use `TimeRangeFilter` for URL strings or
+`DateTimeRange` for controlled timestamp values. Default shortcuts are
+1h / 6h / 24h / 7d; custom ranges commit only on Apply, show the local time
+zone, validate ordering, and respect the data source's maximum window.
+Preserve exact custom timestamps in the URL. Relative shortcuts remain
+relative to now when reopened.
+
+An overview's metrics, chart and table must derive from the same filters.
+Reset pagination when filters change. Show no rate or percentile when there
+are no observations; never substitute a misleading 100% or zero duration.
+Keep demo/debug controls outside the normal filter toolbar.
+
 ## Charts
 
 `TimeChart` (wraps `ThresholdLineChart`) for every time series. Don't hand-roll

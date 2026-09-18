@@ -89,3 +89,10 @@ export function fmtDateTime(date: Date | string | number): string {
 export function fmtDate(date: Date | string | number): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(date))
 }
+
+/** Time of day in the browser's locale and timezone. */
+export function fmtTime(date: Date | string | number): string {
+  return new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(
+    new Date(date)
+  )
+}

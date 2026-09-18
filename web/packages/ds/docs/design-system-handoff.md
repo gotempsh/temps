@@ -72,6 +72,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `Callout` | `tone` (info/success/warning/error) | In-page notices | Honour-system |
 | `EchoDialog` | `phrase`, `confirmLabel`, `onConfirm` | Irreversible destructive actions | Honour-system |
 | `Picker` | `items`, `value`, `onValueChange` | Inline searchable select | Honour-system |
+| `DateTimeRange` / `TimeRangeFilter` | controlled value + `onChange`, `maxRangeDays?` | Compact 1h / 6h / 24h / 7d shortcuts and validated custom local date/time; `TimeRangeFilter` accepts URL strings | Existing date-range unit tests |
+| `ResponsivePagination` | `page`, `pageSize`, `total`, `totalPages`, `onPageChange` | Tables with counts, mobile controls, and optional page-size changes; promoted console implementation | Existing console behavior |
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
@@ -122,11 +124,16 @@ point (repo-wide discoverability rule, `CLAUDE.md`).
 
 ## Collection-state reference
 
-Sandbox `/table-states` demonstrates an embedded execution history with
-URL-backed scenario and task-path filters. Switch between loaded, initial
+Sandbox `/table-states` demonstrates an execution overview: four summary
+metrics, a `TimeChart`, and paginated history share one filtered collection.
+A compact toolbar combines search, result selection, and the existing
+`TimeRangeFilter` with 1h / 6h / 24h / 7d and custom date-time windows. All
+filters and pagination live in the URL. Example-state controls are collapsed
+below the content. Switch between loaded, initial
 loading, successful empty, failed, and refresh-failed states. Retry recovers
-the sample request without clearing the filter; a filter with no matches has
-its own clear action. All records are invented and no API is called.
+the sample request without clearing filters; a selection with no matches
+has a reset action. Fixture dates are relative to when the page opens, so
+presets remain useful; custom ranges preserve absolute timestamps. All records are invented and no API is called.
 
 `DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
 The caller owns request errors, empty/no-match copy, filters, and retries.

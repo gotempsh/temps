@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2020",
+    "types": ["node"],
+    "typeRoots": ["../web/node_modules/@types"],
     "lib": ["DOM", "DOM.Iterable", "ES2020"],
     "jsx": "react-jsx",
     "module": "ESNext",
