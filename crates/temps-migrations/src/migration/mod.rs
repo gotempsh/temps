@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod m20260916_000001_visitor_activity_reports;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -602,6 +604,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000001_add_next_check_at_to_status_monitors::Migration),
             Box::new(m20260917_000002_add_breach_started_at_to_alert_rules::Migration),
             Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
+            Box::new(m20260916_000001_visitor_activity_reports::Migration),
         ]
     }
 }

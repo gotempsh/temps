@@ -22,6 +22,8 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-migrations = { path = "../temps-migrations" }
 schemars = { workspace = true }
+reqwest = { workspace = true }
+scraper = "0.27"
 serde = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"

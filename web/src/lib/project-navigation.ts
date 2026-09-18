@@ -53,6 +53,7 @@ export const PROJECT_SECTION_LINKS: Partial<
   analytics: [
     { title: 'Overview', url: 'analytics' },
     { title: 'Visitors', url: 'analytics/visitors' },
+    { title: 'Activity report', url: 'analytics/activity' },
     { title: 'Pages', url: 'analytics/pages' },
     { title: 'Sessions', url: 'analytics/replays' },
     { title: 'Funnels', url: 'analytics/funnels' },

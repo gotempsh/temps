@@ -67,8 +67,12 @@ impl TempsPlugin for AnalyticsPlugin {
                 Arc::new(AnalyticsService::new(db.clone(), cookie_crypto.clone()));
 
             // Create ApiTrafficService (shares the DB connection and AI registry)
-            let api_traffic_service = Arc::new(ApiTrafficService::new(db.clone(), ai));
+            let api_traffic_service = Arc::new(ApiTrafficService::new(db.clone(), ai.clone()));
             context.register_service(api_traffic_service);
+            context.register_service(Arc::new(crate::activity::service::ActivityService::new(
+                db.clone(),
+                ai,
+            )));
             context.register_service(Arc::new(crate::global::GlobalAnalyticsService::new(
                 db.clone(),
             )));
@@ -128,7 +132,15 @@ impl TempsPlugin for AnalyticsPlugin {
                         context.get_service::<dyn temps_core::ProjectAccessChecker>(),
                 },
             )))
-            .merge(configure_ingest_key_routes().with_state(ingest_keys_state));
+            .merge(configure_ingest_key_routes().with_state(ingest_keys_state))
+            .merge(crate::activity::handlers::routes().with_state(Arc::new(
+                crate::activity::handlers::ActivityState {
+                    service: context.require_service::<crate::activity::service::ActivityService>(),
+                    audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                    project_access_checker:
+                        context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                },
+            )));
 
         Some(PluginRoutes::new(routes))
     }
@@ -138,6 +150,17 @@ impl TempsPlugin for AnalyticsPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            let activity = context.require_service::<crate::activity::service::ActivityService>();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = activity.run_due().await {
+                        tracing::warn!(error = %error, "Daily visitor activity scheduler failed");
+                    }
+                }
+            });
             let service = context.require_service::<ApiTrafficService>();
             if let Some(source) =
                 context.get_service::<dyn crate::api_traffic::ApiTrafficDataSource>()
@@ -204,6 +227,7 @@ impl TempsPlugin for AnalyticsPlugin {
         let mut doc = AnalyticsApiDoc::openapi();
         doc.merge(AnalyticsIngestKeyApiDoc::openapi());
         doc.merge(crate::global_handler::GlobalAnalyticsApiDoc::openapi());
+        doc.merge(crate::activity::handlers::ActivityApiDoc::openapi());
         Some(doc)
     }
 }

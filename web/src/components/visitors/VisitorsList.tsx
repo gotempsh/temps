@@ -52,7 +52,7 @@ import {
   X,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FacetCombobox, type FacetOption } from './FacetCombobox'
 
@@ -273,6 +273,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle>Visitors</CardTitle>
+              <Link to={`/projects/${project.slug}/analytics/activity`} className="text-sm underline underline-offset-4">Understand visitor activity with AI</Link>
               <CardDescription>
                 {data
                   ? `${data.filtered_count.toLocaleString()} visitors found`
