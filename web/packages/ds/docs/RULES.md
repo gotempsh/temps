@@ -209,3 +209,20 @@ Filters, tab, page number, selected record: `useUrlState`, not local
    this, but re-scan by eye for anything the regex can't (inline `<style>`,
    a `boxShadow` object).
 4. The record recipe order (title → verdict → facts → main → aside) holds.
+
+## Progressive disclosure
+
+Show only what the user needs for the next action. Page descriptions are optional;
+omit copy that repeats a title, label, or obvious control. Keep field-format
+requirements next to the field. Prefer one short sentence over a paragraph.
+
+Use `HelpPopover` for optional, short context and `Disclosure` for longer technical
+details or advanced settings. Name the topic in the trigger ("Retention details",
+not "Learn more"). Help opens by click or keyboard, never hover alone.
+Do not nest help buttons inside a label or another interactive control.
+
+Never hide validation, actionable warnings, destructive consequences, or missing
+setup requirements. Do not collapse frequently used controls. Keep a visible
+sample label in demos, and move walkthrough instructions into "About this example"
+outside the main workflow. Use existing semantic spacing and colors; help is not
+a new bordered card around every field.

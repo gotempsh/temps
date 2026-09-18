@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Disclosure } from '@temps-sdk/ds'
+
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -172,7 +174,6 @@ export function Settings() {
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
       <PageHeader
         title="Settings"
-        description="Configure this Temps instance"
       />
       <SettingsSection
         title="External URL"
@@ -244,14 +245,13 @@ export function Settings() {
             </SelectContent>
           </Select>
           <p className="text-sm text-muted-foreground">
-            Applies to plain-HTTP requests for the host above.{' '}
-            <strong>Automatic</strong> redirects only once that hostname has a
-            certificate issued through Temps, so HTTP-only installs keep
-            working. Choose <strong>Always</strong> only if Temps itself
-            terminates TLS — if a CDN or reverse proxy in front of Temps does,
-            it will loop, because Temps sees a plain-HTTP connection and
-            redirects it straight back.
+            Use Always only when Temps terminates TLS. A CDN or reverse proxy
+            terminating TLS can cause redirect loops.
           </p>
+          <Disclosure label="How automatic redirects work">
+            <p>Automatic redirects HTTP requests only after Temps has issued a
+            certificate for the console hostname. HTTP-only installations keep working.</p>
+          </Disclosure>
         </div>
 
         <div className="space-y-2 pt-4">

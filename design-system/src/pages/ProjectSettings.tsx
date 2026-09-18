@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useRef, useState } from 'react'
-import { Field, Settings } from '@temps-sdk/ds'
+import { Disclosure, Field, Settings } from '@temps-sdk/ds'
 import { Input } from '@temps-sdk/ui'
 
 const INITIAL = { name: 'checkout-api', notifyEmail: '' }
@@ -31,7 +31,7 @@ export default function ProjectSettings() {
   return (
     <Settings
       title="Project settings"
-      description="Try editing, validation, and saving. Changes stay in this example only."
+      description="Sample project"
       errors={errors}
       dirty={dirty && !hasErrors}
       saving={saving}
@@ -47,6 +47,9 @@ export default function ProjectSettings() {
         }, 900)
       }}
     >
+      <Disclosure label="About this example">
+        <p>Try editing, validation, and saving. Changes stay in this example.</p>
+      </Disclosure>
       <Field label="Project name" error={errors.name}>
         {(fieldProps) => (
           <Input

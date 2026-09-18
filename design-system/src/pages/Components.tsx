@@ -5,6 +5,8 @@ import { useState, type ReactNode } from 'react'
 import { AlertTriangle, CircleDollarSign, Cpu, HardDrive, Network, Rocket } from 'lucide-react'
 import {
   Article,
+  Disclosure,
+  HelpPopover,
   Button,
   Callout,
   CompactRow,
@@ -65,6 +67,11 @@ export default function Components() {
             actions={<Button>Primary action</Button>}
           />
         </div>
+      </Block>
+
+      <Block title="Contextual help">
+        <div className="flex items-center gap-1">Retention <HelpPopover label="About retention">Older logs are removed automatically after the retention period.</HelpPopover></div>
+        <Disclosure label="Retention details"><p>Export logs you need to keep before changing retention.</p></Disclosure>
       </Block>
 
       <Block title="Status">

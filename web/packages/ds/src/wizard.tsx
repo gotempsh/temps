@@ -15,7 +15,7 @@ export interface WizardStep {
 
 export interface WizardProps {
   title: ReactNode
-  description: ReactNode
+  description?: ReactNode
   currentStep: string
   steps: WizardStep[]
   children: ReactNode

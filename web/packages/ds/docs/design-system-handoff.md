@@ -77,6 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
 | `ResourceStat` | `icon`, `value`, `limit?` | Inline CPU/memory/disk usage display | Honour-system |
@@ -394,3 +395,17 @@ EchoDialog has mobile gutters, a bounded scrollable surface, a compact close
 control, wrapping confirmation names, and space between stacked actions.
 Browser checks covered label and keyword selection, no matches, dark mode,
 and long-name confirmation at 390px without document overflow.
+
+### Progressive disclosure polish
+
+| Before | After | Why |
+|---|---|---|
+| Server header explained sampling, refresh and keyboard navigation | Freshness stays visible; optional details in named help | Status is the first thing operators need |
+| Wizard repeated its title and selection instructions | Compact progress, required format guidance, sample label, optional walkthrough | Keep decisions and actions prominent |
+| Settings explained redirect mechanics in a paragraph | Concise visible redirect-loop warning; mechanics collapsed | Preserve consequences without burying the setting |
+| Sandbox settings explained its test procedure in the subtitle | Sample label with collapsed walkthrough | Keep implementation notes outside the workflow |
+
+Verified console typecheck, package lint, console and sandbox builds, help and
+query unit tests. Browser checks covered HelpPopover open/Escape/focus return,
+Disclosure Enter activation, and the wizard's default layout. Console built CSS
+contains the package-only badge height utility through the explicit DS source scan.

@@ -7,11 +7,11 @@ import {
   ArrowRight,
   Check,
   GitBranch,
-  LockKeyhole,
 } from 'lucide-react'
 import { Link } from 'react-router'
 import {
   Button,
+  Disclosure,
   Field,
   GitProviderMark,
   PageContainer,
@@ -26,14 +26,12 @@ const STEPS = [
   {
     id: 'provider',
     label: 'Choose provider',
-    description: 'Where your code lives',
   },
   {
     id: 'repository',
     label: 'Select repository',
-    description: 'Repository and branch',
   },
-  { id: 'done', label: 'Connection ready', description: 'Review the result' },
+  { id: 'done', label: 'Connection ready' },
 ]
 const PROVIDERS = [
   { name: 'GitHub', description: 'Personal and organization repositories' },
@@ -74,7 +72,7 @@ export default function ConnectRepoWizard() {
       <>
         <p className="text-sm text-muted-foreground sm:mr-auto">
           {provider
-            ? `${provider.name} selected. Continue to choose a repository.`
+            ? `${provider.name} selected`
             : 'Choose a provider to continue.'}
         </p>
         <Button
@@ -128,7 +126,6 @@ export default function ConnectRepoWizard() {
     <PageContainer>
       <Wizard
         title="Connect a repository"
-        description="Choose your Git provider and the repository you want to deploy."
         currentStep={step}
         steps={STEPS}
         headerActions={
@@ -144,9 +141,6 @@ export default function ConnectRepoWizard() {
               <legend className="text-lg font-semibold">
                 Where is your repository hosted?
               </legend>
-              <p className="text-sm text-muted-foreground">
-                Select the provider that holds the code you want to deploy.
-              </p>
               <div className="space-y-3">
                 {PROVIDERS.map((item) => {
                   const selected = provider?.name === item.name
@@ -186,13 +180,7 @@ export default function ConnectRepoWizard() {
                 })}
               </div>
             </fieldset>
-            <aside className="flex gap-3 border-t pt-4">
-              <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">
-                Use an account with access to your repository. This example uses
-                sample data and does not sign in to a provider.
-              </p>
-            </aside>
+
           </div>
         )}
 
@@ -254,10 +242,7 @@ export default function ConnectRepoWizard() {
                 </div>
               </div>
             </div>
-            <p className="border-t pt-4 text-sm text-muted-foreground">
-              Sample only. No authorization is required, and no webhook or
-              deployment will be created.
-            </p>
+
           </form>
         )}
 
@@ -288,6 +273,9 @@ export default function ConnectRepoWizard() {
           </div>
         )}
       </Wizard>
+      <Disclosure label="About this example">
+        <p>This uses sample data. No provider sign-in, webhook, or deployment is created.</p>
+      </Disclosure>
     </PageContainer>
   )
 }

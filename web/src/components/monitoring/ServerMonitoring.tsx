@@ -14,6 +14,8 @@
  * generated SDK bindings.
  */
 
+import { HelpPopover } from '@temps-sdk/ds'
+
 import { PageHeader } from '@temps-sdk/ds'
 import {
   nodeDockerDiskUsageGetOptions,
@@ -790,13 +792,11 @@ function SectionIntro({
       title="Server"
       description={
         <>
-          Resource usage of the machine running this control plane, sampled
-          every {formatAge(scrapeInterval)}
-          {ageSeconds != null
-            ? ` · last sample ${formatAge(ageSeconds)} ago`
-            : ''}
-          {paused ? ' · updates paused' : ' · refreshes every 30 s'}. Hover or
-          focus a chart and use ← → to read every panel at one instant.
+          {paused ? 'Updates paused' : ageSeconds != null ? `Updated ${formatAge(ageSeconds)} ago` : 'Waiting for a sample'}
+          <HelpPopover label="About server metrics">
+            <p>Resource usage of the control-plane host. Samples are collected every {formatAge(scrapeInterval)} and refreshed every 30 seconds.</p>
+            <p>Hover or focus a chart and use the arrow keys to compare every panel at the same instant.</p>
+          </HelpPopover>
         </>
       }
       actions={

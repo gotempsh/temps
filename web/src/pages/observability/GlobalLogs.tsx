@@ -17,7 +17,7 @@ import { positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { RefreshCw, Play, Pause } from 'lucide-react'
-import { Callout } from '@temps-sdk/ds'
+import { Callout, HelpPopover } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 export default function GlobalLogs() {
@@ -145,8 +145,12 @@ export default function GlobalLogs() {
                 }}
               />
               <span className="text-[11px] text-muted-foreground">
-                Times in UTC
+                UTC
               </span>
+              <HelpPopover label="About log search">
+                <p>Search messages or use project:, env:, source:, and level: filters.</p>
+                <p>Counts and groups describe the loaded page. Times are in UTC.</p>
+              </HelpPopover>
               <Button
                 size="sm"
                 variant="ghost"
