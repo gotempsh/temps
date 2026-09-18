@@ -58,3 +58,5 @@ export { ResponsivePagination, type ResponsivePaginationProps } from './responsi
 export { GitProviderMark, type GitProviderMarkProps } from './git-provider-mark'
 
 export { clampPage } from './lib/pagination'
+
+export { LogLevelBadge } from './log-level-badge'

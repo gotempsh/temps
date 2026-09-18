@@ -10,6 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { LogLevelBadge } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -64,13 +65,6 @@ const LEVEL_OPTIONS: LiveLogLevel[] = [
   'TRACE',
 ]
 
-const LEVEL_COLORS: Record<LiveLogLevel, string> = {
-  ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-  WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
-  DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
-  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
-}
 
 // Leading ISO timestamp the server prepends when ?timestamps=true is on.
 // Docker emits RFC 3339 with nano precision (`2025-05-30T10:40:00.123456789Z`).
@@ -207,15 +201,7 @@ const LiveLogRow = memo(function LiveLogRow({
         </span>
       )}
       {columns.level && (
-        <Badge
-          variant="outline"
-          className={cn(
-            'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
-            LEVEL_COLORS[parsed.level]
-          )}
-        >
-          {parsed.level}
-        </Badge>
+        <LogLevelBadge level={parsed.level} />
       )}
       {columns.service && serviceLabel && (
         <span
@@ -1680,16 +1666,18 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               the filteredLogs memo above. Layout intentionally lives between
               the source-picker row and the mode-segmented control so it's
               always visible regardless of Advanced Options state. */}
-          <div className="flex gap-1.5 flex-wrap items-center">
+          <div className="flex gap-1.5 flex-wrap items-center" role="group" aria-label="Log levels">
+            <span className="text-xs font-medium text-muted-foreground mr-0.5">Levels</span>
             {LEVEL_OPTIONS.map((level) => (
               <button
                 type="button"
                 key={level}
+                aria-pressed={selectedLevels.includes(level)}
                 onClick={() => toggleLevel(level)}
                 className={cn(
                   'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
                   selectedLevels.includes(level)
-                    ? LEVEL_COLORS[level]
+                    ? 'bg-secondary text-foreground border-foreground/40'
                     : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted'
                 )}
               >

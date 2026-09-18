@@ -14,6 +14,7 @@ import {
   FormErrors,
   Kbd,
   LogLine,
+  LogLevelBadge,
   notify,
   PageContainer,
   PageHeader,
@@ -80,6 +81,9 @@ export default function Components() {
         <Kbd keys={['⌘', 'K']} showOnMobile />
       </Block>
 
+      <Block title="Log severity">
+        {['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE'].map(level => <LogLevelBadge key={level} level={level} />)}
+      </Block>
       <Block title="LogLine">
         <div className="w-full rounded-md border bg-background">
           <LogLine content="Starting build for checkout-api@a1b2c3d" />

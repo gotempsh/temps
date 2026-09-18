@@ -12,7 +12,7 @@ import {
   getProjectDeploymentsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
+import { LogLevelBadge } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -87,13 +87,6 @@ const LOG_LEVEL_OPTIONS: LogLevel[] = [
   'TRACE',
 ]
 
-const LEVEL_COLORS: Record<LogLevel, string> = {
-  ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-  WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
-  DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
-  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
-}
 
 // Server enforces a 24h cap on full-text search (MAX_FULLTEXT_HOURS in
 // search.rs). The 7d/30d presets and any custom range over 24h are fine for
@@ -379,15 +372,7 @@ function HistoryLogRow({
         </span>
       )}
       {columns.level && (
-        <Badge
-          variant="outline"
-          className={cn(
-            'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
-            LEVEL_COLORS[level] ?? LEVEL_COLORS.INFO
-          )}
-        >
-          {level}
-        </Badge>
+        <LogLevelBadge level={level} />
       )}
       {columns.service && (
         <span className="text-muted-foreground shrink-0 w-[70px] truncate">
@@ -1222,11 +1207,12 @@ export default function HistoryLogViewer({
               <button
                 type="button"
                 key={level}
+                aria-pressed={selectedLevels.includes(level)}
                 onClick={() => toggleLevel(level)}
                 className={cn(
                   'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
                   selectedLevels.includes(level)
-                    ? LEVEL_COLORS[level]
+                    ? 'bg-secondary text-foreground border-foreground/40'
                     : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted'
                 )}
               >

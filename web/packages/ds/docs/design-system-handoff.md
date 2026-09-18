@@ -77,6 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
 | `ResourceStat` | `icon`, `value`, `limit?` | Inline CPU/memory/disk usage display | Honour-system |
 | `fmt.ts` | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)` | Any formatted number/date | Honour-system |
