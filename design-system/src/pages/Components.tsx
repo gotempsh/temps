@@ -58,6 +58,7 @@ export default function Components() {
         <div className="w-full rounded-md border p-4">
           <PageHeader
             title="Example page"
+            headingLevel="h2"
             description="Description text goes here."
             verdict={<Status tone="ok" />}
             actions={<Button>Primary action</Button>}
@@ -103,9 +104,9 @@ export default function Components() {
           />
           <CompactRow
             timestamp={new Date(Date.now() - 41 * 60_000).toISOString()}
-            icon={<CircleDollarSign className="h-3.5 w-3.5 text-emerald-500" />}
+            icon={<CircleDollarSign className="h-3.5 w-3.5 text-success" />}
             primary="checkout.completed"
-            meta={<span className="font-mono tabular-nums text-emerald-600">$48.00</span>}
+            meta={<span className="font-mono tabular-nums text-success">$48.00</span>}
           />
         </div>
       </Block>

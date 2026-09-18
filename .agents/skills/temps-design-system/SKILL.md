@@ -141,3 +141,17 @@ surfaces, keyboard focus, reduced motion, and narrow layouts. Frequent filtering
 should respond immediately. Add motion only when it helps explain a change.
 Record findings in a Before/After/Why table and state what was actually verified.
 The sandbox examples must demonstrate working interactions, not inert mockups.
+
+## Extraction and architecture review
+
+Use `design-system-patterns` as supplemental guidance for semantic tokens,
+composition, accessible interaction states, and theme coverage. Reuse the console
+theme provider; keep sandbox preferences separate from the app.
+
+Use `extract-design-system` to inventory observed styles before proposing token
+changes. For the authenticated local console, the user-approved adapter is
+`agent-browser`: measure computed styles and existing CSS custom properties on
+representative routes. Record route, theme, viewport, and sampling limitations.
+Never capture credentials, input values, or customer records in the audit.
+Keep measurements separate from canonical tokens; a rendered sample does not
+prove the entire system. The existing decisions and RULES remain authoritative.

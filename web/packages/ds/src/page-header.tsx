@@ -29,6 +29,8 @@ export function PageContainer({ className, innerClassName, children }: PageConta
 }
 
 export interface PageHeaderProps {
+  /** Use h2 for a nested example or section; page titles remain h1. */
+  headingLevel?: 'h1' | 'h2'
   title: ReactNode
   description?: ReactNode
   /**
@@ -42,6 +44,7 @@ export interface PageHeaderProps {
 }
 
 export function PageHeader({
+  headingLevel: Heading = 'h1',
   title,
   description,
   verdict,
@@ -58,7 +61,7 @@ export function PageHeader({
     >
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+          <Heading className="text-2xl font-semibold tracking-tight">{title}</Heading>
           {verdict}
         </div>
         {description ? (

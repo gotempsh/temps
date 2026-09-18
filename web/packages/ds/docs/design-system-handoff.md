@@ -364,3 +364,12 @@ it for loading and loaded states alike. Standalone details retain their own shel
 `pagination` prop: `page`, `pageSize`, `total`, `totalPages`, and `onPageChange`,
 plus optional page-size controls. Supply real API counts, never inferred totals.
 `ResponsivePagination` is now owned by the package; the console path re-exports it.
+
+### Theme and interaction review
+
+The sandbox theme controls use the console's existing `next-themes` provider,
+with a separate `temps-ds-theme` preference. Light, dark, and system modes apply
+to every example and its toast surfaces. The settings example demonstrates
+validation, unsaved changes, saving, and a new saved baseline without real API calls.
+See [rendered-app-audit.md](./rendered-app-audit.md) for the source measurements
+and the scope of browser verification.

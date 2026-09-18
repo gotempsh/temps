@@ -10,7 +10,7 @@ import {
   useNavigate,
 } from 'react-router'
 import { Toaster } from 'sonner'
-import { cn, Field } from '@temps-sdk/ds'
+import { cn, Field, Button } from '@temps-sdk/ds'
 import {
   Select,
   SelectContent,
@@ -18,6 +18,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@temps-sdk/ui'
+import { Sun, Moon, Monitor } from 'lucide-react'
+import { useTheme } from '../../web/src/components/providers/ThemeProvider'
 import Guide from './pages/Guide'
 import Iconography from './pages/Iconography'
 import TableStates from './pages/TableStates'
@@ -57,11 +59,25 @@ const NAV_SECTIONS = [
 export default function App() {
   const { pathname } = useLocation()
   const navigate = useNavigate()
+  const { theme, resolvedTheme, setTheme } = useTheme()
   return (
     <div className="flex min-h-screen flex-col md:flex-row bg-background text-foreground">
       <aside className="flex w-full md:w-56 shrink-0 flex-col border-b md:border-b-0 md:border-r">
-        <div className="border-b px-4 py-3 text-sm font-semibold">
-          @temps-sdk/ds
+        <div className="space-y-3 border-b px-4 py-3">
+          <div className="text-sm font-semibold">@temps-sdk/ds</div>
+          <div role="group" aria-label="Preview theme" className="flex gap-1">
+            {([
+              ['light', 'Light theme', Sun],
+              ['dark', 'Dark theme', Moon],
+              ['system', 'System theme', Monitor],
+            ] as const).map(([value, label, Icon]) => (
+              <Button key={value} size="sm" variant={theme === value ? 'secondary' : 'ghost'}
+                aria-label={label} title={label} aria-pressed={theme === value}
+                onClick={() => setTheme(value)}>
+                <Icon className="size-4" aria-hidden />
+              </Button>
+            ))}
+          </div>
         </div>
         <div className="p-4 md:hidden">
           <Field label="Explore examples">
@@ -133,7 +149,7 @@ export default function App() {
           <Route path="/onboarding" element={<AiSummaries />} />
         </Routes>
       </main>
-      <Toaster position="top-center" />
+      <Toaster position="top-center" theme={resolvedTheme === 'dark' ? 'dark' : 'light'} />
     </div>
   )
 }
