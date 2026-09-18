@@ -15,7 +15,8 @@ import { LogQueryInput } from '@/components/observability/LogQueryInput'
 import { positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { AlertTriangle, RefreshCw, Play, Pause } from 'lucide-react'
+import { RefreshCw, Play, Pause } from 'lucide-react'
+import { Callout } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 export default function GlobalLogs() {
@@ -76,16 +77,10 @@ export default function GlobalLogs() {
   const incomplete = ready && !!query.data?.scan_limit_reached
   const lines = ready ? (query.data?.lines ?? []) : []
   const status = incomplete ? (
-    <div
-      role="status"
-      className="flex items-center gap-1.5 px-1 text-xs text-amber-700 dark:text-amber-400"
-    >
-      <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
-      <span>
-        Scan limit reached{lines.length ? ' · showing partial results' : ''}.
-        Use Next page to continue or narrow the search.
-      </span>
-    </div>
+    <Callout tone="warning" title="Scan limit reached">
+      {lines.length ? 'Showing partial results. ' : ''}
+      Use Next page to continue, or narrow your search or time range.
+    </Callout>
   ) : !ready || !lines.length ? (
     <QueryContent
       title="Logs"
@@ -189,7 +184,7 @@ export default function GlobalLogs() {
           </div>
         }
         footer={
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t py-2 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center justify-between gap-2 py-3 text-xs text-muted-foreground">
             <span>
               {ready
                 ? `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · ${incomplete ? 'partial results' : 'newest first'}`

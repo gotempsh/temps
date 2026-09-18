@@ -158,7 +158,7 @@ export function LogExplorer({
     <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_264px]">
       <section aria-label="Log explorer" className="min-w-0">
         {toolbar}
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-y py-2">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 pb-3">
           <span className="text-xs text-muted-foreground">
             {lines.length} loaded {lines.length === 1 ? 'line' : 'lines'} ·
             newest first
@@ -237,11 +237,11 @@ export function LogExplorer({
             </Button>
           </div>
         </div>
-        {status}
+        {status && <div className="mb-3">{status}</div>}
         {(!status || lines.length > 0) &&
           (mode !== 'list' ? (
-            <div className="border-x border-b">
-              <p className="border-b px-3 py-2 text-xs text-muted-foreground">
+            <div className="overflow-hidden rounded-md border">
+              <p className="px-4 py-3 text-xs text-muted-foreground">
                 {mode === 'patterns' ? 'Exact repeated messages' : 'Services'}{' '}
                 on this loaded page. Select a row to inspect an example.
               </p>
@@ -257,7 +257,7 @@ export function LogExplorer({
                 </TableHeader>
                 <TableBody>
                   {groups.map((group) => (
-                    <TableRow key={group.id}>
+                    <TableRow key={group.id} className="border-0 even:bg-muted/20">
                       <TableCell className="max-w-sm">
                         <button
                           type="button"
@@ -283,9 +283,9 @@ export function LogExplorer({
               </Table>
             </div>
           ) : (
-            <div className="border-x border-b [&>div]:max-h-[62vh]">
+            <div className="overflow-hidden rounded-md border [&>div]:max-h-[62vh]">
               <Table className="table-fixed">
-                <TableHeader className="sticky top-0 z-10 bg-muted/70 [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
+                <TableHeader className="sticky top-0 z-10 bg-muted [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
                   <TableRow>
                     <TableHead className="hidden w-24 md:table-cell">
                       Time
@@ -313,6 +313,7 @@ export function LogExplorer({
                   {lines.map((entry) => (
                     <TableRow
                       key={identity(entry)}
+                      className="border-0 even:bg-muted/20"
                       data-state={
                         selected === identity(entry) ? 'selected' : undefined
                       }
@@ -495,7 +496,7 @@ export function LogExplorer({
                 <section
                   key={facet.key}
                   aria-label={`${facet.title} facets`}
-                  className="border-t pt-3"
+                  className="space-y-1"
                 >
                   <h3 className="mb-1 text-xs font-medium text-muted-foreground">
                     {facet.title}
@@ -507,7 +508,7 @@ export function LogExplorer({
                         key={value}
                         variant="ghost"
                         size="sm"
-                        className="relative flex h-7 w-full justify-between gap-2 overflow-hidden rounded-none border-b px-2 text-[11px]"
+                        className="relative flex h-7 w-full justify-between gap-2 overflow-hidden rounded-md px-2 text-[11px]"
                         onClick={() =>
                           onFilter({
                             [facet.key]: value,
