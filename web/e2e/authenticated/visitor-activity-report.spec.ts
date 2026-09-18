@@ -302,6 +302,19 @@ for (const width of [390, 1280]) {
     expect(settings.property_keys).toEqual(['topic'])
     expect(settings.share_activity_with_ai).toBe(true)
     expect(settings.daily_enabled).toBe(true)
+    await expect(
+      page.getByRole('heading', { name: 'Saved goal', exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByText('Daily reports on', { exact: true })
+    ).toBeVisible()
+    await page.reload()
+    await expect(
+      page.getByRole('heading', { name: 'Saved goal', exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Analyze website', exact: true })
+    ).toHaveCount(0)
     // Preview-generated settings must not change the operator's schedule choice.
     const dailySwitch = page.getByRole('switch', {
       name: 'Run automatically every 24 hours',
@@ -496,6 +509,13 @@ for (const width of [390, 1280]) {
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
     await expect(
+      page.getByRole('heading', { name: 'Saved goal', exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Analyze website', exact: true })
+    ).toHaveCount(0)
+    await page.getByRole('button', { name: 'Change goal', exact: true }).click()
+    await expect(
       page.getByRole('textbox', {
         name: 'What do you want to understand?',
         exact: true,
@@ -583,7 +603,7 @@ for (const width of [390, 1280]) {
     ).toBeEnabled()
     await expect(
       page.getByRole('button', { name: 'Run saved settings' })
-    ).toHaveCount(0)
+    ).toBeEnabled()
     await expect(
       page.getByText('No visitor activity in the last 24 hours.', {
         exact: true,
@@ -704,6 +724,7 @@ for (const width of [390, 1280]) {
     expect(settings.environment_id).toBe(1)
     expect(settings.source_url).toBe('https://docs.example.com')
     await page.reload()
+    await page.getByRole('button', { name: 'Change goal', exact: true }).click()
     await expect(url).toHaveValue('https://docs.example.com')
     await website.click()
     await page
@@ -715,6 +736,7 @@ for (const width of [390, 1280]) {
     expect(settings.source_url).toBeNull()
     expect(settings.source_domain).toBe('www.example.com')
     await page.reload()
+    await page.getByRole('button', { name: 'Change goal', exact: true }).click()
     await expect(url).toHaveCount(0)
     await expect(website).toContainText('www.example.com')
     await website.click()
@@ -734,6 +756,7 @@ for (const width of [390, 1280]) {
       })
     )
     await page.reload()
+    await page.getByRole('button', { name: 'Change goal', exact: true }).click()
     await expect(url).toHaveCount(0)
     await expect(website).toContainText(
       'https://renamed-production.example.com'

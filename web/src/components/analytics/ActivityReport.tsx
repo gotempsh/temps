@@ -159,7 +159,10 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               queryClient.invalidateQueries({ queryKey: options.queryKey })
             }
           />
-          {(report || running || data.last_error) && (
+          {(data.settings_revision > 0 ||
+            report ||
+            running ||
+            data.last_error) && (
             <section
               aria-label="Visitor activity"
               className="space-y-5 border-t pt-6"
@@ -227,7 +230,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                 {!report ? (
                   <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
                     {data.has_recent_activity
-                      ? 'Preview your visitors to see a report.'
+                      ? 'Your setup is saved. Run a report to see visitor activity.'
                       : 'Waiting for visitor activity.'}
                   </div>
                 ) : (
@@ -431,6 +434,7 @@ function ActivitySettingsForm({
     daily_enabled: dailyEnabled,
   }
   const [editing, setEditing] = useState(false)
+  const [discovering, setDiscovering] = useState(status.settings_revision === 0)
   const [choosingGoal, setChoosingGoal] = useState(false)
   useEffect(() => {
     if (editing) form.setFocus('application_context')
@@ -487,31 +491,58 @@ function ActivitySettingsForm({
 
   return (
     <section aria-label="Report setup" className="space-y-6">
-      <GoalSuggestions
-        key={selectedEnvironment ?? 'none'}
-        projectId={projectId}
-        environment={environment}
-        sourceUrl={sourceUrl}
-        sourceDomain={sourceDomain}
-        onSourceChange={(url, domain) => {
-          form.setValue('source_url', url, { shouldDirty: true })
-          form.setValue('source_domain', domain, { shouldDirty: true })
-        }}
-        configured={status.configured}
-        aiProvider={status.ai_provider ?? null}
-        aiModel={status.ai_model ?? null}
-        disabled={busy}
-        onResultsChange={setChoosingGoal}
-        onSelect={(goal) => {
-          form.setValue('application_context', goal.goal, {
-            shouldDirty: true,
-          })
-          setHasSetup(false)
-          onPreview(null)
-          preview.reset()
-          setEditing(true)
-        }}
-      />
+      {status.settings_revision > 0 && !discovering && (
+        <div className="space-y-3" aria-label="Saved report setup">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Check className="h-4 w-4 text-primary" />
+              <h2 className="font-semibold">Saved goal</h2>
+              <Badge variant="secondary">
+                {status.settings.daily_enabled
+                  ? 'Daily reports on'
+                  : 'Manual reports'}
+              </Badge>
+            </div>
+            <Button
+              type="button"
+              disabled={busy}
+              onClick={() => setDiscovering(true)}
+            >
+              Change goal
+            </Button>
+          </div>
+          <p className="text-sm whitespace-pre-wrap">
+            {status.settings.application_context}
+          </p>
+        </div>
+      )}
+      {discovering && (
+        <GoalSuggestions
+          key={selectedEnvironment ?? 'none'}
+          projectId={projectId}
+          environment={environment}
+          sourceUrl={sourceUrl}
+          sourceDomain={sourceDomain}
+          onSourceChange={(url, domain) => {
+            form.setValue('source_url', url, { shouldDirty: true })
+            form.setValue('source_domain', domain, { shouldDirty: true })
+          }}
+          configured={status.configured}
+          aiProvider={status.ai_provider ?? null}
+          aiModel={status.ai_model ?? null}
+          disabled={busy}
+          onResultsChange={setChoosingGoal}
+          onSelect={(goal) => {
+            form.setValue('application_context', goal.goal, {
+              shouldDirty: true,
+            })
+            setHasSetup(false)
+            onPreview(null)
+            preview.reset()
+            setEditing(true)
+          }}
+        />
+      )}
       <details
         hidden={choosingGoal}
         open={editing}
