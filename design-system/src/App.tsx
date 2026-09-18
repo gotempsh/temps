@@ -12,6 +12,7 @@ import ProjectSettings from './pages/ProjectSettings'
 import ReleaseNotes from './pages/ReleaseNotes'
 import AiSummaries from './pages/AiSummaries'
 import ProjectsGrid from './pages/ProjectsGrid'
+import ConnectRepoWizard from './pages/ConnectRepoWizard'
 
 const NAV_SECTIONS = [
   {
@@ -28,6 +29,7 @@ const NAV_SECTIONS = [
       { to: '/detail', label: 'Detail — Deployment' },
       { to: '/settings', label: 'Settings — Project' },
       { to: '/card-grid', label: 'CardGrid — Projects' },
+      { to: '/wizard', label: 'Wizard — Connect a repository' },
       { to: '/article', label: 'Article — Release notes' },
       { to: '/onboarding', label: 'PageState — Onboarding' },
     ],
@@ -76,6 +78,7 @@ export default function App() {
           <Route path="/detail" element={<DeploymentDetail />} />
           <Route path="/settings" element={<ProjectSettings />} />
           <Route path="/card-grid" element={<ProjectsGrid />} />
+          <Route path="/wizard" element={<ConnectRepoWizard />} />
           <Route path="/article" element={<ReleaseNotes />} />
           <Route path="/onboarding" element={<AiSummaries />} />
         </Routes>

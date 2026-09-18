@@ -280,6 +280,17 @@ export default function Components() {
         </p>
       </Block>
 
+      <Block title="Wizard">
+        <p className="w-full text-sm text-muted-foreground">
+          Step-indicator + title/description shell for a multi-step flow
+          (setup wizards, onboarding, "connect a resource"). Owns its own
+          `h1`, so — like `Ledger`/`Detail`/`Settings`/`CardGrid` — it isn't
+          demoed inline here; see the "Wizard — Connect a repository"
+          reference screen for a working 3-step example with the confetti
+          celebration on the final step.
+        </p>
+      </Block>
+
       <Block title="TimeChart">
         <div className="w-full">
           <TimeChart

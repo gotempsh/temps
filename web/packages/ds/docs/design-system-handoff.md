@@ -71,6 +71,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
 | `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `isLoading?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
 | `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
+| `Wizard` | `title`, `description`, `currentStep`, `steps`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
 
 ## Page templates + record recipe
 
@@ -89,6 +90,12 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
   reimplement any specific card component — bring your own (`ProjectCard`,
   etc.) as `renderCard`. Reference screen: `design-system/` "CardGrid —
   Projects".
+- **`Wizard`** (multi-step flow): step indicator + title/description +
+  confetti celebration on the final step. Not one of the three original
+  templates (`Ledger`/`Detail`/`Settings`) — a fourth shape for input
+  collected across steps rather than a single form. Promoted as-is from
+  `SetupWizardShell.tsx`. Reference screen: `design-system/` "Wizard —
+  Connect a repository".
 
 ## Responsive & keyboard
 
@@ -265,3 +272,19 @@ this phase needs):
     `components/dashboard/ProjectCard.tsx` (456 lines) is intentionally
     untouched — only the generic grid layout wrapper around it (`CardGrid`)
     was extracted; the card's own internals stay exactly as they are.
+15. `SetupWizardShell.tsx` is promoted into `@temps-sdk/ds` as `Wizard`
+    (`web/packages/ds/src/wizard.tsx`); its 4 existing importers
+    (`ErrorTrackingSetup.tsx`, `ProjectAnalytics.tsx`,
+    `AiFirstWorkspace.tsx`, `TracesList.tsx`, plus the
+    `harness-onboarding.test.tsx` test) keep working unchanged through the
+    thin re-export. At least 9 other wizard-shaped pages hand-roll their
+    own step UI instead of adopting `Wizard` — **not migrated this pass**,
+    left as a follow-up (each has its own step-count/validation/branching
+    logic worth reviewing individually rather than a mechanical swap):
+    `AddDomain.tsx`, `ApiKeyCreate.tsx`, `AddDnsProvider.tsx`,
+    `AddEmailProvider.tsx`, `AddClusterMember.tsx`,
+    `AddNotificationProvider.tsx`, `CreateServiceNew.tsx`,
+    `NewProject.tsx`, `Setup.tsx`. `EmailDomainNew.tsx` also hand-rolls its
+    own step indicator (a comment there says it took the visual pattern
+    from `SetupWizardShell` without importing it) — worth folding into
+    `Wizard` alongside the other 9 when this is picked up.
