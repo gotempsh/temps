@@ -26,10 +26,7 @@ export function Notifications() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
-      <PageHeader
-        title="Notifications"
-        description="Manage delivery providers and notification routes."
-      />
+      <PageHeader title="Notifications" />
       <div className="w-full">
         <Tabs
           value={activeTab}

@@ -335,13 +335,7 @@ export function ProvidersManagement() {
     <div className="space-y-4">
       <div className="flex justify-between items-center">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">
-            Notification Providers
-          </h2>
-          <p className="text-muted-foreground">
-            Configure where notifications can be delivered. Routes decide which
-            alerts reach each destination.
-          </p>
+          <h2 className="text-base font-semibold">Providers</h2>
         </div>
 
         {/* Only one of this and the empty-state button is ever mounted, so
@@ -371,7 +365,7 @@ export function ProvidersManagement() {
           {providers?.map((provider) => {
             const typedProvider = provider as ExtendedNotificationProvider
             return (
-              <Card key={provider.id}>
+              <Card key={provider.id} className="shadow-none">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                   <div className="space-y-1">
                     <CardTitle className="text-base font-medium leading-none">
