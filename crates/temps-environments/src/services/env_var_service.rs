@@ -62,6 +62,11 @@ pub enum EnvVarError {
     SecretValueRequired { key: String },
 
     #[error(
+        "Secret environment variable '{key}' (id={var_id}) is write-only and cannot be revealed"
+    )]
+    SecretValueCannotBeRevealed { var_id: i32, key: String },
+
+    #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
     )]
     AmbiguousValue { project_id: i32, key: String },
@@ -648,6 +653,13 @@ impl EnvVarService {
             ))
         })?;
 
+        if var.is_secret {
+            return Err(EnvVarError::SecretValueCannotBeRevealed {
+                var_id: var.id,
+                key: var.key,
+            });
+        }
+
         let is_secret = var.is_secret;
         let value = self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
         Ok((value, is_secret))
@@ -1067,7 +1079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_environment_variable_value_reveals_secret_through_scoped_endpoint() {
+    async fn test_get_environment_variable_value_rejects_secret_through_scoped_endpoint() {
         let encryption_service = make_encryption_service();
         let encrypted = encryption_service
             .encrypt_string("reveal-on-demand")
@@ -1086,13 +1098,18 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let (value, is_secret) = service
+        let error = service
             .get_environment_variable_value_for_audited_reveal(10, "WRITE_ONLY_TOKEN", None, None)
             .await
-            .expect("an authorized audited endpoint must be able to reveal a secret");
+            .expect_err("stored secrets must remain write-only even with scoped access");
 
-        assert_eq!(value, "reveal-on-demand");
-        assert!(is_secret);
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueCannotBeRevealed {
+                var_id: 4,
+                ref key,
+            } if key == "WRITE_ONLY_TOKEN"
+        ));
     }
 
     /// Building a mock that walks the update transaction: SELECT the row,

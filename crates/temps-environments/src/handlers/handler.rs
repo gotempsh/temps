@@ -77,6 +77,12 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
+            EnvVarError::SecretValueCannotBeRevealed { .. } => {
+                temps_core::error_builder::forbidden()
+                    .title("Secret environment variable is write-only")
+                    .detail(err.to_string())
+                    .build()
+            }
             EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
                 .title("Environment variable value is ambiguous")
                 .detail(err.to_string())
@@ -98,20 +104,18 @@ fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<
     Ok(())
 }
 
-/// Gate for revealing a single, already-identified environment variable.
-/// Only variables explicitly classified as secret need the extra,
-/// separately-audited SecretsRead permission. A regular plaintext variable
-/// is already visible to (and overwritable by) anyone with
-/// EnvironmentsRead/EnvironmentsWrite, so gating its reveal behind
-/// SecretsRead too just breaks the edit flow for non-admin roles without
-/// adding real protection.
+/// A regular variable can be revealed with EnvironmentsRead. Secrets remain
+/// write-only regardless of the caller's permissions.
 fn require_environment_variable_reveal(
     auth: &temps_auth::AuthContext,
     is_secret: bool,
 ) -> Result<(), Problem> {
     permission_guard!(auth, EnvironmentsRead);
     if is_secret {
-        permission_guard!(auth, SecretsRead);
+        return Err(temps_core::error_builder::forbidden()
+            .title("Secret environment variable is write-only")
+            .detail("Stored secret values cannot be revealed. Replace the value to rotate it.")
+            .build());
     }
     Ok(())
 }
@@ -2470,15 +2474,18 @@ mod tests {
     fn user_cannot_reveal_a_secret_environment_variable() {
         let problem =
             require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), true)
-                .expect_err("a variable classified as secret still requires SecretsRead");
+                .expect_err("a secret must be write-only for a regular user");
 
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
-    fn admin_can_reveal_a_secret_environment_variable() {
-        require_environment_variable_reveal(&test_auth_context(temps_auth::Role::Admin), true)
-            .expect("admin holds SecretsRead and can reveal a secret variable");
+    fn admin_cannot_reveal_a_secret_environment_variable() {
+        let problem =
+            require_environment_variable_reveal(&test_auth_context(temps_auth::Role::Admin), true)
+                .expect_err("a secret must be write-only even for an administrator");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
