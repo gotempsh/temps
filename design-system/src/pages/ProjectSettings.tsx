@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type ReactNode } from "react";
-import { Button, Disclosure, Field, Settings } from "@temps-sdk/ds";
+import { useState } from "react";
+import {
+  Button,
+  Disclosure,
+  Field,
+  Settings,
+  SettingsGroup as Group,
+} from "@temps-sdk/ds";
 import {
   Input,
   Switch,
@@ -20,15 +26,6 @@ const INITIAL = {
   certificates: "production",
   screenshots: true,
 };
-
-function Group({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10">
-      <h2 className="text-base font-semibold">{title}</h2>
-      <div className="min-w-0 space-y-5">{children}</div>
-    </section>
-  );
-}
 
 export default function ProjectSettings() {
   const [values, setValues] = useState(INITIAL);

@@ -3,7 +3,12 @@
 
 export { cn } from './lib/cn'
 
-export { PageContainer, PageHeader, type PageContainerProps, type PageHeaderProps } from './page-header'
+export {
+  PageContainer,
+  PageHeader,
+  type PageContainerProps,
+  type PageHeaderProps,
+} from './page-header'
 export { ProjectAvatar, type ProjectAvatarProps } from './project-avatar'
 export { Article, type ArticleProps } from './article'
 export {
@@ -20,7 +25,12 @@ export { CompactRow, type CompactRowProps } from './compact-row'
 export { Wizard, type WizardStep, type WizardProps } from './wizard'
 export { Button, type ButtonProps } from './button'
 export { CopyAction } from './copy-action'
-export { Field, FormErrors, type FieldProps, type FormErrorsProps } from './field'
+export {
+  Field,
+  FormErrors,
+  type FieldProps,
+  type FormErrorsProps,
+} from './field'
 export { Callout, type CalloutTone, type CalloutProps } from './callout'
 export {
   PageState,
@@ -41,7 +51,11 @@ export { notify } from './notify'
 export * from './fmt'
 
 export { Ledger, type LedgerColumn, type LedgerProps } from './templates/ledger'
-export { DataTable, type DataTableColumn, type DataTableProps } from './templates/data-table'
+export {
+  DataTable,
+  type DataTableColumn,
+  type DataTableProps,
+} from './templates/data-table'
 export { CardGrid, type CardGridProps } from './templates/card-grid'
 export { Detail, type DetailFact, type DetailProps } from './templates/detail'
 export { Settings, type SettingsProps } from './templates/settings'
@@ -53,7 +67,10 @@ export {
   serializeTimeRange,
   type DateTimeRangeValue,
 } from './date-time-range'
-export { ResponsivePagination, type ResponsivePaginationProps } from './responsive-pagination'
+export {
+  ResponsivePagination,
+  type ResponsivePaginationProps,
+} from './responsive-pagination'
 
 export { GitProviderMark, type GitProviderMarkProps } from './git-provider-mark'
 
@@ -64,3 +81,5 @@ export { LogLevelBadge } from './log-level-badge'
 export { HelpPopover, Disclosure } from './help'
 
 export { SettingsSection } from './settings-section'
+
+export { SettingsGroup } from './settings-group'

@@ -6,7 +6,7 @@
 import { getPreferences, updatePreferences } from '@/api/client/sdk.gen'
 import { NotificationPreferencesResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
+import { SettingsGroup } from '@temps-sdk/ds'
 import {
   Form,
   FormControl,
@@ -85,7 +85,6 @@ function ProjectAlerts({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Project Health</h3>
           <div className="space-y-4">
             <FormField
               control={form.control}
@@ -219,7 +218,6 @@ function DomainAlerts({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Domain Monitoring</h3>
           <div className="space-y-4">
             <FormField
               control={form.control}
@@ -330,7 +328,6 @@ function BackupAlerts({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Backup Monitoring</h3>
           <div className="space-y-4">
             <FormField
               control={form.control}
@@ -433,7 +430,6 @@ function RouteAlerts({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Route Monitoring</h3>
           <div className="space-y-4">
             <FormField
               control={form.control}
@@ -505,7 +501,6 @@ function NotificationSettings({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Notification Preferences</h3>
           <div className="space-y-4">
             <FormField
               control={form.control}
@@ -659,7 +654,6 @@ function WeeklyDigest({
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
-          <h3 className="text-lg font-medium">Weekly Digest</h3>
           <p className="text-sm text-muted-foreground">
             Receive a comprehensive weekly summary of your project&apos;s
             activity, performance, and health metrics
@@ -1026,7 +1020,7 @@ export function MonitoringSettings() {
   const renderContent = () => {
     if (currentSection === 'rules') {
       return (
-        <div className="space-y-8">
+        <div className="max-w-5xl space-y-10">
           <NodeAlertRules />
           <AlertRulesManagement />
         </div>
@@ -1112,48 +1106,48 @@ export function MonitoringSettings() {
     switch (currentSection) {
       case 'alerts':
         return (
-          <div className="grid items-start gap-4 xl:grid-cols-2">
-            <Card className="p-5 sm:p-6">
+          <div className="max-w-5xl space-y-10">
+            <SettingsGroup title="Project Health">
               <ProjectAlerts
                 onSave={handleProjectSave}
                 defaultValues={projectDefaults}
               />
-            </Card>
-            <Card className="p-5 sm:p-6">
+            </SettingsGroup>
+            <SettingsGroup title="Domain Monitoring">
               <DomainAlerts
                 onSave={handleDomainSave}
                 defaultValues={domainDefaults}
               />
-            </Card>
-            <Card className="p-5 sm:p-6">
+            </SettingsGroup>
+            <SettingsGroup title="Backup Monitoring">
               <BackupAlerts
                 onSave={handleBackupSave}
                 defaultValues={backupDefaults}
               />
-            </Card>
-            <Card className="p-5 sm:p-6">
+            </SettingsGroup>
+            <SettingsGroup title="Route Monitoring">
               <RouteAlerts
                 onSave={handleRouteSave}
                 defaultValues={routeDefaults}
               />
-            </Card>
+            </SettingsGroup>
           </div>
         )
       case 'notifications':
         return (
-          <div className="space-y-8">
-            <Card className="p-6">
+          <div className="max-w-5xl space-y-10">
+            <SettingsGroup title="Notification Preferences">
               <NotificationSettings
                 onSave={handleNotificationSave}
                 defaultValues={notificationDefaults}
               />
-            </Card>
-            <Card className="p-6">
+            </SettingsGroup>
+            <SettingsGroup title="Weekly Digest">
               <WeeklyDigest
                 onSave={handleDigestSave}
                 defaultValues={digestDefaults}
               />
-            </Card>
+            </SettingsGroup>
           </div>
         )
       default:
@@ -1163,10 +1157,7 @@ export function MonitoringSettings() {
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        title="Monitoring & Alerts"
-        description="Configure monitoring thresholds and alert notifications"
-      />
+      <PageHeader title="Monitoring & Alerts" />
 
       {/* Mobile Select */}
       <div className="sm:hidden">
