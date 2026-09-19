@@ -7,14 +7,7 @@ import {
   createSlackProviderMutation,
   createWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  Button,
-  Callout,
-  PageContainer,
-  Status,
-  Wizard,
-  useUrlState,
-} from '@temps-sdk/ds'
+import { Button, Callout, Status, Wizard, useUrlState } from '@temps-sdk/ds'
 import { Badge } from '@/components/ui/badge'
 
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -325,148 +318,141 @@ export function AddNotificationProvider() {
     createCloudflareMutation.error
 
   return (
-    <PageContainer>
-      <Wizard
-        title="Add notification provider"
-        description="Choose a delivery method and configure where Temps sends notifications."
-        currentStep={currentStep}
-        steps={[
-          { id: 'provider-type', label: 'Choose provider' },
-          { id: 'configuration', label: 'Configure' },
-          { id: 'complete', label: 'Ready' },
-        ]}
-        footer={
-          currentStep === 'configuration' ? (
-            <>
-              <Button variant="ghost" disabled={isLoading} onClick={handleBack}>
-                <ArrowLeft className="size-4" /> Back
-              </Button>
-              <Button
-                type="submit"
-                form="add-notification-provider-form"
-                busy={isLoading}
-                busyLabel="Adding provider…"
-              >
-                Add provider
-              </Button>
-            </>
-          ) : (
-            <Button
-              variant="outline"
-              onClick={() =>
-                navigate(
-                  currentStep === 'complete'
-                    ? '/settings/notifications?tab=routes'
-                    : '/settings/notifications'
-                )
-              }
-            >
-              {currentStep === 'complete'
-                ? 'View notification routes'
-                : 'Cancel'}
+    <Wizard
+      title="Add notification provider"
+      description="Choose a delivery method and configure where Temps sends notifications."
+      currentStep={currentStep}
+      steps={[
+        { id: 'provider-type', label: 'Choose provider' },
+        { id: 'configuration', label: 'Configure' },
+        { id: 'complete', label: 'Ready' },
+      ]}
+      footer={
+        currentStep === 'configuration' ? (
+          <>
+            <Button variant="ghost" disabled={isLoading} onClick={handleBack}>
+              <ArrowLeft className="size-4" /> Back
             </Button>
-          )
-        }
-      >
-        {currentStep === 'provider-type' && (
-          <div className="space-y-5">
-            <h2
-              ref={headingRef}
-              tabIndex={-1}
-              className="text-lg font-semibold outline-none"
+            <Button
+              type="submit"
+              form="add-notification-provider-form"
+              busy={isLoading}
+              busyLabel="Adding provider…"
             >
-              How should notifications reach you?
-            </h2>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {providerOptions.map((provider) => (
-                <Button
-                  key={provider.id}
-                  variant="outline"
-                  disabled={!provider.available}
-                  onClick={() => handleProviderSelect(provider.id)}
-                  className={cn(
-                    'h-auto justify-start gap-3 whitespace-normal p-4 text-left',
-                    selectedProvider === provider.id && 'border-primary'
-                  )}
+              Add provider
+            </Button>
+          </>
+        ) : (
+          <Button
+            variant="outline"
+            onClick={() =>
+              navigate(
+                currentStep === 'complete'
+                  ? '/settings/notifications?tab=routes'
+                  : '/settings/notifications'
+              )
+            }
+          >
+            {currentStep === 'complete' ? 'View notification routes' : 'Cancel'}
+          </Button>
+        )
+      }
+    >
+      {currentStep === 'provider-type' && (
+        <div className="space-y-5">
+          <h2
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-lg font-semibold outline-none"
+          >
+            How should notifications reach you?
+          </h2>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {providerOptions.map((provider) => (
+              <Button
+                key={provider.id}
+                variant="outline"
+                disabled={!provider.available}
+                onClick={() => handleProviderSelect(provider.id)}
+                className={cn(
+                  'h-auto justify-start gap-3 whitespace-normal p-4 text-left',
+                  selectedProvider === provider.id && 'border-primary'
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  className="flex size-10 shrink-0 items-center justify-center rounded-md border"
                 >
-                  <span
-                    aria-hidden="true"
-                    className="flex size-10 shrink-0 items-center justify-center rounded-md border"
-                  >
-                    {provider.icon}
+                  {provider.icon}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium">{provider.name}</span>
+                  <span className="mt-1 block text-sm font-normal text-muted-foreground">
+                    {provider.description}
                   </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-medium">{provider.name}</span>
-                    <span className="mt-1 block text-sm font-normal text-muted-foreground">
-                      {provider.description}
-                    </span>
-                    {!provider.available && (
-                      <Badge variant="secondary" className="mt-2">
-                        Coming soon
-                      </Badge>
-                    )}
-                  </span>
-                  {provider.available && (
-                    <ArrowRight
-                      aria-hidden="true"
-                      className="size-4 shrink-0"
-                    />
+                  {!provider.available && (
+                    <Badge variant="secondary" className="mt-2">
+                      Coming soon
+                    </Badge>
                   )}
-                </Button>
-              ))}
-            </div>
+                </span>
+                {provider.available && (
+                  <ArrowRight aria-hidden="true" className="size-4 shrink-0" />
+                )}
+              </Button>
+            ))}
           </div>
-        )}
-        {currentStep === 'configuration' && selectedProvider && (
-          <div className="space-y-6">
-            <h2
-              ref={headingRef}
-              tabIndex={-1}
-              className="text-lg font-semibold outline-none"
-            >
-              Configure {providerLabels[selectedProvider]}
-            </h2>
-            {mutationError && (
-              <Callout tone="error" title="Could not add provider">
-                Check the configuration and try again.{' '}
-                {mutationError instanceof Error ? mutationError.message : ''}
-              </Callout>
-            )}
-            <ProviderForm
-              form={form}
-              onSubmit={async (data) => {
-                if (isLoading) return
-                try {
-                  await onSubmit(data)
-                } catch {
-                  /* Mutation state renders the retryable error above. */
-                }
-              }}
-              isLoading={isLoading}
-              isEdit={false}
-              formId="add-notification-provider-form"
-              hideSubmit
-              hideProviderType
-            />
-          </div>
-        )}
-        {currentStep === 'complete' && (
-          <div className="space-y-4">
-            <h2
-              ref={headingRef}
-              tabIndex={-1}
-              className="text-lg font-semibold outline-none"
-            >
-              Provider added
-            </h2>
-            <Status tone="ok" label="Ready to send notifications" />
-            <p className="text-sm text-muted-foreground">
-              A route for all notifications was created. Opening notification
-              routes…
-            </p>
-          </div>
-        )}
-      </Wizard>
-    </PageContainer>
+        </div>
+      )}
+      {currentStep === 'configuration' && selectedProvider && (
+        <div className="space-y-6">
+          <h2
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-lg font-semibold outline-none"
+          >
+            Configure {providerLabels[selectedProvider]}
+          </h2>
+          {mutationError && (
+            <Callout tone="error" title="Could not add provider">
+              Check the configuration and try again.{' '}
+              {mutationError instanceof Error ? mutationError.message : ''}
+            </Callout>
+          )}
+          <ProviderForm
+            form={form}
+            onSubmit={async (data) => {
+              if (isLoading) return
+              try {
+                await onSubmit(data)
+              } catch {
+                /* Mutation state renders the retryable error above. */
+              }
+            }}
+            isLoading={isLoading}
+            isEdit={false}
+            formId="add-notification-provider-form"
+            hideSubmit
+            hideProviderType
+          />
+        </div>
+      )}
+      {currentStep === 'complete' && (
+        <div className="space-y-4">
+          <h2
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-lg font-semibold outline-none"
+          >
+            Provider added
+          </h2>
+          <Status tone="ok" label="Ready to send notifications" />
+          <p className="text-sm text-muted-foreground">
+            A route for all notifications was created. Opening notification
+            routes…
+          </p>
+        </div>
+      )}
+    </Wizard>
   )
 }

@@ -40,7 +40,7 @@ for (const [path, endpoint, fromKey, toKey] of cases) {
         exact: true,
       })
       await expect(control).toBeVisible()
-      for (const preset of ['1h', '6h', '1d', '7d'])
+      for (const preset of ['1h', '6h', '24h', '7d'])
         await expect(
           control.getByRole('button', { name: preset, exact: true })
         ).toBeVisible()

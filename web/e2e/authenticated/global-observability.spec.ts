@@ -149,7 +149,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         await page.getByRole('option', { name: /Storefront/ }).click()
       }
       await expect(page).toHaveURL(/project_id=1/)
-      for (const preset of ['1h', '6h', '1d', '7d'])
+      for (const preset of ['1h', '6h', '24h', '7d'])
         await expect(
           page.getByRole('button', { name: preset, exact: true })
         ).toBeVisible()
@@ -286,7 +286,9 @@ for (const width of [1440, 390]) {
         })
     )
     await page.goto('/logs')
-    const warning = page.getByRole('status').filter({ hasText: 'Scan limit reached' })
+    const warning = page
+      .getByRole('status')
+      .filter({ hasText: 'Scan limit reached' })
     await expect(warning).toBeVisible()
     await expect(warning).toContainText('Showing partial results.')
     await expect(warning).toContainText('Use Next page to continue')
@@ -388,10 +390,10 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await page.keyboard.press('Escape')
-    await page.getByRole('button', { name: '1d', exact: true }).click()
+    await page.getByRole('button', { name: '24h', exact: true }).click()
     await expect(page).toHaveURL(/range=1d/)
     await expect(
-      page.getByRole('button', { name: '1d', exact: true })
+      page.getByRole('button', { name: '24h', exact: true })
     ).toHaveAttribute('aria-pressed', 'true')
   })
 }
