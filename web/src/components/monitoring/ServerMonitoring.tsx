@@ -798,27 +798,26 @@ function SectionIntro({
   return (
     <PageHeader
       title="Server"
-      description={
-        <>
-          {paused
-            ? 'Updates paused'
-            : ageSeconds != null
-              ? `Updated ${formatAge(ageSeconds)} ago`
-              : 'Waiting for a sample'}
-          <HelpPopover label="About server metrics">
-            <p>
-              Resource usage of the control-plane host. Samples are collected
-              every {formatAge(scrapeInterval)} and refreshed every 30 seconds.
-            </p>
-            <p>
-              Hover or focus a chart and use the arrow keys to compare every
-              panel at the same instant.
-            </p>
-          </HelpPopover>
-        </>
-      }
       actions={
         <div className="flex shrink-0 flex-wrap items-center gap-1">
+          <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
+            {paused
+              ? 'Updates paused'
+              : ageSeconds != null
+                ? `Updated ${formatAge(ageSeconds)} ago`
+                : 'Waiting for a sample'}
+            <HelpPopover label="About server metrics">
+              <p>
+                Resource usage of the control-plane host. Samples are collected
+                every {formatAge(scrapeInterval)} and refreshed every 30
+                seconds.
+              </p>
+              <p>
+                Hover or focus a chart and use the arrow keys to compare every
+                panel at the same instant.
+              </p>
+            </HelpPopover>
+          </div>
           <Button
             variant="outline"
             size="sm"
