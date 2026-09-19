@@ -717,6 +717,57 @@ pub async fn record_link_connected_audit(audit: &dyn AuditLogger, actor: CloudEn
     write_cloud_link_audit(audit, actor, "CLOUD_LINK_CONNECTED", None, None).await;
 }
 
+/// `CLOUD_BACKEND_URL_BOOTSTRAPPED` — written when the `TEMPS_CLOUD_BACKEND_URL`
+/// one-shot bootstrap input persists a non-default `cloud.backend_url` before
+/// the unattended enrollment it enables runs. A distinct event from
+/// `CLOUD_LINK_CONNECTED`: this one records a *configuration* change (which
+/// Cloud tenant this instance will ever talk to), separately from the
+/// credential the enrollment that follows may or may not establish. Only ever
+/// written with [`CloudEnrollmentActor::UnattendedBootstrap`] today -- there
+/// is no operator-facing way to set this field yet -- but takes the actor
+/// like every other Cloud audit event so that changes if one is added.
+#[derive(Debug, Serialize)]
+struct CloudBackendUrlBootstrappedAudit {
+    context: CloudAuditActor,
+    backend_url: String,
+}
+
+impl AuditOperation for CloudBackendUrlBootstrappedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_BACKEND_URL_BOOTSTRAPPED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
+
+pub async fn record_backend_url_bootstrapped_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    backend_url: &str,
+) {
+    let event = CloudBackendUrlBootstrappedAudit {
+        context: actor.into(),
+        backend_url: backend_url.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            backend_url,
+            "failed to record CLOUD_BACKEND_URL_BOOTSTRAPPED audit event"
+        );
+    }
+}
+
 /// The managed-backup half of [`record_enrollment_audit`]: one of the
 /// `cloud.backup_credential.*` events when
 /// [`CloudService::provision_managed_backups_after_enrollment`] changed
@@ -1287,6 +1338,28 @@ mod tests {
             rows(&audit),
             vec![(
                 "CLOUD_LINK_CONNECTED".to_string(),
+                None,
+                None,
+                UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_url_bootstrap_records_the_url_with_no_user_actor() {
+        let audit = actor_recorder();
+
+        record_backend_url_bootstrapped_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.staging.example",
+        )
+        .await;
+
+        assert_eq!(
+            rows(&audit),
+            vec![(
+                "CLOUD_BACKEND_URL_BOOTSTRAPPED".to_string(),
                 None,
                 None,
                 UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),

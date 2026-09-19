@@ -1483,6 +1483,58 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(current)
     }
 
+    /// Atomically set only `cloud.backend_url`, leaving the rest of the
+    /// shared settings row untouched. Mirrors [`Self::update_cloud_features`]'s
+    /// locked read-modify-write for the same reason: the settings row is
+    /// shared, and a `get_settings`/`update_settings` round trip through the
+    /// 5s cache would lose a concurrent unrelated write.
+    ///
+    /// Used by the `TEMPS_CLOUD_BACKEND_URL` one-shot bootstrap input, which
+    /// runs once at first boot before any admin has touched Cloud settings --
+    /// the caller is responsible for validating `backend_url` first (see
+    /// `CloudService::apply_bootstrap_backend_url`); this just persists it.
+    pub async fn set_cloud_backend_url(
+        &self,
+        backend_url: &str,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.backend_url = backend_url.to_string();
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
     /// Atomically update only the geolocation section of the shared settings
     /// row.
     ///
@@ -3564,5 +3616,49 @@ mod tests {
             "strict.example.com"
         );
         temps_core::tls::set_insecure_tls(false);
+    }
+
+    /// The `TEMPS_CLOUD_BACKEND_URL` bootstrap path's only write: confirms
+    /// `set_cloud_backend_url` persists just that one field, round trips
+    /// through the cache, and leaves unrelated settings (here, the preview
+    /// domain) untouched.
+    #[tokio::test]
+    async fn set_cloud_backend_url_persists_and_round_trips() {
+        let mut row = settings_row("example.test");
+        let mut initial = AppSettings::from_json(row.data.clone());
+        initial.cloud.backend_url = "https://app.temps.sh".to_string();
+        row.data = initial.to_json();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let returned = svc
+            .set_cloud_backend_url("https://cloud.staging.example")
+            .await
+            .expect("set_cloud_backend_url");
+        assert_eq!(returned.cloud.backend_url, "https://cloud.staging.example");
+        assert_eq!(
+            returned.preview_domain, "example.test",
+            "unrelated settings must survive the targeted write"
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("cloud.staging.example"), "{update_sql}");
     }
 }

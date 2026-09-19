@@ -843,6 +843,32 @@ impl CloudService {
             .map_err(CloudServiceError::Client)
     }
 
+    /// Apply the `TEMPS_CLOUD_BACKEND_URL` one-shot bootstrap input: validate
+    /// `url` with the same rule [`Self::status`]/[`Self::capability`] apply to
+    /// `cloud.backend_url`, then persist it via
+    /// [`ConfigService::set_cloud_backend_url`] so the enrollment that follows
+    /// (`enroll_link_if_unlinked`, via [`Self::configure_link_for_enrollment`])
+    /// reads it back from settings and points the link at it.
+    ///
+    /// Deliberately does not itself decide whether enrollment should run --
+    /// that is `run_cloud_enrollment_bootstrap`'s job in `temps-cli`, kept
+    /// thin by calling this and then the existing enroll path. Returns
+    /// [`CloudServiceError::InvalidBackend`] without writing anything if `url`
+    /// fails validation, so an operator's typo in the bootstrap input can
+    /// never point this instance's default Cloud settings at an unreachable
+    /// or malicious host.
+    pub async fn apply_bootstrap_backend_url(&self, url: &str) -> Result<(), CloudServiceError> {
+        parse_backend(
+            url,
+            self.allow_loopback_development || self.link.allows_loopback_development(),
+        )
+        .map_err(|error| CloudServiceError::InvalidBackend {
+            reason: error.to_string(),
+        })?;
+        self.config.set_cloud_backend_url(url).await?;
+        Ok(())
+    }
+
     /// Point the link at the configured backend and apply the feature
     /// switches from settings, so the enrollment that follows persists a
     /// credential for the right origin with the right exports enabled.
