@@ -310,7 +310,13 @@ impl ExternalPluginsService {
         selected: SelectedRepository,
         progress: Option<&ProgressHandle>,
     ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        if let Some(progress) = progress {
+            progress.advance(Stage::WaitingForLifecycle).await;
+        }
         let _lifecycle = self.lifecycle.lock().await;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
@@ -1086,6 +1092,86 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn repository_install_reports_actual_lifecycle_wait() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        ));
+        let progress = service
+            .register_install_progress("queued-install".into())
+            .await
+            .expect("register progress");
+        progress.advance(Stage::FetchingSource).await;
+        progress.complete_current().await;
+        let gate = service.lifecycle.lock().await;
+        let selected = SelectedRepository {
+            source: repository::RepositorySource {
+                repository: "https://github.com/example/plugin".into(),
+                name: "fixture-plugin".into(),
+                ref_name: "main".into(),
+                path: None,
+                commit: "a".repeat(40),
+                version: "1.0.0".into(),
+                source_dir: temp.path().to_path_buf(),
+            },
+            _temporary: tempfile::tempdir().expect("staging dir"),
+            name: "fixture-plugin".into(),
+        };
+        let installing_service = service.clone();
+        let installing_progress = progress.clone();
+        let install = tokio::spawn(async move {
+            installing_service
+                .install_repository_with_progress(selected, Some(&installing_progress))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = service
+                    .repository_install_progress("queued-install")
+                    .await
+                    .expect("progress exists");
+                if snapshot.stages.len() == 2 {
+                    assert_eq!(
+                        snapshot.stages[0].status,
+                        crate::install_progress::ProgressStatus::Completed
+                    );
+                    assert_eq!(snapshot.stages[1].stage, "waiting_for_lifecycle");
+                    assert_eq!(
+                        snapshot.stages[1].status,
+                        crate::install_progress::ProgressStatus::Running
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting stage visible before lock acquisition");
+        service.closing.store(true, Ordering::Release);
+        drop(gate);
+        assert!(matches!(
+            install.await.expect("install task"),
+            Err(ExternalPluginsError::ShuttingDown)
+        ));
+        let snapshot = service
+            .repository_install_progress("queued-install")
+            .await
+            .expect("progress remains");
+        assert_eq!(
+            snapshot.stages[1].status,
+            crate::install_progress::ProgressStatus::Completed
+        );
+    }
 
     #[tokio::test]
     async fn registry_install_cannot_replace_repository_source() {

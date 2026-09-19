@@ -71,3 +71,34 @@ test('successful install stops the last spinner while final progress catches up'
   expect(html).not.toContain('animate-spin')
   expect(html).not.toContain('first build')
 })
+
+test('queued installations show an active wait after source fetching completes', () => {
+  const html = renderToStaticMarkup(
+    <RepositoryInstallProgress
+      waitingSeconds={0}
+      progress={{
+        id: 'queued',
+        status: 'running',
+        elapsed_ms: 32000,
+        stages: [
+          {
+            stage: 'fetching_source',
+            message: 'Fetching repository source',
+            status: 'completed',
+            elapsed_ms: 2000,
+          },
+          {
+            stage: 'waiting_for_lifecycle',
+            message: 'Waiting for plugin operations',
+            status: 'running',
+            elapsed_ms: 30000,
+          },
+        ],
+      }}
+    />
+  )
+  expect(html).toContain('Waiting for plugin operations')
+  expect(html).toContain('animate-spin')
+  expect(html).toContain('Installing plugin')
+  expect(html).not.toContain('Plugin installed')
+})

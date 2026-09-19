@@ -43,6 +43,7 @@ pub struct ProgressSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     FetchingSource,
+    WaitingForLifecycle,
     PreparingBuilder,
     InstallingDependencies,
     PreparingRuntime,
@@ -56,6 +57,7 @@ impl Stage {
     fn label(self) -> (&'static str, &'static str) {
         match self {
             Self::FetchingSource => ("fetching_source", "Fetching repository source"),
+            Self::WaitingForLifecycle => ("waiting_for_lifecycle", "Waiting for plugin operations"),
             Self::PreparingBuilder => ("preparing_builder", "Preparing isolated builder"),
             Self::InstallingDependencies => ("installing_dependencies", "Installing dependencies"),
             Self::PreparingRuntime => ("preparing_runtime", "Preparing target runtime"),
@@ -71,7 +73,7 @@ impl Stage {
 pub enum ProgressError {
     #[error("Install progress ID '{id}' already exists")]
     Duplicate { id: String },
-    #[error("Install progress capacity is full ({MAX_ENTRIES} active or retained installs)")]
+    #[error("Install progress capacity is full ({MAX_ENTRIES} active installs)")]
     Full,
 }
 
@@ -83,6 +85,7 @@ struct StageEntry {
 }
 
 struct Entry {
+    registration: Arc<()>,
     started: Instant,
     ended: Option<Instant>,
     status: ProgressStatus,
@@ -98,6 +101,7 @@ pub struct InstallProgressStore {
 pub struct ProgressHandle {
     store: Arc<InstallProgressStore>,
     id: String,
+    registration: Arc<()>,
 }
 
 impl InstallProgressStore {
@@ -113,20 +117,31 @@ impl InstallProgressStore {
             return Err(ProgressError::Duplicate { id });
         }
         if entries.len() >= MAX_ENTRIES {
-            return Err(ProgressError::Full);
+            let oldest_finished = entries
+                .iter()
+                .filter_map(|(id, entry)| entry.ended.map(|ended| (id.clone(), ended)))
+                .min_by_key(|(_, ended)| *ended);
+            if let Some((oldest_id, _)) = oldest_finished {
+                entries.remove(&oldest_id);
+            } else {
+                return Err(ProgressError::Full);
+            }
         }
+        let registration = Arc::new(());
         entries.insert(
             id.clone(),
             Entry {
+                registration: registration.clone(),
                 started: now,
                 ended: None,
                 status: ProgressStatus::Running,
-                stages: Vec::with_capacity(8),
+                stages: Vec::with_capacity(9),
             },
         );
         Ok(ProgressHandle {
             store: self.clone(),
             id,
+            registration,
         })
     }
 
@@ -192,7 +207,8 @@ impl ProgressHandle {
         let Some(entry) = entries.get_mut(&self.id) else {
             return;
         };
-        if entry.status != ProgressStatus::Running
+        if !Arc::ptr_eq(&entry.registration, &self.registration)
+            || entry.status != ProgressStatus::Running
             || entry.stages.last().is_some_and(|last| last.stage == stage)
         {
             return;
@@ -219,7 +235,9 @@ impl ProgressHandle {
         let Some(entry) = entries.get_mut(&self.id) else {
             return;
         };
-        if entry.status != ProgressStatus::Running {
+        if !Arc::ptr_eq(&entry.registration, &self.registration)
+            || entry.status != ProgressStatus::Running
+        {
             return;
         }
         if let Some(last) = entry
@@ -238,7 +256,9 @@ impl ProgressHandle {
         let Some(entry) = entries.get_mut(&self.id) else {
             return;
         };
-        if entry.status != ProgressStatus::Running {
+        if !Arc::ptr_eq(&entry.registration, &self.registration)
+            || entry.status != ProgressStatus::Running
+        {
             return;
         }
         entry.status = if success {
@@ -345,18 +365,127 @@ mod tests {
         for index in 2..MAX_ENTRIES {
             store.register(index.to_string()).await.expect("capacity");
         }
+        store
+            .register("overflow".into())
+            .await
+            .expect("evict finished");
+        assert!(store.snapshot("first").await.is_none());
+        assert!(store.snapshot("second").await.is_some());
         assert!(matches!(
-            store.register("overflow".into()).await,
+            store.register("new".into()).await,
             Err(ProgressError::Full)
         ));
         store
             .entries
             .lock()
             .await
-            .get_mut("first")
-            .expect("first entry")
+            .get_mut("second")
+            .expect("second entry")
             .ended = Some(Instant::now() - RETAIN_FINISHED);
-        assert!(store.snapshot("first").await.is_none());
+        assert!(store.snapshot("second").await.is_none());
         assert!(store.register("new".into()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn more_than_capacity_finished_installs_evict_oldest_without_touching_active() {
+        let store = Arc::new(InstallProgressStore::default());
+        let active = store.register("active".into()).await.expect("active");
+        active.advance(Stage::FetchingSource).await;
+        for index in 0..(MAX_ENTRIES * 2) {
+            let id = format!("finished-{index}");
+            let handle = store.register(id).await.expect("finished slot");
+            handle.advance(Stage::FetchingSource).await;
+            handle.finish(index % 2 == 0).await;
+        }
+        assert_eq!(store.entries.lock().await.len(), MAX_ENTRIES);
+        assert!(store.snapshot("active").await.is_some());
+        assert!(store.snapshot("finished-0").await.is_none());
+        assert!(store.snapshot("finished-64").await.is_none());
+        assert_eq!(
+            store
+                .snapshot("finished-65")
+                .await
+                .expect("newer finished")
+                .status,
+            ProgressStatus::Failed
+        );
+        assert_eq!(
+            store
+                .snapshot("finished-126")
+                .await
+                .expect("newest completed")
+                .status,
+            ProgressStatus::Completed
+        );
+        assert!(matches!(
+            store.register("finished-127".into()).await,
+            Err(ProgressError::Duplicate { .. })
+        ));
+        store
+            .register("next".into())
+            .await
+            .expect("evict another finished");
+        assert!(store.snapshot("active").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn full_active_capacity_rejects_another_install() {
+        let store = Arc::new(InstallProgressStore::default());
+        for index in 0..MAX_ENTRIES {
+            store
+                .register(index.to_string())
+                .await
+                .expect("active slot");
+        }
+        assert!(matches!(
+            store.register("extra".into()).await,
+            Err(ProgressError::Full)
+        ));
+        assert_eq!(store.entries.lock().await.len(), MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn evicted_registration_cannot_mutate_reused_id() {
+        let store = Arc::new(InstallProgressStore::default());
+        let old = store
+            .register("reused".into())
+            .await
+            .expect("old registration");
+        old.advance(Stage::FetchingSource).await;
+        old.finish(true).await;
+        let old_guard = ProgressGuard::new(old.clone());
+        for index in 0..(MAX_ENTRIES - 1) {
+            store
+                .register(index.to_string())
+                .await
+                .expect("fill capacity");
+        }
+        let evict = store
+            .register("evict".into())
+            .await
+            .expect("evict old entry");
+        assert!(store.snapshot("reused").await.is_none());
+        evict.finish(true).await;
+        let current = store.register("reused".into()).await.expect("reuse ID");
+        current.advance(Stage::WaitingForLifecycle).await;
+        old.advance(Stage::Compiling).await;
+        old.complete_current().await;
+        old.finish(true).await;
+        old.finish(false).await;
+        drop(old_guard);
+        tokio::task::yield_now().await;
+        let snapshot = store.snapshot("reused").await.expect("current entry");
+        assert_eq!(snapshot.status, ProgressStatus::Running);
+        assert_eq!(snapshot.stages.len(), 1);
+        assert_eq!(snapshot.stages[0].stage, "waiting_for_lifecycle");
+        assert_eq!(snapshot.stages[0].status, ProgressStatus::Running);
+        current.advance(Stage::PreparingBuilder).await;
+        current.finish(false).await;
+        let snapshot = store
+            .snapshot("reused")
+            .await
+            .expect("current terminal entry");
+        assert_eq!(snapshot.status, ProgressStatus::Failed);
+        assert_eq!(snapshot.stages[1].stage, "preparing_builder");
     }
 }
