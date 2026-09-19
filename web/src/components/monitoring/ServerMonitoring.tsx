@@ -146,12 +146,16 @@ function UsageCard({
 }: UsageCardProps) {
   const tone = usageTone(percent, thresholds)
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="pb-2">
-        <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          {title}
-        </CardTitle>
-        <CardDescription>{description}</CardDescription>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {title}
+          </CardTitle>
+          <HelpPopover label={`About ${title.toLowerCase()}`}>
+            {description}
+          </HelpPopover>
+        </div>
       </CardHeader>
       <CardContent>
         {isPending ? (
@@ -161,7 +165,7 @@ function UsageCard({
           </div>
         ) : (
           <>
-            <div className="flex items-baseline justify-between gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span
                 className={cn(
                   'text-2xl font-semibold tracking-tight tabular-nums',
@@ -223,10 +227,14 @@ function ChartPanel({
   footer,
 }: ChartPanelProps) {
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>{description}</CardDescription>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-base">{title}</CardTitle>
+          <HelpPopover label={`About ${title.toLowerCase()} chart`}>
+            {description}
+          </HelpPopover>
+        </div>
       </CardHeader>
       <CardContent>
         {isPending ? (
@@ -298,7 +306,7 @@ function DockerDiskUsageCard() {
       )
     : 0
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0 pb-2">
         <div>
           <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -346,7 +354,7 @@ function DockerDiskUsageCard() {
           </div>
         ) : (
           <>
-            <div className="flex items-baseline justify-between gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span className="text-2xl font-semibold tracking-tight tabular-nums">
                 {formatBytesDecimal(usage.total_bytes)}
               </span>
@@ -572,7 +580,7 @@ export function ServerMonitoring() {
           paused={paused}
           onTogglePause={() => setPaused((p) => !p)}
         />
-        <Card>
+        <Card className="shadow-none">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -792,10 +800,20 @@ function SectionIntro({
       title="Server"
       description={
         <>
-          {paused ? 'Updates paused' : ageSeconds != null ? `Updated ${formatAge(ageSeconds)} ago` : 'Waiting for a sample'}
+          {paused
+            ? 'Updates paused'
+            : ageSeconds != null
+              ? `Updated ${formatAge(ageSeconds)} ago`
+              : 'Waiting for a sample'}
           <HelpPopover label="About server metrics">
-            <p>Resource usage of the control-plane host. Samples are collected every {formatAge(scrapeInterval)} and refreshed every 30 seconds.</p>
-            <p>Hover or focus a chart and use the arrow keys to compare every panel at the same instant.</p>
+            <p>
+              Resource usage of the control-plane host. Samples are collected
+              every {formatAge(scrapeInterval)} and refreshed every 30 seconds.
+            </p>
+            <p>
+              Hover or focus a chart and use the arrow keys to compare every
+              panel at the same instant.
+            </p>
           </HelpPopover>
         </>
       }

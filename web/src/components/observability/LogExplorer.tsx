@@ -15,7 +15,7 @@ import {
   TableHead,
   TableCell,
 } from '@/components/ui/table'
-import { Download, WrapText, X, Columns3 } from 'lucide-react'
+import { Download, WrapText, X, Columns3, ListFilter } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { logEnvironmentLabel } from '@/lib/log-environment'
 import { LogLevelBadge } from '@temps-sdk/ds'
@@ -77,6 +77,7 @@ export function LogExplorer({
   const opener = useRef<HTMLButtonElement | null>(null)
   const [selected, setSelected] = useState<string>()
   const wrap = params.get('wrap') === '1'
+  const showFacets = params.get('facets') === '1'
   useEffect(() => {
     if (selected) inspector.current?.focus()
   }, [selected])
@@ -156,7 +157,12 @@ export function LogExplorer({
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   return (
-    <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_264px]">
+    <div
+      className={cn(
+        'grid min-w-0 items-start gap-5',
+        (line || showFacets) && 'xl:grid-cols-[minmax(0,1fr)_264px]'
+      )}
+    >
       <section aria-label="Log explorer" className="min-w-0">
         {toolbar}
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2 pb-3">
@@ -165,6 +171,19 @@ export function LogExplorer({
             newest first
           </span>
           <div className="flex flex-wrap items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-expanded={showFacets && !line}
+              aria-controls="log-facets"
+              onClick={() => {
+                setSelected(undefined)
+                presentation('facets', showFacets && !line ? '0' : '1')
+              }}
+            >
+              <ListFilter className="mr-1.5 size-3.5" />
+              Filters
+            </Button>
             <div
               role="group"
               aria-label="Log presentation"
@@ -466,8 +485,12 @@ export function LogExplorer({
             </>
           )}
         </aside>
-      ) : (
-        <aside aria-label="Log facets" className="space-y-5 xl:sticky xl:top-4">
+      ) : showFacets ? (
+        <aside
+          id="log-facets"
+          aria-label="Log facets"
+          className="space-y-5 xl:sticky xl:top-4"
+        >
           <div>
             <h2 className="text-sm font-semibold">Facets</h2>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -547,7 +570,7 @@ export function LogExplorer({
             )
           })}
         </aside>
-      )}
+      ) : null}
     </div>
   )
 }
