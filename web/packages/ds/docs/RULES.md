@@ -228,6 +228,8 @@ outside the main workflow. Use existing semantic spacing and colors; help is not
 a new bordered card around every field.
 
 Use `SettingsSection` for collapsible form groups, not the informational
-`Disclosure`: it retains field values and reveals validation errors. Keep primary
-fields open by default. `Field.help` places optional context beside the label;
+`Disclosure`: it retains field values and reveals validation errors. Use open, plainly headed sections for everyday settings; separate groups with
+spacing instead of a card or divider around each one. Reserve collapsible form
+groups for advanced or infrequent controls. Keep short forms at a readable width
+(the settings reference uses `max-w-2xl`) rather than stretching inputs across the viewport. `Field.help` places optional context beside the label;
 required instructions and errors remain visible below the control.

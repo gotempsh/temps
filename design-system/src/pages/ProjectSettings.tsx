@@ -1,117 +1,67 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useRef, useState } from "react";
-import { Disclosure, Field, Settings, SettingsSection } from "@temps-sdk/ds";
-import { Settings2, Bell } from "lucide-react";
-import { Input } from "@temps-sdk/ui";
+import { useState, type ReactNode } from 'react'
+import { Button, Disclosure, Field, Settings } from '@temps-sdk/ds'
+import { Input, Switch, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@temps-sdk/ui'
 
-const INITIAL = { name: "checkout-api", notifyEmail: "" };
+const INITIAL = { url: 'https://console.example.com', domain: 'apps.example.com', email: 'ops@example.com', certificates: 'production', screenshots: true }
 
-/** Reference screen for the `Settings` template: `Field`s + sticky save bar. */
-export default function ProjectSettings() {
-  const [values, setValues] = useState(INITIAL);
-  const [baseline, setBaseline] = useState(INITIAL);
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(timer.current), []);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-
-  const dirty =
-    values.name !== baseline.name ||
-    values.notifyEmail !== baseline.notifyEmail;
-
-  const errors: Record<string, string | undefined> = {
-    name:
-      values.name.trim().length === 0 ? "Project name is required." : undefined,
-    notifyEmail:
-      values.notifyEmail && !values.notifyEmail.includes("@")
-        ? "Enter a valid email address."
-        : undefined,
-  };
-
-  const hasErrors = Object.values(errors).some(Boolean);
-
+function Group({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <Settings
-      title="Project settings"
-      description="Sample project"
-      errors={errors}
-      dirty={dirty && !hasErrors}
-      saving={saving}
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (hasErrors || !dirty || saving) return;
-        setSaved(false);
-        setSaving(true);
-        timer.current = setTimeout(() => {
-          setBaseline(values);
-          setSaving(false);
-          setSaved(true);
-        }, 900);
-      }}
-    >
-      <Disclosure label="About this example">
-        <p>
-          Try editing, validation, and saving. Changes stay in this example.
-        </p>
-      </Disclosure>
-      <SettingsSection
-        title="General"
-        icon={Settings2}
-        defaultOpen
-        hasError={!!errors.name}
-      >
-        <Field label="Project name" error={errors.name}>
-          {(fieldProps) => (
-            <Input
-              {...fieldProps}
-              readOnly={saving}
-              value={values.name}
-              onChange={(e) =>
-                setValues((v) => ({ ...v, name: e.target.value }))
-              }
-            />
-          )}
-        </Field>
-      </SettingsSection>
-      <SettingsSection
-        title="Notifications"
-        icon={Bell}
-        hasError={!!errors.notifyEmail}
-      >
-        <Field
-          label="Deploy notification email"
-          optional
-          help={{
-            label: "About deployment notifications",
-            content: "Sent when a deployment to this project fails.",
-          }}
-          error={errors.notifyEmail}
-        >
-          {(fieldProps) => (
-            <Input
-              {...fieldProps}
-              readOnly={saving}
-              type="email"
-              placeholder="you@example.com"
-              value={values.notifyEmail}
-              onChange={(e) =>
-                setValues((v) => ({ ...v, notifyEmail: e.target.value }))
-              }
-            />
-          )}
-        </Field>
-      </SettingsSection>
-      <p role="status" className="text-sm text-muted-foreground">
-        {saving
-          ? "Saving sample changes…"
-          : dirty
-            ? "You have unsaved changes."
-            : saved
-              ? "Sample changes saved."
-              : "No unsaved changes."}
-      </p>
+    <section className="min-w-0 space-y-5">
+      <h2 className="text-base font-semibold">{title}</h2>
+      <div className="min-w-0 space-y-5">{children}</div>
+    </section>
+  )
+}
+
+export default function ProjectSettings() {
+  const [values, setValues] = useState(INITIAL)
+  const [baseline, setBaseline] = useState(INITIAL)
+  const [saved, setSaved] = useState(false)
+  const [refreshed, setRefreshed] = useState(false)
+  const dirty = JSON.stringify(values) !== JSON.stringify(baseline)
+  let urlError: string | undefined
+  try { if (!['http:', 'https:'].includes(new URL(values.url).protocol)) urlError = 'Use an HTTP or HTTPS URL.' }
+  catch { urlError = 'Enter a valid URL.' }
+  const errors = { 'External URL': urlError, 'Contact email': values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email) ? 'Enter a valid email address.' : undefined }
+  return (
+    <Settings title="Platform settings" description="Interactive sample · changes stay in this example" dirty={dirty} errors={errors}
+      onSubmit={event => { event.preventDefault(); if (!dirty || Object.values(errors).some(Boolean)) return; setBaseline(values); setSaved(true) }}>
+      <div className="max-w-2xl space-y-10">
+        <Group title="Platform">
+          <Field label="External URL" error={urlError} help={{ label: 'About the external URL', content: 'Used for OAuth callbacks, webhooks, and external integrations.' }}>
+            {props => <Input {...props} type="url" value={values.url} onChange={e => setValues(v => ({ ...v, url: e.target.value }))} />}
+          </Field>
+          <Field label="Preview domain" description="New deployments receive a subdomain here.">
+            {props => <Input {...props} value={values.domain} onChange={e => setValues(v => ({ ...v, domain: e.target.value }))} />}
+          </Field>
+        </Group>
+        <Group title="Certificates">
+          <Field label="Contact email" optional error={errors['Contact email']} help={{ label: 'About certificate email', content: 'The certificate authority uses this address for account notices.' }}>
+            {props => <Input {...props} type="email" value={values.email} onChange={e => setValues(v => ({ ...v, email: e.target.value }))} />}
+          </Field>
+          <Field label="Certificate environment">
+            {props => <Select value={values.certificates} onValueChange={certificates => setValues(v => ({ ...v, certificates }))}>
+              <SelectTrigger {...props}><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="production">Production</SelectItem><SelectItem value="staging">Staging</SelectItem></SelectContent>
+            </Select>}
+          </Field>
+          {values.certificates === 'staging' && <p className="text-sm text-muted-foreground">Staging certificates are not trusted by browsers. Use them only for testing.</p>}
+        </Group>
+        <Group title="Screenshots">
+          <Field label="Capture deployment screenshots">
+            {props => <Switch {...props} checked={values.screenshots} onCheckedChange={screenshots => setValues(v => ({ ...v, screenshots }))} />}
+          </Field>
+          {values.screenshots && <Disclosure label="Capture details"><p>A screenshot is captured after each successful deployment. This sample does not run a capture.</p></Disclosure>}
+        </Group>
+        <Disclosure label="Troubleshooting">
+          <p>Refresh routes when a deployment or configuration change is out of sync.</p>
+          <Button type="button" variant="outline" onClick={() => setRefreshed(true)}>{refreshed ? 'Sample routes refreshed' : 'Refresh sample routes'}</Button>
+        </Disclosure>
+        <p role="status" className="text-sm text-muted-foreground">{dirty ? 'Unsaved changes' : saved ? 'Sample changes saved' : 'All changes saved'}</p>
+      </div>
     </Settings>
-  );
+  )
 }
