@@ -7,11 +7,9 @@ Follow root `DESIGN.md`, shared `web/src/components/ui/` primitives and
 specific design worktree/version, inspect and use that source instead, documenting its
 revision. Do not substitute a new visual identity or choose a package based on its name.
 
-As of the 2026-09-18 source review, `@temps-sdk/ds` is retained for existing operator-UI
-consumers; its README explicitly says it is **not** the current console design standard.
-Its old prototype and `.operator.ink.v1` skin are not equivalent to current console UI.
-Re-check that README before future integrations. Do not present an archived prototype or
-unpublished workspace export as the standard for all new plugins.
+The maintained `web/packages/ds` package codifies the console conventions; root
+`DESIGN.md` is authoritative. Use matching shared components and tokens, not the retired
+operator-ink prototype. Embedded workspaces follow the plugin layout rules in DESIGN.md.
 
 Use a published standalone component package only after verifying its exports, styles,
 peer dependencies and compatibility. Where console components are not independently
@@ -36,17 +34,25 @@ lookalikes just to avoid integrating their dependencies.
 4. Add a provenance file with upstream commit, paths, license and import-only adaptations.
    Build from a clean checkout and inspect button, checkbox, table and dialog states in
    both themes before designing the rest of the screen.
-5. Inspect the host's plugin iframe wrapper and SDK for an actual theme API. If none exists,
-   use `prefers-color-scheme` plus an explicit plugin toggle. If a message bridge exists,
-   match its schema and validate sender origin/source. Test host theme changes through the
-   real iframe before claiming automatic synchronization.
+5. Inherit the resolved host theme and live changes. Same-origin embedded UIs can read
+   the parent's root `dark` class and observe class changes with MutationObserver; clean
+   up the observer on unmount. A documented message bridge must validate origin/source.
+   Use `prefers-color-scheme` only for standalone previews. Do not add a plugin-specific
+   theme toggle or persist a competing theme preference. Test the real embedded path.
+
 
 ## Screen design
 
 Start with the primary user outcome. Choose a collection, record/detail, or settings
 layout. Use the shared page container/header, semantic colors, typography and controls:
 
-- A visible navigation entry and clear page title; no giant marketing hero inside the console.
+- The host owns plugin identity; do not repeat its name/description inside the iframe.
+- Multi-view plugins use an internal icon-and-label sidebar, adapting to a horizontally
+  scrollable navigation strip on mobile. Use compact view titles.
+- Separate paginated history lists from addressable detail views. Starting a job opens
+  its detail view; back navigation preserves the running job and history position.
+- Paginate URL/results collections too; clamp pages after filtering or deletion. Keep
+  navigation/toolbars visible and scroll the workspace body within the iframe height.
 - Shared tables for comparable records, local horizontal overflow, and responsive actions.
 - Text-labeled status badges; color must not be the only status signal.
 - Labels tied to controls, keyboard focus, pending states that prevent duplicate actions,
@@ -58,8 +64,7 @@ layout. Use the shared page container/header, semantic colors, typography and co
 
 Use the shared light/dark tokens and test controls, dialogs and portalled content in both
 themes. An iframe does not inherit the host document's CSS; include required styles/assets.
-Use a documented theme bridge if available, or a clear local/system-theme fallback, without
-claiming automatic host synchronization. Never trust arbitrary cross-origin messages as
+Use the host theme while embedded and a system-theme fallback only when standalone. Never trust arbitrary cross-origin messages as
 configuration.
 
 ## Asset delivery and navigation

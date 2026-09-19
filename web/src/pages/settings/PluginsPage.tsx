@@ -3,7 +3,20 @@
 
 import type { ReloadFailureResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
 import { Button } from '@/components/ui/button'
 import { PageHeader, Status } from '@temps-sdk/ds'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
@@ -38,8 +51,14 @@ import {
   Puzzle,
   RefreshCw,
   Shield,
+  MoreHorizontal,
+  ArrowUpRight,
+  GitPullRequest,
+  Trash2,
+  Tag,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { createElement, useEffect, useState } from 'react'
+import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
@@ -56,6 +75,8 @@ export function PluginsPage() {
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
+  const [updateName, setUpdateName] = useState<string | null>(null)
+  const [updatePending, setUpdatePending] = useState(false)
   const [permissionsName, setPermissionsName] = useState<string | null>(null)
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
@@ -111,6 +132,29 @@ export function PluginsPage() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
+      <Dialog
+        open={updateName !== null}
+        onOpenChange={(open) => {
+          if (!open && !updatePending) setUpdateName(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <GitPullRequest className="size-5" /> Update plugin
+            </DialogTitle>
+            <DialogDescription>
+              Choose the revision to build for {updateName}.
+            </DialogDescription>
+          </DialogHeader>
+          <RepositoryUpdate
+            name={updateName ?? ''}
+            disabled={managementPending}
+            onSensitiveError={handleSensitiveActionError}
+            onPendingChange={setUpdatePending}
+          />
+        </DialogContent>
+      </Dialog>
       <PluginPermissionsDialog
         name={permissionsName}
         open={canManagePlugins && permissionsName !== null}
@@ -215,13 +259,14 @@ export function PluginsPage() {
             className="space-y-3"
             aria-labelledby="running-plugins-title"
           >
-            <div className="flex items-baseline justify-between gap-4 border-b pb-3">
+            <div className="flex items-center justify-between gap-4">
               <div>
-                <h2 id="running-plugins-title" className="font-semibold">
+                <h2 id="running-plugins-title" className="sr-only">
                   Running
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Verified plugins currently loaded by Temps.
+                  {plugins.length} {plugins.length === 1 ? 'plugin' : 'plugins'}{' '}
+                  running
                 </p>
               </div>
               {canManagePlugins && (
@@ -262,63 +307,80 @@ export function PluginsPage() {
                 </Button>
               </div>
             ) : (
-              <div className="space-y-2">
+              <div className="divide-y rounded-lg border bg-card">
                 {plugins.map((plugin) => (
                   <div
                     key={plugin.name}
-                    className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between"
+                    className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between"
                   >
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-medium">
-                          {plugin.display_name || plugin.name}
-                        </p>
-                        <Badge variant="secondary">v{plugin.version}</Badge>
-                        <Status tone="ok" label="Running" />
+                    <div className="flex min-w-0 items-start gap-3">
+                      <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border bg-muted/40">
+                        {createElement(
+                          resolvePluginIcon(plugin.nav[0]?.icon ?? 'puzzle'),
+                          { className: 'size-5 text-muted-foreground' }
+                        )}
                       </div>
-                      {plugin.description && (
-                        <p className="mt-1 text-sm text-muted-foreground">
-                          {plugin.description}
-                        </p>
-                      )}
-                      <PluginNavigationHint nav={plugin.nav} />
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="font-medium">
+                            {plugin.display_name || plugin.name}
+                          </p>
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                            <Tag className="size-3" /> v{plugin.version}
+                          </span>
+                          <Status tone="ok" label="Running" />
+                        </div>
+                        {plugin.description && (
+                          <p className="mt-1 text-sm text-muted-foreground">
+                            {plugin.description}
+                          </p>
+                        )}
+                        <PluginNavigationHint nav={plugin.nav} />
+                      </div>
                     </div>
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
-                      {canManagePlugins && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Permissions for ${plugin.display_name || plugin.name}`}
-                          title="Plugin permissions"
-                          disabled={managementPending}
-                          onClick={() => setPermissionsName(plugin.name)}
-                        >
-                          <Shield className="size-4" aria-hidden="true" />
-                        </Button>
-                      )}
-                      {canManagePlugins && (
-                        <RepositoryUpdate
-                          name={plugin.name}
-                          disabled={managementPending}
-                          onSensitiveError={handleSensitiveActionError}
-                        />
-                      )}
                       {plugin.nav.some(
                         (entry) => entry.section !== 'project'
                       ) && (
                         <Button asChild variant="outline" size="sm">
-                          <Link to={`/plugins/${plugin.name}`}>Open</Link>
+                          <Link to={`/plugins/${plugin.name}`}>
+                            Open <ArrowUpRight className="ml-1 size-4" />
+                          </Link>
                         </Button>
                       )}
                       {canManagePlugins && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={managementPending}
-                          onClick={() => setUninstallName(plugin.name)}
-                        >
-                          Uninstall
-                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for ${plugin.display_name || plugin.name}`}
+                              disabled={managementPending}
+                            >
+                              <MoreHorizontal className="size-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onSelect={() => setUpdateName(plugin.name)}
+                            >
+                              <GitPullRequest className="mr-2 size-4" /> Update
+                              from GitHub
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => setPermissionsName(plugin.name)}
+                            >
+                              <Shield className="mr-2 size-4" /> Permissions
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onSelect={() => setUninstallName(plugin.name)}
+                            >
+                              <Trash2 className="mr-2 size-4" /> Uninstall
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                       )}
                     </div>
                   </div>

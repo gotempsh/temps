@@ -270,3 +270,13 @@ screens have been migrated.
 
 Exceptions require an explicit product decision. Update this document alongside
 the shared implementation rather than creating a competing design guide.
+
+## 9. Embedded plugin workspaces
+
+Plugins inherit the resolved Temps light/dark theme and follow live changes. They do not expose an independent theme toggle or persist a separate theme preference. Standalone previews may follow the OS preference.
+
+The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a horizontally scrollable navigation strip.
+
+Separate history lists from record details using addressable routes. Paginate history and result collections with shared responsive pagination, clamp pages after filtering or deletion, and preserve keyboard navigation. Starting a job opens its detail view; returning to history must not cancel it.
+
+Plugin workspaces fill the available iframe height. Navigation and the view toolbar remain visible while the content region scrolls. Do not stack the creation form, entire history, and expanded report on one page. Bound expanded diagnostics so long referrer lists do not push every other control out of reach.

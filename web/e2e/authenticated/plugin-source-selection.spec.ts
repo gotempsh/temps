@@ -59,6 +59,9 @@ test('changing a plugin ref clears the override and keeps its directory', async 
   })
   await page.goto('/settings/plugins')
   await page.getByRole('tab', { name: /Running/ }).click()
+  await expect(page.getByLabel('Update branch, tag, or commit')).toBeHidden()
+  await page.getByRole('button', { name: 'Actions for Nested fixture' }).click()
+  await page.getByRole('menuitem', { name: 'Update from GitHub' }).click()
   const field = page.getByLabel('Update branch, tag, or commit')
   await field.fill('release/v2')
   await page.getByRole('button', { name: 'Update from GitHub' }).click()
@@ -66,7 +69,7 @@ test('changing a plugin ref clears the override and keeps its directory', async 
   await expect(field).toHaveAttribute('placeholder', 'Keep release/v2')
   await page.getByRole('button', { name: 'Update from GitHub' }).click()
   await expect.poll(() => updates).toEqual([{ ref_name: 'release/v2' }, {}])
-  await expect(page.getByText('plugins/demo ·', { exact: false })).toBeVisible()
+  await expect(page.getByText('plugins/demo', { exact: true })).toBeVisible()
   await page.setViewportSize({ width: 390, height: 844 })
   await field.scrollIntoViewIfNeeded()
   expect(
