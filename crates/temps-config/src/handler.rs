@@ -2001,16 +2001,58 @@ impl CloudFieldsSent {
     }
 }
 
-/// Whether the client sent `multi_node.node_failover_after_secs`, read off the
-/// wire for the same reason as [`CloudFieldsSent`]: `PUT /settings` replaces the
-/// whole document and `#[serde(default)]` turns an absent key into `Some(300)`.
-/// Without this, an older client saving unrelated settings would silently reset
-/// a custom grace period — and turn an explicit `null` (automatic failover
-/// disabled) back on. An explicit `null` counts as sent.
-fn node_failover_after_secs_sent(body: &serde_json::Value) -> bool {
-    body.get("multi_node")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|multi_node| multi_node.contains_key("node_failover_after_secs"))
+/// The presence-sensitive part of a `PUT /settings` body, as a typed view.
+///
+/// `PUT /settings` replaces the whole document and `#[serde(default)]` turns an
+/// absent `multi_node.node_failover_after_secs` into `Some(300)`, so
+/// `AppSettings` alone cannot tell "the client did not mention it" from "the
+/// client wants the default". Without that distinction an older client saving
+/// unrelated settings would silently reset a custom grace period — and turn an
+/// explicit `null` (automatic failover disabled) back on.
+///
+/// The outer `Option` is presence, the inner one is the value: absent key ->
+/// `None`, explicit `null` -> `Some(None)`, a number -> `Some(Some(n))`. A plain
+/// `Option<Option<T>>` cannot express that — serde collapses `null` into the
+/// outer `None` — hence [`deserialize_present`].
+#[derive(Debug, Default, Deserialize)]
+struct SettingsWritePresence {
+    #[serde(default)]
+    multi_node: Option<MultiNodeWritePresence>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MultiNodeWritePresence {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    node_failover_after_secs: Option<Option<u64>>,
+}
+
+/// Deserialize a field that was present on the wire, keeping `null` as
+/// `Some(None)`. Only runs when the key exists; `#[serde(default)]` supplies
+/// the outer `None` when it does not.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl SettingsWritePresence {
+    /// Read presence from a settings body. A body this view cannot read (a
+    /// non-object `multi_node`, a non-numeric grace period) reports nothing as
+    /// sent: the full `AppSettings` deserialization rejects that same body
+    /// moments later, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        Self::deserialize(body).unwrap_or_default()
+    }
+
+    /// Whether the client sent `multi_node.node_failover_after_secs` at all.
+    /// An explicit `null` counts as sent.
+    fn node_failover_after_secs_sent(&self) -> bool {
+        self.multi_node
+            .as_ref()
+            .is_some_and(|multi_node| multi_node.node_failover_after_secs.is_some())
+    }
 }
 
 /// Keep the parts of the `cloud` block a generic settings write must not change:
@@ -2548,7 +2590,8 @@ async fn update_settings(
     // generic SettingsWrite requests, including full-document round trips.
     discard_plugin_reporting_consent(&mut body);
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
-    let node_failover_sent = node_failover_after_secs_sent(&body);
+    let node_failover_sent =
+        SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
     let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
         let field = e.path().to_string();
         ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3890,19 +3933,34 @@ mod tests {
     /// `node_failover_after_secs` must be told apart from an explicit `null`.
     #[test]
     fn node_failover_grace_presence_is_read_off_the_wire() {
-        assert!(!node_failover_after_secs_sent(&serde_json::json!({})));
-        assert!(!node_failover_after_secs_sent(&serde_json::json!({
-            "multi_node": { "require_mtls": true }
-        })));
-        assert!(!node_failover_after_secs_sent(&serde_json::json!({
-            "multi_node": null
-        })));
-        assert!(node_failover_after_secs_sent(&serde_json::json!({
+        let sent = |body: serde_json::Value| {
+            SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent()
+        };
+
+        assert!(!sent(serde_json::json!({})));
+        assert!(!sent(
+            serde_json::json!({ "multi_node": { "require_mtls": true } })
+        ));
+        assert!(!sent(serde_json::json!({ "multi_node": null })));
+        assert!(sent(serde_json::json!({
             "multi_node": { "node_failover_after_secs": 600 }
         })));
-        // Explicit null = "disable automatic failover", and must be honoured.
-        assert!(node_failover_after_secs_sent(&serde_json::json!({
+
+        // Explicit null = "disable automatic failover": present, with no value.
+        let disabled = SettingsWritePresence::from_settings_body(&serde_json::json!({
             "multi_node": { "node_failover_after_secs": null }
+        }));
+        assert!(disabled.node_failover_after_secs_sent());
+        assert_eq!(
+            disabled.multi_node.and_then(|m| m.node_failover_after_secs),
+            Some(None)
+        );
+
+        // A body the typed view cannot read reports nothing as sent; the full
+        // `AppSettings` deserialization is what rejects it.
+        assert!(!sent(serde_json::json!({ "multi_node": "not-an-object" })));
+        assert!(!sent(serde_json::json!({
+            "multi_node": { "node_failover_after_secs": "soon" }
         })));
     }
 
