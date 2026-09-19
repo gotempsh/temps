@@ -349,6 +349,16 @@ export function PluginsPage() {
                         </Button>
                       )}
                       {canManagePlugins && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setUpdateName(plugin.name)}
+                          disabled={managementPending}
+                        >
+                          <GitPullRequest className="mr-2 size-4" /> Update
+                        </Button>
+                      )}
+                      {canManagePlugins && (
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
                             <Button
@@ -361,12 +371,6 @@ export function PluginsPage() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              onSelect={() => setUpdateName(plugin.name)}
-                            >
-                              <GitPullRequest className="mr-2 size-4" /> Update
-                              from GitHub
-                            </DropdownMenuItem>
                             <DropdownMenuItem
                               onSelect={() => setPermissionsName(plugin.name)}
                             >
