@@ -19,6 +19,7 @@ pub mod grants;
 pub mod handler;
 pub mod host_api;
 pub mod install;
+pub mod install_progress;
 pub mod manager;
 pub mod plugin;
 pub mod proxy;

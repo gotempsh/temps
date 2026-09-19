@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::install_progress::{ProgressHandle, Stage};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -181,12 +182,32 @@ pub(crate) fn normalize_path(
     Ok(Some(path.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_source(
     repository_url: &str,
     reference: Option<&str>,
     path: Option<&str>,
     source_dir: PathBuf,
     expected_name: Option<&str>,
+) -> Result<RepositorySource, RepositoryError> {
+    fetch_source_with_progress(
+        repository_url,
+        reference,
+        path,
+        source_dir,
+        expected_name,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_source_with_progress(
+    repository_url: &str,
+    reference: Option<&str>,
+    path: Option<&str>,
+    source_dir: PathBuf,
+    expected_name: Option<&str>,
+    _progress: Option<&ProgressHandle>,
 ) -> Result<RepositorySource, RepositoryError> {
     let (owner, repo) = parse_repository(repository_url)?;
     if reference.is_some_and(|reference| !valid_git_ref(reference)) {
@@ -734,7 +755,19 @@ pub(crate) fn bun_target() -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<(), RepositoryError> {
+    build_with_progress(source, output, None).await
+}
+
+pub(crate) async fn build_with_progress(
+    source: &RepositorySource,
+    output: &Path,
+    progress: Option<&ProgressHandle>,
+) -> Result<(), RepositoryError> {
+    if let Some(progress) = progress {
+        progress.advance(Stage::PreparingBuilder).await;
+    }
     let run = |reason: String| RepositoryError::Build {
         repository: source.repository.clone(),
         commit: source.commit.clone(),
@@ -841,6 +874,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         }
         // Package resolution may use the network, but lifecycle scripts are
         // disabled. Disconnect before compiling attacker-controlled source.
+        if let Some(progress) = progress { progress.advance(Stage::InstallingDependencies).await; }
         let install = tokio::time::timeout(
             BUILD_TIMEOUT,
             Command::new("docker")
@@ -868,6 +902,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         // Bun downloads a cross-target runtime on first use. Prime that cache
         // with a fixed, installer-owned source while networking is available;
         // the repository's TypeScript is compiled only after disconnection.
+        if let Some(progress) = progress { progress.advance(Stage::PreparingRuntime).await; }
         let warmup = tokio::time::timeout(
             BUILD_TIMEOUT,
             Command::new("docker")
@@ -899,6 +934,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
                 String::from_utf8_lossy(&disconnect.stderr)
             )));
         }
+        if let Some(progress) = progress { progress.advance(Stage::Compiling).await; }
         let compile = tokio::time::timeout(
             BUILD_TIMEOUT,
             Command::new("docker")
@@ -943,6 +979,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         }
         // docker cp cannot inspect tmpfs paths under a read-only rootfs.
         // Stream the output through exec and enforce the same binary cap.
+        if let Some(progress) = progress { progress.advance(Stage::ExtractingBinary).await; }
         let mut export = Command::new("docker")
             .args(["exec", &id, "cat", "/work/plugin"])
             .stdout(Stdio::piped())

@@ -22,6 +22,7 @@ use crate::install::{
     normalize_digest, platform_target, validate_plugin_name, validate_release_for_install,
     validate_version, InstallError, PluginInstaller, RepositoryReceipt,
 };
+use crate::install_progress::{InstallProgressStore, ProgressHandle, ProgressSnapshot, Stage};
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
 use crate::repository::{self, RepositoryError};
@@ -47,6 +48,7 @@ pub struct ExternalPluginsService {
     /// must be committed in a single monotonic order with installations.
     registry_state: tokio::sync::Mutex<()>,
     source_catalog: crate::source_catalog::SourceCatalog,
+    install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     closing: AtomicBool,
@@ -140,6 +142,17 @@ pub struct RepositoryInstallOutcome {
 }
 
 impl ExternalPluginsService {
+    pub async fn register_install_progress(
+        &self,
+        id: String,
+    ) -> Result<ProgressHandle, crate::install_progress::ProgressError> {
+        self.install_progress.register(id).await
+    }
+
+    pub async fn repository_install_progress(&self, id: &str) -> Option<ProgressSnapshot> {
+        self.install_progress.snapshot(id).await
+    }
+
     pub async fn plugin_grants(
         &self,
         name: &str,
@@ -224,6 +237,18 @@ impl ExternalPluginsService {
         reference: Option<&str>,
         path: Option<&str>,
     ) -> Result<SelectedRepository, ExternalPluginsError> {
+        self.select_repository_with_progress(requested_name, repository_url, reference, path, None)
+            .await
+    }
+
+    pub async fn select_repository_with_progress(
+        &self,
+        requested_name: Option<&str>,
+        repository_url: &str,
+        reference: Option<&str>,
+        path: Option<&str>,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<SelectedRepository, ExternalPluginsError> {
         if let Some(name) = requested_name {
             validate_plugin_name(name)?;
         }
@@ -248,17 +273,24 @@ impl ExternalPluginsService {
                 path: staging.display().to_string(),
                 reason: error.to_string(),
             })?;
-        let source = repository::fetch_source(
+        if let Some(progress) = progress {
+            progress.advance(Stage::FetchingSource).await;
+        }
+        let source = repository::fetch_source_with_progress(
             repository_url,
             reference,
             path,
             temporary.path().join("source"),
             requested_name,
+            progress,
         )
         .await?;
         validate_plugin_name(&source.name)?;
         self.ensure_repository_identity(&source.name, repository_url, source.path.as_deref())
             .await?;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         Ok(SelectedRepository {
             name: source.name.clone(),
             source,
@@ -269,6 +301,14 @@ impl ExternalPluginsService {
     pub async fn install_repository(
         &self,
         selected: SelectedRepository,
+    ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        self.install_repository_with_progress(selected, None).await
+    }
+
+    pub async fn install_repository_with_progress(
+        &self,
+        selected: SelectedRepository,
+        progress: Option<&ProgressHandle>,
     ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
@@ -281,7 +321,10 @@ impl ExternalPluginsService {
         )
         .await?;
         let output = selected._temporary.path().join("plugin");
-        repository::build(&selected.source, &output).await?;
+        repository::build_with_progress(&selected.source, &output, progress).await?;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         let sha256 = crate::install::hash_regular_file_capped(
             &selected.name,
             &output,
@@ -307,6 +350,9 @@ impl ExternalPluginsService {
             &output,
         )
         .await?;
+        if let Some(progress) = progress {
+            progress.advance(Stage::StartingPlugin).await;
+        }
         let pending = match self
             .manager
             .prepare_candidate(
@@ -352,6 +398,9 @@ impl ExternalPluginsService {
                     });
                 }
             };
+        if let Some(progress) = progress {
+            progress.advance(Stage::PromotingPlugin).await;
+        }
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         let activation_rollback = match installer.capture_activation(&candidate).await {
             Ok(rollback) => rollback,
@@ -438,6 +487,7 @@ impl ExternalPluginsService {
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
+            install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
         }
     }
@@ -528,6 +578,7 @@ impl ExternalPluginsService {
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
+            install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
         }
     }

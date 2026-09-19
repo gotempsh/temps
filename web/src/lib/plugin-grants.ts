@@ -67,3 +67,10 @@ export const pluginPermissionLabels = {
   PluginGrantsValues['permissions'][number],
   { label: string; description: string }
 >
+
+/** Author-declared catalog requirements; runtime authorization remains host-owned. */
+export type PluginPermissionRequirement = {
+  permission: string
+  required: boolean
+  reason: string
+}

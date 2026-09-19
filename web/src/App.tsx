@@ -341,6 +341,11 @@ const OidcProviderDetailPage = lazy(() =>
     default: m.OidcProviderDetailPage,
   }))
 )
+const PluginInstallPage = lazy(() =>
+  import('./pages/settings/PluginInstallPage').then((m) => ({
+    default: m.PluginInstallPage,
+  }))
+)
 const PluginsPage = lazy(() =>
   import('./pages/settings/PluginsPage').then((m) => ({
     default: m.PluginsPage,
@@ -741,6 +746,10 @@ const FullAppRoutes = () => {
                         element={<NodeDetailPage />}
                       />
                       <Route path="plugins" element={<PluginsPage />} />
+                      <Route
+                        path="plugins/install"
+                        element={<PluginInstallPage />}
+                      />
                       <Route
                         path="otel-pipeline"
                         element={<OtelPipelineStatusPage />}

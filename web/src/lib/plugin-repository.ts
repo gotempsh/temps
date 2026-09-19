@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { z } from 'zod'
-import { pluginGrantsSchema } from './plugin-grants'
+import {
+  type PluginPermissionRequirement,
+  pluginGrantsSchema,
+} from './plugin-grants'
 
 export const repositoryInstallSchema = z.object({
   name: z
@@ -58,6 +61,7 @@ export type RepositorySelection = {
   commit: string
   path?: string | null
   ref?: string | null
+  permissions?: PluginPermissionRequirement[] | null
 }
 
 /** Catalog selection pins the reviewed revision, but never grants execution consent. */
