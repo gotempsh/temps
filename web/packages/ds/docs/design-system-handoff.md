@@ -458,3 +458,7 @@ capacity forecasts visible. No live configuration or route reload was submitted.
 Local before/after review captures six pages; images remain outside git because
 they contain real instance data. Charts and logs were captured at different times,
 so compare layout rather than data values.
+
+Notification providers now render as list items without a repeated Providers heading.
+Rows show type, sender/channel when available, recipient count, last update,
+and enabled state. Webhook credentials are never rendered; existing actions remain.
