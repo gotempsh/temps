@@ -62,7 +62,10 @@ flowchart TB
     EdgeA -. snapshot sync .-> API
     EdgeB -. snapshot sync .-> API
     Workers --> Databases[Database members on separate workers]
-    Workers -. local DNS role observers .-> Monitor[Independent database HA monitor]
+    ObserverA[Assigned observer A] --> Monitor[Independent database HA monitor]
+    ObserverB[Assigned observer B] --> Monitor
+    ObserverA -. signed role observations .-> Workers
+    ObserverB -. signed role observations .-> Workers
     Monitor --> Databases
 ```
 
@@ -152,6 +155,20 @@ The scheduler enforces aggregate budgets per worker and per monitor. Initial def
 
 An assigned observer queries the existing monitor through an authenticated, least-privilege channel and checks the selected member's actual database role and readiness. It does not promote databases, elect a primary, or infer authority from a TCP port being open. Provision this observation path before declaring the service HA-ready; the current monitor query's trust-auth assumption is not an acceptable general remote credential model.
 
+#### Console-independent observation transport
+
+Extend the agent listener with a worker-authenticated role-observation endpoint. Existing control-plane command endpoints remain restricted to control-plane identities. The new endpoint accepts only cluster node certificates and serves only observation envelopes for services present in the caller's persisted assignment. A caller cannot provide a monitor address, backend address, or arbitrary service identifier outside that assignment.
+
+Before HA mode becomes ready, a console compiles and distributes a versioned observation topology containing the service and membership revision, the two observer identities, node endpoints, certificate-authority chain, signing public keys, and two bounded dissemination trees rooted at different observers. Every node atomically persists this topology with its DNS membership snapshot. The normal control-plane sync path may update it while consoles are healthy, but it is not used to deliver role observations. A node without a valid persisted topology cannot report the service as console-outage ready.
+
+Observers publish immutable envelopes containing `cluster_id`, `service_id`, membership revision, assignment revision, observer node ID, monotonic sequence, observed time, validity deadline, selected member identity and role, and a hash of the monitor response used. The observer signs the envelope with its scoped node signing key. Receivers verify the cluster CA, observer assignment, signature, revisions, monotonic sequence, and deadline before applying it. Intermediate workers forward the original signed envelope without changing or re-signing it.
+
+Distribution uses direct worker connectivity over the supported private network or verified mesh. Each child long-polls its parent on both persisted trees and keeps only the newest valid envelope from each observer. A parent serves its cached envelope from memory and an atomically replaced disk snapshot, so forwarding does not require a console or metadata database. The node-wide transport caps parent connections, child connections, response size, and concurrent deliveries; each tree has a fixed maximum fanout of eight. Placement rejects a topology that would exceed a node's aggregate observation transport budget instead of silently adding connections.
+
+The two trees are independent delivery paths. Loss of one observer or one tree leaves the other path active. When both observers provide fresh results, their selected primary and membership revision must agree. A fresh result from one assigned observer is usable while the other path is unavailable; conflicting fresh results fail closed. If both paths are unavailable, cached answers remain usable only until the envelope deadline and then the resolver returns SERVFAIL. Workers do not elect replacement observers or rewrite the trees during a console outage; replacement is a control-plane operation after quorum returns.
+
+Cold-start recovery loads the topology but treats a persisted role envelope as untrusted until one configured parent supplies a newly verified envelope. This preserves the existing rule that a restart cannot revive an expired primary. HA mode therefore promises fresh role answers during total console outage only while at least one assigned observer, one dissemination path to each consuming worker, the database monitor, and the worker network remain healthy.
+
 Separate the resolver's console-owned membership zone from a local, short-lived role view. For services migrated to this mode, disable console publication of competing role aliases. The local observer is the only authority for their `primary.*` and `replica.*` answers. Merge at lookup time according to configured ownership; never let an old console snapshot overwrite fresher observations. Report observations to the console when available, without making publication depend on that acknowledgement.
 
 Require a fresh, unambiguous monitor observation and matching member role before advertising a new primary. No primary or multiple primary candidates means no writable alias; return SERVFAIL for an existing role name whose current answer cannot be established. Do not select the first apparent primary. These checks do not replace the configured HA orchestrator's fencing guarantees.
@@ -160,7 +177,7 @@ Role results expire independently of DNS TTL. Bound DNS response TTL by remainin
 
 Keep `<service>.temps.local` semantics as member discovery, not primary-only routing. Persist stable member names/addresses and recommend multi-host, role-validating clients where supported. Member discovery does not expire merely because role observation is unavailable; membership changes still need a console. Client pools must reconnect after promotion, and neither DNS nor a future L4 proxy can migrate established database sessions. Application caches that ignore TTL are outside the DNS recovery bound.
 
-Total console outage is supported for discovery among previously configured members while the monitor, observers, and worker network remain healthy. Creating members, replacing their addresses, rotating expired credentials, and changing policy still require the control plane. If the monitor also fails, Temps does not invent a replacement election protocol.
+Total console outage is supported for discovery among previously configured members while the monitor, at least one assigned observer, one persisted dissemination path to every consuming worker, and the worker network remain healthy. Creating members, replacing their addresses, reassigning observers or distribution trees, rotating expired credentials, and changing policy still require the control plane. If the monitor or every assigned observer fails, Temps does not invent a replacement election protocol.
 
 ### 7. Network and related ADR boundaries
 
@@ -178,7 +195,7 @@ These are target guarantees after the corresponding phases pass validation, not 
 |---|---|---|
 | One ingress lost | New connections use surviving ingress after external detection; connections through failed node drop | No console failover required |
 | One console lost | Unaffected | API requests retry elsewhere; controller/job ownership recovers with fencing |
-| All consoles lost | Running reachable replicas continue through cached ingress, within cert/policy validity | No deploys or new wake guarantees; autonomous role DNS continues for configured members if monitor/network survive |
+| All consoles lost | Running reachable replicas continue through cached ingress, within cert/policy validity | No deploys or new wake guarantees; autonomous role DNS continues for configured members while a monitor, assigned observer, and persisted worker dissemination path survive |
 | Metadata writer unavailable | Same cached traffic guarantee | Mutations stop until a correctly fenced writer returns; worker role observers do not depend on metadata DB |
 | One worker lost | Surviving app replicas serve after ingress ejection | Replacement scheduling needs console + metadata; singleton/local-volume workloads can fail |
 | Database primary lost | Apps may fail temporarily and must reconnect | Monitor/keepers perform failover; observers refresh aliases after safe promotion |
@@ -206,7 +223,7 @@ Recovery is not instantaneous. Measure ingress recovery as detection + endpoint 
 
 1. **Record current failure modes and establish the thin-console boundary.** Build on #1031 and track #1034 separately. Inventory every startup task, local filesystem dependency, probe, and mutation path. Verify no-workload console behavior. Add a visible HA readiness page even when prerequisites are missing.
 2. **Ship independently redundant ingress.** Add remote-worker proxy mode, durable route/policy/certificate snapshots, durable revisions, proxy-side health checks, and external-front-door documentation. Prove console-off traffic and cold-start recovery. Keep a single console supported here; label this ingress HA, not control-plane HA.
-3. **Ship worker probes and autonomous role DNS.** Implement authenticated observation configuration, explicit zone ownership, expiry, and role validation. Enable per service only after every consuming resolver supports the new protocol and acknowledges configuration. Prove primary failover with all consoles stopped.
+3. **Ship worker probes and autonomous role DNS.** Implement authenticated observation configuration, direct worker transport, persisted dissemination trees, explicit zone ownership, expiry, and role validation. Enable per service only after every consuming resolver supports the new protocol, acknowledges both topology paths, and receives a fresh signed observation. Prove primary failover with all consoles stopped.
 4. **Make mutations safe to replicate.** Add leases, worker-enforced authorization, durable jobs/outbox, migration ownership, distributed session state, shared artifacts, and takeover reconciliation. Audit all plugin startup loops before starting a second active console. Reuse existing durable claims where correct.
 5. **Enable and qualify multi-console deployments.** Introduce redundant API endpoint onboarding, rolling upgrade/drain behavior, and failure tests against HA metadata storage. Publish tested recovery measurements and limitations. Security-auditor sign-off is required before merging identity, remote-command, certificate, or fencing changes.
 
@@ -220,7 +237,7 @@ Unit tests cover lease expiry, fencing rejection, idempotency, stale observation
 
 * Kill ingress A under HTTP, TLS, streaming, and WebSocket traffic; verify new connections recover through B and record dropped established connections.
 * Stop all consoles, then restart an ingress from disk. Exercise app routes, static sites, authentication policies, and certificate validity boundaries.
-* With all consoles stopped, lose a database primary; verify promotion through the surviving monitor and fresh role answers on every consuming worker. Repeat with monitor loss, expired observations, asymmetric partitions, and client pools that cache DNS.
+* With all consoles stopped, lose a database primary; verify promotion through the surviving monitor and fresh role answers on every consuming worker. Kill each observer and each dissemination parent independently, restart resolvers from persisted topology, and verify one-path continuity plus fail-closed expiry when both paths are gone. Repeat with monitor loss, conflicting signed observations, expired/replayed envelopes, asymmetric partitions, and client pools that cache DNS.
 * Pause the controller beyond its lease, elect a successor, then resume it. Deliver the stale command before the new controller contacts that worker; assert rejection. Crash between remote side effect and acknowledgement; assert safe reconciliation without duplicate destructive work.
 * Fail over metadata PostgreSQL during claims/publication. Test missed notifications, equal-revision/different-content responses, database restore, and reconnecting clients against different consoles.
 * Partition worker paths while agent heartbeats remain healthy; distinguish path failure from workload failure. Stop every control-plane network interface to expose hidden tunnel dependencies.
