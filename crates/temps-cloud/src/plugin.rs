@@ -94,6 +94,19 @@ impl TempsPlugin for CloudPlugin {
                     "backup plugin not registered; Temps Cloud managed backup schedules unavailable"
                 ),
             }
+            // ADR-045 §4: hand over the auth plugin's `OidcService` so this
+            // plugin can provision/revoke the managed console-access
+            // provider. `get_service`, not `require_service`: a build with
+            // no auth plugin has no console to authenticate into, and must
+            // still start (`apply_console_oidc_config`/
+            // `revoke_console_oidc_provider` degrade to a logged no-op).
+            match context.get_service::<temps_auth::oidc_service::OidcService>() {
+                Some(oidc_service) => service.set_oidc_service(oidc_service),
+                None => tracing::info!(
+                    "auth plugin's OidcService not registered; Temps Cloud console access has \
+                     no managed OIDC provider to provision"
+                ),
+            }
             if cloud_initialization_succeeded(service.initialize().await) {
                 service.start_backup_mirror(
                     context.require_service::<sea_orm::DatabaseConnection>(),

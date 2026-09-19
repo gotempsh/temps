@@ -25750,6 +25750,12 @@
               "null"
             ]
           },
+          "progressId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ref_name": {
             "type": [
               "string",
@@ -30537,6 +30543,10 @@
           "jit_provisioning": {
             "type": "boolean"
           },
+          "managed_by_cloud": {
+            "description": "ADR-045 §4: true only for the provider Temps Cloud provisions for\nconsole access. The admin UI should disable edit/delete controls for\nsuch a row — the API itself refuses those requests regardless\n(`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -30567,7 +30577,8 @@
           "group_claim",
           "role_claim",
           "default_role",
-          "trust_idp_email"
+          "trust_idp_email",
+          "managed_by_cloud"
         ],
         "type": "object"
       },
@@ -34715,6 +34726,67 @@
         ],
         "type": "object"
       },
+      "ProgressSnapshot": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/ProgressStage"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "elapsed_ms",
+          "stages"
+        ],
+        "type": "object"
+      },
+      "ProgressStage": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "stage",
+          "message",
+          "status",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "ProgressStatus": {
+        "enum": [
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ProjectAccessResponse": {
         "properties": {
           "created_at": {
@@ -38667,6 +38739,26 @@
         ],
         "type": "object"
       },
+      "RepositoryCatalogPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/PluginHostPermission"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "permission",
+          "required",
+          "reason"
+        ],
+        "type": "object"
+      },
       "RepositoryCatalogPlugin": {
         "properties": {
           "author": {
@@ -38704,6 +38796,13 @@
               "string",
               "null"
             ]
+          },
+          "permissions": {
+            "description": "Author-declared capabilities for display only; never used to grant access.\nNone means the legacy catalog did not declare permissions.",
+            "items": {
+              "$ref": "#/components/schemas/RepositoryCatalogPermission"
+            },
+            "type": "array"
           },
           "platforms": {
             "items": {
@@ -97209,7 +97308,7 @@
     },
     "/projects/{project_id}/env-vars/resolved": {
       "get": {
-        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for plaintext (audit-logged).",
+        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for regular plaintext values (audit-logged). Marked secrets\ncannot be revealed.",
         "operationId": "get_resolved_environment_variables",
         "parameters": [
           {
@@ -117079,6 +117178,52 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryCatalogResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install/progress/{id}": {
+      "get": {
+        "operationId": "getRepositoryInstallProgress",
+        "parameters": [
+          {
+            "description": "Client-generated installation UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProgressSnapshot"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

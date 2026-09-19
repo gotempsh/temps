@@ -37,6 +37,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -71,6 +76,8 @@ function providerIcon(
       return SiGoogle
     case 'azure-ad':
       return Cloud
+    case 'temps_cloud':
+      return Cloud
     case 'generic':
     default:
       return Lock
@@ -80,9 +87,19 @@ function providerIcon(
 function formatTemplate(template?: string): string {
   if (!template) return 'Generic'
   if (template === 'azure-ad') return 'Azure AD'
+  if (template === 'temps_cloud') return 'Temps Cloud'
   if (template === 'generic') return 'Generic'
   return template.charAt(0).toUpperCase() + template.slice(1)
 }
+
+/**
+ * ADR-045 §4: tooltip shown on the disabled edit/delete controls for the
+ * provider Temps Cloud provisions for console access. Points at the one
+ * place that actually controls this row instead of leaving the operator to
+ * guess why the usual controls are greyed out.
+ */
+const MANAGED_BY_CLOUD_TOOLTIP =
+  'Managed by Temps Cloud. Turn off "Console access through Temps Cloud" on the Temps Cloud settings page to remove it.'
 
 export function AuthSettingsPage() {
   usePageTitle('Authentication')
@@ -244,6 +261,12 @@ export function AuthSettingsPage() {
                       <Badge variant="outline" className="shrink-0">
                         {formatTemplate(provider.template)}
                       </Badge>
+                      {provider.managed_by_cloud && (
+                        <Badge className="shrink-0 gap-1">
+                          <Cloud className="h-3 w-3" aria-hidden="true" />
+                          Managed by Temps Cloud
+                        </Badge>
+                      )}
                       {!provider.enabled && (
                         <Badge variant="secondary" className="shrink-0">
                           Disabled
@@ -256,18 +279,35 @@ export function AuthSettingsPage() {
                   </div>
                 </Link>
                 <div className="flex shrink-0 items-center gap-2">
-                  <Switch
-                    checked={provider.enabled}
-                    disabled={togglingThis}
-                    onCheckedChange={(checked) =>
-                      handleToggle(provider, checked)
-                    }
-                    aria-label={
-                      provider.enabled
-                        ? `Disable ${provider.name}`
-                        : `Enable ${provider.name}`
-                    }
-                  />
+                  {provider.managed_by_cloud ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span tabIndex={0}>
+                          <Switch
+                            checked={provider.enabled}
+                            disabled
+                            aria-label={`${provider.name} is managed by Temps Cloud`}
+                          />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {MANAGED_BY_CLOUD_TOOLTIP}
+                      </TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    <Switch
+                      checked={provider.enabled}
+                      disabled={togglingThis}
+                      onCheckedChange={(checked) =>
+                        handleToggle(provider, checked)
+                      }
+                      aria-label={
+                        provider.enabled
+                          ? `Disable ${provider.name}`
+                          : `Enable ${provider.name}`
+                      }
+                    />
+                  )}
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button
@@ -282,19 +322,38 @@ export function AuthSettingsPage() {
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem asChild>
                         <Link to={`/settings/auth/providers/${provider.id}`}>
-                          Configure
+                          {provider.managed_by_cloud ? 'View' : 'Configure'}
                         </Link>
                       </DropdownMenuItem>
-                      <DropdownMenuItem
-                        className="text-destructive focus:text-destructive"
-                        onSelect={(event) => {
-                          event.preventDefault()
-                          setDeleteTarget(provider)
-                        }}
-                      >
-                        <Trash2 className="mr-2 h-4 w-4" />
-                        Delete
-                      </DropdownMenuItem>
+                      {provider.managed_by_cloud ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span>
+                              <DropdownMenuItem
+                                disabled
+                                className="text-destructive focus:text-destructive"
+                              >
+                                <Trash2 className="mr-2 h-4 w-4" />
+                                Delete
+                              </DropdownMenuItem>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent side="left">
+                            {MANAGED_BY_CLOUD_TOOLTIP}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : (
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onSelect={(event) => {
+                            event.preventDefault()
+                            setDeleteTarget(provider)
+                          }}
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          Delete
+                        </DropdownMenuItem>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                   <Link

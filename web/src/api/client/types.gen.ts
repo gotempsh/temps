@@ -13829,6 +13829,13 @@ export type OidcProviderResponse = {
     id: number;
     issuer_url: string;
     jit_provisioning: boolean;
+    /**
+     * ADR-045 §4: true only for the provider Temps Cloud provisions for
+     * console access. The admin UI should disable edit/delete controls for
+     * such a row — the API itself refuses those requests regardless
+     * (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).
+     */
+    managed_by_cloud: boolean;
     name: string;
     role_claim: string;
     scopes: string;

@@ -3,6 +3,7 @@
 
 mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
+mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -609,6 +610,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000001_visitor_activity_reports::Migration),
             Box::new(m20260918_000001_visitor_activity_run_history::Migration),
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
+            Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
         ]
     }
 }

@@ -51,6 +51,12 @@ const OIDC_ERROR_MESSAGES: Record<string, string> = {
   role_invalid: 'The role assigned by the SSO provider is invalid.',
   role_mapping_not_found: 'No matching SSO role mapping.',
   provider_conflict: 'SSO provider configuration conflict.',
+  provider_managed_by_cloud:
+    'This SSO provider is managed by Temps Cloud and cannot be edited here.',
+  insufficient_role:
+    "Your Temps Cloud account doesn't have the owner or admin role on this instance. Ask an instance owner or admin to grant it, then try again.",
+  issuer_managed_by_cloud:
+    'This issuer is already used by the Temps Cloud-managed sign-in provider. Use "Continue with Temps Cloud" to sign in, or remove the Cloud link before adding a custom provider with this issuer.',
   internal_error:
     'An internal error occurred while processing the SSO callback.',
 }

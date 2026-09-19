@@ -57,6 +57,37 @@ pub enum OidcError {
     #[error("Invalid SSO role {role}: must be 'admin' or 'user'")]
     InvalidRole { role: String },
 
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud and cannot be edited manually"
+    )]
+    ManagedByCloudEdit { provider_id: i32, name: String },
+
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud and cannot be deleted manually"
+    )]
+    ManagedByCloudDelete { provider_id: i32, name: String },
+
+    /// ADR-045 §4 role gate: the provider requires `admin_only_role_required`
+    /// and the role resolved from claims was not `admin`. Refused outright
+    /// rather than falling through to `default_role`.
+    #[error(
+        "OIDC provider {provider_id} requires an admin-level role for login, but the resolved role was '{resolved_role}'"
+    )]
+    InsufficientRole {
+        provider_id: i32,
+        resolved_role: String,
+    },
+
+    /// SECURITY: refuses an ordinary provider create/edit that would point
+    /// its `issuer_url` at the same issuer as the Cloud-managed
+    /// console-access provider, which would create a second, unguarded
+    /// relying-party registration for that IdP -- see
+    /// `OidcService::assert_issuer_not_shadowing_managed_cloud_provider`.
+    #[error(
+        "Issuer URL '{issuer_url}' matches the Temps Cloud managed provider's issuer; a second provider on this issuer would not enforce its admin-only role gate"
+    )]
+    IssuerMatchesManagedCloudProvider { issuer_url: String },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -130,6 +161,19 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "Role '{role}' is invalid for Temps SSO mapping (use 'admin' or 'user')"
                 )),
+            OidcError::ManagedByCloudEdit { .. } | OidcError::ManagedByCloudDelete { .. } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("Managed By Temps Cloud")
+                    .with_detail(err.to_string())
+            }
+            OidcError::InsufficientRole { .. } => problem_new(StatusCode::FORBIDDEN)
+                .with_title("Insufficient Role")
+                .with_detail(err.to_string()),
+            OidcError::IssuerMatchesManagedCloudProvider { .. } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("Issuer Matches Managed Provider")
+                    .with_detail(err.to_string())
+            }
             OidcError::Database(err) => {
                 // Don't return the raw Sea-ORM error text to the
                 // caller: it can include table names, column names,

@@ -223,6 +223,7 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::State(_)
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
+        | CloudServiceError::ConsoleOidcProvisioning(_)
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -621,7 +622,8 @@ async fn disconnect_cloud(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    let (result, backup_credential_revoked) = state.service.disconnect().await.map_err(problem)?;
+    let (result, backup_credential_revoked, console_oidc_revoked) =
+        state.service.disconnect().await.map_err(problem)?;
     audit(
         &state,
         &auth,
@@ -637,6 +639,17 @@ async fn disconnect_cloud(
             &auth,
             &metadata,
             "cloud.backup_credential.revoked",
+            None,
+            None,
+        )
+        .await;
+    }
+    if console_oidc_revoked {
+        audit(
+            &state,
+            &auth,
+            &metadata,
+            "cloud.console_oidc_provider.revoked",
             None,
             None,
         )
