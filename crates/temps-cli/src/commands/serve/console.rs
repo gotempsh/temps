@@ -83,7 +83,7 @@ use tracing::{debug, error, info, warn};
 use temps_deployments::handlers::nodes::NodeAppState;
 use temps_deployments::jobs::node_health_check::{
     check_control_plane_resources, check_drain_completion, check_node_health, check_node_resources,
-    failover_offline_nodes, notify_nodes_offline, refresh_control_plane_metrics,
+    failover_due_nodes, notify_nodes_offline, refresh_control_plane_metrics,
 };
 use temps_deployments::services::node_service::NodeService;
 use utoipa_swagger_ui::SwaggerUi;
@@ -3922,6 +3922,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 // control-plane node shows live CPU/mem/disk (it has no agent
                 // heartbeat). Always runs, independent of alert config.
                 refresh_control_plane_metrics();
+                // Failover grace period (`None` = automatic failover disabled).
+                // If settings can't be read, keep the default rather than
+                // failing over faster — or not at all — than the operator expects.
+                let failover_after_secs = match &health_config_service {
+                    Some(config_service) => match config_service.get_settings().await {
+                        Ok(settings) => settings.multi_node.node_failover_after_secs,
+                        Err(e) => {
+                            tracing::error!(
+                                "Node health check: failed to read failover settings, using default: {}",
+                                e
+                            );
+                            temps_core::MultiNodeSettings::default().node_failover_after_secs
+                        }
+                    },
+                    None => temps_core::MultiNodeSettings::default().node_failover_after_secs,
+                };
                 let offline_ids = check_node_health(&health_node_service, health_db.as_ref()).await;
                 if !offline_ids.is_empty() {
                     tracing::info!(
@@ -3930,17 +3946,35 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     );
                     // Alert operators that worker node(s) went down (best-effort).
                     if let Some(ref alarm_service) = health_alarm_service {
-                        notify_nodes_offline(&offline_ids, &health_node_service, alarm_service)
-                            .await;
-                    }
-                    // Trigger failover redeployment for affected environments
-                    if let Some(ref deployment_service) = deployment_service_for_failover {
-                        failover_offline_nodes(
+                        notify_nodes_offline(
                             &offline_ids,
                             &health_node_service,
-                            deployment_service,
+                            alarm_service,
+                            failover_after_secs,
                         )
                         .await;
+                    }
+                }
+
+                // Fail over nodes that have stayed offline past the grace
+                // period. Decoupled from the offline transition above on
+                // purpose: a node that merely missed a heartbeat window keeps
+                // its workloads, and only a sustained outage moves them.
+                if let (Some(after_secs), Some(ref deployment_service)) =
+                    (failover_after_secs, &deployment_service_for_failover)
+                {
+                    let failed_over = failover_due_nodes(
+                        after_secs,
+                        &health_node_service,
+                        deployment_service,
+                        health_alarm_service.as_ref(),
+                    )
+                    .await;
+                    if !failed_over.is_empty() {
+                        tracing::info!(
+                            "Node health check: failed over workloads from {} node(s)",
+                            failed_over.len()
+                        );
                     }
                 }
 

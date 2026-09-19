@@ -5,9 +5,15 @@
 //! and triggers failover redeployment for affected environments.
 //!
 //! Runs on the control plane every 60 seconds. Nodes that haven't sent
-//! a heartbeat in >90 seconds are marked offline. When a node transitions
-//! to offline, its affected environments are automatically redeployed
-//! to healthy nodes.
+//! a heartbeat in >90 seconds are marked offline and operators are alerted.
+//!
+//! Failover is deliberately NOT tied to that transition. Going offline only
+//! means the control plane stopped hearing from the agent — a short network
+//! partition or a stalled control plane looks identical to a dead machine, and
+//! the node's containers usually keep serving traffic throughout. Redeploying
+//! every single-replica environment on the node is disruptive, so it waits
+//! until the node has been silent for `settings.multi_node
+//! .node_failover_after_secs` (default 300s) and runs once per outage.
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::collections::HashSet;
@@ -89,10 +95,15 @@ pub async fn check_node_health(node_service: &NodeService, db: &DatabaseConnecti
 /// configured channels). A node is only marked offline on the active->offline
 /// transition, so this fires exactly once per outage — no repeat spam while a
 /// node stays down. Best-effort: delivery failures are logged, never fatal.
+///
+/// `failover_after_secs` is the configured grace period (`None` = automatic
+/// failover disabled), so the alert states what will actually happen next
+/// instead of claiming workloads are already moving.
 pub async fn notify_nodes_offline(
     offline_node_ids: &[i32],
     node_service: &NodeService,
     alarm_service: &std::sync::Arc<AlarmService>,
+    failover_after_secs: Option<u64>,
 ) {
     for &node_id in offline_node_ids {
         let name = node_service
@@ -116,9 +127,11 @@ pub async fn notify_nodes_offline(
             severity: AlarmSeverity::Critical,
             title: format!("Worker node '{}' is offline", name),
             message: format!(
-                "Node '{}' (id {}) stopped sending heartbeats for over {}s and was marked offline. \
-                 Affected workloads are being failed over to healthy nodes.",
-                name, node_id, HEARTBEAT_STALE_THRESHOLD_SECS
+                "Node '{}' (id {}) stopped sending heartbeats for over {}s and was marked offline. {}",
+                name,
+                node_id,
+                HEARTBEAT_STALE_THRESHOLD_SECS,
+                offline_next_step(failover_after_secs)
             ),
             metadata: Some(serde_json::json!({
                 "node_id": node_id,
@@ -418,7 +431,117 @@ pub async fn check_drain_completion(node_service: &NodeService) -> Vec<i32> {
     }
 }
 
-/// Handle failover for nodes that just went offline.
+/// What happens to an offline node's workloads next, for the offline alert.
+fn offline_next_step(failover_after_secs: Option<u64>) -> String {
+    match failover_after_secs {
+        Some(secs) => format!(
+            "Its workloads stay where they are for now; if no heartbeat arrives within {}s of \
+             the last one, they will be failed over to healthy nodes.",
+            effective_failover_after_secs(secs)
+        ),
+        None => "Automatic failover is disabled (settings.multi_node.node_failover_after_secs), \
+                 so its workloads will not be moved."
+            .to_string(),
+    }
+}
+
+/// The failover grace period can never be shorter than the offline threshold:
+/// a node has to be offline before it can be failed over.
+fn effective_failover_after_secs(configured: u64) -> i64 {
+    i64::try_from(configured)
+        .unwrap_or(i64::MAX)
+        .max(HEARTBEAT_STALE_THRESHOLD_SECS)
+}
+
+/// Fail over offline nodes that have outlasted the grace period.
+///
+/// Runs every health tick, independent of the active->offline transition: a
+/// node marked offline several ticks ago becomes due here once its last
+/// heartbeat is older than `failover_after_secs`. The node is stamped
+/// `failover_at` BEFORE the redeploys are queued so a crash or restart mid-way
+/// cannot replay them on the next tick; if the stamp cannot be written the node
+/// is skipped and retried next tick rather than failed over unrecorded.
+///
+/// Returns the node IDs that were failed over.
+pub async fn failover_due_nodes(
+    failover_after_secs: u64,
+    node_service: &NodeService,
+    deployment_service: &DeploymentService,
+    alarm_service: Option<&std::sync::Arc<AlarmService>>,
+) -> Vec<i32> {
+    let after_secs = effective_failover_after_secs(failover_after_secs);
+    let due = match node_service.list_due_for_failover(after_secs).await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            tracing::error!("Failed to query offline nodes due for failover: {}", e);
+            return vec![];
+        }
+    };
+
+    let mut failed_over = Vec::new();
+    for node in &due {
+        if let Err(e) = node_service.mark_failed_over(node.id).await {
+            tracing::error!(
+                node_id = node.id,
+                node_name = %node.name,
+                "Failover: could not record failover for node, skipping this tick: {}",
+                e
+            );
+            continue;
+        }
+
+        tracing::warn!(
+            node_id = node.id,
+            node_name = %node.name,
+            last_heartbeat = ?node.last_heartbeat,
+            failover_after_secs = after_secs,
+            "Node stayed offline past the failover grace period, failing over its workloads"
+        );
+
+        if let Some(alarm_service) = alarm_service {
+            notify_node_failover(node.id, &node.name, after_secs, alarm_service).await;
+        }
+        failover_offline_nodes(&[node.id], node_service, deployment_service).await;
+        failed_over.push(node.id);
+    }
+
+    failed_over
+}
+
+/// Alert operators that an offline node's workloads are now being moved.
+/// Fires once per outage (guarded by `nodes.failover_at`). Best-effort.
+async fn notify_node_failover(
+    node_id: i32,
+    node_name: &str,
+    failover_after_secs: i64,
+    alarm_service: &std::sync::Arc<AlarmService>,
+) {
+    let request = FireAlarmRequest {
+        project_id: None,
+        environment_id: None,
+        deployment_id: None,
+        container_id: None,
+        service_id: None,
+        alarm_type: AlarmType::NodeFailover,
+        severity: AlarmSeverity::Critical,
+        title: format!("Failing over workloads from node '{}'", node_name),
+        message: format!(
+            "Node '{}' (id {}) has sent no heartbeat for over {}s. Environments with no healthy \
+             replica on another node are being redeployed to healthy nodes.",
+            node_name, node_id, failover_after_secs
+        ),
+        metadata: Some(serde_json::json!({
+            "node_id": node_id,
+            "node_name": node_name,
+        })),
+    };
+
+    if let Err(e) = alarm_service.fire_alarm(request).await {
+        tracing::error!(node_id, node_name = %node_name, "Failed to fire node-failover alarm: {}", e);
+    }
+}
+
+/// Handle failover for offline nodes (see [`failover_due_nodes`] for when).
 ///
 /// For each affected deployment:
 /// - If other nodes still have healthy replicas, just retire the containers
@@ -588,6 +711,7 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
@@ -672,6 +796,62 @@ mod tests {
 
         let marked = check_node_health(&node_service, &db).await;
         assert_eq!(marked, vec![5]);
+    }
+
+    // ── Failover grace period ────────────────────────────────────────────
+
+    #[test]
+    fn test_effective_failover_grace_never_below_offline_threshold() {
+        // A node must be offline before it can be failed over.
+        assert_eq!(
+            effective_failover_after_secs(10),
+            HEARTBEAT_STALE_THRESHOLD_SECS
+        );
+        assert_eq!(effective_failover_after_secs(300), 300);
+        assert_eq!(effective_failover_after_secs(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn test_offline_alert_states_what_happens_next() {
+        let with_grace = offline_next_step(Some(300));
+        assert!(with_grace.contains("300s"), "{with_grace}");
+        assert!(with_grace.contains("stay where they are"), "{with_grace}");
+
+        let disabled = offline_next_step(None);
+        assert!(disabled.contains("disabled"), "{disabled}");
+        assert!(disabled.contains("node_failover_after_secs"), "{disabled}");
+    }
+
+    #[tokio::test]
+    async fn test_list_due_for_failover_filters_offline_unfailed_past_grace() {
+        let due = make_node(7, "worker-7", "offline", 400);
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![due]])
+                .into_connection(),
+        );
+        let node_service = NodeService::new(db.clone());
+
+        let nodes = node_service
+            .list_due_for_failover(300)
+            .await
+            .expect("query should succeed");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 7);
+        drop(node_service);
+
+        // The grace gate lives in SQL: only offline nodes, never one already
+        // failed over, and only once the last heartbeat is older than the cutoff.
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let query = log.last().expect("the lookup must issue a statement");
+        let statement = &query.statements()[0];
+        let sql = &statement.sql;
+        assert!(sql.contains(r#""failover_at" IS NULL"#), "{sql}");
+        assert!(sql.contains(r#""last_heartbeat" <"#), "{sql}");
+        assert!(sql.contains(r#""status" ="#), "{sql}");
+        let values = format!("{:?}", statement.values);
+        assert!(values.contains("offline"), "{values}");
     }
 
     // ── Resource-alert threshold evaluation (resource_breaches) ──────────

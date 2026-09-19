@@ -73,6 +73,10 @@ pub enum AlarmType {
     DiskSpaceLow,
     /// A worker/agent node stopped responding to heartbeats.
     NodeOffline,
+    /// An offline node outlasted the failover grace period and its workloads
+    /// are being redeployed to healthy nodes. Separate from `NodeOffline` so
+    /// the two share no cooldown bucket — this one fires minutes after it.
+    NodeFailover,
     /// A worker/agent node's CPU/memory/disk usage crossed the configured
     /// threshold.
     NodeResourcePressure,
@@ -110,6 +114,7 @@ impl AlarmType {
             Self::VulnerabilityFound => "vulnerability_found",
             Self::DiskSpaceLow => "disk_space_low",
             Self::NodeOffline => "node_offline",
+            Self::NodeFailover => "node_failover",
             Self::NodeResourcePressure => "node_resource_pressure",
             Self::TraefikContainerDrift => "traefik_container_drift",
         }
@@ -140,6 +145,7 @@ impl AlarmType {
             "vulnerability_found" => Some(Self::VulnerabilityFound),
             "disk_space_low" => Some(Self::DiskSpaceLow),
             "node_offline" => Some(Self::NodeOffline),
+            "node_failover" => Some(Self::NodeFailover),
             "node_resource_pressure" => Some(Self::NodeResourcePressure),
             "traefik_container_drift" => Some(Self::TraefikContainerDrift),
             _ => None,
@@ -1353,6 +1359,7 @@ mod tests {
             AlarmType::VulnerabilityFound,
             AlarmType::DiskSpaceLow,
             AlarmType::NodeOffline,
+            AlarmType::NodeFailover,
             AlarmType::NodeResourcePressure,
             AlarmType::TraefikContainerDrift,
         ];

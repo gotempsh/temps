@@ -3606,6 +3606,7 @@
               "legacy_shared_token_enabled": true,
               "node_cpu_alert_percent": 90,
               "node_disk_alert_percent": 90,
+              "node_failover_after_secs": 300,
               "node_memory_alert_percent": 90,
               "private_address": null,
               "require_mtls": true
@@ -29499,6 +29500,16 @@
               "null"
             ]
           },
+          "node_failover_after_secs": {
+            "default": 300,
+            "description": "Seconds a worker node must go without a heartbeat before its workloads\nare failed over to healthy nodes. A node is reported offline (and\noperators alerted) well before this; the gap is a grace period so a\nbrief network partition or a control-plane stall does not redeploy a\nwhole node's worth of apps that never stopped serving. `None` disables\nautomatic failover entirely. Default 300.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "node_memory_alert_percent": {
             "default": 90,
             "description": "Memory-usage percent above which a worker node raises a resource alert.\n`None` disables memory alerting. Default 90.",
@@ -29564,6 +29575,15 @@
             "format": "double",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "node_failover_after_secs": {
+            "description": "Seconds without a heartbeat before a node's workloads are failed over;\n`None` = automatic failover disabled.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           },
