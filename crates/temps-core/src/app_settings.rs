@@ -264,6 +264,21 @@ pub struct CloudSettings {
     /// Explicit consent to send notifications through managed providers.
     pub notifications_enabled: bool,
 
+    /// ADR-045 §5: explicit consent to let Temps Cloud open this instance's
+    /// console over the console-proxy tunnel — no inbound port, but
+    /// interactive admin access relayed through a third party, with the
+    /// managed OIDC provider as the only sign-in path. Unlike
+    /// `telemetry_enabled`/`backups_enabled`, this is **not** always
+    /// operator-initiated: the unattended first-boot bootstrap
+    /// (`TEMPS_CLOUD_ENROLLMENT_CODE`, no operator present) sets this `true`
+    /// once, at the moment the link is established, and audits the decision
+    /// like any other write — see `CloudEnrollmentActor::UnattendedBootstrap`
+    /// in `temps-cloud`. An operator-pasted enrollment code leaves this at
+    /// its `false` default, matching `telemetry_enabled`/`backups_enabled`'s
+    /// "linking never enables export; settings are applied explicitly" rule.
+    #[serde(default)]
+    pub console_access_enabled: bool,
+
     /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
     /// backs Cloud-primary telemetry writes.
     ///
@@ -428,6 +443,10 @@ impl Default for CloudSettings {
             telemetry_enabled: false,
             backups_enabled: false,
             notifications_enabled: false,
+            // Set explicitly to `true` exactly once, by the unattended
+            // first-boot bootstrap path, at the moment it establishes a
+            // link — never by this default. See the field's doc comment.
+            console_access_enabled: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
             // ADR-042 §3: unthrottled by default. "Activate now" is what the
             // customer paid for, and a throttle nobody asked for makes a long
@@ -3010,6 +3029,13 @@ mod tests {
         assert!(!defaults.telemetry_enabled);
         assert!(!defaults.backups_enabled);
         assert!(!defaults.notifications_enabled);
+        // ADR-045 §5: console access defaults off just like the other three
+        // consent flags -- an instance never gets it merely by loading
+        // settings. The unattended first-boot bootstrap is the one path
+        // that flips it, and it does so through a dedicated, audited write
+        // (`CloudService::enable_console_access_for_unattended_bootstrap`),
+        // never through this default.
+        assert!(!defaults.console_access_enabled);
 
         let parsed = AppSettings::from_json(serde_json::json!({
             "cloud": {"backend_url": "https://cloud.example.com"}
@@ -3017,6 +3043,21 @@ mod tests {
         assert!(!parsed.cloud.telemetry_enabled);
         assert!(!parsed.cloud.backups_enabled);
         assert!(!parsed.cloud.notifications_enabled);
+        assert!(!parsed.cloud.console_access_enabled);
+
+        // A settings row written before this field existed (no `cloud.
+        // console_access_enabled` key at all) must deserialize as off
+        // rather than failing the whole settings read.
+        let legacy = AppSettings::from_json(serde_json::json!({
+            "cloud": {
+                "backend_url": "https://cloud.example.com",
+                "telemetry_enabled": true,
+                "backups_enabled": false,
+                "notifications_enabled": false
+            }
+        }));
+        assert!(!legacy.cloud.console_access_enabled);
+        assert!(legacy.cloud.telemetry_enabled);
     }
 
     #[test]

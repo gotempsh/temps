@@ -76,6 +76,11 @@ impl TempsPlugin for CloudPlugin {
             ));
             context.register_service(link);
             context.register_service(service);
+            // ADR-045 §3: the console router does not exist yet at this point
+            // of startup, so register an empty dispatch slot the host process
+            // fills once it has assembled the router (see `temps-cli`'s
+            // console startup). The worker reads the slot per request.
+            context.register_service(Arc::new(temps_cloud_client::ConsoleDispatchSlot::new()));
             Ok(())
         })
     }
@@ -94,6 +99,19 @@ impl TempsPlugin for CloudPlugin {
                     "backup plugin not registered; Temps Cloud managed backup schedules unavailable"
                 ),
             }
+            // ADR-045 §4: hand over the auth plugin's `OidcService` so this
+            // plugin can provision/revoke the managed console-access
+            // provider. `get_service`, not `require_service`: a build with
+            // no auth plugin has no console to authenticate into, and must
+            // still start (`apply_console_oidc_config`/
+            // `revoke_console_oidc_provider` degrade to a logged no-op).
+            match context.get_service::<temps_auth::oidc_service::OidcService>() {
+                Some(oidc_service) => service.set_oidc_service(oidc_service),
+                None => tracing::info!(
+                    "auth plugin's OidcService not registered; Temps Cloud console access has \
+                     no managed OIDC provider to provision"
+                ),
+            }
             if cloud_initialization_succeeded(service.initialize().await) {
                 service.start_backup_mirror(
                     context.require_service::<sea_orm::DatabaseConnection>(),
@@ -101,6 +119,12 @@ impl TempsPlugin for CloudPlugin {
                 );
                 service.start_backup_credential_rotation();
                 service.start_heartbeat_sender();
+                service.start_console_proxy_worker(
+                    context
+                        .require_service::<temps_cloud_client::ConsoleDispatchSlot>()
+                        .as_ref()
+                        .clone(),
+                );
                 service.start_backup_lifecycle_notify(
                     context.require_service::<dyn temps_core::JobQueue>(),
                 );

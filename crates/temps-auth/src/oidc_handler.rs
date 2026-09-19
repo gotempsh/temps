@@ -217,6 +217,45 @@ pub async fn oidc_callback(
                         err
                     );
                 }
+                OidcError::InsufficientRole {
+                    provider_id,
+                    resolved_role,
+                } => {
+                    // ADR-045 §4: this reached a real IdP identity and was
+                    // refused by the instance-side role gate -- a materially
+                    // different, more interesting failure than "credentials
+                    // never resolved to a user at all"
+                    // (`LoginAudit{success: false}`), so it gets its own
+                    // audit row rather than being folded into that one.
+                    warn!(
+                        target: "temps_auth::oidc::abuse",
+                        provider_id = provider_id,
+                        resolved_role = %resolved_role,
+                        ip = %metadata.ip_address,
+                        user_agent = %metadata.user_agent,
+                        "OIDC login denied: provider requires an admin-level role"
+                    );
+                    let provider_name = state
+                        .oidc_service
+                        .get_provider(*provider_id)
+                        .await
+                        .map(|provider| provider.name)
+                        .unwrap_or_else(|_| format!("provider {provider_id}"));
+                    if let Err(audit_error) = state
+                        .audit_service
+                        .create_audit_log(&crate::audit::OidcLoginDeniedAudit {
+                            user_id: None,
+                            ip_address: Some(metadata.ip_address.to_string()),
+                            user_agent: metadata.user_agent.as_str().to_string(),
+                            provider_id: *provider_id,
+                            provider_name,
+                            reason: "insufficient_role",
+                        })
+                        .await
+                    {
+                        error!(%audit_error, "Failed to create OIDC login-denied audit log");
+                    }
+                }
                 _ => {
                     warn!("OIDC callback failed: {}", err);
                 }
@@ -254,6 +293,11 @@ fn login_error_code_for(err: &OidcError) -> &'static str {
         OidcError::InvalidRole { .. } => "role_invalid",
         OidcError::RoleMappingNotFound { .. } => "role_mapping_not_found",
         OidcError::ProviderAlreadyExists { .. } => "provider_conflict",
+        OidcError::ManagedByCloudEdit { .. } | OidcError::ManagedByCloudDelete { .. } => {
+            "provider_managed_by_cloud"
+        }
+        OidcError::InsufficientRole { .. } => "insufficient_role",
+        OidcError::IssuerMatchesManagedCloudProvider { .. } => "issuer_managed_by_cloud",
         OidcError::Database(_) => "internal_error",
     }
 }
@@ -466,7 +510,11 @@ async fn complete_oidc_login(
                 user_agent: metadata.user_agent.as_str().to_string(),
             },
             success: true,
-            login_method: "oidc".to_string(),
+            // ADR-045 §4: distinguishes a Temps Cloud managed-provider login
+            // from every other OIDC provider's login in the audit trail —
+            // previously this was the constant `"oidc"` regardless of which
+            // provider template authenticated the user.
+            login_method: format!("oidc:{}", provider.template),
         })
         .await
     {

@@ -49,6 +49,16 @@ pub struct CloudFeatureSwitchesRequest {
     pub telemetry_enabled: bool,
     pub backups_enabled: bool,
     pub notifications_enabled: bool,
+    /// ADR-045 §5: console access through Temps Cloud's console-proxy
+    /// tunnel. Deliberately **not** `#[serde(default)]`, matching the other
+    /// three fields on this request: `PATCH /cloud/features` is a small,
+    /// dedicated endpoint whose only callers send the whole switch set every
+    /// time (the console's "Temps Cloud" settings page renders all four
+    /// together from one status response), so a request that omits it is
+    /// rejected outright rather than silently interpreted as "turn console
+    /// access off" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`
+    /// exists to avoid on the general `PUT /settings` endpoint.
+    pub console_access_enabled: bool,
 }
 
 /// Who performed a Cloud enrollment, for the audit trail.
@@ -114,6 +124,7 @@ struct CloudFeatureAuditValues {
     telemetry_enabled: bool,
     backups_enabled: bool,
     notifications_enabled: bool,
+    console_access_enabled: bool,
 }
 
 impl From<CloudFeatureSwitches> for CloudFeatureAuditValues {
@@ -122,6 +133,7 @@ impl From<CloudFeatureSwitches> for CloudFeatureAuditValues {
             telemetry_enabled: value.telemetry,
             backups_enabled: value.backups,
             notifications_enabled: value.notifications,
+            console_access_enabled: value.console_access,
         }
     }
 }
@@ -223,6 +235,7 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::State(_)
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
+        | CloudServiceError::ConsoleOidcProvisioning(_)
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -294,6 +307,7 @@ async fn update_cloud_features(
         telemetry: request.telemetry_enabled,
         backups: request.backups_enabled,
         notifications: request.notifications_enabled,
+        console_access: request.console_access_enabled,
     };
     let result = state
         .service
@@ -621,7 +635,8 @@ async fn disconnect_cloud(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    let (result, backup_credential_revoked) = state.service.disconnect().await.map_err(problem)?;
+    let (result, backup_credential_revoked, console_oidc_revoked) =
+        state.service.disconnect().await.map_err(problem)?;
     audit(
         &state,
         &auth,
@@ -637,6 +652,17 @@ async fn disconnect_cloud(
             &auth,
             &metadata,
             "cloud.backup_credential.revoked",
+            None,
+            None,
+        )
+        .await;
+    }
+    if console_oidc_revoked {
+        audit(
+            &state,
+            &auth,
+            &metadata,
+            "cloud.console_oidc_provider.revoked",
             None,
             None,
         )
@@ -715,6 +741,27 @@ pub async fn record_enrollment_audit(
 /// audit row.
 pub async fn record_link_connected_audit(audit: &dyn AuditLogger, actor: CloudEnrollmentActor) {
     write_cloud_link_audit(audit, actor, "CLOUD_LINK_CONNECTED", None, None).await;
+}
+
+/// ADR-045 §5: audits the unattended first-boot bootstrap's one-time,
+/// automatic `cloud.console_access_enabled = true` default -- called by
+/// `temps-cli`'s `bootstrap_cloud_enrollment_from_env` right after
+/// [`record_link_connected_audit`] for the same enrollment, since this
+/// default is a direct, disclosed consequence of that specific enrollment
+/// path (never the operator-pasted one) rather than an ordinary settings
+/// change.
+pub async fn record_console_access_default_enabled_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+) {
+    write_cloud_link_audit(
+        audit,
+        actor,
+        "cloud.console_access_enabled.default_on_bootstrap",
+        None,
+        None,
+    )
+    .await;
 }
 
 /// The managed-backup half of [`record_enrollment_audit`]: one of the
@@ -1152,6 +1199,7 @@ mod tests {
                     telemetry: false,
                     backups: false,
                     notifications: false,
+                    console_access: false,
                 }
                 .into(),
             ),
@@ -1160,6 +1208,7 @@ mod tests {
                     telemetry: true,
                     backups: true,
                     notifications: false,
+                    console_access: false,
                 }
                 .into(),
             ),

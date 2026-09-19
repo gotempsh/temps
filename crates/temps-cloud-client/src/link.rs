@@ -338,6 +338,12 @@ pub struct CloudLink {
     /// restore, and impossible for the operator to notice.
     managed_backup_destination: AtomicBool,
     notifications_enabled: AtomicBool,
+    /// ADR-045 §5: `cloud.console_access_enabled` consent. Read by
+    /// [`CloudLink::feature_switches`] the same way as the three switches
+    /// above; the `watch::Sender<bool>` a console-proxy worker actually
+    /// blocks on lives on `temps-cloud`'s `CloudService`, not here, because
+    /// only that layer needs `.changed()` semantics.
+    console_access_enabled: AtomicBool,
     encryption: Option<Arc<temps_core::EncryptionService>>,
     /// ADR-041 §7c. Set once at startup by whoever owns the write mode.
     telemetry_fallback: RwLock<Option<Arc<dyn CloudTelemetryFallback>>>,
@@ -443,6 +449,7 @@ impl CloudLink {
             backups_enabled: AtomicBool::new(false),
             managed_backup_destination: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(false),
+            console_access_enabled: AtomicBool::new(false),
             encryption,
             telemetry_fallback: RwLock::new(None),
             telemetry_reverted_projects: AtomicUsize::new(0),
@@ -608,6 +615,8 @@ impl CloudLink {
             .store(switches.backups, Ordering::Release);
         self.notifications_enabled
             .store(switches.notifications, Ordering::Release);
+        self.console_access_enabled
+            .store(switches.console_access, Ordering::Release);
         if switches.telemetry {
             return Ok(());
         }
@@ -670,6 +679,7 @@ impl CloudLink {
             telemetry: self.telemetry_enabled.load(Ordering::Acquire),
             backups: self.backups_enabled.load(Ordering::Acquire),
             notifications: self.notifications_enabled.load(Ordering::Acquire),
+            console_access: self.console_access_enabled.load(Ordering::Acquire),
         }
     }
 

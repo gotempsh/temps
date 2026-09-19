@@ -3397,6 +3397,7 @@
             "default": {
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
+              "console_access_enabled": false,
               "notifications_enabled": false,
               "telemetry_bulk_anomaly_factor": null,
               "telemetry_bulk_rate_limit_spans_per_sec": null,
@@ -7435,6 +7436,10 @@
           "backups_enabled": {
             "type": "boolean"
           },
+          "console_access_enabled": {
+            "description": "ADR-045 §5: console access through Temps Cloud's console-proxy\ntunnel. Deliberately **not** `#[serde(default)]`, matching the other\nthree fields on this request: `PATCH /cloud/features` is a small,\ndedicated endpoint whose only callers send the whole switch set every\ntime (the console's \"Temps Cloud\" settings page renders all four\ntogether from one status response), so a request that omits it is\nrejected outright rather than silently interpreted as \"turn console\naccess off\" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`\nexists to avoid on the general `PUT /settings` endpoint.",
+            "type": "boolean"
+          },
           "notifications_enabled": {
             "type": "boolean"
           },
@@ -7445,7 +7450,8 @@
         "required": [
           "telemetry_enabled",
           "backups_enabled",
-          "notifications_enabled"
+          "notifications_enabled",
+          "console_access_enabled"
         ],
         "type": "object"
       },
@@ -7472,6 +7478,11 @@
           "backups_enabled": {
             "default": false,
             "description": "Explicit consent to export completed backup objects.",
+            "type": "boolean"
+          },
+          "console_access_enabled": {
+            "default": false,
+            "description": "ADR-045 §5: explicit consent to let Temps Cloud open this instance's\nconsole over the console-proxy tunnel — no inbound port, but\ninteractive admin access relayed through a third party, with the\nmanaged OIDC provider as the only sign-in path. Unlike\n`telemetry_enabled`/`backups_enabled`, this is **not** always\noperator-initiated: the unattended first-boot bootstrap\n(`TEMPS_CLOUD_ENROLLMENT_CODE`, no operator present) sets this `true`\nonce, at the moment the link is established, and audits the decision\nlike any other write — see `CloudEnrollmentActor::UnattendedBootstrap`\nin `temps-cloud`. An operator-pasted enrollment code leaves this at\nits `false` default, matching `telemetry_enabled`/`backups_enabled`'s\n\"linking never enables export; settings are applied explicitly\" rule.",
             "type": "boolean"
           },
           "notifications_enabled": {
@@ -7532,6 +7543,10 @@
           "backups_enabled": {
             "type": "boolean"
           },
+          "console_access_enabled": {
+            "description": "ADR-045 §5: whether this instance currently permits Temps Cloud to\nopen its console over the console-proxy tunnel.",
+            "type": "boolean"
+          },
           "health": {
             "type": "string"
           },
@@ -7574,6 +7589,7 @@
           "telemetry_enabled",
           "backups_enabled",
           "notifications_enabled",
+          "console_access_enabled",
           "managed_backup_setup"
         ],
         "type": "object"
@@ -25749,6 +25765,12 @@
               "null"
             ]
           },
+          "progressId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ref_name": {
             "type": [
               "string",
@@ -30517,6 +30539,10 @@
           "jit_provisioning": {
             "type": "boolean"
           },
+          "managed_by_cloud": {
+            "description": "ADR-045 §4: true only for the provider Temps Cloud provisions for\nconsole access. The admin UI should disable edit/delete controls for\nsuch a row — the API itself refuses those requests regardless\n(`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -30547,7 +30573,8 @@
           "group_claim",
           "role_claim",
           "default_role",
-          "trust_idp_email"
+          "trust_idp_email",
+          "managed_by_cloud"
         ],
         "type": "object"
       },
@@ -34695,6 +34722,67 @@
         ],
         "type": "object"
       },
+      "ProgressSnapshot": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/ProgressStage"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "elapsed_ms",
+          "stages"
+        ],
+        "type": "object"
+      },
+      "ProgressStage": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "stage",
+          "message",
+          "status",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "ProgressStatus": {
+        "enum": [
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ProjectAccessResponse": {
         "properties": {
           "created_at": {
@@ -38647,6 +38735,26 @@
         ],
         "type": "object"
       },
+      "RepositoryCatalogPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/PluginHostPermission"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "permission",
+          "required",
+          "reason"
+        ],
+        "type": "object"
+      },
       "RepositoryCatalogPlugin": {
         "properties": {
           "author": {
@@ -38684,6 +38792,13 @@
               "string",
               "null"
             ]
+          },
+          "permissions": {
+            "description": "Author-declared capabilities for display only; never used to grant access.\nNone means the legacy catalog did not declare permissions.",
+            "items": {
+              "$ref": "#/components/schemas/RepositoryCatalogPermission"
+            },
+            "type": "array"
           },
           "platforms": {
             "items": {
@@ -97189,7 +97304,7 @@
     },
     "/projects/{project_id}/env-vars/resolved": {
       "get": {
-        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for plaintext (audit-logged).",
+        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for regular plaintext values (audit-logged). Marked secrets\ncannot be revealed.",
         "operationId": "get_resolved_environment_variables",
         "parameters": [
           {
@@ -117059,6 +117174,52 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryCatalogResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install/progress/{id}": {
+      "get": {
+        "operationId": "getRepositoryInstallProgress",
+        "parameters": [
+          {
+            "description": "Client-generated installation UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProgressSnapshot"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

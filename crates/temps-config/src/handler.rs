@@ -2021,6 +2021,11 @@ fn preserve_cloud_settings_not_sent_by_every_client(
     incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
     incoming.cloud.backups_enabled = current.cloud.backups_enabled;
     incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+    // ADR-045 §5: same reasoning as the three consent flags above -- enabling
+    // console access requires `PATCH /cloud/features` (and, on the
+    // unattended bootstrap path, is set exactly once and audited there), so
+    // a generic settings write must never be able to flip it either way.
+    incoming.cloud.console_access_enabled = current.cloud.console_access_enabled;
 
     if !sent.backend_url {
         incoming.cloud.backend_url = current.cloud.backend_url.clone();
@@ -3696,6 +3701,12 @@ mod tests {
         incoming.cloud.telemetry_enabled = true;
         incoming.cloud.backups_enabled = true;
         incoming.cloud.notifications_enabled = true;
+        // ADR-045 §5: console access is exactly as unwritable through this
+        // endpoint as the three consent flags above -- it is a
+        // resource-specific `PATCH /cloud/features` decision (or the
+        // bootstrap default), never a side effect of an unrelated settings
+        // save.
+        incoming.cloud.console_access_enabled = true;
 
         preserve_cloud_settings_not_sent_by_every_client(
             &mut incoming,
@@ -3706,6 +3717,7 @@ mod tests {
         assert!(!incoming.cloud.telemetry_enabled);
         assert!(!incoming.cloud.backups_enabled);
         assert!(!incoming.cloud.notifications_enabled);
+        assert!(!incoming.cloud.console_access_enabled);
     }
 
     #[test]
@@ -3714,6 +3726,7 @@ mod tests {
         current.cloud.telemetry_enabled = true;
         current.cloud.backups_enabled = true;
         current.cloud.notifications_enabled = true;
+        current.cloud.console_access_enabled = true;
         let mut incoming = AppSettings::default();
 
         preserve_cloud_settings_not_sent_by_every_client(
@@ -3725,6 +3738,7 @@ mod tests {
         assert!(incoming.cloud.telemetry_enabled);
         assert!(incoming.cloud.backups_enabled);
         assert!(incoming.cloud.notifications_enabled);
+        assert!(incoming.cloud.console_access_enabled);
     }
 
     /// A settings row whose operator-tuned Cloud fields have all been moved off

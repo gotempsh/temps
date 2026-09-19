@@ -22,6 +22,13 @@ sea-orm = { workspace = true }
 
 async-trait.workspace = true
 base64.workspace = true
+# ADR-045 §3: the console-proxy dispatcher (`src/console_proxy.rs`) hands a
+# synthesized request to the instance's own console `Router` and, for a
+# WebSocket-upgrading request, drives hyper's own client/server upgrade
+# machinery over an in-process `tokio::io::duplex` pair rather than
+# reimplementing RFC 6455 (ADR-045 §3's "WebSocket upgrade passthrough").
+axum.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 # Points a stock ClickHouse client at Temps Cloud's HTTP-interface read proxy
 # (`src/query.rs`). Same 0.15 line as `temps-otel` and `temps-analytics-backend`
@@ -49,12 +56,24 @@ tokio-util.workspace = true
 # way by `temps-deployments`' remote-terminal proxy, so this resolves one
 # tokio-tungstenite across the workspace rather than a second one.
 tokio-tungstenite.workspace = true
+tower.workspace = true
+# `hyper`'s client/server connection drivers, used only by the console-proxy
+# upgrade relay (see the `axum` comment above). Same workspace-pinned version
+# every other crate resolves, so this adds no second copy.
+hyper.workspace = true
+# Adapts `tokio::io::duplex`'s halves to `hyper::rt::{Read, Write}`. Not a
+# workspace dependency elsewhere yet, but the version below matches what the
+# lockfile already resolves transitively through `axum`/`hyper`, so this does
+# not add a second copy either.
+hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-axum.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` backs `#[tokio::test(start_paused = true)]`, used by
+# `console_proxy`'s idle-timer tests to advance virtual time instantly
+# instead of sleeping for real minutes.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

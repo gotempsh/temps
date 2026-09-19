@@ -39,6 +39,7 @@ import {
   DatabaseBackup,
   ExternalLink,
   Loader2,
+  MonitorSmartphone,
   Radio,
   RefreshCw,
   ShieldCheck,
@@ -169,7 +170,11 @@ export function CloudSettingsPage() {
   }
 
   const setFeature = async (
-    feature: 'telemetry_enabled' | 'backups_enabled' | 'notifications_enabled',
+    feature:
+      | 'telemetry_enabled'
+      | 'backups_enabled'
+      | 'notifications_enabled'
+      | 'console_access_enabled',
     enabled: boolean,
     label: string
   ) => {
@@ -180,6 +185,7 @@ export function CloudSettingsPage() {
           telemetry_enabled: status.data.telemetry_enabled,
           backups_enabled: status.data.backups_enabled,
           notifications_enabled: status.data.notifications_enabled,
+          console_access_enabled: status.data.console_access_enabled,
           [feature]: enabled,
         },
       })
@@ -314,6 +320,20 @@ export function CloudSettingsPage() {
           </AlertDescription>
         </Alert>
       ) : null}
+
+      <ConsoleAccessCard
+        connected={connected}
+        stateUnreadable={stateUnreadable}
+        checked={status.data?.console_access_enabled ?? false}
+        pending={updateFeatures.isPending}
+        onCheckedChange={(enabled) =>
+          void setFeature(
+            'console_access_enabled',
+            enabled,
+            'Console access through Temps Cloud'
+          )
+        }
+      />
 
       {connected ? (
         <div className="space-y-6">
@@ -478,7 +498,10 @@ export function CloudSettingsPage() {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
+        <div
+          id="cloud-connect"
+          className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]"
+        >
           <Card className="border-border shadow-none">
             <CardContent className="p-6 md:p-8">
               <div className="mb-8 flex items-start justify-between gap-4">
@@ -567,6 +590,74 @@ export function CloudSettingsPage() {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * ADR-045 §5: the console-access switch is always rendered, even when this
+ * instance isn't linked to Temps Cloud at all — per CLAUDE.md "Feature
+ * Discoverability", an unconfigured feature must onboard rather than
+ * disappear. When not linked, the row stays visible but disabled, states
+ * the precise reason, and links to the section below that fixes it.
+ */
+function ConsoleAccessCard({
+  connected,
+  stateUnreadable,
+  checked,
+  pending,
+  onCheckedChange,
+}: {
+  connected: boolean
+  stateUnreadable: boolean
+  checked: boolean
+  pending: boolean
+  onCheckedChange: (checked: boolean) => void
+}) {
+  const description =
+    'Cloud members with the owner or admin role on this instance can open ' +
+    'this console at its Cloud console URL — no inbound port required. On ' +
+    'by default for instances provisioned through Temps Cloud, off for ' +
+    'instances linked manually. Turning this off immediately revokes the ' +
+    'Cloud sign-in provider and signs out every session created through it.'
+
+  return (
+    <Card className="border-border shadow-none">
+      <CardContent className="space-y-4 p-6">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
+            Remote administration
+          </p>
+          <h2 className="mt-2 text-lg font-semibold">
+            Console access through Temps Cloud
+          </h2>
+        </div>
+        <div className="divide-y divide-border border-y border-border">
+          <FeatureToggle
+            icon={<MonitorSmartphone />}
+            label="Console access through Temps Cloud"
+            description={description}
+            checked={connected && checked}
+            disabled={!connected || pending}
+            onCheckedChange={onCheckedChange}
+          />
+        </div>
+        {!connected ? (
+          <p className="text-xs text-muted-foreground">
+            Not available — this instance is not connected to Temps Cloud.{' '}
+            {stateUnreadable ? (
+              'Resolve the Cloud credential issue above, then reconnect to enable it.'
+            ) : (
+              <a
+                href="#cloud-connect"
+                className="underline underline-offset-4 hover:text-foreground"
+              >
+                Connect it below
+              </a>
+            )}
+          </p>
+        ) : null}
+      </CardContent>
+    </Card>
   )
 }
 

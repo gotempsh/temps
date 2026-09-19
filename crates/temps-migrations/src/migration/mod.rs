@@ -275,6 +275,7 @@ pub mod m20260916_000001_reconcile_otel_trace_summaries;
 pub mod m20260917_000001_add_next_check_at_to_status_monitors;
 pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
+mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
 pub struct Migrator;
 
@@ -607,6 +608,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
             Box::new(m20260916_000001_visitor_activity_reports::Migration),
             Box::new(m20260918_000001_visitor_activity_run_history::Migration),
+            Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
         ]
     }
 }

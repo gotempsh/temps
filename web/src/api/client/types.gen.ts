@@ -3319,6 +3319,18 @@ export type CloudCapability = {
 
 export type CloudFeatureSwitchesRequest = {
     backups_enabled: boolean;
+    /**
+     * ADR-045 §5: console access through Temps Cloud's console-proxy
+     * tunnel. Deliberately **not** `#[serde(default)]`, matching the other
+     * three fields on this request: `PATCH /cloud/features` is a small,
+     * dedicated endpoint whose only callers send the whole switch set every
+     * time (the console's "Temps Cloud" settings page renders all four
+     * together from one status response), so a request that omits it is
+     * rejected outright rather than silently interpreted as "turn console
+     * access off" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`
+     * exists to avoid on the general `PUT /settings` endpoint.
+     */
+    console_access_enabled: boolean;
     notifications_enabled: boolean;
     telemetry_enabled: boolean;
 };
@@ -3345,6 +3357,21 @@ export type CloudSettings = {
      * Explicit consent to export completed backup objects.
      */
     backups_enabled?: boolean;
+    /**
+     * ADR-045 §5: explicit consent to let Temps Cloud open this instance's
+     * console over the console-proxy tunnel — no inbound port, but
+     * interactive admin access relayed through a third party, with the
+     * managed OIDC provider as the only sign-in path. Unlike
+     * `telemetry_enabled`/`backups_enabled`, this is **not** always
+     * operator-initiated: the unattended first-boot bootstrap
+     * (`TEMPS_CLOUD_ENROLLMENT_CODE`, no operator present) sets this `true`
+     * once, at the moment the link is established, and audits the decision
+     * like any other write — see `CloudEnrollmentActor::UnattendedBootstrap`
+     * in `temps-cloud`. An operator-pasted enrollment code leaves this at
+     * its `false` default, matching `telemetry_enabled`/`backups_enabled`'s
+     * "linking never enables export; settings are applied explicitly" rule.
+     */
+    console_access_enabled?: boolean;
     /**
      * Explicit consent to send notifications through managed providers.
      */
@@ -3429,6 +3456,11 @@ export type CloudStatus = {
     account_email?: string | null;
     backend_url: string;
     backups_enabled: boolean;
+    /**
+     * ADR-045 §5: whether this instance currently permits Temps Cloud to
+     * open its console over the console-proxy tunnel.
+     */
+    console_access_enabled: boolean;
     health: string;
     health_message: string;
     instance_id?: string | null;
@@ -13815,6 +13847,13 @@ export type OidcProviderResponse = {
     id: number;
     issuer_url: string;
     jit_provisioning: boolean;
+    /**
+     * ADR-045 §4: true only for the provider Temps Cloud provisions for
+     * console access. The admin UI should disable edit/delete controls for
+     * such a row — the API itself refuses those requests regardless
+     * (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).
+     */
+    managed_by_cloud: boolean;
     name: string;
     role_claim: string;
     scopes: string;

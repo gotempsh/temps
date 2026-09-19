@@ -77,10 +77,29 @@ function providerIcon(
       // No reliable single-color "Azure AD" simple-icons mark since the
       // Entra rebrand. Cloud is the right semantic fallback.
       return Cloud
+    case 'temps_cloud':
+      // ADR-045 §4: the managed provider Temps Cloud provisions for
+      // console access. Same Cloud glyph as the azure-ad fallback above —
+      // there's no separate Temps brand mark in simple-icons.
+      return Cloud
     case 'generic':
     default:
       return Lock
   }
+}
+
+/**
+ * Button copy for an OIDC provider. The Cloud-managed provider
+ * (`template === 'temps_cloud'`, ADR-045 §4) gets distinct wording —
+ * "Continue with Temps Cloud" rather than "Sign in with Temps Cloud" —
+ * so the button reads as the console-access handoff it actually is,
+ * not an ordinary corporate-IdP SSO button.
+ */
+export function providerButtonLabel(provider: OidcProviderOption): string {
+  if (provider.template === 'temps_cloud') {
+    return 'Continue with Temps Cloud'
+  }
+  return `Sign in with ${provider.name}`
 }
 
 interface LoginFormProps {
@@ -157,7 +176,7 @@ export function LoginForm({
                       with the same label would make screen readers
                       say "Keycloak Sign in with Keycloak". */}
                   <Icon className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Sign in with {provider.name}
+                  {providerButtonLabel(provider)}
                 </Button>
               )
             })}

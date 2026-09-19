@@ -90,6 +90,7 @@ fn linked_instance(dir: &tempfile::TempDir, base_url: &str, token: &str) -> Clou
         telemetry: true,
         backups: false,
         notifications: false,
+        console_access: false,
     })
     .expect("enable telemetry for the fixture");
     link

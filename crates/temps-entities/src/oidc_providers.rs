@@ -32,6 +32,24 @@ pub struct Model {
     /// `temps_auth::oidc_service::resolve_user` for the security
     /// rationale this flag bypasses.
     pub trust_idp_email: bool,
+    /// ADR-045 §4: set only on the console-access provider Temps Cloud
+    /// provisions. Governs two things: (1) `resolve_user`'s
+    /// `admin_only_role_required` gate is meaningless on a provider an
+    /// operator does not control end-to-end, so it is paired with this flag
+    /// rather than exposed generally; (2) the `PUT`/`DELETE
+    /// /admin/oidc/providers/{id}` handlers refuse to edit or delete this
+    /// row manually — its credentials are rotated by Cloud's own
+    /// provisioning path (`ConsoleOidcConfig`/`ConsoleOidcRevoke`), mirroring
+    /// `s3_sources.managed_by_cloud`.
+    pub managed_by_cloud: bool,
+    /// ADR-045 §4 role gate, layer 2: when true, `resolve_user` hard-rejects
+    /// with `OidcError::InsufficientRole` unless the role resolved from
+    /// claims (via `role_claim`/`oidc_role_mappings`, same mechanism every
+    /// other provider uses) is `RoleType::Admin` — never falling through to
+    /// `default_role` the way an ungated provider would. Set only alongside
+    /// `managed_by_cloud`; a belt-and-suspenders check independent of
+    /// whatever Cloud's own account-linking screen enforces.
+    pub admin_only_role_required: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
