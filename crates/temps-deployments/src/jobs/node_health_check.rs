@@ -534,16 +534,32 @@ async fn record_failover_outcome(
         return false;
     }
 
-    if let Err(e) = node_service.mark_failed_over(node.id).await {
-        // Work is queued but unrecorded: the next tick repeats the pass,
-        // which the idempotent path absorbs.
-        tracing::error!(
-            node_id = node.id,
-            node_name = %node.name,
-            "Failover: workloads handled but failover could not be recorded, will repeat next tick: {}",
-            e
-        );
-        return false;
+    match node_service.mark_failed_over(node).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // A heartbeat landed while the pass was running: the node is back,
+            // so this outage is over and must not be recorded as failed over —
+            // a stale stamp would suppress failover for the node's next outage.
+            // The recovery redeploys already queued still run; they are valid
+            // placements, just no longer urgent.
+            tracing::info!(
+                node_id = node.id,
+                node_name = %node.name,
+                "Failover: node recovered during the failover pass, not recording it as failed over"
+            );
+            return false;
+        }
+        Err(e) => {
+            // Work is queued but unrecorded: the next tick repeats the pass,
+            // which the idempotent path absorbs.
+            tracing::error!(
+                node_id = node.id,
+                node_name = %node.name,
+                "Failover: workloads handled but failover could not be recorded, will repeat next tick: {}",
+                e
+            );
+            return false;
+        }
     }
 
     if let Some(alarm_service) = alarm_service {
@@ -944,14 +960,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_failover_stamps_failover_at() {
+    async fn test_complete_failover_stamps_failover_at_for_the_observed_outage() {
         let node = make_node(7, "worker-7", "offline", 400);
-        let mut stamped = node.clone();
-        stamped.failover_at = Some(chrono::Utc::now());
         let db = std::sync::Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![node.clone()]])
-                .append_query_results(vec![vec![stamped]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let node_service = NodeService::new(db.clone());
@@ -965,6 +981,32 @@ mod tests {
         let update = log.last().expect("stamping must issue an UPDATE");
         let sql = &update.statements()[0].sql;
         assert!(sql.contains(r#""failover_at" ="#), "{sql}");
+        // The stamp is tied to the outage the pass ran for: still offline,
+        // still unstamped, same last heartbeat.
+        assert!(sql.contains(r#""status" ="#), "{sql}");
+        assert!(sql.contains(r#""failover_at" IS NULL"#), "{sql}");
+        assert!(sql.contains(r#""last_heartbeat" ="#), "{sql}");
+    }
+
+    /// A heartbeat that lands while the pass is running flips the node back to
+    /// active, so the conditional stamp matches no row. The node must NOT be
+    /// reported as failed over: a stale `failover_at` on an active node would
+    /// suppress failover for its next outage.
+    #[tokio::test]
+    async fn test_node_recovered_during_failover_pass_is_not_stamped() {
+        let node = make_node(7, "worker-7", "offline", 400);
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let node_service = NodeService::new(db);
+
+        let recorded = record_failover_outcome(&node, true, 300, &node_service, None).await;
+        assert!(!recorded);
     }
 
     /// If the work was queued but the stamp cannot be written, report the node
@@ -974,13 +1016,43 @@ mod tests {
         let node = make_node(7, "worker-7", "offline", 400);
         let db = std::sync::Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
+                .append_exec_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
                 .into_connection(),
         );
         let node_service = NodeService::new(db);
 
         let recorded = record_failover_outcome(&node, true, 300, &node_service, None).await;
         assert!(!recorded);
+    }
+
+    /// Every new outage starts unfailed-over: going offline clears whatever
+    /// marker an earlier outage left, so it can never exclude this one.
+    #[tokio::test]
+    async fn test_mark_offline_clears_stale_failover_marker() {
+        let mut node = make_node(7, "worker-7", "active", 120);
+        node.failover_at = Some(chrono::Utc::now());
+        let mut offline = node.clone();
+        offline.status = "offline".to_string();
+        offline.failover_at = None;
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![offline]])
+                .into_connection(),
+        );
+        let node_service = NodeService::new(db.clone());
+
+        node_service
+            .mark_offline(7)
+            .await
+            .expect("mark_offline should succeed");
+        drop(node_service);
+
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let sql = &log.last().expect("an UPDATE").statements()[0].sql;
+        assert!(sql.contains(r#""status" ="#), "{sql}");
+        assert!(sql.contains(r#""failover_at" ="#), "{sql}");
     }
 
     // ── Resource-alert threshold evaluation (resource_breaches) ──────────

@@ -662,6 +662,10 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.into();
         active.status = Set("offline".to_string());
+        // A new outage starts unfailed-over, whatever an earlier one left
+        // behind. `failover_at` must never outlive the outage it was stamped for,
+        // or it would exclude this one from `list_due_for_failover`.
+        active.failover_at = Set(None);
         active.update(self.db.as_ref()).await?;
 
         tracing::warn!(node_id = node_id, "Node marked as offline");
@@ -672,17 +676,40 @@ impl NodeService {
     /// Record that an offline node's failover is durably queued, so the health
     /// loop stops retrying it for this outage. Cleared by the next heartbeat.
     /// Call only after every affected workload was handled.
-    pub async fn mark_failed_over(&self, node_id: i32) -> Result<(), NodeError> {
-        let node = nodes::Entity::find_by_id(node_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(NodeError::NotFoundById { node_id })?;
+    ///
+    /// `observed` is the node row the failover pass was started from. The stamp
+    /// is a single conditional UPDATE tied to that outage: it only lands if the
+    /// node is still offline, still unstamped, and its `last_heartbeat` is the
+    /// one the pass saw. A heartbeat that arrived while the pass was running
+    /// (node recovered) changes all of that, so the UPDATE matches no row
+    /// instead of stamping a node that is active again — which would otherwise
+    /// suppress failover for its next outage.
+    ///
+    /// Returns `false` when the node was not stamped because it no longer
+    /// matches the outage the pass ran for.
+    pub async fn mark_failed_over(&self, observed: &nodes::Model) -> Result<bool, NodeError> {
+        let same_heartbeat = match observed.last_heartbeat {
+            Some(last_heartbeat) => nodes::Column::LastHeartbeat.eq(last_heartbeat),
+            None => nodes::Column::LastHeartbeat.is_null(),
+        };
 
-        let mut active: nodes::ActiveModel = node.into();
-        active.failover_at = Set(Some(chrono::Utc::now()));
-        active.update(self.db.as_ref()).await?;
+        let result = nodes::Entity::update_many()
+            .col_expr(
+                nodes::Column::FailoverAt,
+                sea_orm::sea_query::Expr::value(Some(chrono::Utc::now())),
+            )
+            .col_expr(
+                nodes::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(nodes::Column::Id.eq(observed.id))
+            .filter(nodes::Column::Status.eq("offline"))
+            .filter(nodes::Column::FailoverAt.is_null())
+            .filter(same_heartbeat)
+            .exec(self.db.as_ref())
+            .await?;
 
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     /// Offline nodes whose last heartbeat is older than `failover_after_secs`
