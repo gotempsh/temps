@@ -52,6 +52,7 @@ test('settings route wraps provider wizard in exactly one page container', () =>
     </QueryClientProvider>
   )
   expect(markup.match(/data-page-container/g)).toHaveLength(1)
+  expect(markup).not.toContain('lg:w-4/5')
 })
 
 test('a valid URL restores configuration, without credentials in the URL', () => {

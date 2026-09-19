@@ -25,7 +25,7 @@ test('analytics overview restores the default range when back navigation removes
     exact: true,
   })
   await expect(
-    range.getByRole('button', { name: '1d', exact: true })
+    range.getByRole('button', { name: '24h', exact: true })
   ).toHaveAttribute('aria-pressed', 'true')
 
   await range.getByRole('button', { name: '6h', exact: true }).click()
@@ -37,7 +37,7 @@ test('analytics overview restores the default range when back navigation removes
   await page.goBack()
   await expect(page).toHaveURL(`/projects/${project.slug}/analytics`)
   await expect(
-    range.getByRole('button', { name: '1d', exact: true })
+    range.getByRole('button', { name: '24h', exact: true })
   ).toHaveAttribute('aria-pressed', 'true')
 })
 

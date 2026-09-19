@@ -319,6 +319,7 @@ export function AddNotificationProvider() {
 
   return (
     <Wizard
+      fullWidth
       title="Add notification provider"
       description="Choose a delivery method and configure where Temps sends notifications."
       currentStep={currentStep}
