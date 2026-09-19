@@ -60,6 +60,7 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { Link, useNavigate } from 'react-router'
 import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
+import { hasUrgentCertificate } from './domain-expiry'
 
 interface DomainsManagementProps {
   domains?: DomainResponse[]
@@ -77,15 +78,6 @@ interface DomainsManagementProps {
   searchQuery: string
   onSearchChange: (value: string) => void
   isSearching: boolean
-}
-
-const isExpiringSoon = (expirationTime: number) => {
-  const expirationDate = new Date(expirationTime)
-  const now = new Date()
-  const daysUntilExpiration = Math.ceil(
-    (expirationDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
-  )
-  return daysUntilExpiration <= 15
 }
 
 export function DomainsManagement({
@@ -504,7 +496,7 @@ function DomainExpiration({ domain }: { domain: DomainResponse }) {
     return <span className="text-muted-foreground">Not available</span>
   }
   const remaining = formatExpiryRemaining(domain.expiration_time)
-  const urgent = isExpiringSoon(domain.expiration_time)
+  const urgent = hasUrgentCertificate(domain.status, domain.expiration_time)
   return (
     <div className="flex flex-wrap items-center gap-2 whitespace-nowrap">
       <span className="tabular-nums">

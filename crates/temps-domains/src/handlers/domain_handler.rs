@@ -9,6 +9,7 @@ use super::types::{
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
+use crate::domain_service::{DomainSort, DomainSortDirection};
 use crate::tls::models::DNS_CLEANUP_PLAN_KEY;
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
@@ -1495,6 +1496,14 @@ pub struct ListDomainsParams {
     /// Search domains by name (substring match)
     #[param(example = "example.com")]
     pub search: Option<String>,
+    /// Sort column (defaults to created_at)
+    #[param(inline)]
+    #[serde(default)]
+    pub sort_by: DomainSort,
+    /// Sort direction (defaults to desc). Unknown expiration dates always sort last.
+    #[param(inline)]
+    #[serde(default)]
+    pub sort_order: DomainSortDirection,
 }
 
 impl ListDomainsParams {
@@ -1535,7 +1544,13 @@ async fn list_domains(
 
     let (domains, total) = app_state
         .domain_service
-        .list_domains_with_total(page, page_size, params.search.as_deref())
+        .list_domains_with_total(
+            page,
+            page_size,
+            params.search.as_deref(),
+            params.sort_by,
+            params.sort_order,
+        )
         .await
         .map_err(|e| {
             error!("Failed to list domains: {}", e);
@@ -3330,6 +3345,28 @@ mod tests {
             updated_at: now,
         };
         temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[test]
+    fn domain_list_params_validate_sort_and_bound_page_size() {
+        let defaults: ListDomainsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(defaults.normalize(), (1, 20));
+        assert!(matches!(defaults.sort_by, DomainSort::CreatedAt));
+        assert!(matches!(defaults.sort_order, DomainSortDirection::Desc));
+        let params: ListDomainsParams = serde_json::from_value(serde_json::json!({
+            "page": 0, "page_size": 1000, "sort_by": "expiration", "sort_order": "asc"
+        }))
+        .unwrap();
+        assert_eq!(params.normalize(), (1, 100));
+        assert!(matches!(params.sort_by, DomainSort::Expiration));
+        assert!(serde_json::from_value::<ListDomainsParams>(
+            serde_json::json!({"sort_by": "unknown"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ListDomainsParams>(
+            serde_json::json!({"sort_order": "unknown"})
+        )
+        .is_err());
     }
 
     #[test]

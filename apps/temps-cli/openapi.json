@@ -29185,6 +29185,45 @@
         ],
         "type": "object"
       },
+      "NetworkInterface": {
+        "description": "Information about a network interface",
+        "properties": {
+          "address": {
+            "description": "IP address of the interface",
+            "type": "string"
+          },
+          "interface": {
+            "description": "Name of the network interface",
+            "type": "string"
+          },
+          "is_link_local": {
+            "description": "Whether this is a link-local address (IPv6)",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "is_private": {
+            "description": "Whether this is a private IP address (RFC 1918)",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "is_unique_local": {
+            "description": "Whether this is a unique local address (IPv6)",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "interface"
+        ],
+        "type": "object"
+      },
       "NetworkMode": {
         "description": "Network mode",
         "oneOf": [
@@ -34057,6 +34096,37 @@
         ],
         "type": "object"
       },
+      "PrivateIpInfo": {
+        "description": "Information about private/local IP addresses",
+        "properties": {
+          "ipv4_addresses": {
+            "description": "All IPv4 addresses found on non-loopback interfaces",
+            "items": {
+              "$ref": "#/components/schemas/NetworkInterface"
+            },
+            "type": "array"
+          },
+          "ipv6_addresses": {
+            "description": "All IPv6 addresses found on non-loopback interfaces",
+            "items": {
+              "$ref": "#/components/schemas/NetworkInterface"
+            },
+            "type": "array"
+          },
+          "primary_ip": {
+            "description": "The primary private IP address (most likely to be useful)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ipv4_addresses",
+          "ipv6_addresses"
+        ],
+        "type": "object"
+      },
       "ProblemDetails": {
         "description": "Representation of a Problem error to return to the client.\nFollows RFC 7807 - Problem Details for HTTP APIs",
         "example": {
@@ -36660,6 +36730,33 @@
           "flat"
         ],
         "type": "string"
+      },
+      "PublicIpInfo": {
+        "description": "Information about a public IP address lookup",
+        "properties": {
+          "error": {
+            "description": "Error message if IP lookup failed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ip": {
+            "description": "The public IP address, if successfully retrieved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "The source service that provided the IP",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "PublicPresetResponse": {
         "description": "Response for preset detection",
@@ -69358,6 +69455,35 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Sort column (defaults to created_at)",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "description": "Allowlisted sort columns for the paginated domain collection.",
+              "enum": [
+                "created_at",
+                "domain",
+                "status",
+                "expiration"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort direction (defaults to desc). Unknown expiration dates always sort last.",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -89117,6 +89243,13 @@
         "operationId": "get_private_ip",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateIpInfo"
+                }
+              }
+            },
             "description": "Successfully retrieved private IP address"
           },
           "401": {
@@ -89145,6 +89278,13 @@
         "operationId": "get_public_ip",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicIpInfo"
+                }
+              }
+            },
             "description": "Successfully retrieved public IP address"
           },
           "401": {

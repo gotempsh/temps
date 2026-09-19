@@ -4,9 +4,8 @@
 import { PageContainer } from '@/components/layout/PageContainer'
 
 import { useQuery } from '@tanstack/react-query'
-import { listDomains } from '@/api/client/sdk.gen'
-import type { DomainResponse } from '@/api/client/types.gen'
-import { sortDomains, type DomainSort } from '@/components/domains/domain-sort'
+import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { DomainSort } from '@/components/domains/domain-sort'
 import { useSearchParams } from 'react-router'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -26,32 +25,20 @@ export function Domains() {
       ? (params.get('sort') as DomainSort)
       : 'expiration'
   const direction = params.get('direction') === 'desc' ? 'desc' : 'asc'
-  const requestedPage = Math.max(1, Number(params.get('page')) || 1)
+  const parsedPage = Number(params.get('page'))
+  const page =
+    Number.isSafeInteger(parsedPage) && parsedPage > 0 ? parsedPage : 1
   const debouncedSearch = useDebounce(searchQuery, 300)
-  const {
-    data: domains = [],
-    isLoading,
-    isError,
-    refetch,
-  } = useQuery({
-    queryKey: ['domains-table', debouncedSearch],
-    queryFn: async ({ signal }) => {
-      const rows = new Map<number, DomainResponse>()
-      let page = 1
-      let totalPages = 1
-      do {
-        const { data } = await listDomains({
-          query: { page, page_size: 100, search: debouncedSearch || undefined },
-          signal,
-          throwOnError: true,
-        })
-        for (const domain of data.domains) rows.set(domain.id, domain)
-        totalPages = Math.ceil(data.total / 100)
-        page += 1
-      } while (page <= totalPages)
-      return [...rows.values()]
-    },
-  })
+  const query = {
+    page,
+    page_size: PAGE_SIZE,
+    search: debouncedSearch || undefined,
+    sort_by: sort,
+    sort_order: direction,
+  } as const
+  const { data, isLoading, isError, refetch } = useQuery(
+    listDomainsOptions({ query })
+  )
   const updateParams = (values: Record<string, string>) =>
     setParams(
       (previous) => {
@@ -82,16 +69,27 @@ export function Domains() {
 
   usePageTitle('Domains')
 
-  const total = domains.length
+  const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const page = Math.min(Math.floor(requestedPage), totalPages)
-  const sorted = sortDomains(domains, sort, direction)
+
+  useEffect(() => {
+    if (data && page > totalPages) {
+      setParams(
+        (previous) => {
+          const next = new URLSearchParams(previous)
+          next.set('page', String(totalPages))
+          return next
+        },
+        { replace: true }
+      )
+    }
+  }, [data, page, totalPages, setParams])
 
   return (
     <PageContainer innerClassName="space-y-6">
       <div className="space-y-6">
         <DomainsManagement
-          domains={sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)}
+          domains={data?.domains ?? []}
           sort={sort}
           direction={direction}
           onSortChange={handleSortChange}

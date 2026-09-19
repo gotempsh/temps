@@ -20,6 +20,51 @@ use crate::tls::{
     TlsError,
 };
 
+/// Allowlisted sort columns for the paginated domain collection.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSort {
+    #[default]
+    CreatedAt,
+    Domain,
+    Status,
+    Expiration,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+fn sorted_domains_query(
+    search: Option<&str>,
+    sort: DomainSort,
+    direction: DomainSortDirection,
+) -> sea_orm::Select<domains::Entity> {
+    use sea_orm::{sea_query::NullOrdering, Order};
+    let column = match sort {
+        DomainSort::CreatedAt => domains::Column::CreatedAt,
+        DomainSort::Domain => domains::Column::Domain,
+        DomainSort::Status => domains::Column::Status,
+        DomainSort::Expiration => domains::Column::ExpirationTime,
+    };
+    let order = match direction {
+        DomainSortDirection::Asc => Order::Asc,
+        DomainSortDirection::Desc => Order::Desc,
+    };
+    let mut query = domains::Entity::find();
+    if let Some(search) = search.filter(|value| !value.is_empty()) {
+        query = query.filter(domains::Column::Domain.contains(search));
+    }
+    query
+        .order_by_with_nulls(column, order, NullOrdering::Last)
+        .order_by_asc(domains::Column::Domain)
+        .order_by_asc(domains::Column::Id)
+}
+
 #[derive(Error, Debug)]
 pub enum DomainServiceError {
     #[error("Database error: {0}")]
@@ -775,14 +820,12 @@ impl DomainService {
         page: u64,
         page_size: u64,
         search: Option<&str>,
+        sort: DomainSort,
+        direction: DomainSortDirection,
     ) -> Result<(Vec<domains::Model>, u64), DomainServiceError> {
-        let mut query = domains::Entity::find();
-
-        if let Some(search) = search {
-            if !search.is_empty() {
-                query = query.filter(domains::Column::Domain.contains(search));
-            }
-        }
+        let query = sorted_domains_query(search, sort, direction);
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
@@ -1595,6 +1638,120 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn domain_sorted_pagination_handles_nulls_search_and_empty_results() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        let now = Utc::now();
+        for (name, expires) in [
+            ("later.example", Some(now + Duration::days(30))),
+            ("unknown.example", None),
+            ("soon.example", Some(now + Duration::days(2))),
+            ("expired.example", Some(now - Duration::days(2))),
+        ] {
+            let mut model = domain_with_cert(None, None, expires);
+            model.domain = name.to_string();
+            let mut active: domains::ActiveModel = model.into();
+            active.id = sea_orm::ActiveValue::NotSet;
+            active.insert(db.as_ref()).await.unwrap();
+        }
+        let (first, total) = service
+            .list_domains_with_total(
+                1,
+                2,
+                Some("example"),
+                DomainSort::Expiration,
+                DomainSortDirection::Asc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.domain.as_str())
+                .collect::<Vec<_>>(),
+            ["expired.example", "soon.example"]
+        );
+        let (second, _) = service
+            .list_domains_with_total(2, 2, None, DomainSort::Expiration, DomainSortDirection::Asc)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.domain.as_str())
+                .collect::<Vec<_>>(),
+            ["later.example", "unknown.example"]
+        );
+        let (descending, _) = service
+            .list_domains_with_total(
+                1,
+                20,
+                None,
+                DomainSort::Expiration,
+                DomainSortDirection::Desc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(descending.first().unwrap().domain, "later.example");
+        assert_eq!(descending.last().unwrap().domain, "unknown.example");
+        let (empty, total) = service
+            .list_domains_with_total(
+                1,
+                20,
+                Some("missing"),
+                DomainSort::Domain,
+                DomainSortDirection::Asc,
+            )
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn domain_sorting_is_bounded_and_stable() {
+        use sea_orm::{DbBackend, QuerySelect, QueryTrait};
+        for (direction, sql_direction) in [
+            (DomainSortDirection::Asc, "ASC"),
+            (DomainSortDirection::Desc, "DESC"),
+        ] {
+            let sql = sorted_domains_query(Some("example"), DomainSort::Expiration, direction)
+                .limit(20)
+                .offset(20)
+                .build(DbBackend::Postgres)
+                .to_string();
+            assert!(
+                sql.contains(&format!("\"expiration_time\" {sql_direction} NULLS LAST")),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("\"domain\" ASC, \"domains\".\"id\" ASC"),
+                "{sql}"
+            );
+            assert!(sql.contains("LIKE '%example%'"), "{sql}");
+            assert!(sql.contains("LIMIT 20 OFFSET 20"), "{sql}");
+        }
+        for (sort, column) in [
+            (DomainSort::Domain, "domain"),
+            (DomainSort::Status, "status"),
+            (DomainSort::CreatedAt, "created_at"),
+        ] {
+            let sql = sorted_domains_query(None, sort, DomainSortDirection::Desc)
+                .build(DbBackend::Postgres)
+                .to_string();
+            assert!(
+                sql.contains(&format!(
+                    "ORDER BY \"domains\".\"{column}\" DESC NULLS LAST"
+                )),
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn acme_orders_with_dns_cleanup_receipts_are_retained_after_issuance() {
