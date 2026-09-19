@@ -13383,6 +13383,15 @@ export type MultiNodeSettings = {
      */
     node_disk_alert_percent?: number | null;
     /**
+     * Seconds a worker node must go without a heartbeat before its workloads
+     * are failed over to healthy nodes. A node is reported offline (and
+     * operators alerted) well before this; the gap is a grace period so a
+     * brief network partition or a control-plane stall does not redeploy a
+     * whole node's worth of apps that never stopped serving. `None` disables
+     * automatic failover entirely. Default 300.
+     */
+    node_failover_after_secs?: number | null;
+    /**
      * Memory-usage percent above which a worker node raises a resource alert.
      * `None` disables memory alerting. Default 90.
      */
@@ -13425,6 +13434,11 @@ export type MultiNodeSettingsMasked = {
      */
     node_cpu_alert_percent?: number | null;
     node_disk_alert_percent?: number | null;
+    /**
+     * Seconds without a heartbeat before a node's workloads are failed over;
+     * `None` = automatic failover disabled.
+     */
+    node_failover_after_secs?: number | null;
     node_memory_alert_percent?: number | null;
     private_address?: string | null;
     /**

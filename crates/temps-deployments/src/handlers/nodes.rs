@@ -3022,6 +3022,7 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

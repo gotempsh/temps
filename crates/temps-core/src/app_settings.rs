@@ -1291,6 +1291,14 @@ pub struct MultiNodeSettings {
     /// `None` disables disk alerting. Default 90.
     #[serde(default = "default_node_disk_alert_percent")]
     pub node_disk_alert_percent: Option<f64>,
+    /// Seconds a worker node must go without a heartbeat before its workloads
+    /// are failed over to healthy nodes. A node is reported offline (and
+    /// operators alerted) well before this; the gap is a grace period so a
+    /// brief network partition or a control-plane stall does not redeploy a
+    /// whole node's worth of apps that never stopped serving. `None` disables
+    /// automatic failover entirely. Default 300.
+    #[serde(default = "default_node_failover_after_secs")]
+    pub node_failover_after_secs: Option<u64>,
 }
 
 fn default_node_cpu_alert_percent() -> Option<f64> {
@@ -1301,6 +1309,9 @@ fn default_node_memory_alert_percent() -> Option<f64> {
 }
 fn default_node_disk_alert_percent() -> Option<f64> {
     Some(90.0)
+}
+fn default_node_failover_after_secs() -> Option<u64> {
+    Some(300)
 }
 
 fn default_legacy_shared_token_enabled() -> bool {
@@ -1319,6 +1330,7 @@ impl Default for MultiNodeSettings {
             node_cpu_alert_percent: default_node_cpu_alert_percent(),
             node_memory_alert_percent: default_node_memory_alert_percent(),
             node_disk_alert_percent: default_node_disk_alert_percent(),
+            node_failover_after_secs: default_node_failover_after_secs(),
         }
     }
 }

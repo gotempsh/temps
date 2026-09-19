@@ -497,6 +497,10 @@ impl NodeService {
         if node.status == "offline" {
             active.status = Set("active".to_string());
         }
+        // The outage is over: re-arm failover for the next one.
+        if node.failover_at.is_some() {
+            active.failover_at = Set(None);
+        }
         if let Some(labels) = request.labels {
             active.labels = Set(labels);
         }
@@ -663,6 +667,43 @@ impl NodeService {
         tracing::warn!(node_id = node_id, "Node marked as offline");
 
         Ok(())
+    }
+
+    /// Record that an offline node's workloads have been failed over, so the
+    /// health loop does it once per outage. Cleared by the next heartbeat.
+    pub async fn mark_failed_over(&self, node_id: i32) -> Result<(), NodeError> {
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(NodeError::NotFoundById { node_id })?;
+
+        let mut active: nodes::ActiveModel = node.into();
+        active.failover_at = Set(Some(chrono::Utc::now()));
+        active.update(self.db.as_ref()).await?;
+
+        Ok(())
+    }
+
+    /// Offline nodes whose last heartbeat is older than `failover_after_secs`
+    /// and whose workloads have not been failed over yet for this outage.
+    pub async fn list_due_for_failover(
+        &self,
+        failover_after_secs: i64,
+    ) -> Result<Vec<nodes::Model>, NodeError> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(failover_after_secs);
+
+        let nodes = nodes::Entity::find()
+            .filter(nodes::Column::Status.eq("offline"))
+            .filter(nodes::Column::FailoverAt.is_null())
+            .filter(
+                nodes::Column::LastHeartbeat
+                    .lt(cutoff)
+                    .or(nodes::Column::LastHeartbeat.is_null()),
+            )
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(nodes)
     }
 
     /// Mark a node as draining (no new deployments, existing continue).
@@ -1137,6 +1178,7 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
@@ -1705,6 +1747,50 @@ mod tests {
             rendered.contains("37"),
             "UPDATE must carry the reported record count: {rendered}"
         );
+    }
+
+    /// Recovery re-arms failover: a heartbeat from a node that was failed over
+    /// clears `failover_at` (and flips it back to active), while a healthy
+    /// node's heartbeat never touches the column.
+    #[tokio::test]
+    async fn test_heartbeat_clears_failover_marker_only_when_set() {
+        async fn heartbeat_sql(node: nodes::Model) -> String {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![node.clone()]])
+                    .append_query_results(vec![vec![node]])
+                    .into_connection(),
+            );
+            let service = NodeService::new(db.clone());
+            let result = service
+                .heartbeat(
+                    1,
+                    HeartbeatRequest {
+                        architecture: None,
+                        capacity: serde_json::json!({}),
+                        labels: None,
+                        dns_resolver: None,
+                    },
+                )
+                .await;
+            assert!(result.is_ok());
+            drop(service);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = db.into_transaction_log();
+            let update = log.last().expect("heartbeat must issue an UPDATE");
+            update.statements()[0].sql.clone()
+        }
+
+        let mut failed_over = sample_node();
+        failed_over.status = "offline".to_string();
+        failed_over.failover_at = Some(chrono::Utc::now());
+        let sql = heartbeat_sql(failed_over).await;
+        assert!(sql.contains("\"failover_at\" ="), "{sql}");
+        assert!(sql.contains("\"status\" ="), "{sql}");
+
+        let sql = heartbeat_sql(sample_node()).await;
+        // (`RETURNING` lists every column, so match the SET assignment.)
+        assert!(!sql.contains("\"failover_at\" ="), "{sql}");
     }
 
     /// A heartbeat with `dns_resolver: None` (older agent, or a tick that

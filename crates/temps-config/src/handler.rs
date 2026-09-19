@@ -584,6 +584,9 @@ pub struct MultiNodeSettingsMasked {
     pub node_cpu_alert_percent: Option<f64>,
     pub node_memory_alert_percent: Option<f64>,
     pub node_disk_alert_percent: Option<f64>,
+    /// Seconds without a heartbeat before a node's workloads are failed over;
+    /// `None` = automatic failover disabled.
+    pub node_failover_after_secs: Option<u64>,
 }
 
 /// Read-only cluster network state. Pool changes are performed on the control
@@ -720,6 +723,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
                 node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
                 node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
+                node_failover_after_secs: settings.multi_node.node_failover_after_secs,
                 private_address: settings.multi_node.private_address,
             },
             // `effective_metrics_store` defaults to the configured store here;

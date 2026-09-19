@@ -41,6 +41,7 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         edge_public_key: None,
         compute_cidr: None,
         underlay_address: None,
+        failover_at: None,
         last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs)),
         dns_resolver_running: None,
         dns_resolver_tasks_alive: None,
