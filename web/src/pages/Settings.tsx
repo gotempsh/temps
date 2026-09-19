@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Disclosure } from '@temps-sdk/ds'
+import { Disclosure, Field } from '@temps-sdk/ds'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -172,51 +172,50 @@ export function Settings() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <PageHeader
-        title="Settings"
-      />
+      <PageHeader title="Settings" />
       <SettingsSection
         title="External URL"
-        description="Set the external URL for your platform"
         icon={Link}
         hasError={Boolean(errors.external_url || errors.internal_url)}
       >
-        <div className="space-y-2">
-          <Label htmlFor="external-url">External URL</Label>
-          <Input
-            id="external-url"
-            type="url"
-            placeholder="https://your-domain.com"
-            {...register('external_url', {
-              validate: (value) => {
-                if (!value) return true // optional
-                const trimmed = value.trim()
-                if (!trimmed) return true
-                if (
-                  !trimmed.startsWith('http://') &&
-                  !trimmed.startsWith('https://')
-                )
-                  return 'Must start with http:// or https://'
-                if (trimmed.includes('#') || trimmed.includes('?'))
-                  return 'Must not contain # or ? characters'
-                try {
-                  new URL(trimmed)
-                } catch {
-                  return 'Must be a valid URL'
-                }
-                return true
-              },
-            })}
-          />
-          {errors.external_url && (
-            <p className="text-sm text-destructive">
-              {errors.external_url.message}
-            </p>
+        <Field
+          label="External URL"
+          optional
+          error={errors.external_url?.message}
+          help={{
+            label: 'About the external URL',
+            content:
+              'Used for OAuth callbacks, webhooks, and external integrations.',
+          }}
+        >
+          {(fieldProps) => (
+            <Input
+              {...fieldProps}
+              type="url"
+              placeholder="https://your-domain.com"
+              {...register('external_url', {
+                validate: (value) => {
+                  if (!value) return true // optional
+                  const trimmed = value.trim()
+                  if (!trimmed) return true
+                  if (
+                    !trimmed.startsWith('http://') &&
+                    !trimmed.startsWith('https://')
+                  )
+                    return 'Must start with http:// or https://'
+                  if (trimmed.includes('#') || trimmed.includes('?'))
+                    return 'Must not contain # or ? characters'
+                  try {
+                    new URL(trimmed)
+                  } catch {
+                    return 'Must be a valid URL'
+                  }
+                  return true
+                },
+              })}
+            />
           )}
-          <p className="text-sm text-muted-foreground">
-            Used for OAuth callbacks, webhooks, and external integrations
-          </p>
-        </div>
+        </Field>
 
         <div className="space-y-2 pt-4">
           <Label htmlFor="console-force-https">Redirect console to HTTPS</Label>
@@ -249,8 +248,11 @@ export function Settings() {
             terminating TLS can cause redirect loops.
           </p>
           <Disclosure label="How automatic redirects work">
-            <p>Automatic redirects HTTP requests only after Temps has issued a
-            certificate for the console hostname. HTTP-only installations keep working.</p>
+            <p>
+              Automatic redirects HTTP requests only after Temps has issued a
+              certificate for the console hostname. HTTP-only installations keep
+              working.
+            </p>
           </Disclosure>
         </div>
 
@@ -297,11 +299,7 @@ export function Settings() {
         </div>
       </SettingsSection>
 
-      <SettingsSection
-        title="Preview Domain"
-        description="Configure the domain used for deployment previews"
-        icon={Globe}
-      >
+      <SettingsSection title="Preview Domain" icon={Globe}>
         <div className="space-y-2">
           <Label htmlFor="preview-domain">Preview Domain</Label>
           <Input
@@ -319,7 +317,7 @@ export function Settings() {
 
       <SettingsSection
         title="Let's Encrypt"
-        description="Contact email for automatic TLS certificate issuance and renewal"
+        description="Automatic TLS certificates"
         icon={ShieldCheck}
         hasError={Boolean(errors.letsencrypt?.email)}
       >
@@ -402,11 +400,7 @@ export function Settings() {
         </div>
       </SettingsSection>
 
-      <SettingsSection
-        title="Screenshots"
-        description="Configure screenshot generation for deployments"
-        icon={Image}
-      >
+      <SettingsSection title="Screenshots" icon={Image}>
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
@@ -475,11 +469,11 @@ export function Settings() {
         </div>
       </SettingsSection>
 
-      <SettingsSection
-        title="Route Table"
-        description="Manually refresh proxy routes from the database when deployments or configuration changes appear out of sync."
-        icon={RefreshCw}
-      >
+      <SettingsSection title="Route Table" icon={RefreshCw}>
+        <p className="mb-3 text-sm text-muted-foreground">
+          Refresh proxy routes if a deployment or configuration change is out of
+          sync.
+        </p>
         <Button
           type="button"
           variant="outline"

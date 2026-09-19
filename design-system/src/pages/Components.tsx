@@ -13,6 +13,7 @@ import {
   CopyAction,
   DataTable,
   Field,
+  SettingsSection,
   FormErrors,
   Kbd,
   LogLine,
@@ -66,6 +67,16 @@ export default function Components() {
             verdict={<Status tone="ok" />}
             actions={<Button>Primary action</Button>}
           />
+        </div>
+      </Block>
+
+      <Block title="Settings sections">
+        <div className="w-full">
+          <SettingsSection title="Resource limits" icon={Cpu}>
+            <Field label="Memory limit" description="Enter a limit in MiB." help={{ label: 'About memory limits', content: 'Limits apply to each container in this sample.' }}>
+              {(props) => <Input {...props} defaultValue="512" type="number" />}
+            </Field>
+          </SettingsSection>
         </div>
       </Block>
 

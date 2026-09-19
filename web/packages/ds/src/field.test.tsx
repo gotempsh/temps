@@ -6,7 +6,11 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { Field, FormErrors } from './field'
 
 test('field links its label, help and error to the control', () => {
-  const html = renderToStaticMarkup(<Field label="Project" description="Choose a name" error="Required">{props => <input {...props} />}</Field>)
+  const html = renderToStaticMarkup(
+    <Field label="Project" description="Choose a name" error="Required">
+      {(props) => <input {...props} />}
+    </Field>
+  )
   expect(html).toContain('aria-invalid="true"')
   const id = html.match(/<input id="([^"]+)"/)?.[1]
   expect(id).toBeDefined()
@@ -15,9 +19,32 @@ test('field links its label, help and error to the control', () => {
 })
 
 test('summary identifies which fields have the same validation message', () => {
-  const html = renderToStaticMarkup(<FormErrors errors={{Project: 'Required', Service: 'Required', Email: undefined}} />)
+  const html = renderToStaticMarkup(
+    <FormErrors
+      errors={{ Project: 'Required', Service: 'Required', Email: undefined }}
+    />
+  )
   expect(html).toContain('Project:')
   expect(html).toContain('Service:')
   expect(html).not.toContain('Email:')
   expect(html).toContain('Fix 2 fields')
+})
+
+test('optional field help is separate from the label and required instructions', () => {
+  const html = renderToStaticMarkup(
+    <Field
+      label="External URL"
+      description="Use HTTPS"
+      error="Invalid URL"
+      help={{ label: 'About the external URL', content: 'Background context' }}
+    >
+      {(props) => <input {...props} />}
+    </Field>
+  )
+  expect(html).toContain('aria-label="About the external URL"')
+  expect(html).toContain('aria-expanded="false"')
+  expect(html.match(/<label[^>]*>.*?<\/label>/)?.[0]).not.toContain('<button')
+  expect(html).toContain('Use HTTPS')
+  expect(html).toContain('Invalid URL')
+  expect(html).not.toContain('Background context')
 })

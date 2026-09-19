@@ -226,3 +226,8 @@ setup requirements. Do not collapse frequently used controls. Keep a visible
 sample label in demos, and move walkthrough instructions into "About this example"
 outside the main workflow. Use existing semantic spacing and colors; help is not
 a new bordered card around every field.
+
+Use `SettingsSection` for collapsible form groups, not the informational
+`Disclosure`: it retains field values and reveals validation errors. Keep primary
+fields open by default. `Field.help` places optional context beside the label;
+required instructions and errors remain visible below the control.

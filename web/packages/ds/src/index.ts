@@ -62,3 +62,5 @@ export { clampPage } from './lib/pagination'
 export { LogLevelBadge } from './log-level-badge'
 
 export { HelpPopover, Disclosure } from './help'
+
+export { SettingsSection } from './settings-section'

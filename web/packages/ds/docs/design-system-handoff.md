@@ -77,6 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
 | `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
@@ -409,3 +410,19 @@ Verified console typecheck, package lint, console and sandbox builds, help and
 query unit tests. Browser checks covered HelpPopover open/Escape/focus return,
 Disclosure Enter activation, and the wizard's default layout. Console built CSS
 contains the package-only badge height utility through the explicit DS source scan.
+
+### Settings help refinement
+
+`Field.help` accepts `{ label, content }` for optional background context. Its
+help trigger is a sibling of the label, never nested in it. Keep required format
+instructions in `description` and validation in `error`. `SettingsSection` is
+now owned by the package; the old console import is a thin re-export. The sandbox
+settings example demonstrates open general settings and collapsed notifications.
+
+Read-only browser review against a populated instance at the local console proxy:
+settings summaries previously repeated their titles or showed operational details
+before expansion. Redundant summaries were removed; route-refresh context now sits
+beside its action. External URL context uses `Field.help`; validation remains inline.
+Verified help open/Escape/focus return and a 390px dark viewport without horizontal
+overflow. No live forms were submitted and no resources were modified. Form value
+retention and error expansion are covered by the existing section regression tests.
