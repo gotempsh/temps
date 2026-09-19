@@ -1202,50 +1202,40 @@ async fn install_repository(
         },
     )
     .await?;
-    // Reserve a validated client UUID only after authorization and source checks.
-    // A request without progressId keeps the original synchronous behavior.
-    let progress = if let Some(raw_id) = request.progress_id.as_deref() {
-        let id = uuid::Uuid::parse_str(raw_id)
-            .map_err(|_| {
+    // The service validates source identity before reserving a progress ID.
+    let preparation = state
+        .service
+        .prepare_repository_install(
+            &request.repository_url,
+            request.path.as_deref(),
+            request.progress_id.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::service::RepositoryInstallPreparationError::InvalidProgressId => {
                 temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Install Progress ID")
                     .with_detail("progressId must be a UUID")
-            })?
-            .to_string();
-        crate::repository::parse_repository(&request.repository_url)
-            .map_err(|error| service_problem(&ExternalPluginsError::Repository(error)))?;
-        crate::repository::normalize_path(request.path.as_deref(), &request.repository_url)
-            .map_err(|error| service_problem(&ExternalPluginsError::Repository(error)))?;
-        let handle =
-            state
-                .service
-                .register_install_progress(id)
-                .await
-                .map_err(|error| match error {
-                    crate::install_progress::ProgressError::Duplicate { .. } => {
-                        temps_core::problemdetails::new(StatusCode::CONFLICT)
-                            .with_title("Install Progress ID In Use")
-                            .with_detail("This progressId is already registered")
-                    }
-                    crate::install_progress::ProgressError::Full => {
-                        temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                            .with_title("Install Progress Unavailable")
-                            .with_detail("Too many installations are being tracked; retry shortly")
-                    }
-                })?;
-        Some(crate::install_progress::ProgressGuard::new(handle))
-    } else {
-        None
-    };
+            }
+            crate::service::RepositoryInstallPreparationError::Repository(error) => {
+                service_problem(&ExternalPluginsError::Repository(error))
+            }
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Duplicate { .. },
+            ) => temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Install Progress ID In Use")
+                .with_detail("This progressId is already registered"),
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Full,
+            ) => temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Install Progress Unavailable")
+                .with_detail("Too many installations are being tracked; retry shortly"),
+        })?;
+    let progress = preparation
+        .progress
+        .map(crate::install_progress::ProgressGuard::new);
     let context = audit_context(&auth, &metadata);
-    let requested_source = crate::repository::parse_repository(&request.repository_url)
-        .ok()
-        .and_then(|(owner, repo)| {
-            let canonical = format!("https://github.com/{owner}/{repo}");
-            crate::repository::normalize_path(request.path.as_deref(), &canonical)
-                .ok()
-                .map(|path| crate::manager::repository_actor_source(&canonical, path.as_deref()))
-        });
+    let requested_source = preparation.requested_source;
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
