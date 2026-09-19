@@ -71,6 +71,8 @@ pub enum RepositoryError {
     UnsafeUrl,
     #[error("Unsafe Git ref for repository '{repository}'")]
     UnsafeRef { repository: String },
+    #[error("Unsafe plugin directory '{path}' in repository '{repository}'")]
+    UnsafePath { repository: String, path: String },
     #[error("GitHub request for repository '{repository}' failed during {operation}: {reason}")]
     GitHub {
         repository: String,
@@ -104,6 +106,7 @@ pub(crate) struct RepositorySource {
     pub repository: String,
     pub name: String,
     pub ref_name: String,
+    pub path: Option<String>,
     pub commit: String,
     pub version: String,
     pub source_dir: PathBuf,
@@ -152,9 +155,36 @@ pub(crate) fn parse_repository(url: &str) -> Result<(String, String), Repository
     Ok((owner, repo))
 }
 
+pub(crate) fn normalize_path(
+    path: Option<&str>,
+    repository: &str,
+) -> Result<Option<String>, RepositoryError> {
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    if path.len() > 512
+        || path.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.eq_ignore_ascii_case(".git")
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+    {
+        return Err(RepositoryError::UnsafePath {
+            repository: repository.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(Some(path.to_string()))
+}
+
 pub(crate) async fn fetch_source(
     repository_url: &str,
     reference: Option<&str>,
+    path: Option<&str>,
     source_dir: PathBuf,
     expected_name: Option<&str>,
 ) -> Result<RepositorySource, RepositoryError> {
@@ -165,6 +195,7 @@ pub(crate) async fn fetch_source(
         });
     }
     let repository = format!("https://github.com/{owner}/{repo}");
+    let path = normalize_path(path, &repository)?;
     let git_dir = source_dir.with_extension("git");
     std::fs::create_dir_all(&git_dir).map_err(|error| RepositoryError::GitHub {
         repository: repository.clone(),
@@ -257,6 +288,7 @@ pub(crate) async fn fetch_source(
     }
     let bytes = archive_commit(&repository, &git_dir, &commit).await?;
     extract_archive(&bytes, &source_dir, &repository, &commit)?;
+    let source_dir = select_source_directory(source_dir, path.as_deref(), &repository, &commit)?;
     let package = std::fs::read(source_dir.join("package.json")).map_err(|error| {
         RepositoryError::Manifest {
             repository: repository.clone(),
@@ -296,13 +328,32 @@ pub(crate) async fn fetch_source(
         repository,
         name: name.to_string(),
         ref_name: reference,
+        path,
         commit,
         version: manifest.version,
         source_dir,
     })
 }
 
-fn valid_git_ref(reference: &str) -> bool {
+fn select_source_directory(
+    root: PathBuf,
+    path: Option<&str>,
+    repository: &str,
+    commit: &str,
+) -> Result<PathBuf, RepositoryError> {
+    let Some(path) = path else { return Ok(root) };
+    let selected = root.join(path);
+    if !selected.is_dir() {
+        return Err(RepositoryError::Manifest {
+            repository: repository.to_string(),
+            commit: commit.to_string(),
+            reason: format!("plugin directory '{path}' does not exist"),
+        });
+    }
+    Ok(selected)
+}
+
+pub(crate) fn valid_git_ref(reference: &str) -> bool {
     !reference.is_empty()
         && !reference.starts_with('-')
         && reference.len() <= 128
@@ -1009,6 +1060,70 @@ mod tests {
         eprintln!("Docker builder quota probe confirmed read-only root and /work ENOSPC");
     }
 
+    #[test]
+    fn nested_source_selection_and_refs() {
+        let root = tempfile::tempdir().expect("source fixture");
+        std::fs::create_dir_all(root.path().join("plugins/one")).expect("nested plugin");
+        let selected = select_source_directory(
+            root.path().to_path_buf(),
+            Some("plugins/one"),
+            "https://github.com/example/plugins",
+            &"a".repeat(40),
+        )
+        .expect("existing path");
+        assert_eq!(selected, root.path().join("plugins/one"));
+        assert!(matches!(
+            select_source_directory(
+                root.path().to_path_buf(),
+                Some("plugins/missing"),
+                "https://github.com/example/plugins",
+                &"a".repeat(40)
+            ),
+            Err(RepositoryError::Manifest { .. })
+        ));
+        assert!(valid_git_ref("feature/plugin-one"));
+        assert!(valid_git_ref("releases/v1.2.3"));
+        assert!(valid_git_ref(&"a".repeat(40)));
+        assert!(!valid_git_ref("missing..ref"));
+    }
+
+    #[test]
+    fn selected_plugin_directory_is_strict_and_root_is_canonical() {
+        let repository = "https://github.com/example/plugins";
+        assert_eq!(normalize_path(None, repository).expect("root"), None);
+        assert_eq!(
+            normalize_path(Some(""), repository).expect("empty root"),
+            None
+        );
+        assert_eq!(
+            normalize_path(Some("plugins/alpha-1"), repository).expect("subtree"),
+            Some("plugins/alpha-1".into())
+        );
+        for invalid in [
+            "/plugin",
+            "plugin/",
+            "a//b",
+            ".",
+            "..",
+            "a/../b",
+            "a/.git/b",
+            "a/.GIT",
+            "a\\b",
+            "a%2Fb",
+            "a b",
+            "é",
+            "a".repeat(513).as_str(),
+        ] {
+            assert!(
+                matches!(
+                    normalize_path(Some(invalid), repository),
+                    Err(RepositoryError::UnsafePath { .. })
+                ),
+                "accepted {invalid}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn public_template_build_produces_host_binary_when_docker_available() {
         let docker = Command::new("docker")
@@ -1023,6 +1138,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = fetch_source(
             "https://github.com/gotempsh/temps-plugin-template",
+            None,
             None,
             temp.path().join("source"),
             None,
@@ -1114,6 +1230,99 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         result.stdout
+    }
+
+    #[tokio::test]
+    async fn local_git_fetch_resolves_branch_tag_sha_and_rejects_missing_ref() {
+        let temp = tempfile::tempdir().expect("git fixture");
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("checkout directory");
+        local_git(&checkout, &["init", "-q"]).await;
+        std::fs::write(checkout.join("fixture"), b"source").expect("fixture source");
+        local_git(&checkout, &["add", "fixture"]).await;
+        local_git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )
+        .await;
+        local_git(&checkout, &["branch", "feature/nested"]).await;
+        local_git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "tag",
+                "-am",
+                "release",
+                "releases/v1",
+            ],
+        )
+        .await;
+        let expected = String::from_utf8(local_git(&checkout, &["rev-parse", "HEAD"]).await)
+            .expect("sha")
+            .trim()
+            .to_string();
+        for reference in ["feature/nested", "releases/v1", expected.as_str()] {
+            let bare = temp
+                .path()
+                .join(format!("bare-{}", reference.replace('/', "-")));
+            std::fs::create_dir(&bare).expect("bare directory");
+            local_git(&bare, &["init", "--bare", "-q"]).await;
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(&bare)
+                .args([
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--depth=1",
+                    "--",
+                    checkout.to_str().expect("checkout path"),
+                    reference,
+                ])
+                .output()
+                .await
+                .expect("fetch process");
+            assert!(
+                result.status.success(),
+                "fetch {reference}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let actual = String::from_utf8(
+                local_git(&bare, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"]).await,
+            )
+            .expect("resolved commit");
+            assert_eq!(actual.trim(), expected, "{reference}");
+        }
+        let bare = temp.path().join("bare-missing");
+        std::fs::create_dir(&bare).expect("bare directory");
+        local_git(&bare, &["init", "--bare", "-q"]).await;
+        let missing = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--depth=1",
+                "--",
+                checkout.to_str().expect("checkout path"),
+                "missing/ref",
+            ])
+            .output()
+            .await
+            .expect("missing fetch process");
+        assert!(!missing.status.success());
     }
 
     #[tokio::test]
@@ -1302,22 +1511,39 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().expect("tempdir");
-        let source_dir = temp.path().join("source");
+        let root = temp.path().join("source");
+        let selected_path = "plugins/fixture";
+        let source_dir = root.join(selected_path);
         tokio::fs::create_dir_all(source_dir.join("src"))
             .await
-            .expect("source directory");
+            .expect("nested source directory");
+        tokio::fs::create_dir_all(root.join("plugins/sibling/src"))
+            .await
+            .expect("sibling source directory");
+        tokio::fs::write(
+            root.join("package.json"),
+            br#"{"name":"invalid-root-plugin","version":"invalid","dependencies":{}}"#,
+        )
+        .await
+        .expect("invalid root manifest");
+        tokio::fs::write(
+            root.join("plugins/sibling/package.json"),
+            b"{invalid-sibling-manifest",
+        )
+        .await
+        .expect("invalid sibling manifest");
         tokio::fs::write(
             source_dir.join("package.json"),
             br#"{"name":"fixture-plugin","version":"1.0.0","dependencies":{}}"#,
         )
         .await
-        .expect("package manifest");
+        .expect("nested package manifest");
         tokio::fs::write(
             source_dir.join("src/index.ts"),
             b"console.log('fixture');\n",
         )
         .await
-        .expect("entrypoint");
+        .expect("nested entrypoint");
         let lockfile = Command::new("bun")
             .args(["install", "--lockfile-only", "--ignore-scripts"])
             .current_dir(&source_dir)
@@ -1332,13 +1558,22 @@ mod tests {
             ),
             Err(error) => panic!("fixture lockfile: {error}"),
         }
+        let selected = select_source_directory(
+            root,
+            Some(selected_path),
+            "https://github.com/example/plugin",
+            &"a".repeat(40),
+        )
+        .expect("select nested plugin");
+        assert_eq!(selected, source_dir);
         let source = RepositorySource {
             repository: "https://github.com/example/plugin".into(),
             name: "fixture-plugin".into(),
             ref_name: "main".into(),
+            path: Some(selected_path.into()),
             commit: "a".repeat(40),
             version: "1.0.0".into(),
-            source_dir,
+            source_dir: selected,
         };
         let output = temp.path().join("plugin");
         build(&source, &output).await.expect("bounded compile");

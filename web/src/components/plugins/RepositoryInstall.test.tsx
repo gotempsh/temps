@@ -15,6 +15,8 @@ test('catalog review shows the pinned commit and keeps explicit trust without cu
           name: 'example',
           repository: 'https://github.com/example/plugin',
           commit: 'a'.repeat(40),
+          path: 'plugins/demo',
+          ref: 'release/v1',
         }}
       />
     </QueryClientProvider>
@@ -22,6 +24,8 @@ test('catalog review shows the pinned commit and keeps explicit trust without cu
   expect(markup).toContain('Review installation')
   expect(markup).toContain('a'.repeat(40))
   expect(markup).toContain('Back to catalog')
+  expect(markup).toContain('plugins/demo')
+  expect(markup).toContain('release/v1')
   expect(markup).toContain('aria-checked="false"')
   expect(markup).toContain('I trust this repository')
   expect(markup).not.toContain('Name and revision')

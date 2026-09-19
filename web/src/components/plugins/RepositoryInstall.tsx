@@ -50,6 +50,7 @@ export function RepositoryInstall({
       name: '',
       repository_url: '',
       ref_name: '',
+      path: '',
       trusted: false,
     },
   })
@@ -116,6 +117,15 @@ export function RepositoryInstall({
             Installation is pinned to commit{' '}
             <code className="break-all">{selection.commit}</code>.
           </p>
+          <p>
+            Directory: <code>{selection.path || 'Repository root'}</code>
+            {selection.ref && (
+              <>
+                {' '}
+                · Catalog ref: <code>{selection.ref}</code>
+              </>
+            )}
+          </p>
           <p className="text-muted-foreground">
             A catalog listing is not a security audit. Review the source before
             granting it the host’s permissions.
@@ -148,6 +158,23 @@ export function RepositoryInstall({
               {form.formState.errors.repository_url?.message}
             </p>
           </div>
+          {!selection && (
+            <div className="space-y-2 sm:col-span-2">
+              <Label htmlFor="plugin-path">Plugin directory (optional)</Label>
+              <Input
+                id="plugin-path"
+                placeholder="plugins/my-plugin"
+                {...form.register('path')}
+              />
+              <p className="text-sm text-muted-foreground">
+                Leave empty for the repository root. This directory must contain
+                its own package.json, lockfile, and build assets.
+              </p>
+              <p className="text-sm text-destructive">
+                {form.formState.errors.path?.message}
+              </p>
+            </div>
+          )}
           {!selection && (
             <Collapsible className="sm:col-span-2">
               <CollapsibleTrigger asChild>

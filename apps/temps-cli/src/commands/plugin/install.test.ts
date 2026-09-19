@@ -84,3 +84,33 @@ test("install and update are discoverable with advanced ref options", () => {
   expect(command.commands[0]?.helpInformation()).toContain("--grant");
   expect(command.commands[1]?.helpInformation()).not.toContain("--grant");
 });
+
+for (const path of ["plugins/demo", "site-crawl-plugin", "nested/plugin.v2"]) {
+  test(`install supports subdirectory ${path} and custom ref`, () => {
+    expect(installBody(repository, { path, ref: "release/v2" })).toEqual({
+      repository_url: repository,
+      path,
+      ref_name: "release/v2",
+    });
+  });
+}
+for (const path of [
+  "../plugin",
+  "/plugin",
+  "a//b",
+  "a/./b",
+  "a/../b",
+  "a/",
+  "a\\b",
+  ".git/plugin",
+  "a/.GIT/plugin",
+  "%2e%2e/plugin",
+  "a".repeat(513),
+]) {
+  test(`rejects unsafe subdirectory ${path}`, () =>
+    expect(() => installBody(repository, { path })).toThrow("--path"));
+}
+test("empty path preserves root install request", () =>
+  expect(installBody(repository, { path: "" })).toEqual({
+    repository_url: repository,
+  }));

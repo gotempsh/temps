@@ -118,6 +118,9 @@ impl SelectedRepository {
     pub fn repository(&self) -> &str {
         &self.source.repository
     }
+    pub fn path(&self) -> Option<&str> {
+        self.source.path.as_deref()
+    }
     pub fn source_commit(&self) -> &str {
         &self.source.commit
     }
@@ -183,6 +186,7 @@ impl ExternalPluginsService {
         &self,
         name: &str,
         repository_url: &str,
+        path: Option<&str>,
     ) -> Result<(), ExternalPluginsError> {
         let (owner, repo) = repository::parse_repository(repository_url)?;
         let canonical = format!("https://github.com/{owner}/{repo}");
@@ -192,13 +196,13 @@ impl ExternalPluginsService {
             .await
             .is_ok();
         if active_exists
-            && existing
-                .as_ref()
-                .is_none_or(|source| source.repository != canonical)
+            && existing.as_ref().is_none_or(|source| {
+                source.repository != canonical || source.path.as_deref() != path
+            })
         {
             return Err(repository::RepositoryError::SourceConflict {
                 name: name.to_string(),
-                repository: canonical,
+                repository: format!("{canonical} (path '{}')", path.unwrap_or("/")),
             }
             .into());
         }
@@ -218,6 +222,7 @@ impl ExternalPluginsService {
         requested_name: Option<&str>,
         repository_url: &str,
         reference: Option<&str>,
+        path: Option<&str>,
     ) -> Result<SelectedRepository, ExternalPluginsError> {
         if let Some(name) = requested_name {
             validate_plugin_name(name)?;
@@ -246,12 +251,13 @@ impl ExternalPluginsService {
         let source = repository::fetch_source(
             repository_url,
             reference,
+            path,
             temporary.path().join("source"),
             requested_name,
         )
         .await?;
         validate_plugin_name(&source.name)?;
-        self.ensure_repository_identity(&source.name, repository_url)
+        self.ensure_repository_identity(&source.name, repository_url, source.path.as_deref())
             .await?;
         Ok(SelectedRepository {
             name: source.name.clone(),
@@ -268,8 +274,12 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        self.ensure_repository_identity(&selected.name, &selected.source.repository)
-            .await?;
+        self.ensure_repository_identity(
+            &selected.name,
+            &selected.source.repository,
+            selected.source.path.as_deref(),
+        )
+        .await?;
         let output = selected._temporary.path().join("plugin");
         repository::build(&selected.source, &output).await?;
         let sha256 = crate::install::hash_regular_file_capped(
@@ -283,6 +293,7 @@ impl ExternalPluginsService {
             source: "github".to_string(),
             repository: selected.source.repository.clone(),
             ref_name: selected.source.ref_name.clone(),
+            path: selected.source.path.clone(),
             commit: selected.source.commit.clone(),
             builder: repository::BUILDER_IMAGE.to_string(),
             plugin_name: selected.name.clone(),
@@ -303,7 +314,10 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::repository_actor_source(&selected.source.repository),
+                crate::manager::repository_actor_source(
+                    &selected.source.repository,
+                    selected.source.path.as_deref(),
+                ),
             )
             .await
         {
@@ -1046,6 +1060,7 @@ mod tests {
             source: "github".into(),
             repository: "https://github.com/example/plugin".into(),
             ref_name: "main".into(),
+            path: Some("plugins/first".into()),
             commit: "a".repeat(40),
             builder: repository::BUILDER_IMAGE.into(),
             plugin_name: "fixture-plugin".into(),
@@ -1061,6 +1076,38 @@ mod tests {
             .activate(&candidate)
             .await
             .expect("activate repo");
+        assert!(service
+            .ensure_repository_identity(
+                "fixture-plugin",
+                "https://github.com/example/plugin",
+                Some("plugins/first")
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            service
+                .ensure_repository_identity(
+                    "fixture-plugin",
+                    "https://github.com/example/plugin",
+                    Some("plugins/sibling")
+                )
+                .await,
+            Err(ExternalPluginsError::Repository(
+                RepositoryError::SourceConflict { .. }
+            ))
+        ));
+        assert!(matches!(
+            service
+                .ensure_repository_identity(
+                    "fixture-plugin",
+                    "https://github.com/example/plugin",
+                    None
+                )
+                .await,
+            Err(ExternalPluginsError::Repository(
+                RepositoryError::SourceConflict { .. }
+            ))
+        ));
         let selected = selected_plugin(
             "http://127.0.0.1/artifact".into(),
             b"fixture",

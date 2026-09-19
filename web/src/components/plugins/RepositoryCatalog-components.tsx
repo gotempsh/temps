@@ -192,7 +192,7 @@ export function RepositoryCatalog({
                     <div className="text-sm">
                       <a
                         className="underline underline-offset-4"
-                        href={`${plugin.repository}/tree/${plugin.commit}`}
+                        href={`${plugin.repository}/tree/${plugin.commit}${plugin.path ? `/${plugin.path.split('/').map(encodeURIComponent).join('/')}` : ''}`}
                         target="_blank"
                         rel="noopener noreferrer"
                       >

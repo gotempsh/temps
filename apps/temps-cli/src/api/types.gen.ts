@@ -11656,6 +11656,7 @@ export type InstallPluginResponse = {
 export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
+    path?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -13358,6 +13359,32 @@ export type NetworkConfiguration = {
      * Network mode
      */
     mode: NetworkMode;
+};
+
+/**
+ * Information about a network interface
+ */
+export type NetworkInterface = {
+    /**
+     * IP address of the interface
+     */
+    address: string;
+    /**
+     * Name of the network interface
+     */
+    interface: string;
+    /**
+     * Whether this is a link-local address (IPv6)
+     */
+    is_link_local?: boolean | null;
+    /**
+     * Whether this is a private IP address (RFC 1918)
+     */
+    is_private?: boolean | null;
+    /**
+     * Whether this is a unique local address (IPv6)
+     */
+    is_unique_local?: boolean | null;
 };
 
 /**
@@ -15344,6 +15371,7 @@ export type PluginSourceResponse = {
     builder_image: string;
     commit: string;
     kind: string;
+    path?: string | null;
     ref_name: string;
     repository_url: string;
     version: string;
@@ -15610,6 +15638,24 @@ export type PreviewShareLinkResponse = {
 
 export type PricingResponse = {
     models: Array<ModelPricing>;
+};
+
+/**
+ * Information about private/local IP addresses
+ */
+export type PrivateIpInfo = {
+    /**
+     * All IPv4 addresses found on non-loopback interfaces
+     */
+    ipv4_addresses: Array<NetworkInterface>;
+    /**
+     * All IPv6 addresses found on non-loopback interfaces
+     */
+    ipv6_addresses: Array<NetworkInterface>;
+    /**
+     * The primary private IP address (most likely to be useful)
+     */
+    primary_ip?: string | null;
 };
 
 /**
@@ -16809,6 +16855,24 @@ export type PublicEnvExampleResponse = {
 export type PublicHostnameStrategy = 'standard' | 'flat';
 
 /**
+ * Information about a public IP address lookup
+ */
+export type PublicIpInfo = {
+    /**
+     * Error message if IP lookup failed
+     */
+    error?: string | null;
+    /**
+     * The public IP address, if successfully retrieved
+     */
+    ip?: string | null;
+    /**
+     * The source service that provided the IP
+     */
+    source?: string | null;
+};
+
+/**
  * Response for preset detection
  */
 export type PublicPresetResponse = {
@@ -17505,8 +17569,10 @@ export type RepositoryCatalogPlugin = {
     latestVersion: string;
     logoUrl?: string | null;
     name: string;
+    path?: string | null;
     platforms: Array<string>;
     readmeUrl?: string | null;
+    ref?: string | null;
     repository: string;
     screenshots: Array<RepositoryScreenshot>;
     summary: string;
@@ -45462,8 +45528,10 @@ export type GetPrivateIpResponses = {
     /**
      * Successfully retrieved private IP address
      */
-    200: unknown;
+    200: PrivateIpInfo;
 };
+
+export type GetPrivateIpResponse = GetPrivateIpResponses[keyof GetPrivateIpResponses];
 
 export type GetPublicIpData = {
     body?: never;
@@ -45487,8 +45555,10 @@ export type GetPublicIpResponses = {
     /**
      * Successfully retrieved public IP address
      */
-    200: unknown;
+    200: PublicIpInfo;
 };
+
+export type GetPublicIpResponse = GetPublicIpResponses[keyof GetPublicIpResponses];
 
 export type ListPresetsData = {
     body?: never;

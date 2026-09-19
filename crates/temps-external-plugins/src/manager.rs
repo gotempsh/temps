@@ -27,8 +27,11 @@ use crate::channel::PluginChannel;
 use crate::install::open_verified_executable;
 use crate::proxy::PluginProxy;
 
-pub(crate) fn repository_actor_source(repository: &str) -> String {
-    format!("repository:{repository}")
+pub(crate) fn repository_actor_source(repository: &str, path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!("repository:{repository}/tree/{path}"),
+        None => format!("repository:{repository}"),
+    }
 }
 
 pub(crate) fn registry_actor_source(registry_url: &str) -> String {
@@ -993,7 +996,9 @@ impl ExternalPluginManager {
         )
         .await
         {
-            Ok(Some(receipt)) => repository_actor_source(&receipt.repository),
+            Ok(Some(receipt)) => {
+                repository_actor_source(&receipt.repository, receipt.path.as_deref())
+            }
             Ok(None) => registry_actor_source(&self.config.registry.url),
             Err(error) => {
                 return Err(format!(
@@ -1313,14 +1318,18 @@ mod tests {
     fn repository_candidate_and_restart_use_the_same_actor_source_identity() {
         let verified_repository = "https://github.com/example/plugin";
 
-        let candidate_identity = repository_actor_source(verified_repository);
-        let restart_receipt_identity = repository_actor_source(verified_repository);
+        let candidate_identity = repository_actor_source(verified_repository, None);
+        let restart_receipt_identity = repository_actor_source(verified_repository, None);
 
         assert_eq!(candidate_identity, restart_receipt_identity);
         assert_eq!(
             candidate_identity,
             "repository:https://github.com/example/plugin"
         );
+        let first = repository_actor_source(verified_repository, Some("plugins/first"));
+        let sibling = repository_actor_source(verified_repository, Some("plugins/sibling"));
+        assert_ne!(first, sibling);
+        assert_ne!(first, candidate_identity);
     }
 
     #[test]

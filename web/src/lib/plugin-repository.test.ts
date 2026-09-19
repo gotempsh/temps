@@ -84,3 +84,46 @@ test('catalog selection pins the exact revision and requires fresh trust', () =>
     trusted: false,
   })
 })
+
+test('catalog selection retains the path and pins the reviewed commit instead of the moving ref', () => {
+  const values = repositorySelectionValues({
+    name: 'demo',
+    repository: valid.repository_url,
+    commit: 'a'.repeat(40),
+    path: 'plugins/demo',
+    ref: 'release/v2',
+  })
+  expect(repositoryInstallBody(values)).toEqual({
+    name: 'demo',
+    repository_url: valid.repository_url,
+    ref_name: 'a'.repeat(40),
+    path: 'plugins/demo',
+  })
+  expect(repositorySelectionValues(null).path).toBeUndefined()
+})
+for (const path of [
+  '../x',
+  '/x',
+  'a//b',
+  'a/./b',
+  'a/../b',
+  'a/',
+  'a\\b',
+  '.git/x',
+  'a/.GIT/x',
+  '%2froot',
+  'a'.repeat(513),
+]) {
+  test(`rejects unsafe plugin path ${path}`, () =>
+    expect(repositoryInstallSchema.safeParse({ ...valid, path }).success).toBe(
+      false
+    ))
+}
+test('supports plugin directory and slash-containing tag', () =>
+  expect(
+    repositoryInstallSchema.safeParse({
+      ...valid,
+      path: 'plugins/demo',
+      ref_name: 'releases/v2',
+    }).success
+  ).toBe(true))

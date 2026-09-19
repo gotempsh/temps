@@ -11656,6 +11656,7 @@ export type InstallPluginResponse = {
 export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
+    path?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -15370,6 +15371,7 @@ export type PluginSourceResponse = {
     builder_image: string;
     commit: string;
     kind: string;
+    path?: string | null;
     ref_name: string;
     repository_url: string;
     version: string;
@@ -17567,8 +17569,10 @@ export type RepositoryCatalogPlugin = {
     latestVersion: string;
     logoUrl?: string | null;
     name: string;
+    path?: string | null;
     platforms: Array<string>;
     readmeUrl?: string | null;
+    ref?: string | null;
     repository: string;
     screenshots: Array<RepositoryScreenshot>;
     summary: string;

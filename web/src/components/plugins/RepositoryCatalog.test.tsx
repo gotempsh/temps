@@ -14,6 +14,8 @@ const plugin: RepositoryCatalogPlugin = {
   author: 'Example team',
   category: 'Development',
   repository: 'https://github.com/example/plugin',
+  path: 'plugins/demo',
+  ref: 'release/v1',
   commit: 'a'.repeat(40),
   latestVersion: '1.0.0',
   logoUrl: null,
@@ -67,7 +69,9 @@ function renderCatalog(canInstall: boolean, available = true) {
 
 test('catalog shows exact commit source link and explicit review action for admins', () => {
   const html = renderCatalog(true)
-  expect(html).toContain(`${plugin.repository}/tree/${plugin.commit}`)
+  expect(html).toContain(
+    `${plugin.repository}/tree/${plugin.commit}/plugins/demo`
+  )
   expect(html).toContain('Review and install')
   expect(html).toContain('not a security audit')
   expect(html).toContain('darwin-arm64')
