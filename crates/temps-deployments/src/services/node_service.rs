@@ -669,8 +669,9 @@ impl NodeService {
         Ok(())
     }
 
-    /// Record that an offline node's workloads have been failed over, so the
-    /// health loop does it once per outage. Cleared by the next heartbeat.
+    /// Record that an offline node's failover is durably queued, so the health
+    /// loop stops retrying it for this outage. Cleared by the next heartbeat.
+    /// Call only after every affected workload was handled.
     pub async fn mark_failed_over(&self, node_id: i32) -> Result<(), NodeError> {
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())

@@ -18,9 +18,10 @@
 //! marker lives on the row.
 //!
 //! NULL means "workloads have not been failed over for the current outage".
-//! The health loop stamps it when failover runs and the heartbeat handler
-//! clears it on recovery, so the column is self-correcting and needs no
-//! backfill.
+//! The health loop stamps it only once every affected workload is retired or
+//! has its recovery redeploy queued — a failed or interrupted pass leaves it
+//! NULL and is retried — and the heartbeat handler clears it on recovery, so
+//! the column is self-correcting and needs no backfill.
 
 use sea_orm_migration::prelude::*;
 

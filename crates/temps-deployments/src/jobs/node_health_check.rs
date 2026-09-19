@@ -457,12 +457,17 @@ fn effective_failover_after_secs(configured: u64) -> i64 {
 ///
 /// Runs every health tick, independent of the active->offline transition: a
 /// node marked offline several ticks ago becomes due here once its last
-/// heartbeat is older than `failover_after_secs`. The node is stamped
-/// `failover_at` BEFORE the redeploys are queued so a crash or restart mid-way
-/// cannot replay them on the next tick; if the stamp cannot be written the node
-/// is skipped and retried next tick rather than failed over unrecorded.
+/// heartbeat is older than `failover_after_secs`.
 ///
-/// Returns the node IDs that were failed over.
+/// `failover_at` is stamped only AFTER every affected deployment was handled,
+/// so it means "failover is durably queued", not "failover was attempted". If
+/// the affected-deployments query, a retire, or a redeploy fails — or the
+/// process dies mid-pass — the node stays unstamped and the next tick retries
+/// the whole pass. That is at-least-once, which is safe because the pass is
+/// idempotent (see [`failover_node`]); stamping first would instead strand the
+/// workloads for the rest of the outage, since only a heartbeat clears the stamp.
+///
+/// Returns the node IDs whose failover completed this tick.
 pub async fn failover_due_nodes(
     failover_after_secs: u64,
     node_service: &NodeService,
@@ -479,17 +484,10 @@ pub async fn failover_due_nodes(
     };
 
     let mut failed_over = Vec::new();
+    // One recovery redeploy per environment per tick, even when two due nodes
+    // both hosted replicas of it.
+    let mut redeployed_environments = HashSet::new();
     for node in &due {
-        if let Err(e) = node_service.mark_failed_over(node.id).await {
-            tracing::error!(
-                node_id = node.id,
-                node_name = %node.name,
-                "Failover: could not record failover for node, skipping this tick: {}",
-                e
-            );
-            continue;
-        }
-
         tracing::warn!(
             node_id = node.id,
             node_name = %node.name,
@@ -498,24 +496,87 @@ pub async fn failover_due_nodes(
             "Node stayed offline past the failover grace period, failing over its workloads"
         );
 
-        if let Some(alarm_service) = alarm_service {
-            notify_node_failover(node.id, &node.name, after_secs, alarm_service).await;
+        let complete = failover_node(
+            node.id,
+            node_service,
+            deployment_service,
+            &mut redeployed_environments,
+        )
+        .await;
+
+        if record_failover_outcome(node, complete, after_secs, node_service, alarm_service).await {
+            failed_over.push(node.id);
         }
-        failover_offline_nodes(&[node.id], node_service, deployment_service).await;
-        failed_over.push(node.id);
     }
 
     failed_over
 }
 
-/// Alert operators that an offline node's workloads are now being moved.
-/// Fires once per outage (guarded by `nodes.failover_at`). Best-effort.
+/// Apply the result of one node's failover pass: stamp `failover_at` only when
+/// the pass was complete, and alert either way. Returns whether the node is now
+/// recorded as failed over.
+async fn record_failover_outcome(
+    node: &nodes::Model,
+    complete: bool,
+    after_secs: i64,
+    node_service: &NodeService,
+    alarm_service: Option<&std::sync::Arc<AlarmService>>,
+) -> bool {
+    if !complete {
+        tracing::error!(
+            node_id = node.id,
+            node_name = %node.name,
+            "Failover for node did not complete; leaving it unstamped so the next health tick retries"
+        );
+        if let Some(alarm_service) = alarm_service {
+            notify_node_failover(node.id, &node.name, after_secs, false, alarm_service).await;
+        }
+        return false;
+    }
+
+    if let Err(e) = node_service.mark_failed_over(node.id).await {
+        // Work is queued but unrecorded: the next tick repeats the pass,
+        // which the idempotent path absorbs.
+        tracing::error!(
+            node_id = node.id,
+            node_name = %node.name,
+            "Failover: workloads handled but failover could not be recorded, will repeat next tick: {}",
+            e
+        );
+        return false;
+    }
+
+    if let Some(alarm_service) = alarm_service {
+        notify_node_failover(node.id, &node.name, after_secs, true, alarm_service).await;
+    }
+    true
+}
+
+/// Alert operators about an offline node's failover. `complete = true` fires
+/// once per outage (guarded by `nodes.failover_at`); `complete = false` fires
+/// on every failed tick, which the alarm cooldown collapses, so a failover that
+/// keeps failing stays visible instead of living only in the logs. Best-effort.
 async fn notify_node_failover(
     node_id: i32,
     node_name: &str,
     failover_after_secs: i64,
+    complete: bool,
     alarm_service: &std::sync::Arc<AlarmService>,
 ) {
+    let (title, outcome) = if complete {
+        (
+            format!("Failing over workloads from node '{}'", node_name),
+            "Environments with no healthy replica on another node are being redeployed to \
+             healthy nodes.",
+        )
+    } else {
+        (
+            format!("Failover from node '{}' is incomplete", node_name),
+            "Some of its workloads could not be retired or redeployed; the control plane \
+             retries every minute while the node stays offline. Check the control plane logs \
+             for 'Failover:' errors naming the affected project and environment.",
+        )
+    };
     let request = FireAlarmRequest {
         project_id: None,
         environment_id: None,
@@ -524,15 +585,15 @@ async fn notify_node_failover(
         service_id: None,
         alarm_type: AlarmType::NodeFailover,
         severity: AlarmSeverity::Critical,
-        title: format!("Failing over workloads from node '{}'", node_name),
+        title,
         message: format!(
-            "Node '{}' (id {}) has sent no heartbeat for over {}s. Environments with no healthy \
-             replica on another node are being redeployed to healthy nodes.",
-            node_name, node_id, failover_after_secs
+            "Node '{}' (id {}) has sent no heartbeat for over {}s. {}",
+            node_name, node_id, failover_after_secs, outcome
         ),
         metadata: Some(serde_json::json!({
             "node_id": node_id,
             "node_name": node_name,
+            "complete": complete,
         })),
     };
 
@@ -541,25 +602,29 @@ async fn notify_node_failover(
     }
 }
 
-/// Handle failover for offline nodes (see [`failover_due_nodes`] for when).
+/// Fail over one offline node (see [`failover_due_nodes`] for when).
+///
+/// Returns `true` only when every affected deployment was handled: its
+/// containers retired, or its recovery redeploy queued. `false` means the
+/// caller must leave the node unstamped so the next health tick retries.
+/// Retrying is safe: retiring is idempotent, and the job processor drops a
+/// recovery redeploy whose environment already has an in-flight or ready
+/// deployment of the same commit/image (`DeploymentCreationOutcome::Duplicate`).
+///
 ///
 /// For each affected deployment:
 /// - If other nodes still have healthy replicas, just retire the containers
 ///   on the offline node (proxy stops routing to them on next refresh).
 /// - If ALL replicas were on the offline node, trigger a full redeploy so
 ///   the workload is rescheduled to a healthy node.
-pub async fn failover_offline_nodes(
-    offline_node_ids: &[i32],
+async fn failover_node(
+    node_id: i32,
     node_service: &NodeService,
     deployment_service: &DeploymentService,
-) {
-    if offline_node_ids.is_empty() {
-        return;
-    }
-
-    let mut redeployed_environments = HashSet::new();
-
-    for &node_id in offline_node_ids {
+    redeployed_environments: &mut HashSet<(i32, i32)>,
+) -> bool {
+    let mut complete = true;
+    {
         let affected = match node_service.affected_deployments(node_id).await {
             Ok(deps) => deps,
             Err(e) => {
@@ -568,13 +633,13 @@ pub async fn failover_offline_nodes(
                     "Failed to query affected deployments for failover: {}",
                     e
                 );
-                continue;
+                return false;
             }
         };
 
         if affected.is_empty() {
             tracing::debug!(node_id, "No affected deployments for offline node");
-            continue;
+            return true;
         }
 
         tracing::warn!(
@@ -601,6 +666,7 @@ pub async fn failover_offline_nodes(
                         );
                     }
                     Err(e) => {
+                        complete = false;
                         tracing::error!(
                             node_id,
                             project_id = dep.project_id,
@@ -645,6 +711,7 @@ pub async fn failover_offline_nodes(
                         );
                     }
                     Err(e) => {
+                        complete = false;
                         redeployed_environments.remove(&(dep.project_id, dep.environment_id));
                         tracing::error!(
                             node_id,
@@ -672,6 +739,7 @@ pub async fn failover_offline_nodes(
                         );
                     }
                     Err(e) => {
+                        complete = false;
                         tracing::error!(
                             node_id,
                             deployment_id = dep.deployment_id,
@@ -683,6 +751,7 @@ pub async fn failover_offline_nodes(
             }
         }
     }
+    complete
 }
 
 #[cfg(test)]
@@ -852,6 +921,66 @@ mod tests {
         assert!(sql.contains(r#""status" ="#), "{sql}");
         let values = format!("{:?}", statement.values);
         assert!(values.contains("offline"), "{values}");
+    }
+
+    /// A failed or interrupted pass must leave the node retryable: no write at
+    /// all, so `failover_at` stays NULL and the next tick picks it up again.
+    #[tokio::test]
+    async fn test_incomplete_failover_leaves_node_unstamped_for_retry() {
+        let node = make_node(7, "worker-7", "offline", 400);
+        let db =
+            std::sync::Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let node_service = NodeService::new(db.clone());
+
+        let recorded = record_failover_outcome(&node, false, 300, &node_service, None).await;
+        assert!(!recorded);
+        drop(node_service);
+
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        assert!(
+            db.into_transaction_log().is_empty(),
+            "an incomplete failover must not touch the node row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_failover_stamps_failover_at() {
+        let node = make_node(7, "worker-7", "offline", 400);
+        let mut stamped = node.clone();
+        stamped.failover_at = Some(chrono::Utc::now());
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node.clone()]])
+                .append_query_results(vec![vec![stamped]])
+                .into_connection(),
+        );
+        let node_service = NodeService::new(db.clone());
+
+        let recorded = record_failover_outcome(&node, true, 300, &node_service, None).await;
+        assert!(recorded);
+        drop(node_service);
+
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log.last().expect("stamping must issue an UPDATE");
+        let sql = &update.statements()[0].sql;
+        assert!(sql.contains(r#""failover_at" ="#), "{sql}");
+    }
+
+    /// If the work was queued but the stamp cannot be written, report the node
+    /// as not failed over so the (idempotent) pass repeats next tick.
+    #[tokio::test]
+    async fn test_failover_stamp_write_failure_is_retried() {
+        let node = make_node(7, "worker-7", "offline", 400);
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
+                .into_connection(),
+        );
+        let node_service = NodeService::new(db);
+
+        let recorded = record_failover_outcome(&node, true, 300, &node_service, None).await;
+        assert!(!recorded);
     }
 
     // ── Resource-alert threshold evaluation (resource_breaches) ──────────
