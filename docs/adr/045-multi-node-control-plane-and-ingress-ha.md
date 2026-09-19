@@ -18,7 +18,7 @@ This ADR extends [ADR-017](./017-split-proxy-console-processes.md) and [ADR-011]
 
 ### Verified starting point
 
-Source inspection used local checkout `86dbade268fe41f46e9f9ca1e483df4de26ea727` on 2026-09-19, including existing working-tree changes. This checkout predates the control-plane profile; PR status was checked separately. Existing ADRs describe intent and are not proof of implementation.
+Source inspection used committed revision [`86dbade268fe41f46e9f9ca1e483df4de26ea727`](https://github.com/gotempsh/temps/commit/86dbade268fe41f46e9f9ca1e483df4de26ea727) on 2026-09-19. Uncommitted working-tree changes were excluded from the evidence below. That revision predates the control-plane profile, so its merged implementation was verified separately through PR #1031. Existing ADRs describe intent and are not proof of implementation.
 
 | Area | Existing behavior and implication |
 |---|---|
@@ -35,7 +35,7 @@ Source inspection used local checkout `86dbade268fe41f46e9f9ca1e483df4de26ea727`
 
 Today, losing the only ingress IP makes apps unreachable through that IP even if their containers survive. Running a separate proxy process on that same machine does not fix this.
 
-Database promotion and DNS publication are separate operations. With a surviving monitor, eligible standby, and working database network, pg_auto_failover can orchestrate promotion without Temps. If the monitor is lost with the primary, automated promotion cannot be assumed. Keep monitor, primary, and standby in separate failure domains; a separate monitor still needs recovery procedures. See the upstream [fault-tolerance contract](https://pg-auto-failover.readthedocs.io/en/main/fault-tolerance.html).
+Database promotion and DNS publication are separate operations. With a surviving database HA monitor, eligible standby, and working database network, the configured HA orchestrator can promote a standby without Temps. If the monitor is lost with the primary, automated promotion cannot be assumed. Keep monitor, primary, and standby in separate failure domains; a separate monitor still needs recovery procedures. The supported orchestrator's fault-tolerance contract is authoritative for promotion behavior.
 
 Even after successful promotion, the current console-owned role reconciler cannot update DNS while all consoles are offline. Worker resolvers retain their snapshot. `primary.<service>.temps.local` is a primary-only record; `<service>.temps.local` is a multi-A set of data members, not a write-primary alias. A client that tries the surviving members and validates writability may still reconnect using that set. This depends on driver behavior and retained member addresses, not on fresh role DNS. PostgreSQL documents [multi-host connections and `target_session_attrs=read-write`](https://www.postgresql.org/docs/16/libpq-connect.html).
 
@@ -62,7 +62,7 @@ flowchart TB
     EdgeA -. snapshot sync .-> API
     EdgeB -. snapshot sync .-> API
     Workers --> Databases[Database members on separate workers]
-    Workers -. local DNS role observers .-> Monitor[Independent pg_auto_failover monitor]
+    Workers -. local DNS role observers .-> Monitor[Independent database HA monitor]
     Monitor --> Databases
 ```
 
@@ -79,7 +79,7 @@ Arrows to the API for snapshot sync are management connections, not application 
 
 ### 2. Public ingress: active/active with an independent front door
 
-Domain records point to an external HA load balancer or to an operator-managed floating IP supported by the network provider. That front door selects healthy ingress nodes. Cloudflare Load Balancing is one supported integration candidate; its [monitors remove unhealthy pools from rotation](https://developers.cloudflare.com/load-balancing/monitors/create-monitor/). A floating IP requires provider-specific ownership and fencing, not merely starting the same listener twice.
+Domain records point to an external HA load balancer or to an operator-managed floating IP supported by the network provider. That front door selects healthy ingress nodes using independent health monitors and removes unhealthy nodes from rotation. A floating IP requires provider-specific ownership and fencing, not merely starting the same listener twice.
 
 Plain multi-A DNS and ad-hoc DNS failover scripts are not the reference HA configuration: resolver caching and client address selection prevent a bounded recovery guarantee. The first release will not build a Temps-native public floating-IP controller. A single self-hosted load-balancer VM would simply move the single point of failure.
 
@@ -125,7 +125,7 @@ Use durable at-least-once jobs with transactional claims, claim expiry/renewal, 
 | Cron, backup schedules, notifications, certificate renewal | Durable deduplicated jobs; one claim per scheduled occurrence |
 | Proxy route serving and backend ejection | Each ingress independently |
 | Workload health probes and database monitor queries | Worker-side execution; observations tagged with origin and freshness |
-| Database promotion | pg_auto_failover monitor and keepers; never Temps probe voting |
+| Database promotion | Configured database HA monitor and node agents; never Temps probe voting |
 | Migration execution | One explicit migration owner before new API replicas become ready |
 
 Metadata failover must fence the old writer and preserve acknowledged coordination state. Asynchronous loss of lease/operation records can resurrect stale authorization; automatic takeover is unsafe in that case. Require no acknowledged coordination-data loss for automatic recovery, or stop mutations for explicit recovery/epoch reset. Avoid introducing a second consensus system in Temps.
@@ -146,11 +146,15 @@ Scale-to-zero wake becomes a durable environment operation delivered to its assi
 
 Add an opt-in HA role-observation mode to each worker resolver. The console distributes durable service membership, monitor endpoints, allowed member identities, probe credentials, and a policy/configuration revision. Workers persist this configuration independently of the observed role result.
 
-Each participating worker runs one bounded background observer per subscribed database service. It queries the existing monitor through an authenticated, least-privilege channel and checks the selected member's actual PostgreSQL role/readiness. It does not promote databases, elect a primary, or infer authority from a TCP port being open. Provision this observation path before declaring the service HA-ready; the current monitor query's trust-auth assumption is not an acceptable general remote credential model.
+Role observation runs through one node-wide scheduler, rather than one independently spawned task per worker and service. The persisted policy assigns at most two observers to each service for redundancy; unassigned workers consume signed observations over the authenticated worker channel and never begin probing on their own. An assignment revision prevents an old policy from expanding the observer set after reconnect.
+
+The scheduler enforces aggregate budgets per worker and per monitor. Initial defaults are four concurrent role queries per worker, one in-flight query per service, a five-second minimum service interval, and at most two assigned observers per service. These settings are persisted installation policy with validated upper bounds. Connections use a bounded pool, polls are coalesced and jittered, failures use exponential backoff, and no retry may bypass the concurrency limits. When demand exceeds the budget, the scheduler prioritizes observations nearest expiry, records skipped polls, and lets lower-priority role answers expire and fail closed; it never creates an unbounded queue or increases connection concurrency.
+
+An assigned observer queries the existing monitor through an authenticated, least-privilege channel and checks the selected member's actual database role and readiness. It does not promote databases, elect a primary, or infer authority from a TCP port being open. Provision this observation path before declaring the service HA-ready; the current monitor query's trust-auth assumption is not an acceptable general remote credential model.
 
 Separate the resolver's console-owned membership zone from a local, short-lived role view. For services migrated to this mode, disable console publication of competing role aliases. The local observer is the only authority for their `primary.*` and `replica.*` answers. Merge at lookup time according to configured ownership; never let an old console snapshot overwrite fresher observations. Report observations to the console when available, without making publication depend on that acknowledgement.
 
-Require a fresh, unambiguous monitor observation and matching member role before advertising a new primary. No primary or multiple primary candidates means no writable alias; return SERVFAIL for an existing role name whose current answer cannot be established. Do not select the first apparent primary. These checks do not replace pg_auto_failover's fencing guarantees.
+Require a fresh, unambiguous monitor observation and matching member role before advertising a new primary. No primary or multiple primary candidates means no writable alias; return SERVFAIL for an existing role name whose current answer cannot be established. Do not select the first apparent primary. These checks do not replace the configured HA orchestrator's fencing guarantees.
 
 Role results expire independently of DNS TTL. Bound DNS response TTL by remaining observation validity; after expiry, return SERVFAIL rather than reissuing an old primary address. Persisted role answers are untrusted after restart until refreshed. Monitor loss therefore degrades role aliases once their validity expires, even when an existing database connection still works. This is an explicit availability-versus-stale-routing tradeoff.
 
@@ -195,7 +199,7 @@ Recovery is not instantaneous. Measure ingress recovery as detection + endpoint 
 | Add etcd/Raft for control-plane leadership | Defer: adds a second quorum and operations burden; PostgreSQL is already required. Revisit if its coordination load becomes a measured bottleneck |
 | Only move the database monitor to a worker | Necessary placement improvement; insufficient for console-owned DNS publication and public ingress |
 | Only replicate the DNS reconciler across consoles | Handles one console failure, not all consoles failing; retain as transitional behavior only |
-| Make worker observers elect a database primary | Reject: would compete with pg_auto_failover and weaken fencing safety |
+| Make worker observers elect a database primary | Reject: would compete with the configured database HA orchestrator and weaken fencing safety |
 | Build native public DNS failover/floating IP first | Defer: provider/network-specific and does not solve internal job ownership or DNS role freshness |
 
 ## Implementation sequence and release gates
