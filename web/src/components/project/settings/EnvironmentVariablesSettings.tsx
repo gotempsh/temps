@@ -234,9 +234,8 @@ function EnvironmentVariableRow({
     variable.include_in_preview ?? false
   )
   // Whether the edit box actually holds the variable's current value. False
-  // when it has not been explicitly revealed, or when reveal was denied (it
-  // needs SecretsRead on top of EnvironmentsWrite) or failed. This
-  // distinguishes "cleared on purpose" from "never loaded" when saving.
+  // when it has not been explicitly revealed, or when reveal was denied or
+  // failed. This distinguishes "cleared on purpose" from "never loaded".
   const [valueLoaded, setValueLoaded] = useState(false)
   // Opt-in conversion of an existing plain variable into a masked secret.
   // The classification stays one-way so a later list response cannot

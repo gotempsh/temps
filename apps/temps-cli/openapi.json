@@ -10496,7 +10496,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "When true the variable is masked in list responses and can only be\nviewed through the permission-checked, audited per-variable reveal\nendpoint. Updates that omit the value preserve the existing ciphertext.\nThe flag is one-way — secret vars cannot be demoted to regular vars.",
+            "description": "When true the stored value is write-only: it is omitted from API\nresponses and cannot be revealed, even by an administrator. Updates\nthat omit the value preserve the existing ciphertext. The flag is\none-way — secret vars cannot be demoted to regular vars.",
             "type": "boolean"
           },
           "key": {
@@ -17721,7 +17721,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "Whether the variable is a secret. Secrets always have `value: None` in\nlist responses.",
+            "description": "Whether the stored value is write-only. Marked secrets always have\n`value: None` in API responses and cannot be revealed.",
             "type": "boolean"
           },
           "key": {
@@ -17732,7 +17732,7 @@
             "type": "integer"
           },
           "value": {
-            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars; use the audited per-variable reveal endpoint.",
+            "description": "Plaintext for regular variables in create/update responses, or `\"***\"`\nin list responses. Always `None` for marked secrets. Only regular\nvariables can be read through the audited per-variable reveal endpoint.",
             "type": [
               "string",
               "null"
@@ -17753,6 +17753,7 @@
       "EnvironmentVariableValueResponse": {
         "properties": {
           "value": {
+            "description": "Plaintext for a regular manual or integration-sourced variable.\nMarked secret manual variables never produce this response.",
             "type": "string"
           }
         },
@@ -21921,7 +21922,7 @@
             ]
           },
           "var_id": {
-            "description": "Exact manual env-var row to reveal. Required by the dashboard so\nduplicate keys on disjoint environments cannot cross-reveal.",
+            "description": "Exact manual env-var row to read when it is not marked secret. Required\nby the dashboard so duplicate keys cannot select a different row.",
             "format": "int32",
             "type": [
               "integer",
@@ -38723,7 +38724,7 @@
         "type": "object"
       },
       "ResolvedEnvVarResponse": {
-        "description": "One entry in the computed env-var view that merges manual and integration\nsources and tags each result with its origin. `value_preview` is always\nmasked — plaintext must be fetched per-key via the existing reveal endpoint,\nwhich is audit-logged.",
+        "description": "One entry in the computed env-var view that merges manual and integration\nsources and tags each result with its origin. `value_preview` is always\nmasked. Regular manual values and integration values can be fetched per-key\nthrough an audited endpoint; marked secret manual values are write-only.",
         "properties": {
           "environments": {
             "description": "Environments this var applies to. For integration-sourced vars this\nreflects every environment of the project (integrations are global).",
@@ -96297,7 +96298,7 @@
     },
     "/projects/{project_id}/env-vars/resolved/{key}/value": {
       "get": {
-        "description": "Mirrors `GET /projects/{id}/env-vars/{key}/value` but handles keys sourced\nfrom linked integrations (which are not stored in the `env_vars` table).\nResolution order mirrors the merged view:\n\n1. Manual env var with this key — this endpoint reads the manual store when\n   the key exists there, then writes its own reveal audit event so callers\n   can safely use one endpoint regardless of source.\n2. Integration env var supplied by a linked external service.\n\nReturns 404 when neither a manual var nor an integration produces the key.",
+        "description": "Mirrors `GET /projects/{id}/env-vars/{key}/value` but handles keys sourced\nfrom linked integrations (which are not stored in the `env_vars` table).\nResolution order mirrors the merged view:\n\n1. Manual env var with this key — this endpoint reads the manual store when\n   the key exists there, then writes its own reveal audit event so callers\n   can safely use one endpoint regardless of source.\n2. Integration env var supplied by a linked external service.\n\nReturns 403 for a manual variable marked secret, and 404 when neither a\nmanual var nor an integration produces the key.",
         "operationId": "get_resolved_environment_variable_value",
         "parameters": [
           {
@@ -96359,10 +96360,10 @@
                 }
               }
             },
-            "description": "Resolved environment variable value"
+            "description": "Regular manual or integration variable value"
           },
           "403": {
-            "description": "Plaintext secret access is not permitted"
+            "description": "Marked secret values are write-only"
           },
           "404": {
             "description": "Project, key, or integration not found"
@@ -96433,10 +96434,10 @@
                 }
               }
             },
-            "description": "Environment variable value"
+            "description": "Regular environment variable value"
           },
           "403": {
-            "description": "Plaintext secret access is not permitted"
+            "description": "Marked secret values are write-only"
           },
           "404": {
             "description": "Project or variable not found"
@@ -96448,7 +96449,7 @@
             "description": "Internal server error"
           }
         },
-        "summary": "Get environment variable value by key",
+        "summary": "Get a regular environment variable value by key. Marked secrets return 403.",
         "tags": [
           "Projects"
         ]

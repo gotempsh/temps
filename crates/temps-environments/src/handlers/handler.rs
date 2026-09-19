@@ -456,12 +456,8 @@ pub async fn get_environment_variables(
         .get_environment_variables(project_id, params.environment_id)
         .await?;
 
-    // Always mask plaintext values in the list response. Callers that
-    // legitimately need the decrypted value must hit
-    // GET /projects/{id}/env-vars/{key}/value (audited) one secret at
-    // a time. Bulk-dumping every project secret over a single GET is
-    // the kind of mistake that turns a compromised reader token into
-    // a total credential exfiltration.
+    // Mask values in the list response. Regular values can be read through
+    // the audited per-key endpoint; marked secret values remain write-only.
     let response: Vec<EnvironmentVariableResponse> = vars
         .into_iter()
         .map(|v| {
@@ -508,7 +504,8 @@ pub async fn get_environment_variables(
 /// integration key carry a reference to the integration they override.
 ///
 /// Values are always returned as a masked preview. Use the per-key reveal
-/// endpoint for plaintext (audit-logged).
+/// endpoint for regular plaintext values (audit-logged). Marked secrets
+/// cannot be revealed.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/resolved",
@@ -664,14 +661,15 @@ pub async fn get_resolved_environment_variables(
 ///    can safely use one endpoint regardless of source.
 /// 2. Integration env var supplied by a linked external service.
 ///
-/// Returns 404 when neither a manual var nor an integration produces the key.
+/// Returns 403 for a manual variable marked secret, and 404 when neither a
+/// manual var nor an integration produces the key.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/resolved/{key}/value",
     tag = "Projects",
     responses(
-        (status = 200, description = "Resolved environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 200, description = "Regular manual or integration variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Marked secret values are write-only"),
         (status = 404, description = "Project, key, or integration not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
@@ -1000,14 +998,14 @@ pub async fn update_environment_variable(
     Ok(Json(response))
 }
 
-/// Get environment variable value by key
+/// Get a regular environment variable value by key. Marked secrets return 403.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/{key}/value",
     tag = "Projects",
     responses(
-        (status = 200, description = "Environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 200, description = "Regular environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Marked secret values are write-only"),
         (status = 404, description = "Project or variable not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")

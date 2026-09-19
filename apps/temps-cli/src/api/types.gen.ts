@@ -4923,10 +4923,10 @@ export type CreateEnvironmentVariableRequest = {
      */
     include_in_preview?: boolean;
     /**
-     * When true the variable is masked in list responses and can only be
-     * viewed through the permission-checked, audited per-variable reveal
-     * endpoint. Updates that omit the value preserve the existing ciphertext.
-     * The flag is one-way — secret vars cannot be demoted to regular vars.
+     * When true the stored value is write-only: it is omitted from API
+     * responses and cannot be revealed, even by an administrator. Updates
+     * that omit the value preserve the existing ciphertext. The flag is
+     * one-way — secret vars cannot be demoted to regular vars.
      */
     is_secret?: boolean;
     key: string;
@@ -8355,20 +8355,25 @@ export type EnvironmentVariableResponse = {
      */
     include_in_preview: boolean;
     /**
-     * Whether the variable is a secret. Secrets always have `value: None` in
-     * list responses.
+     * Whether the stored value is write-only. Marked secrets always have
+     * `value: None` in API responses and cannot be revealed.
      */
     is_secret: boolean;
     key: string;
     updated_at: number;
     /**
-     * Plaintext value for non-secret vars (or `"***"` mask for list responses).
-     * `None` for secret vars; use the audited per-variable reveal endpoint.
+     * Plaintext for regular variables in create/update responses, or `"***"`
+     * in list responses. Always `None` for marked secrets. Only regular
+     * variables can be read through the audited per-variable reveal endpoint.
      */
     value?: string | null;
 };
 
 export type EnvironmentVariableValueResponse = {
+    /**
+     * Plaintext for a regular manual or integration-sourced variable.
+     * Marked secret manual variables never produce this response.
+     */
     value: string;
 };
 
@@ -10305,8 +10310,8 @@ export type GetEnvironmentVariablesQuery = {
      */
     service_id?: number | null;
     /**
-     * Exact manual env-var row to reveal. Required by the dashboard so
-     * duplicate keys on disjoint environments cannot cross-reveal.
+     * Exact manual env-var row to read when it is not marked secret. Required
+     * by the dashboard so duplicate keys cannot select a different row.
      */
     var_id?: number | null;
 };
@@ -17761,8 +17766,8 @@ export type ResolvePermissionRequest = {
 /**
  * One entry in the computed env-var view that merges manual and integration
  * sources and tags each result with its origin. `value_preview` is always
- * masked — plaintext must be fetched per-key via the existing reveal endpoint,
- * which is audit-logged.
+ * masked. Regular manual values and integration values can be fetched per-key
+ * through an audited endpoint; marked secret manual values are write-only.
  */
 export type ResolvedEnvVarResponse = {
     /**
@@ -50196,7 +50201,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Plaintext secret access is not permitted
+     * Marked secret values are write-only
      */
     403: unknown;
     /**
@@ -50215,7 +50220,7 @@ export type GetResolvedEnvironmentVariableValueErrors = {
 
 export type GetResolvedEnvironmentVariableValueResponses = {
     /**
-     * Resolved environment variable value
+     * Regular manual or integration variable value
      */
     200: EnvironmentVariableValueResponse;
 };
@@ -50249,7 +50254,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Plaintext secret access is not permitted
+     * Marked secret values are write-only
      */
     403: unknown;
     /**
@@ -50268,7 +50273,7 @@ export type GetEnvironmentVariableValueErrors = {
 
 export type GetEnvironmentVariableValueResponses = {
     /**
-     * Environment variable value
+     * Regular environment variable value
      */
     200: EnvironmentVariableValueResponse;
 };

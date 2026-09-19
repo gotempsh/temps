@@ -6926,12 +6926,13 @@ export const getResolvedEnvironmentVariables = <ThrowOnError extends boolean = f
  * can safely use one endpoint regardless of source.
  * 2. Integration env var supplied by a linked external service.
  *
- * Returns 404 when neither a manual var nor an integration produces the key.
+ * Returns 403 for a manual variable marked secret, and 404 when neither a
+ * manual var nor an integration produces the key.
  */
 export const getResolvedEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetResolvedEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/resolved/{key}/value', ...options });
 
 /**
- * Get environment variable value by key
+ * Get a regular environment variable value by key. Marked secrets return 403.
  */
 export const getEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/{key}/value', ...options });
 

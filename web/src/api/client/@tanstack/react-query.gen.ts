@@ -13821,7 +13821,8 @@ export const getResolvedEnvironmentVariableValueQueryKey = (options: Options<Get
  * can safely use one endpoint regardless of source.
  * 2. Integration env var supplied by a linked external service.
  *
- * Returns 404 when neither a manual var nor an integration produces the key.
+ * Returns 403 for a manual variable marked secret, and 404 when neither a
+ * manual var nor an integration produces the key.
  */
 export const getResolvedEnvironmentVariableValueOptions = (options: Options<GetResolvedEnvironmentVariableValueData>) => queryOptions<GetResolvedEnvironmentVariableValueResponse, DefaultError, GetResolvedEnvironmentVariableValueResponse, ReturnType<typeof getResolvedEnvironmentVariableValueQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -13839,7 +13840,7 @@ export const getResolvedEnvironmentVariableValueOptions = (options: Options<GetR
 export const getEnvironmentVariableValueQueryKey = (options: Options<GetEnvironmentVariableValueData>) => createQueryKey('getEnvironmentVariableValue', options);
 
 /**
- * Get environment variable value by key
+ * Get a regular environment variable value by key. Marked secrets return 403.
  */
 export const getEnvironmentVariableValueOptions = (options: Options<GetEnvironmentVariableValueData>) => queryOptions<GetEnvironmentVariableValueResponse, DefaultError, GetEnvironmentVariableValueResponse, ReturnType<typeof getEnvironmentVariableValueQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

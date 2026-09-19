@@ -248,8 +248,8 @@ impl EnvVarService {
                 continue;
             }
 
-            // Secret values are never returned in plaintext from this bulk
-            // API surface. Deployment and explicit reveal use scoped methods.
+            // Marked secrets are omitted from API responses. Deployment reads
+            // use a separate internal path; HTTP reveal rejects secret rows.
             let value = if var.is_secret {
                 None
             } else {
@@ -602,14 +602,9 @@ impl EnvVarService {
         Ok(())
     }
 
-    /// Decrypt one value for an HTTP reveal flow.
-    ///
-    /// This stays crate-private and is deliberately named after its security
-    /// invariant: callers must authorize and durably audit the reveal before
-    /// returning the plaintext outside the process. Returns the decrypted
-    /// value alongside the variable's `is_secret` flag so callers can apply
-    /// the stricter `SecretsRead` gate only to variables actually classified
-    /// as secret, instead of every plaintext variable.
+    /// Read one regular value for an authorized, audited HTTP reveal flow.
+    /// Marked secrets are rejected before decryption. The caller must write
+    /// the audit record before returning plaintext outside the process.
     pub(crate) async fn get_environment_variable_value_for_audited_reveal(
         &self,
         project_id: i32,
