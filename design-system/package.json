@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Minimal Vite+React sandbox proving @temps-sdk/ds's primitives and templates work: a /guide (RULES/brand/handoff with live demos), a /components gallery, and three reference screens (Ledger, Detail, Settings) on invented fixture data. Not the migrated console — see web/packages/ds/docs/design-system-handoff.md's follow-ups for that.",
+  "description": "Minimal Vite+React sandbox proving @temps-sdk/ds's primitives and templates work: a /guide (RULES/brand/handoff with live demos), a /components gallery, and three reference screens (Ledger, Detail, Settings) on invented fixture data. Not the migrated console \u2014 see web/packages/ds/docs/design-system-handoff.md's follow-ups for that.",
   "workspaces": [
     "../web/packages/*"
   ],
@@ -17,7 +17,10 @@
     "@temps-sdk/ui": "workspace:*",
     "lucide-react": "^1.45.0",
     "react-router": "^8.3.1",
-    "sonner": "^2.0.8"
+    "sonner": "^2.0.8",
+    "react-hook-form": "^7.87.0",
+    "@hookform/resolvers": "^5.9.1",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

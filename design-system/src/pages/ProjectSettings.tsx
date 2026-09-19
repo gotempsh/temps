@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from "react";
+import { useForm, Controller } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import {
   Button,
   Disclosure,
@@ -19,7 +22,18 @@ import {
   SelectValue,
 } from "@temps-sdk/ui";
 
-const INITIAL = {
+const schema = z.object({
+  url: z.url({
+    protocol: /^https?$/,
+    error: "Enter a valid HTTP or HTTPS URL.",
+  }),
+  domain: z.string().trim().min(1, "Enter a preview domain."),
+  email: z.union([z.literal(""), z.email("Enter a valid email address.")]),
+  certificates: z.enum(["production", "staging"]),
+  screenshots: z.boolean(),
+});
+
+const INITIAL: z.infer<typeof schema> = {
   url: "https://console.example.com",
   domain: "apps.example.com",
   email: "ops@example.com",
@@ -28,24 +42,25 @@ const INITIAL = {
 };
 
 export default function ProjectSettings() {
-  const [values, setValues] = useState(INITIAL);
-  const [baseline, setBaseline] = useState(INITIAL);
   const [saved, setSaved] = useState(false);
   const [refreshed, setRefreshed] = useState(false);
-  const dirty = JSON.stringify(values) !== JSON.stringify(baseline);
-  let urlError: string | undefined;
-  try {
-    if (!["http:", "https:"].includes(new URL(values.url).protocol))
-      urlError = "Use an HTTP or HTTPS URL.";
-  } catch {
-    urlError = "Enter a valid URL.";
-  }
+  const {
+    register,
+    control,
+    watch,
+    reset,
+    handleSubmit,
+    formState: { errors: fieldErrors, isDirty: dirty },
+  } = useForm<z.infer<typeof schema>>({
+    resolver: zodResolver(schema),
+    defaultValues: INITIAL,
+    mode: "onChange",
+  });
+  const values = watch();
   const errors = {
-    "External URL": urlError,
-    "Contact email":
-      values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)
-        ? "Enter a valid email address."
-        : undefined,
+    "External URL": fieldErrors.url?.message,
+    "Preview domain": fieldErrors.domain?.message,
+    "Contact email": fieldErrors.email?.message,
   };
   return (
     <Settings
@@ -53,48 +68,30 @@ export default function ProjectSettings() {
       description="Interactive sample · changes stay in this example"
       dirty={dirty}
       errors={errors}
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (!dirty || Object.values(errors).some(Boolean)) return;
-        setBaseline(values);
+      onSubmit={handleSubmit((values) => {
+        reset(values);
         setSaved(true);
-      }}
+      })}
     >
       <div className="max-w-5xl space-y-10">
         <Group title="Platform">
           <Field
             label="External URL"
-            error={urlError}
+            error={fieldErrors.url?.message}
             help={{
               label: "About the external URL",
               content:
                 "Used for OAuth callbacks, webhooks, and external integrations.",
             }}
           >
-            {(props) => (
-              <Input
-                {...props}
-                type="url"
-                value={values.url}
-                onChange={(e) =>
-                  setValues((v) => ({ ...v, url: e.target.value }))
-                }
-              />
-            )}
+            {(props) => <Input {...props} type="url" {...register("url")} />}
           </Field>
           <Field
             label="Preview domain"
+            error={fieldErrors.domain?.message}
             description="New deployments receive a subdomain here."
           >
-            {(props) => (
-              <Input
-                {...props}
-                value={values.domain}
-                onChange={(e) =>
-                  setValues((v) => ({ ...v, domain: e.target.value }))
-                }
-              />
-            )}
+            {(props) => <Input {...props} {...register("domain")} />}
           </Field>
         </Group>
         <Group title="Certificates">
@@ -109,32 +106,26 @@ export default function ProjectSettings() {
             }}
           >
             {(props) => (
-              <Input
-                {...props}
-                type="email"
-                value={values.email}
-                onChange={(e) =>
-                  setValues((v) => ({ ...v, email: e.target.value }))
-                }
-              />
+              <Input {...props} type="email" {...register("email")} />
             )}
           </Field>
           <Field label="Certificate environment">
             {(props) => (
-              <Select
-                value={values.certificates}
-                onValueChange={(certificates) =>
-                  setValues((v) => ({ ...v, certificates }))
-                }
-              >
-                <SelectTrigger {...props}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="production">Production</SelectItem>
-                  <SelectItem value="staging">Staging</SelectItem>
-                </SelectContent>
-              </Select>
+              <Controller
+                name="certificates"
+                control={control}
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger {...props}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="production">Production</SelectItem>
+                      <SelectItem value="staging">Staging</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+              />
             )}
           </Field>
           {values.certificates === "staging" && (
@@ -147,23 +138,29 @@ export default function ProjectSettings() {
         <Group title="Screenshots">
           <Field label="Capture deployment screenshots">
             {(props) => (
-              <Switch
-                {...props}
-                checked={values.screenshots}
-                onCheckedChange={(screenshots) =>
-                  setValues((v) => ({ ...v, screenshots }))
-                }
+              <Controller
+                name="screenshots"
+                control={control}
+                render={({ field }) => (
+                  <Switch
+                    {...props}
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    onBlur={field.onBlur}
+                    ref={field.ref}
+                  />
+                )}
               />
             )}
           </Field>
-          {values.screenshots && (
+          <div hidden={!values.screenshots}>
             <Disclosure label="Capture details">
               <p>
                 A screenshot is captured after each successful deployment. This
                 sample does not run a capture.
               </p>
             </Disclosure>
-          )}
+          </div>
         </Group>
         <Group title="Route table">
           <p>
