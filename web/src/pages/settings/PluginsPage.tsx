@@ -265,8 +265,8 @@ export function PluginsPage() {
                   Running
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  {plugins.length} {plugins.length === 1 ? 'plugin' : 'plugins'}{' '}
-                  running
+                  {plugins.length} verified{' '}
+                  {plugins.length === 1 ? 'plugin' : 'plugins'} running
                 </p>
               </div>
               {canManagePlugins && (

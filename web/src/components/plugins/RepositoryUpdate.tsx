@@ -7,6 +7,7 @@ import { useEffect } from 'react'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import { repositoryInstallSchema } from '@/lib/plugin-repository'
 import { Button } from '@/components/ui/button'
 import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
@@ -92,7 +93,24 @@ export function RepositoryUpdate({
       </span>
     )
   if (!name) return null
-  if (status.isPending) return <p role="status">Loading plugin source…</p>
+  if (status.isPending)
+    return (
+      <div
+        role="status"
+        aria-label="Loading plugin source"
+        className="space-y-5"
+      >
+        <div aria-hidden="true" className="space-y-3 rounded-md border p-3">
+          <Skeleton className="h-5 w-3/4" />
+          <Skeleton className="h-4 w-1/2" />
+        </div>
+        <div aria-hidden="true" className="space-y-1">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-9 w-full" />
+        </div>
+        <Skeleton aria-hidden="true" className="h-8 w-44" />
+      </div>
+    )
   if (!status.data?.source)
     return <p>This plugin has no GitHub source available for updates.</p>
   const source = status.data.source
