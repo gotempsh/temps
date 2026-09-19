@@ -11,7 +11,10 @@ import {
   TableRow,
   Skeleton,
 } from '@temps-sdk/ui'
-import { ResponsivePagination, type ResponsivePaginationProps } from '../responsive-pagination'
+import {
+  ResponsivePagination,
+  type ResponsivePaginationProps,
+} from '../responsive-pagination'
 import { cn } from '../lib/cn'
 
 export interface DataTableColumn<T> {
@@ -19,6 +22,7 @@ export interface DataTableColumn<T> {
   header: ReactNode
   render: (row: T) => ReactNode
   className?: string
+  ariaSort?: 'ascending' | 'descending' | 'none'
 }
 
 export interface DataTableProps<T> {
@@ -67,7 +71,11 @@ export function DataTable<T>({
           <TableHeader>
             <TableRow>
               {columns.map((column) => (
-                <TableHead key={column.key} className={column.className}>
+                <TableHead
+                  key={column.key}
+                  className={column.className}
+                  aria-sort={column.ariaSort}
+                >
                   {column.header}
                 </TableHead>
               ))}

@@ -36,8 +36,9 @@ import { useMutation } from '@tanstack/react-query'
 import { Input } from '@/components/ui/input'
 import {
   AlertTriangle,
-  ChevronLeft,
-  ChevronRight,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
   EllipsisVertical,
   Globe,
   Info,
@@ -56,10 +57,16 @@ import {
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
+import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
+import type { DomainSort } from './domain-sort'
 
 interface DomainsManagementProps {
   domains?: DomainResponse[]
+  sort: DomainSort
+  direction: 'asc' | 'desc'
+  onSortChange: (sort: DomainSort) => void
+  isError: boolean
   isLoading: boolean
   reloadDomains: () => void
   total: number
@@ -83,6 +90,10 @@ const isExpiringSoon = (expirationTime: number) => {
 
 export function DomainsManagement({
   domains,
+  sort,
+  direction,
+  onSortChange,
+  isError,
   isLoading,
   reloadDomains,
   total,
@@ -162,23 +173,6 @@ export function DomainsManagement({
     )
   }
 
-  const getPaginationPages = (currentPage: number, total: number) => {
-    const pageNumbers = []
-    const maxButtons = 5
-    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
-    const endPage = Math.min(total, startPage + maxButtons - 1)
-
-    if (endPage - startPage < maxButtons - 1) {
-      startPage = Math.max(1, endPage - maxButtons + 1)
-    }
-
-    for (let i = startPage; i <= endPage; i++) {
-      pageNumbers.push(i)
-    }
-
-    return pageNumbers
-  }
-
   const pendingProvisioningCount =
     domains?.filter(
       (domain) =>
@@ -186,6 +180,79 @@ export function DomainsManagement({
         domain.status === 'pending' ||
         domain.status === 'failed'
     ).length || 0
+
+  const sortable = (key: DomainSort, label: string) => ({
+    key,
+    ariaSort:
+      sort === key
+        ? direction === 'asc'
+          ? ('ascending' as const)
+          : ('descending' as const)
+        : ('none' as const),
+    header: (
+      <Button
+        variant="ghost"
+        size="sm"
+        className="-ml-3 gap-2"
+        onClick={() => onSortChange(key)}
+      >
+        {label}
+        {sort === key ? (
+          direction === 'asc' ? (
+            <ArrowUp className="size-3.5" />
+          ) : (
+            <ArrowDown className="size-3.5" />
+          )
+        ) : (
+          <ArrowUpDown className="size-3.5" />
+        )}
+      </Button>
+    ),
+  })
+  const columns: DataTableColumn<DomainResponse>[] = [
+    {
+      ...sortable('domain', 'Domain'),
+      render: (domain) => (
+        <Link
+          to={`/domains/${domain.id}`}
+          className="font-medium hover:underline focus-visible:underline"
+        >
+          {domain.domain}
+        </Link>
+      ),
+    },
+    {
+      ...sortable('status', 'Status'),
+      render: (domain) => <DomainStatusBadge status={domain.status} />,
+    },
+    {
+      key: 'type',
+      header: 'Type',
+      render: (domain) => (
+        <span className="text-muted-foreground">
+          {domain.is_wildcard ? 'Wildcard' : 'Single domain'}
+        </span>
+      ),
+    },
+    {
+      ...sortable('expiration', 'Certificate expires'),
+      render: (domain) => <DomainExpiration domain={domain} />,
+    },
+    {
+      key: 'actions',
+      header: <span className="sr-only">Actions</span>,
+      className: 'w-12',
+      render: (domain) => (
+        <DomainRowMenu
+          domain={domain}
+          onOpen={(id) => navigate(`/domains/${id}`)}
+          onRenew={handleRenewDomain}
+          onDelete={setDomainToDelete}
+          canManageCertificates={canManageCertificates}
+        />
+      ),
+    },
+  ]
 
   return (
     <div className="space-y-6">
@@ -244,6 +311,7 @@ export function DomainsManagement({
         <Input
           value={searchQuery}
           onChange={(e) => onSearchChange(e.target.value)}
+          aria-label="Search domains"
           placeholder="Search domains..."
           className="pl-9 pr-10"
         />
@@ -283,23 +351,18 @@ export function DomainsManagement({
         </AlertDialogContent>
       </AlertDialog>
 
-      {isLoading ? (
-        <div className="divide-y rounded-lg border">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div
-              key={i}
-              className="flex items-center gap-4 px-4 py-3 animate-pulse"
-            >
-              <div className="size-9 shrink-0 rounded-md bg-muted" />
-              <div className="flex-1 min-w-0 space-y-1.5">
-                <div className="h-4 w-48 bg-muted rounded" />
-                <div className="h-3 w-64 bg-muted rounded" />
-              </div>
-              <div className="h-6 w-20 bg-muted rounded" />
-            </div>
-          ))}
-        </div>
-      ) : !domains?.length ? (
+      {isError ? (
+        <EmptyState
+          icon={AlertTriangle}
+          title="Could not load domains"
+          description="Try loading the domain list again."
+          action={
+            <Button variant="outline" onClick={reloadDomains}>
+              Retry
+            </Button>
+          }
+        />
+      ) : !isLoading && !domains?.length ? (
         searchQuery ? (
           <EmptyState
             icon={Search}
@@ -325,71 +388,21 @@ export function DomainsManagement({
           />
         )
       ) : (
-        <DomainsCompactRows
-          domains={domains}
-          onOpen={(id) => navigate(`/domains/${id}`)}
-          onRenew={handleRenewDomain}
-          onDelete={setDomainToDelete}
-          canManageCertificates={canManageCertificates}
+        <DataTable
+          aria-label="Domains"
+          columns={columns}
+          rows={domains ?? []}
+          rowKey={(domain) => domain.id}
+          isLoading={isLoading}
+          pagination={
+            !isLoading
+              ? { page, pageSize, total, totalPages, onPageChange }
+              : undefined
+          }
         />
-      )}
-
-      {totalPages > 1 && (
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="text-xs sm:text-sm text-muted-foreground text-center sm:text-left">
-            Showing {(page - 1) * pageSize + 1} to{' '}
-            {Math.min(page * pageSize, total)} of {total} domains
-          </div>
-          <div className="flex items-center gap-1 sm:gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => onPageChange(Math.max(1, page - 1))}
-              disabled={page === 1}
-              className="h-8 px-2 sm:h-9 sm:px-3"
-            >
-              <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline ml-1">Previous</span>
-            </Button>
-            <div className="hidden sm:flex items-center gap-1">
-              {getPaginationPages(page, totalPages).map((pageNum) => (
-                <Button
-                  key={pageNum}
-                  variant={pageNum === page ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => onPageChange(pageNum)}
-                  className="w-10"
-                >
-                  {pageNum}
-                </Button>
-              ))}
-            </div>
-            <span className="sm:hidden text-xs text-muted-foreground px-2">
-              {page} / {totalPages}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => onPageChange(Math.min(totalPages, page + 1))}
-              disabled={page === totalPages}
-              className="h-8 px-2 sm:h-9 sm:px-3"
-            >
-              <span className="hidden sm:inline mr-1">Next</span>
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
       )}
     </div>
   )
-}
-
-interface DomainsCompactRowsProps {
-  domains: DomainResponse[]
-  onOpen: (id: number) => void
-  onRenew: (domain: string) => void
-  onDelete: (domain: DomainResponse) => void
-  canManageCertificates: boolean
 }
 
 function DomainStatusBadge({ status }: { status: string }) {
@@ -436,7 +449,12 @@ function DomainRowMenu({
     >
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon" className="h-8 w-8">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            aria-label={`Actions for ${domain.domain}`}
+          >
             <EllipsisVertical className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
@@ -478,89 +496,33 @@ function DomainRowMenu({
   )
 }
 
-function DomainsCompactRows({
-  domains,
-  onOpen,
-  onRenew,
-  onDelete,
-  canManageCertificates,
-}: DomainsCompactRowsProps) {
+function DomainExpiration({ domain }: { domain: DomainResponse }) {
+  if (
+    domain.expiration_time == null ||
+    !Number.isFinite(domain.expiration_time)
+  ) {
+    return <span className="text-muted-foreground">Not available</span>
+  }
+  const remaining = formatExpiryRemaining(domain.expiration_time)
+  const urgent = isExpiringSoon(domain.expiration_time)
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <ul role="list" className="divide-y">
-        {domains.map((domain) => {
-          const expiringSoon =
-            isServingCert(domain.status) &&
-            isExpiringSoon(domain.expiration_time || 0)
-          const expires = domain.expiration_time
-            ? formatLocalDate(domain.expiration_time)
-            : null
-          const remaining = domain.expiration_time
-            ? formatExpiryRemaining(domain.expiration_time)
-            : null
-          const expiryBadgeVariant: 'destructive' | 'warning' =
-            remaining?.expired || (remaining && remaining.totalHours < 48)
+    <div className="flex flex-wrap items-center gap-2 whitespace-nowrap">
+      <span className="tabular-nums">
+        {formatLocalDate(domain.expiration_time)}
+      </span>
+      {urgent && remaining && (
+        <Badge
+          variant={
+            remaining.expired || remaining.totalHours < 48
               ? 'destructive'
               : 'warning'
-          const expiryBadgeLabel = remaining
-            ? remaining.expired
-              ? `Expired ${remaining.short} ago`
-              : `Expires in ${remaining.short}`
-            : 'Expires soon'
-          return (
-            <li
-              key={domain.id}
-              role="button"
-              tabIndex={0}
-              onClick={() => onOpen(domain.id)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault()
-                  onOpen(domain.id)
-                }
-              }}
-              className="flex cursor-pointer items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus:outline-none focus:bg-muted/40"
-            >
-              <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                <Globe className="size-4 text-muted-foreground" />
-              </div>
-              <div className="flex min-w-0 flex-1 items-center gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <p className="truncate text-sm font-medium">
-                      {domain.domain}
-                    </p>
-                    <DomainStatusBadge status={domain.status} />
-                    {domain.is_wildcard && (
-                      <Badge variant="outline" className="text-xs">
-                        Wildcard
-                      </Badge>
-                    )}
-                    {expiringSoon && (
-                      <Badge variant={expiryBadgeVariant} className="text-xs">
-                        {expiryBadgeLabel}
-                      </Badge>
-                    )}
-                  </div>
-                  {expires && (
-                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                      Expires {expires}
-                    </p>
-                  )}
-                </div>
-              </div>
-              <DomainRowMenu
-                domain={domain}
-                onOpen={onOpen}
-                onRenew={onRenew}
-                onDelete={onDelete}
-                canManageCertificates={canManageCertificates}
-              />
-              <ChevronRight className="hidden size-4 shrink-0 text-muted-foreground/50 sm:block" />
-            </li>
-          )
-        })}
-      </ul>
+          }
+        >
+          {remaining.expired
+            ? `Expired ${remaining.short} ago`
+            : `In ${remaining.short}`}
+        </Badge>
+      )}
     </div>
   )
 }
