@@ -866,11 +866,13 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
     match error {
         ExternalPluginsError::Repository(
             crate::repository::RepositoryError::UnsafeUrl
-            | crate::repository::RepositoryError::UnsafeRef { .. }
-            | crate::repository::RepositoryError::UnsafePath { .. },
+            | crate::repository::RepositoryError::UnsafeRef { .. },
         ) => {
             "Use a GitHub URL in the form https://github.com/owner/repo and a safe ref".to_string()
         }
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+            ..
+        }) => "Use a relative plugin directory of at most 512 ASCII characters: letters, digits, '.', '_', '-', and '/' only. Segments must not be empty, '.', '..', or '.git'. Omit the path or use an empty string for the repository root.".to_string(),
         ExternalPluginsError::Repository(crate::repository::RepositoryError::Manifest {
             ..
         }) => "Repository must contain a matching package.json and src/index.ts".to_string(),
@@ -2620,6 +2622,34 @@ mod tests {
             .get("detail")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|detail| detail.contains("rotated-without-anchor")));
+    }
+
+    #[test]
+    fn unsafe_repository_path_is_bad_request_with_safe_directory_guidance() {
+        let secret_path = "../../private/token?credential=must-not-leak";
+        let secret_url = "https://user:must-not-leak@github.com/example/plugin";
+        let error =
+            ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+                repository: secret_url.into(),
+                path: secret_path.into(),
+            });
+        let detail = public_error_detail(&error);
+        let problem = service_problem(&error);
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert!(detail.contains("relative plugin directory"));
+        assert!(detail.contains("512 ASCII characters"));
+        assert!(detail.contains("Segments must not be empty"));
+        assert!(detail.contains("repository root"));
+        assert!(!detail.contains(secret_path));
+        assert!(!detail.contains(secret_url));
+        assert!(!detail.contains("must-not-leak"));
+        assert_eq!(
+            problem
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some(detail.as_str())
+        );
     }
 
     #[test]
