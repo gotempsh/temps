@@ -226,3 +226,18 @@ setup requirements. Do not collapse frequently used controls. Keep a visible
 sample label in demos, and move walkthrough instructions into "About this example"
 outside the main workflow. Use existing semantic spacing and colors; help is not
 a new bordered card around every field.
+
+Use `SettingsSection` for collapsible form groups, not the informational
+`Disclosure`: it retains field values and reveals validation errors. Use open sections for everyday settings, with section headings on the left and
+controls on the right on desktop; stack headings above controls on mobile. Separate groups with
+spacing instead of a card or divider around each one. Reserve collapsible form
+groups for advanced or infrequent controls. Keep short forms at a readable width
+(the settings reference uses a `max-w-5xl` grid with one-third headings and
+two-thirds controls) rather than stretching inputs across the viewport. `Field.help` places optional context beside the label;
+required instructions and errors remain visible below the control.
+
+Use `SettingsGroup` for the aligned open layout. Use `SettingsSection` only when
+the form group should collapse; each caller retains its own save scope.
+
+SettingsGroup descriptions are optional: one short sentence beneath the heading
+that clarifies scope or outcome. Omit repeated labels and detailed instructions.

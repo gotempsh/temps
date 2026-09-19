@@ -17,7 +17,7 @@ import { positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { RefreshCw, Play, Pause } from 'lucide-react'
-import { Callout, HelpPopover } from '@temps-sdk/ds'
+import { HelpPopover } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 export default function GlobalLogs() {
@@ -99,22 +99,23 @@ export default function GlobalLogs() {
       ])
     )
   )
-  const status = incomplete ? (
-    <Callout tone="warning" title="Scan limit reached">
-      {lines.length ? 'Showing partial results. ' : ''}
-      Use Next page to continue, or narrow your search or time range.
-    </Callout>
-  ) : !ready || !lines.length ? (
-    <QueryContent
-      title="Logs"
-      loading={query.isPending}
-      error={query.error}
-      empty={!lines.length}
-      retry={() => void query.refetch()}
-    >
-      {null}
-    </QueryContent>
-  ) : undefined
+  const status =
+    incomplete && !lines.length ? (
+      <p className="py-6 text-sm text-muted-foreground">
+        No matching lines in this scan. Continue to the next page or narrow your
+        search.
+      </p>
+    ) : !ready || !lines.length ? (
+      <QueryContent
+        title="Logs"
+        loading={query.isPending}
+        error={query.error}
+        empty={!lines.length}
+        retry={() => void query.refetch()}
+      >
+        {null}
+      </QueryContent>
+    ) : undefined
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
@@ -144,12 +145,15 @@ export default function GlobalLogs() {
                   view.setTimeRange(range)
                 }}
               />
-              <span className="text-[11px] text-muted-foreground">
-                UTC
-              </span>
+              <span className="text-[11px] text-muted-foreground">UTC</span>
               <HelpPopover label="About log search">
-                <p>Search messages or use project:, env:, source:, and level: filters.</p>
-                <p>Counts and groups describe the loaded page. Times are in UTC.</p>
+                <p>
+                  Search messages or use project:, env:, source:, and level:
+                  filters.
+                </p>
+                <p>
+                  Counts and groups describe the loaded page. Times are in UTC.
+                </p>
               </HelpPopover>
               <Button
                 size="sm"
@@ -214,13 +218,21 @@ export default function GlobalLogs() {
         }
         footer={
           <div className="flex flex-wrap items-center justify-between gap-2 py-3 text-xs text-muted-foreground">
-            <span>
-              {ready
-                ? `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · ${incomplete ? 'partial results' : 'newest first'}`
-                : query.isPending
-                  ? 'Loading logs…'
-                  : 'Search incomplete'}
-            </span>
+            <div className="flex items-center gap-1">
+              <span>
+                {ready
+                  ? `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · ${incomplete ? 'partial results' : 'newest first'}`
+                  : query.isPending
+                    ? 'Loading logs…'
+                    : 'Search incomplete'}
+              </span>
+              {incomplete && (
+                <HelpPopover label="About partial results">
+                  This scan reached its limit. Use Next page to continue, or
+                  narrow your search or time range.
+                </HelpPopover>
+              )}
+            </div>
             <div className="flex gap-1">
               <Button
                 variant="ghost"

@@ -77,6 +77,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `SettingsGroup` | `title`, `description?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
+| `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
 | `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
@@ -409,3 +411,105 @@ Verified console typecheck, package lint, console and sandbox builds, help and
 query unit tests. Browser checks covered HelpPopover open/Escape/focus return,
 Disclosure Enter activation, and the wizard's default layout. Console built CSS
 contains the package-only badge height utility through the explicit DS source scan.
+
+### Settings help refinement
+
+`Field.help` accepts `{ label, content }` for optional background context. Its
+help trigger is a sibling of the label, never nested in it. Keep required format
+instructions in `description` and validation in `error`. `SettingsSection` is
+now owned by the package; the old console import is a thin re-export. The sandbox
+settings example uses the selected Aligned rows layout (option 3): visible platform,
+certificate, and screenshot settings in a bounded two-column grid (headings left, controls right), with optional capture
+details collapsed and a visible Route table section. Changes and save feedback are sample-only.
+
+Read-only browser review against a populated instance at the local console proxy:
+settings summaries previously repeated their titles or showed operational details
+before expansion. Redundant summaries were removed; route-refresh context now sits
+beside its action. External URL context uses `Field.help`; validation remains inline.
+Verified help open/Escape/focus return and a 390px dark viewport without horizontal
+overflow. No live forms were submitted and no resources were modified. Form value
+retention and error expansion are covered by the existing section regression tests.
+
+### Platform settings layout
+
+The console Settings page now follows the selected Aligned rows reference:
+Headings sit left of their controls on desktop and stack above them on mobile.
+External URL and Preview Domain share Platform; certificate email/environment
+and the screenshot switch stay visible. Advanced networking and DNS use
+SettingsSection to retain registered values and reveal validation errors.
+Route table has a visible explanation and reload action in the same aligned layout. The form keeps its existing settings
+mutation and normalization, with an always-mounted save bar and error summary.
+
+Latest populated-screen priorities are recorded in the audit section below.
+
+### Audit implementation: settings and observability
+
+SettingsGroup promotes the selected sandbox layout into a shared primitive.
+Monitoring uses it while retaining each section's independent form and save.
+Build Limits and Request Timeouts use the same layout and persistent save bars;
+restart requirements, BuildKit limitations, and timeout semantics remain visible.
+Notifications has compact subheadings and quieter provider cards.
+
+Logs exposes its optional facets through a Filters button, persisted as facets=1
+in the URL. The inspector still opens alongside the selected record. Server cards
+use named help for metric definitions and keep thresholds, current values, and
+capacity forecasts visible. No live configuration or route reload was submitted.
+
+Local before/after review captures six pages; images remain outside git because
+they contain real instance data. Charts and logs were captured at different times,
+so compare layout rather than data values.
+
+Notification providers now render as list items without a repeated Providers heading.
+Rows show type, sender/channel when available, recipient count, last update,
+and enabled state. Webhook credentials are never rendered; existing actions remain.
+
+## Populated console UI audit — 2026-09-19
+
+Read-only review of localhost:3028, proxying the user's populated instance.
+Ten routes sampled in light mode at 1440 × 1000; Settings also checked at
+390 × 844 with no horizontal document overflow. Screenshots stayed local
+because they contain customer data. No settings were saved, providers toggled,
+routes reloaded, or resources changed. Login password file was deleted.
+
+This is a prioritized sample, not a complete route inventory or accessibility
+audit. Initial loading screenshots were revisited before assessing loaded pages.
+Project details, creation flows, dark mode, and mobile pages other than Settings
+still need a separate pass. Rankings are design judgments from the rendered UI.
+
+### Next work, in order
+
+| Priority | Route | Observed issue | Proposed change |
+|---|---|---|---|
+| 1 | /monitoring | Four large shadowed cards, long label-to-switch distances, uneven heights and independent save buttons competing for attention | Aligned section headings and bounded control columns. Preserve independent save scopes, show save feedback beside the affected section; do not silently combine API writes |
+| 1 | /settings/request-timeouts | Every primary group is collapsed; no normal page heading in the content | Shared PageHeader and aligned rows; expose common timeout controls and current values, keep override ceilings advanced |
+| 1 | /settings/build-limits | Three equal columns contain very unequal amounts of technical explanation; nested notice and outer card dominate | Aligned settings sections. Keep restart requirement and BuildKit applicability visible; move legacy implementation details into named help. Avoid implying unsupported limits are enforced |
+| 2 | /settings/notifications | Page title/description followed by another large provider title/description; provider cards repeat their type | One page header with Providers/Routes navigation and the relevant action. Compact provider rows or quieter cards; preserve enabled state and destination identity |
+| 2 | /logs | Several toolbar groups compete, tiny dense text, side facets reduce message width; duplicate-looking environment labels appeared | Give search/range primary placement, group presentation/export actions, consider an optional facet panel. Investigate environment identity before merging labels; presentation changes must preserve filtering and wrapping contracts |
+| 2 | /monitoring/server | Repeated metric descriptions and chart subtitles, equally heavy cards; capacity forecast is small relative to its significance | Compact overview metrics, concise chart captions, optional sampling help. Keep capacity warnings conspicuous. Do not change sampling/forecast semantics during styling |
+| 3 | /projects | Setup strip, migration actions, card graphs and multiple status cues compete with browsing; some project names truncate | Review the surrounding collection toolbar/onboarding priority first. Card internals remain explicitly deferred; don't mechanically migrate this page |
+| 3 | /settings/load-balancer | Heading scale differs from adjacent settings pages; list is otherwise concise | Normalize header and action placement; retain the compact route list |
+| Keep / light polish | /errors | Search, filters and table are already clear; description is longer than needed | Shorten optional copy and keep the existing collection structure |
+| Implemented this pass | /settings | Generic collapsed Troubleshooting hid a named operational action | Visible Route table heading left, short purpose/reload explanation and Reload route table action right; same pattern in sandbox |
+
+### Design-system implications
+
+- Aligned rows are the settings default: section identity left, controls right,
+  stacking on mobile. Use spacing rather than a card around every group.
+- Show common controls and current values immediately. Collapse genuinely advanced
+  configuration, not all content.
+- A distinct operation such as route-table reload deserves a named section and
+  an explicit action. It is not generic troubleshooting documentation.
+- One page header per surface; nested tabs should not introduce another full
+  title and description.
+- Preserve warnings, scope, units and operational consequences. Reduce background
+  explanation through Field.help or named Disclosure.
+- Standardize save placement and feedback without changing transaction boundaries.
+- Prefer a dedicated review for log presentation and complex project cards.
+
+### Route-table verification
+
+Checked the existing backend handler: POST /settings/routes/refresh reloads saved
+routes into the proxy's in-memory cache and returns the loaded route count.
+The UI retains that existing request; this pass changes its discoverability and
+copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
+and sandbox build passed; browser confirmed the named section and exposed action.

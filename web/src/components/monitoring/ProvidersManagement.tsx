@@ -16,7 +16,7 @@ import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { fmtDateTime, fmtRelativeTime } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -35,7 +35,14 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Bell, EllipsisVertical } from 'lucide-react'
+import {
+  Bell,
+  EllipsisVertical,
+  Mail,
+  Hash,
+  Webhook,
+  Cloud,
+} from 'lucide-react'
 import { useNavigate } from 'react-router'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -333,17 +340,7 @@ export function ProvidersManagement() {
   )
   return (
     <div className="space-y-4">
-      <div className="flex justify-between items-center">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">
-            Notification Providers
-          </h2>
-          <p className="text-muted-foreground">
-            Configure where notifications can be delivered. Routes decide which
-            alerts reach each destination.
-          </p>
-        </div>
-
+      <div className="flex justify-end">
         {/* Only one of this and the empty-state button is ever mounted, so
             the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
@@ -367,71 +364,124 @@ export function ProvidersManagement() {
           }
         />
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <ul
+          aria-label="Notification providers"
+          className="divide-y rounded-lg border"
+        >
           {providers?.map((provider) => {
             const typedProvider = provider as ExtendedNotificationProvider
+            const config = typedProvider.config
+            const Icon =
+              provider.provider_type === 'email'
+                ? Mail
+                : provider.provider_type === 'slack'
+                  ? Hash
+                  : provider.provider_type === 'cloudflare'
+                    ? Cloud
+                    : Webhook
+            const destination =
+              provider.provider_type === 'email' ||
+              provider.provider_type === 'cloudflare'
+                ? config?.from_address
+                  ? `From ${config.from_address}`
+                  : 'No sender address configured'
+                : provider.provider_type === 'slack'
+                  ? config?.channel && config.channel !== '***'
+                    ? config.channel
+                    : config?.webhook_url
+                      ? 'Webhook configured'
+                      : 'No webhook configured'
+                  : config?.url
+                    ? 'Webhook configured'
+                    : 'No webhook configured'
             return (
-              <Card key={provider.id}>
-                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                  <div className="space-y-1">
-                    <CardTitle className="text-base font-medium leading-none">
-                      {provider.name}
-                    </CardTitle>
-                    <p className="text-xs text-muted-foreground capitalize">
+              <li
+                key={provider.id}
+                className="flex flex-wrap items-start gap-4 p-4 sm:items-center sm:p-5"
+              >
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
+                  <Icon
+                    className="size-4 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                </span>
+                <div className="min-w-0 flex-1 basis-48 space-y-1">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <h3 className="text-sm font-medium">{provider.name}</h3>
+                    <span className="text-xs text-muted-foreground capitalize">
                       {provider.provider_type}
-                    </p>
+                    </span>
                   </div>
-                  <div className="flex items-center gap-1">
-                    <Switch
-                      checked={provider.enabled}
-                      onCheckedChange={() => handleToggleEnabled(typedProvider)}
-                      disabled={toggleEnabledMutation.isPending}
-                      className="data-[state=checked]:bg-primary"
-                    />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="h-8 w-8">
-                          <EllipsisVertical className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onClick={() => handleEdit(typedProvider)}
-                        >
-                          Edit
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => handleTest(typedProvider)}
-                        >
-                          Test
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          className="text-destructive"
-                          onClick={() => handleDelete(typedProvider)}
-                        >
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <p className="text-sm text-muted-foreground truncate">
-                    {provider.provider_type === 'email' ||
-                    provider.provider_type === 'cloudflare'
-                      ? typedProvider.config?.from_address ||
-                        'No address configured'
-                      : provider.provider_type === 'slack'
-                        ? typedProvider.config?.webhook_url ||
-                          'No webhook configured'
-                        : typedProvider.config?.url || 'No webhook configured'}
+                  <p className="break-words text-sm text-muted-foreground">
+                    {destination}
                   </p>
-                </CardContent>
-              </Card>
+                  <p className="text-xs text-muted-foreground">
+                    {Array.isArray(config?.to_addresses) &&
+                      config.to_addresses.length > 0 && (
+                        <span>
+                          {config.to_addresses.length}{' '}
+                          {config.to_addresses.length === 1
+                            ? 'recipient'
+                            : 'recipients'}{' '}
+                          ·{' '}
+                        </span>
+                      )}
+                    Updated{' '}
+                    <time
+                      dateTime={new Date(provider.updated_at).toISOString()}
+                      title={fmtDateTime(provider.updated_at)}
+                    >
+                      {fmtRelativeTime(provider.updated_at)}
+                    </time>
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-3">
+                  <span className="text-xs text-muted-foreground">
+                    {provider.enabled ? 'Enabled' : 'Disabled'}
+                  </span>
+                  <Switch
+                    aria-label={`Enable ${provider.name}`}
+                    checked={provider.enabled}
+                    onCheckedChange={() => handleToggleEnabled(typedProvider)}
+                    disabled={toggleEnabledMutation.isPending}
+                    className="data-[state=checked]:bg-primary"
+                  />
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        aria-label={`Actions for ${provider.name}`}
+                      >
+                        <EllipsisVertical className="h-4 w-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onClick={() => handleEdit(typedProvider)}
+                      >
+                        Edit
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => handleTest(typedProvider)}
+                      >
+                        Test
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        className="text-destructive"
+                        onClick={() => handleDelete(typedProvider)}
+                      >
+                        Delete
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </li>
             )
           })}
-        </div>
+        </ul>
       )}
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>

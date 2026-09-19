@@ -33165,6 +33165,14 @@ export type ListDomainsData = {
          * Search domains by name (substring match)
          */
         search?: string | null;
+        /**
+         * Allowlisted sort columns for the paginated domain collection.
+         */
+        sort_by?: 'created_at' | 'domain' | 'status' | 'expiration';
+        /**
+         * Sort direction (defaults to desc). Unknown expiration dates always sort last.
+         */
+        sort_order?: 'asc' | 'desc';
     };
     url: '/domains';
 };

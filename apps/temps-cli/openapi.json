@@ -70014,6 +70014,35 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Sort column (defaults to created_at)",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "description": "Allowlisted sort columns for the paginated domain collection.",
+              "enum": [
+                "created_at",
+                "domain",
+                "status",
+                "expiration"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort direction (defaults to desc). Unknown expiration dates always sort last.",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string"
+            }
           }
         ],
         "responses": {
