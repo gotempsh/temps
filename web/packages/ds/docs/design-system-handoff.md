@@ -428,3 +428,12 @@ beside its action. External URL context uses `Field.help`; validation remains in
 Verified help open/Escape/focus return and a 390px dark viewport without horizontal
 overflow. No live forms were submitted and no resources were modified. Form value
 retention and error expansion are covered by the existing section regression tests.
+
+### Platform settings layout
+
+The console Settings page now follows the selected open-section reference:
+External URL and Preview Domain share Platform; certificate email/environment
+and the screenshot switch stay visible. Advanced networking and DNS use
+SettingsSection to retain registered values and reveal validation errors.
+Troubleshooting contains route refresh. The form keeps its existing settings
+mutation and normalization, with an always-mounted save bar and error summary.
