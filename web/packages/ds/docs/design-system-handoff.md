@@ -77,6 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `SettingsGroup` | `title`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
 | `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
 | `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
@@ -440,3 +441,20 @@ Route table has a visible explanation and reload action in the same aligned layo
 mutation and normalization, with an always-mounted save bar and error summary.
 
 Latest populated-screen priorities: [2026-09-19 app UI audit](./app-ui-audit-2026-09-19.md).
+
+### Audit implementation: settings and observability
+
+SettingsGroup promotes the selected sandbox layout into a shared primitive.
+Monitoring uses it while retaining each section's independent form and save.
+Build Limits and Request Timeouts use the same layout and persistent save bars;
+restart requirements, BuildKit limitations, and timeout semantics remain visible.
+Notifications has compact subheadings and quieter provider cards.
+
+Logs exposes its optional facets through a Filters button, persisted as facets=1
+in the URL. The inspector still opens alongside the selected record. Server cards
+use named help for metric definitions and keep thresholds, current values, and
+capacity forecasts visible. No live configuration or route reload was submitted.
+
+Local before/after review captures six pages; images remain outside git because
+they contain real instance data. Charts and logs were captured at different times,
+so compare layout rather than data values.

@@ -235,3 +235,6 @@ groups for advanced or infrequent controls. Keep short forms at a readable width
 (the settings reference uses a `max-w-5xl` grid with one-third headings and
 two-thirds controls) rather than stretching inputs across the viewport. `Field.help` places optional context beside the label;
 required instructions and errors remain visible below the control.
+
+Use `SettingsGroup` for the aligned open layout. Use `SettingsSection` only when
+the form group should collapse; each caller retains its own save scope.
