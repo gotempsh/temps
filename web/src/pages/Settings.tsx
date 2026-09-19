@@ -169,10 +169,10 @@ export function Settings() {
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
       <PageHeader title="Settings" />
-      <div className="max-w-2xl space-y-10">
+      <div className="max-w-5xl space-y-10">
         <section
           aria-labelledby="platform-settings-heading"
-          className="space-y-5"
+          className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
         >
           <h2
             id="platform-settings-heading"
@@ -180,152 +180,154 @@ export function Settings() {
           >
             Platform
           </h2>
-          <Field
-            label="External URL"
-            optional
-            error={errors.external_url?.message}
-            help={{
-              label: 'About the external URL',
-              content:
-                'Used for OAuth callbacks, webhooks, and external integrations.',
-            }}
-          >
-            {(fieldProps) => (
-              <Input
-                {...fieldProps}
-                type="url"
-                placeholder="https://your-domain.com"
-                {...register('external_url', {
-                  validate: (value) => {
-                    if (!value) return true // optional
-                    const trimmed = value.trim()
-                    if (!trimmed) return true
-                    if (
-                      !trimmed.startsWith('http://') &&
-                      !trimmed.startsWith('https://')
-                    )
-                      return 'Must start with http:// or https://'
-                    if (trimmed.includes('#') || trimmed.includes('?'))
-                      return 'Must not contain # or ? characters'
-                    try {
-                      new URL(trimmed)
-                    } catch {
-                      return 'Must be a valid URL'
-                    }
-                    return true
-                  },
-                })}
-              />
-            )}
-          </Field>
-
-          <div className="space-y-2">
-            <Label htmlFor="preview-domain">Preview Domain</Label>
-            <Input
-              id="preview-domain"
-              type="text"
-              placeholder="localho.st"
-              {...register('preview_domain')}
-            />
-            <p className="text-sm text-muted-foreground">
-              Deployments will be accessible at subdomain.
-              {settings?.preview_domain || 'localho.st'}
-            </p>
-          </div>
-          <SettingsSection
-            title="Advanced networking"
-            icon={ShieldCheck}
-            hasError={Boolean(errors.internal_url)}
-          >
-            <div className="space-y-2 pt-4">
-              <Label htmlFor="console-force-https">
-                Redirect console to HTTPS
-              </Label>
-              <Select
-                value={consoleForceHttpsValue}
-                onValueChange={(value) =>
-                  setValue(
-                    'console_force_https',
-                    value === 'auto' ? null : value === 'always',
-                    { shouldDirty: true }
-                  )
-                }
-              >
-                <SelectTrigger
-                  id="console-force-https"
-                  className="w-full sm:w-[280px]"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="auto">
-                    Automatic — once a certificate exists
-                  </SelectItem>
-                  <SelectItem value="always">Always redirect</SelectItem>
-                  <SelectItem value="never">Never redirect</SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                Use Always only when Temps terminates TLS. A CDN or reverse
-                proxy terminating TLS can cause redirect loops.
-              </p>
-              <Disclosure label="How automatic redirects work">
-                <p>
-                  Automatic redirects HTTP requests only after Temps has issued
-                  a certificate for the console hostname. HTTP-only
-                  installations keep working.
-                </p>
-              </Disclosure>
-            </div>
-
-            <div className="space-y-2 pt-4">
-              <Label htmlFor="internal-url">Internal URL</Label>
-              <Input
-                id="internal-url"
-                type="url"
-                placeholder="http://host.docker.internal:8080"
-                {...register('internal_url', {
-                  validate: (value) => {
-                    if (!value) return true // optional — falls back to default
-                    const trimmed = value.trim()
-                    if (!trimmed) return true
-                    if (
-                      !trimmed.startsWith('http://') &&
-                      !trimmed.startsWith('https://')
-                    )
-                      return 'Must start with http:// or https://'
-                    if (trimmed.includes('#') || trimmed.includes('?'))
-                      return 'Must not contain # or ? characters'
-                    try {
-                      new URL(trimmed)
-                    } catch {
-                      return 'Must be a valid URL'
-                    }
-                    return true
-                  },
-                })}
-              />
-              {errors.internal_url && (
-                <p className="text-sm text-destructive">
-                  {errors.internal_url.message}
-                </p>
+          <div className="min-w-0 space-y-5">
+            <Field
+              label="External URL"
+              optional
+              error={errors.external_url?.message}
+              help={{
+                label: 'About the external URL',
+                content:
+                  'Used for OAuth callbacks, webhooks, and external integrations.',
+              }}
+            >
+              {(fieldProps) => (
+                <Input
+                  {...fieldProps}
+                  type="url"
+                  placeholder="https://your-domain.com"
+                  {...register('external_url', {
+                    validate: (value) => {
+                      if (!value) return true // optional
+                      const trimmed = value.trim()
+                      if (!trimmed) return true
+                      if (
+                        !trimmed.startsWith('http://') &&
+                        !trimmed.startsWith('https://')
+                      )
+                        return 'Must start with http:// or https://'
+                      if (trimmed.includes('#') || trimmed.includes('?'))
+                        return 'Must not contain # or ? characters'
+                      try {
+                        new URL(trimmed)
+                      } catch {
+                        return 'Must be a valid URL'
+                      }
+                      return true
+                    },
+                  })}
+                />
               )}
+            </Field>
+
+            <div className="space-y-2">
+              <Label htmlFor="preview-domain">Preview Domain</Label>
+              <Input
+                id="preview-domain"
+                type="text"
+                placeholder="localho.st"
+                {...register('preview_domain')}
+              />
               <p className="text-sm text-muted-foreground">
-                How service containers reach the Temps API from inside the
-                Docker network (OTLP metrics ingest, agent callbacks). Leave
-                blank to use{' '}
-                <code className="font-mono text-xs">
-                  http://host.docker.internal:&lt;proxy-port&gt;
-                </code>
-                .
+                Deployments will be accessible at subdomain.
+                {settings?.preview_domain || 'localho.st'}
               </p>
             </div>
-          </SettingsSection>
+            <SettingsSection
+              title="Advanced networking"
+              icon={ShieldCheck}
+              hasError={Boolean(errors.internal_url)}
+            >
+              <div className="space-y-2 pt-4">
+                <Label htmlFor="console-force-https">
+                  Redirect console to HTTPS
+                </Label>
+                <Select
+                  value={consoleForceHttpsValue}
+                  onValueChange={(value) =>
+                    setValue(
+                      'console_force_https',
+                      value === 'auto' ? null : value === 'always',
+                      { shouldDirty: true }
+                    )
+                  }
+                >
+                  <SelectTrigger
+                    id="console-force-https"
+                    className="w-full sm:w-[280px]"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">
+                      Automatic — once a certificate exists
+                    </SelectItem>
+                    <SelectItem value="always">Always redirect</SelectItem>
+                    <SelectItem value="never">Never redirect</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-sm text-muted-foreground">
+                  Use Always only when Temps terminates TLS. A CDN or reverse
+                  proxy terminating TLS can cause redirect loops.
+                </p>
+                <Disclosure label="How automatic redirects work">
+                  <p>
+                    Automatic redirects HTTP requests only after Temps has
+                    issued a certificate for the console hostname. HTTP-only
+                    installations keep working.
+                  </p>
+                </Disclosure>
+              </div>
+
+              <div className="space-y-2 pt-4">
+                <Label htmlFor="internal-url">Internal URL</Label>
+                <Input
+                  id="internal-url"
+                  type="url"
+                  placeholder="http://host.docker.internal:8080"
+                  {...register('internal_url', {
+                    validate: (value) => {
+                      if (!value) return true // optional — falls back to default
+                      const trimmed = value.trim()
+                      if (!trimmed) return true
+                      if (
+                        !trimmed.startsWith('http://') &&
+                        !trimmed.startsWith('https://')
+                      )
+                        return 'Must start with http:// or https://'
+                      if (trimmed.includes('#') || trimmed.includes('?'))
+                        return 'Must not contain # or ? characters'
+                      try {
+                        new URL(trimmed)
+                      } catch {
+                        return 'Must be a valid URL'
+                      }
+                      return true
+                    },
+                  })}
+                />
+                {errors.internal_url && (
+                  <p className="text-sm text-destructive">
+                    {errors.internal_url.message}
+                  </p>
+                )}
+                <p className="text-sm text-muted-foreground">
+                  How service containers reach the Temps API from inside the
+                  Docker network (OTLP metrics ingest, agent callbacks). Leave
+                  blank to use{' '}
+                  <code className="font-mono text-xs">
+                    http://host.docker.internal:&lt;proxy-port&gt;
+                  </code>
+                  .
+                </p>
+              </div>
+            </SettingsSection>
+          </div>
         </section>
 
         <section
           aria-labelledby="certificate-settings-heading"
-          className="space-y-5"
+          className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
         >
           <h2
             id="certificate-settings-heading"
@@ -333,93 +335,95 @@ export function Settings() {
           >
             Certificates
           </h2>
-          <div className="space-y-2">
-            <Label htmlFor="letsencrypt-email">Contact Email</Label>
-            <Input
-              id="letsencrypt-email"
-              type="email"
-              placeholder="ops@your-domain.com"
-              {...register('letsencrypt.email', {
-                validate: (value) => {
-                  if (!value) return true // optional, but renewals will fail without it
-                  const trimmed = value.trim()
-                  if (!trimmed) return true
-                  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
-                    return 'Must be a valid email address'
-                  return true
-                },
-              })}
-            />
-            {errors.letsencrypt?.email && (
-              <p className="text-sm text-destructive">
-                {errors.letsencrypt.email.message}
-              </p>
-            )}
-            {!settings?.letsencrypt?.email && (
-              <p className="text-sm text-amber-600 dark:text-amber-500">
-                No contact email configured — certificate issuance and automatic
-                renewal will fail until this is set.
-              </p>
-            )}
-            <Disclosure label="How certificate provisioning works">
-              <p>
-                Let&apos;s Encrypt uses this email to register the account used
-                for certificate issuance and automatic renewal.
-              </p>
-            </Disclosure>
-          </div>
-
-          <div className="space-y-2 pt-4">
-            <Label htmlFor="letsencrypt-environment">Environment</Label>
-            <Select
-              value={letsencryptEnvironment}
-              onValueChange={(value: 'production' | 'staging') =>
-                setValue('letsencrypt.environment', value, {
-                  shouldDirty: true,
-                })
-              }
-            >
-              <SelectTrigger id="letsencrypt-environment">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="production">Production</SelectItem>
-                <SelectItem value="staging">
-                  Staging (testing, avoids rate limits)
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            {letsencryptEnvironment === 'staging' && (
-              <p className="text-sm text-muted-foreground">
-                Staging certificates are not trusted by browsers. Use only for
-                testing.
-              </p>
-            )}
-          </div>
-
-          <SettingsSection title="Advanced DNS settings" icon={ShieldCheck}>
+          <div className="min-w-0 space-y-5">
             <div className="space-y-2">
-              <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
+              <Label htmlFor="letsencrypt-email">Contact Email</Label>
               <Input
-                id="edge-target"
-                type="text"
-                placeholder="203.0.113.10 or edge.example.com"
-                {...register('edge_target')}
+                id="letsencrypt-email"
+                type="email"
+                placeholder="ops@your-domain.com"
+                {...register('letsencrypt.email', {
+                  validate: (value) => {
+                    if (!value) return true // optional, but renewals will fail without it
+                    const trimmed = value.trim()
+                    if (!trimmed) return true
+                    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
+                      return 'Must be a valid email address'
+                    return true
+                  },
+                })}
               />
-              <p className="text-sm text-muted-foreground">
-                Public address that generated DNS records point at when a
-                managed domain opts into record sync. An IP creates A/AAAA
-                records; a hostname creates CNAME records. Leave blank to
-                disable DNS sync. The Standard vs Flat hostname layout is
-                configured per managed domain under DNS providers.
-              </p>
+              {errors.letsencrypt?.email && (
+                <p className="text-sm text-destructive">
+                  {errors.letsencrypt.email.message}
+                </p>
+              )}
+              {!settings?.letsencrypt?.email && (
+                <p className="text-sm text-amber-600 dark:text-amber-500">
+                  No contact email configured — certificate issuance and
+                  automatic renewal will fail until this is set.
+                </p>
+              )}
+              <Disclosure label="How certificate provisioning works">
+                <p>
+                  Let&apos;s Encrypt uses this email to register the account
+                  used for certificate issuance and automatic renewal.
+                </p>
+              </Disclosure>
             </div>
-          </SettingsSection>
+
+            <div className="space-y-2 pt-4">
+              <Label htmlFor="letsencrypt-environment">Environment</Label>
+              <Select
+                value={letsencryptEnvironment}
+                onValueChange={(value: 'production' | 'staging') =>
+                  setValue('letsencrypt.environment', value, {
+                    shouldDirty: true,
+                  })
+                }
+              >
+                <SelectTrigger id="letsencrypt-environment">
+                  <SelectValue placeholder="Select environment" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="production">Production</SelectItem>
+                  <SelectItem value="staging">
+                    Staging (testing, avoids rate limits)
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              {letsencryptEnvironment === 'staging' && (
+                <p className="text-sm text-muted-foreground">
+                  Staging certificates are not trusted by browsers. Use only for
+                  testing.
+                </p>
+              )}
+            </div>
+
+            <SettingsSection title="Advanced DNS settings" icon={ShieldCheck}>
+              <div className="space-y-2">
+                <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
+                <Input
+                  id="edge-target"
+                  type="text"
+                  placeholder="203.0.113.10 or edge.example.com"
+                  {...register('edge_target')}
+                />
+                <p className="text-sm text-muted-foreground">
+                  Public address that generated DNS records point at when a
+                  managed domain opts into record sync. An IP creates A/AAAA
+                  records; a hostname creates CNAME records. Leave blank to
+                  disable DNS sync. The Standard vs Flat hostname layout is
+                  configured per managed domain under DNS providers.
+                </p>
+              </div>
+            </SettingsSection>
+          </div>
         </section>
 
         <section
           aria-labelledby="screenshot-settings-heading"
-          className="space-y-5"
+          className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
         >
           <h2
             id="screenshot-settings-heading"
@@ -427,71 +431,75 @@ export function Settings() {
           >
             Screenshots
           </h2>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <Label htmlFor="screenshots-enabled">Enable Screenshots</Label>
-                <p className="text-sm text-muted-foreground">
-                  Generate screenshots of deployments for previews
-                </p>
-              </div>
-              <Switch
-                id="screenshots-enabled"
-                checked={screenshots?.enabled}
-                onCheckedChange={(checked) =>
-                  setValue('screenshots.enabled', checked, {
-                    shouldDirty: true,
-                  })
-                }
-              />
-            </div>
-
-            {screenshots?.enabled && (
-              <>
-                <div className="space-y-2">
-                  <Label htmlFor="screenshot-provider">Provider</Label>
-                  <Select
-                    value={screenshots?.provider}
-                    onValueChange={(value: 'local' | 'external') =>
-                      setValue('screenshots.provider', value, {
-                        shouldDirty: true,
-                      })
-                    }
-                  >
-                    <SelectTrigger id="screenshot-provider">
-                      <SelectValue placeholder="Select provider" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="local">
-                        Local Screenshot Service
-                      </SelectItem>
-                      <SelectItem value="external">
-                        External Screenshot API
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+          <div className="min-w-0 space-y-5">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label htmlFor="screenshots-enabled">
+                    Enable Screenshots
+                  </Label>
+                  <p className="text-sm text-muted-foreground">
+                    Generate screenshots of deployments for previews
+                  </p>
                 </div>
+                <Switch
+                  id="screenshots-enabled"
+                  checked={screenshots?.enabled}
+                  onCheckedChange={(checked) =>
+                    setValue('screenshots.enabled', checked, {
+                      shouldDirty: true,
+                    })
+                  }
+                />
+              </div>
 
-                {screenshots.provider === 'external' && (
+              {screenshots?.enabled && (
+                <>
                   <div className="space-y-2">
-                    <Label htmlFor="screenshot-url">Screenshot API URL</Label>
-                    <Input
-                      id="screenshot-url"
-                      type="url"
-                      placeholder="https://<your-domain>/api/screenshot?url={url}&width=1920&height=1080"
-                      {...register('screenshots.url')}
-                    />
-                    <p className="text-sm text-muted-foreground">
-                      Configure your API endpoint with{' '}
-                      <code className="px-1 py-0.5 bg-muted rounded text-xs">
-                        {'{url}'}
-                      </code>{' '}
-                      placeholder.
-                    </p>
+                    <Label htmlFor="screenshot-provider">Provider</Label>
+                    <Select
+                      value={screenshots?.provider}
+                      onValueChange={(value: 'local' | 'external') =>
+                        setValue('screenshots.provider', value, {
+                          shouldDirty: true,
+                        })
+                      }
+                    >
+                      <SelectTrigger id="screenshot-provider">
+                        <SelectValue placeholder="Select provider" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="local">
+                          Local Screenshot Service
+                        </SelectItem>
+                        <SelectItem value="external">
+                          External Screenshot API
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
-                )}
-              </>
-            )}
+
+                  {screenshots.provider === 'external' && (
+                    <div className="space-y-2">
+                      <Label htmlFor="screenshot-url">Screenshot API URL</Label>
+                      <Input
+                        id="screenshot-url"
+                        type="url"
+                        placeholder="https://<your-domain>/api/screenshot?url={url}&width=1920&height=1080"
+                        {...register('screenshots.url')}
+                      />
+                      <p className="text-sm text-muted-foreground">
+                        Configure your API endpoint with{' '}
+                        <code className="px-1 py-0.5 bg-muted rounded text-xs">
+                          {'{url}'}
+                        </code>{' '}
+                        placeholder.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </section>
 

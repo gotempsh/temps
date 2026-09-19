@@ -417,8 +417,8 @@ contains the package-only badge height utility through the explicit DS source sc
 help trigger is a sibling of the label, never nested in it. Keep required format
 instructions in `description` and validation in `error`. `SettingsSection` is
 now owned by the package; the old console import is a thin re-export. The sandbox
-settings example uses the selected Open sections layout: visible platform,
-certificate, and screenshot settings in a bounded column, with optional capture
+settings example uses the selected Aligned rows layout (option 3): visible platform,
+certificate, and screenshot settings in a bounded two-column grid (headings left, controls right), with optional capture
 details and troubleshooting collapsed. Changes and save feedback are sample-only.
 
 Read-only browser review against a populated instance at the local console proxy:
@@ -431,7 +431,8 @@ retention and error expansion are covered by the existing section regression tes
 
 ### Platform settings layout
 
-The console Settings page now follows the selected open-section reference:
+The console Settings page now follows the selected Aligned rows reference:
+Headings sit left of their controls on desktop and stack above them on mobile.
 External URL and Preview Domain share Platform; certificate email/environment
 and the screenshot switch stay visible. Advanced networking and DNS use
 SettingsSection to retain registered values and reveal validation errors.
