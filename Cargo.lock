@@ -11008,6 +11008,7 @@ dependencies = [
 name = "temps-cloud-protocol"
 version = "0.1.0-beta.56"
 dependencies = [
+ "bytes",
  "chrono",
  "serde",
  "serde_json",

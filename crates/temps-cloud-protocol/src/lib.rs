@@ -29,8 +29,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod console_proxy;
 pub mod messages;
 
+pub use console_proxy::{
+    ConsoleDataFrame, ConsoleFrameError, ConsoleFrameKind, ConsoleOidcConfig, ConsoleOidcRevoke,
+    ConsoleRefusalReason, ConsoleResponseHead, ConsoleStreamCancel, ConsoleStreamEnd,
+    ConsoleStreamEndReason, ConsoleStreamOpen, ConsoleStreamRefused, ConsoleWindowUpdate,
+    CONSOLE_DATA_FRAME_HEADER_LEN, CONSOLE_DATA_FRAME_VERSION, CONSOLE_MAX_CONCURRENT_STREAMS,
+    CONSOLE_MAX_FRAME_BYTES, CONSOLE_MAX_HEADER_BYTES, CONSOLE_STREAM_IDLE_TIMEOUT,
+    CONSOLE_STREAM_WINDOW_BYTES,
+};
 pub use messages::{
     truncate_status_text, BackupCompression, BackupEngine, BackupFormat,
     BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage,
@@ -90,6 +99,17 @@ pub enum Capability {
     /// the instance what to do. See [`crate::messages::StatusReport`]'s own
     /// doc comment for why that boundary is load-bearing, not incidental.
     InstanceStatusReporting,
+    /// Instance opens a second, dedicated outbound connection
+    /// (`{backend}/v1/console-proxy`) and dispatches the HTTP/WebSocket frames
+    /// defined in [`crate::console_proxy`] against its own admin router, so an
+    /// operator can open this instance's console from the managed backend
+    /// without exposing any inbound port (ADR-045).
+    ///
+    /// Negotiated independently of every other capability, on its own
+    /// connection, for the same head-of-line-blocking reason heartbeat itself
+    /// is split out: an old backend or an old instance on either end simply
+    /// never opens the connection, exactly like [`Capability::TelemetryQuery`].
+    ConsoleProxy,
     /// A capability introduced by a newer peer. Older agents retain the
     /// connection and simply decline to negotiate the unknown feature.
     #[serde(other)]
@@ -219,6 +239,54 @@ mod tests {
                 .negotiate(&peer)
                 .unwrap(),
             vec![Capability::TelemetryShipping]
+        );
+    }
+
+    #[test]
+    fn console_proxy_is_negotiated_like_any_other_capability_and_unknown_capabilities_still_tolerated(
+    ) {
+        // ADR-045: an old backend that has never heard of console proxying
+        // must not stop the instance from negotiating everything else it
+        // shares, and a peer sending a capability newer than both must still
+        // parse rather than fail the whole `Hello`.
+        let peer: Hello = serde_json::from_str(
+            r#"{"protocol_version":1,"agent_version":"future","capabilities":["console_proxy","telemetry_shipping","future_export"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            peer.capabilities,
+            vec![
+                Capability::ConsoleProxy,
+                Capability::TelemetryShipping,
+                Capability::Unknown
+            ]
+        );
+
+        let ours = hello(&[Capability::ConsoleProxy, Capability::TelemetryShipping]);
+        assert_eq!(
+            ours.negotiate(&peer).unwrap(),
+            vec![Capability::ConsoleProxy, Capability::TelemetryShipping]
+        );
+
+        let old_backend = hello(&[Capability::TelemetryShipping]);
+        assert_eq!(
+            ours.negotiate(&old_backend).unwrap(),
+            vec![Capability::TelemetryShipping]
+        );
+    }
+
+    #[test]
+    fn console_proxy_survives_a_serde_round_trip_as_snake_case() {
+        // The wire name is part of the contract with the backend; a rename
+        // would silently read as `Unknown` on the peer.
+        assert_eq!(
+            serde_json::to_string(&Capability::ConsoleProxy).expect("capability must serialize"),
+            r#""console_proxy""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Capability>(r#""console_proxy""#)
+                .expect("capability must parse"),
+            Capability::ConsoleProxy
         );
     }
 
