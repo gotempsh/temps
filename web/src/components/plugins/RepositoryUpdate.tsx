@@ -21,6 +21,48 @@ import {
   Download,
 } from 'lucide-react'
 
+function useRepositorySource(name: string) {
+  const statusKey = [...PLUGINS_QUERY_KEY, name, 'source']
+  return useQuery({
+    queryKey: statusKey,
+    queryFn: async () => {
+      const response = await getPluginStatus({
+        path: { name },
+        throwOnError: true,
+      })
+      return response.data
+    },
+    enabled: Boolean(name),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+export function RepositoryUpdateButton({
+  name,
+  disabled,
+  onClick,
+}: {
+  name: string
+  disabled: boolean
+  onClick: () => void
+}) {
+  const status = useRepositorySource(name)
+  if (status.isPending) return <Skeleton className="h-8 w-24" />
+  if (status.isSuccess && !status.data?.source)
+    return (
+      <span className="text-xs text-muted-foreground">
+        Manual update · no GitHub source
+      </span>
+    )
+  return (
+    <Button variant="outline" size="sm" onClick={onClick} disabled={disabled}>
+      <Download className="mr-2 size-4" />
+      {status.isError ? 'Retry update source' : 'Update'}
+    </Button>
+  )
+}
+
 export function RepositoryUpdate({
   name,
   disabled,
@@ -37,20 +79,7 @@ export function RepositoryUpdate({
     resolver: zodResolver(repositoryInstallSchema.pick({ ref_name: true })),
     defaultValues: { ref_name: '' },
   })
-  const statusKey = [...PLUGINS_QUERY_KEY, name, 'source']
-  const status = useQuery({
-    queryKey: statusKey,
-    queryFn: async () => {
-      const response = await getPluginStatus({
-        path: { name },
-        throwOnError: true,
-      })
-      return response.data
-    },
-    enabled: Boolean(name),
-    retry: false,
-    staleTime: 60_000,
-  })
+  const status = useRepositorySource(name)
   const { reset } = form
   useEffect(() => {
     reset({ ref_name: '' })

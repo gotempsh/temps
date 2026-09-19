@@ -3,7 +3,7 @@
 import { expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { RepositoryUpdate } from './RepositoryUpdate'
+import { RepositoryUpdate, RepositoryUpdateButton } from './RepositoryUpdate'
 import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
 
 test('update shows the stored directory and ref without offering a source-path override', () => {
@@ -36,4 +36,23 @@ test('update shows the stored directory and ref without offering a source-path o
   expect(markup).toContain('name="ref_name"')
   expect(markup).not.toContain('name="path"')
   expect(markup).toContain('type="submit"')
+})
+
+test('plugins without a repository source show manual update status instead of an action', () => {
+  const client = new QueryClient()
+  client.setQueryData([...PLUGINS_QUERY_KEY, 'manual', 'source'], {
+    source: null,
+  })
+  const markup = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <RepositoryUpdateButton
+        name="manual"
+        disabled={false}
+        onClick={() => {}}
+      />
+    </QueryClientProvider>
+  )
+  expect(markup).toContain('Manual update')
+  expect(markup).toContain('no GitHub source')
+  expect(markup).not.toContain('<button')
 })

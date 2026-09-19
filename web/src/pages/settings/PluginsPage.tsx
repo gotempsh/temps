@@ -62,7 +62,10 @@ import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
-import { RepositoryUpdate } from '@/components/plugins/RepositoryUpdate'
+import {
+  RepositoryUpdate,
+  RepositoryUpdateButton,
+} from '@/components/plugins/RepositoryUpdate'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
 
@@ -349,14 +352,11 @@ export function PluginsPage() {
                         </Button>
                       )}
                       {canManagePlugins && (
-                        <Button
-                          variant="outline"
-                          size="sm"
+                        <RepositoryUpdateButton
+                          name={plugin.name}
                           onClick={() => setUpdateName(plugin.name)}
                           disabled={managementPending}
-                        >
-                          <GitPullRequest className="mr-2 size-4" /> Update
-                        </Button>
+                        />
                       )}
                       {canManagePlugins && (
                         <DropdownMenu>
