@@ -419,7 +419,7 @@ instructions in `description` and validation in `error`. `SettingsSection` is
 now owned by the package; the old console import is a thin re-export. The sandbox
 settings example uses the selected Aligned rows layout (option 3): visible platform,
 certificate, and screenshot settings in a bounded two-column grid (headings left, controls right), with optional capture
-details and troubleshooting collapsed. Changes and save feedback are sample-only.
+details collapsed and a visible Route table section. Changes and save feedback are sample-only.
 
 Read-only browser review against a populated instance at the local console proxy:
 settings summaries previously repeated their titles or showed operational details
@@ -436,5 +436,7 @@ Headings sit left of their controls on desktop and stack above them on mobile.
 External URL and Preview Domain share Platform; certificate email/environment
 and the screenshot switch stay visible. Advanced networking and DNS use
 SettingsSection to retain registered values and reveal validation errors.
-Troubleshooting contains route refresh. The form keeps its existing settings
+Route table has a visible explanation and reload action in the same aligned layout. The form keeps its existing settings
 mutation and normalization, with an always-mounted save bar and error summary.
+
+Latest populated-screen priorities: [2026-09-19 app UI audit](./app-ui-audit-2026-09-19.md).
