@@ -168,19 +168,22 @@ export default function ProjectSettings() {
             </Disclosure>
           )}
         </Group>
-        <Disclosure label="Troubleshooting">
+        <Group title="Route table">
           <p>
-            Refresh routes when a deployment or configuration change is out of
-            sync.
+            The proxy uses the route table to send requests to deployments and
+            services. Reload it from saved configuration if traffic is reaching
+            an outdated destination.
           </p>
           <Button
             type="button"
             variant="outline"
             onClick={() => setRefreshed(true)}
           >
-            {refreshed ? "Sample routes refreshed" : "Refresh sample routes"}
+            {refreshed
+              ? "Sample route table reloaded"
+              : "Reload sample route table"}
           </Button>
-        </Disclosure>
+        </Group>
         <p role="status" className="text-sm text-muted-foreground">
           {dirty
             ? "Unsaved changes"

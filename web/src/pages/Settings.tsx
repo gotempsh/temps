@@ -503,48 +503,57 @@ export function Settings() {
           </div>
         </section>
 
-        <Disclosure label="Troubleshooting">
-          <p className="mb-3 text-sm text-muted-foreground">
-            Refresh proxy routes if a deployment or configuration change is out
-            of sync.
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            busy={isRefreshingRoutes}
-            busyLabel="Refreshing…"
-            onClick={async () => {
-              setIsRefreshingRoutes(true)
-              try {
-                const response = await client.post({
-                  url: '/settings/routes/refresh',
-                  security: [{ scheme: 'bearer', type: 'http' }],
-                })
-                const data = response.data as
-                  { route_count: number; message: string } | undefined
-                toast.success(
-                  data?.message || 'Route table refreshed successfully'
-                )
-              } catch {
-                toast.error('Failed to refresh route table')
-              } finally {
-                setIsRefreshingRoutes(false)
-              }
-            }}
-          >
-            {isRefreshingRoutes ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Refreshing...
-              </>
-            ) : (
-              <>
-                <RefreshCw className="mr-2 h-4 w-4" />
-                Refresh Routes
-              </>
-            )}
-          </Button>
-        </Disclosure>
+        <section
+          aria-labelledby="route-table-heading"
+          className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
+        >
+          <h2 id="route-table-heading" className="text-base font-semibold">
+            Route table
+          </h2>
+          <div className="min-w-0 space-y-4">
+            <p className="text-sm text-muted-foreground">
+              The proxy uses the route table to send requests to deployments and
+              services. Reload it from saved configuration if traffic is
+              reaching an outdated destination.
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              busy={isRefreshingRoutes}
+              busyLabel="Reloading…"
+              onClick={async () => {
+                setIsRefreshingRoutes(true)
+                try {
+                  const response = await client.post({
+                    url: '/settings/routes/refresh',
+                    security: [{ scheme: 'bearer', type: 'http' }],
+                  })
+                  const data = response.data as
+                    { route_count: number; message: string } | undefined
+                  toast.success(
+                    data?.message || 'Route table refreshed successfully'
+                  )
+                } catch {
+                  toast.error('Failed to refresh route table')
+                } finally {
+                  setIsRefreshingRoutes(false)
+                }
+              }}
+            >
+              {isRefreshingRoutes ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Refreshing...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  Reload route table
+                </>
+              )}
+            </Button>
+          </div>
+        </section>
       </div>
 
       <FormErrors
