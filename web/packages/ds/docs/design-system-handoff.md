@@ -77,7 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
-| `SettingsGroup` | `title`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
+| `SettingsGroup` | `title`, `description?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
 | `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
 | `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |

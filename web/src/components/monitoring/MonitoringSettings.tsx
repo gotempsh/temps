@@ -1107,19 +1107,28 @@ export function MonitoringSettings() {
       case 'alerts':
         return (
           <div className="max-w-5xl space-y-10">
-            <SettingsGroup title="Project Health">
+            <SettingsGroup
+              title="Project Health"
+              description="Choose which deployment and runtime events trigger alerts."
+            >
               <ProjectAlerts
                 onSave={handleProjectSave}
                 defaultValues={projectDefaults}
               />
             </SettingsGroup>
-            <SettingsGroup title="Domain Monitoring">
+            <SettingsGroup
+              title="Domain Monitoring"
+              description="Get notified before domains or certificates expire."
+            >
               <DomainAlerts
                 onSave={handleDomainSave}
                 defaultValues={domainDefaults}
               />
             </SettingsGroup>
-            <SettingsGroup title="Backup Monitoring">
+            <SettingsGroup
+              title="Backup Monitoring"
+              description="Choose which backup events trigger notifications."
+            >
               <BackupAlerts
                 onSave={handleBackupSave}
                 defaultValues={backupDefaults}

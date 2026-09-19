@@ -238,3 +238,6 @@ required instructions and errors remain visible below the control.
 
 Use `SettingsGroup` for the aligned open layout. Use `SettingsSection` only when
 the form group should collapse; each caller retains its own save scope.
+
+SettingsGroup descriptions are optional: one short sentence beneath the heading
+that clarifies scope or outcome. Omit repeated labels and detailed instructions.
