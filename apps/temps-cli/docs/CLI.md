@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-09-17
+> Generated on: 2026-09-19
 
 ## Installation
 
@@ -2302,6 +2302,7 @@ Manage platform settings
 
 - `show` (`get`) - Show current platform settings
 - `update` (`set`) - Update platform settings
+- `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -2342,6 +2343,16 @@ Update platform settings
 | `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
+### `settings geo-status`
+
+Show the freshness of the geolocation (GeoLite2) database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ### `settings set-external-url`
 
 Set the external URL for the platform
@@ -2369,6 +2380,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -2378,6 +2390,16 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform features`
+
+Show which capabilities the server process actually provides
 
 **Options:**
 
@@ -3592,6 +3614,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | Yes |
 | `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | Yes |
 | `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | Yes |
 | `-y, --yes` | Trust the repository and allow installation without prompting | - | No |

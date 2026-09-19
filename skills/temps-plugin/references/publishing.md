@@ -12,20 +12,20 @@ Current authoritative instructions:
 - [Catalog contribution guide](https://github.com/gotempsh/plugins/blob/main/registry/README.md)
 - Host installer: `crates/temps-external-plugins/src/repository.rs`
 
-## 1. Prepare a dedicated repository
+## 1. Prepare the plugin directory
 
-Create from the template when repository creation is in scope. If it already exists, work
-there. The repository root needs a nonempty `README.md`, `package.json`, committed Bun
-lockfile, and the source/assets necessary to compile its entrypoint. Neither catalog
-subdirectory paths nor installing a plugin folder inside another repository are currently
-supported. Extract a monorepo example to its own repository before presenting it as
-GitHub-installable.
+Use either a dedicated repository or a self-contained subdirectory in a monorepo.
+The selected directory needs a nonempty `README.md`, `package.json`, committed Bun
+lockfile, and all source/assets needed to compile its entrypoint. For a subdirectory,
+pass `--path plugins/route-checker` or enter it in the console's Plugin directory field.
+The builder receives only that subtree: dependencies on parent workspace files or
+sibling packages are not supported. Keep generated UI assets within the subtree.
 
-For an existing monorepo example, copy only its source, lockfile, build tooling,
-license/attribution and required assets into a clean dedicated repository; remove workspace
-and local `file:` dependencies. Preserve history with a reviewed subtree/history extraction
-only if requested; do not rewrite the original repository. Choose one canonical source
-repository and link the old example to it so releases do not drift between two copies.
+Paths are repository-relative and case-sensitive, with at most 512 ASCII characters
+(letters, digits, dot, dash, underscore and slash). Empty means repository root;
+absolute paths, empty segments, `.`, `..`, `.git`, backslashes and encoded separators
+are rejected. Repository download/extraction limits still apply to the whole repository.
+Older Temps hosts do not support `path`; verify the target host before publishing.
 
 Keep the template's current metadata shape. Example fields to customize:
 
@@ -102,6 +102,19 @@ bunx --bun @temps-sdk/cli plugin install https://github.com/your-org/route-check
 bunx --bun @temps-sdk/cli plugin update route-checker --ref <new-commit-sha>
 ```
 
+To select a nested plugin and track a custom branch or tag:
+
+```sh
+bunx --bun @temps-sdk/cli plugin install https://github.com/your-org/plugins --path plugins/route-checker --ref release/v1 --grant events_read
+bunx --bun @temps-sdk/cli plugin update route-checker --ref v1.1.0
+```
+
+Omitting `--ref` on update keeps the stored ref and directory; an install without a
+ref resolves the repository default branch. Every operation records the resolved
+commit. Updates cannot change directory. Installing the same name from another
+repository or path is rejected; uninstall/reinstall is a new source identity with
+fresh grants. Changing only the ref preserves the actor and grants.
+
 Use actual immutable SHAs, not the literal placeholders. Grant only permissions declared
 and used by the plugin. Omit `--grant` for a plugin that needs none. Inspect `--help` for
 AI quota options when needed. Avoid `--yes` unless source trust has already been authorized.
@@ -123,15 +136,20 @@ To request discovery in the public catalog, open a PR to `gotempsh/plugins` addi
 ```json
 {
   "repo": "your-org/route-checker",
-  "categories": ["seo"]
+  "categories": ["seo"],
+  "path": "plugins/route-checker",
+  "ref": "release/v1"
 }
 ```
 
-The filename matches `temps.name`. Current categories are `analytics`, `automation`,
+The filename matches `temps.name`. Omit `path` for root plugins and `ref` for the
+default branch. Distinct paths in one repository may have separate listings. Current categories are `analytics`, `automation`,
 `databases`, `developer-tools`, `observability`, `seo`, `security`, `other`; the first is
 primary. Check the live contribution guide for changes. Submit the small repository record,
 not a hand-edited generated `registry/catalog.json`. The generator reads metadata and
-screenshots at a pinned source commit. Run the catalog repository's documented validation
+screenshots relative to the plugin directory at a pinned source commit. Catalogs
+with subdirectories require schema version 2; older hosts reject them. Catalog
+installation pins the reviewed commit even when the listing tracks a moving branch. Run the catalog repository's documented validation
 and include install/runtime evidence in the PR.
 
 Catalog validation installs dependencies without lifecycle scripts and compiles in a capped

@@ -26,7 +26,10 @@ use temps_audit::AuditPlugin;
 use temps_auth::{ApiKeyPlugin, AuthPlugin};
 use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
-use temps_cloud::{CloudPlugin, CloudService};
+use temps_cloud::{
+    CloudEnrollmentActor, CloudPlugin, CloudService, CloudServiceError, ManagedBackupOutcome,
+};
+use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
@@ -74,7 +77,7 @@ use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Multi-node support
 use temps_deployments::handlers::nodes::NodeAppState;
@@ -817,6 +820,287 @@ fn ensure_existing_initial_admin_is_active(
         });
     }
     Ok(())
+}
+
+/// `TEMPS_CLOUD_ENROLLMENT_CODE` -- a first-boot bootstrap *input*, not a
+/// runtime setting.
+///
+/// This is not configuration in the sense CLAUDE.md's "no env vars for
+/// configuration" rule forbids: nothing reads it to decide behaviour, and it
+/// is never re-read for the life of the process. It is the same sanctioned
+/// first-boot exception as `TEMPS_ADMIN_EMAIL`/`TEMPS_ADMIN_PASSWORD_FILE`
+/// above -- a one-shot input consumed once, whose *result* is what gets
+/// persisted: the Cloud link row (encrypted, via `CloudService::enroll`) and
+/// a `CLOUD_LINK_CONNECTED` audit record, exactly as if an operator had
+/// entered the code under Settings > Cloud. Like the admin bootstrap, it is
+/// necessarily read after the database is up, because the thing it creates
+/// lives in the database. The value itself is a short-lived, single-use
+/// enrollment code minted for this instance's Temps Cloud tenant (see the
+/// Cloud repo's ADR 0040), so an automated provisioning flow can link a
+/// freshly booted instance with no human present to paste the code in.
+///
+/// Enrollment through this variable is best-effort and must never block or
+/// fail server startup: it runs on its own task (see
+/// [`bootstrap_cloud_enrollment_from_env`]), and an invalid, expired, or
+/// already-consumed code, or an unreachable backend, degrades to a warning
+/// log while the server starts normally. An instance that is already linked
+/// treats the variable as a silent no-op instead of attempting to re-enroll,
+/// so a leftover value from a previous boot (e.g. a `.env` a provisioning
+/// tool reused) is harmless -- and that decision is made atomically with the
+/// enrollment (`CloudService::enroll_link_if_unlinked`), so a link an
+/// operator establishes while the code is in flight is never replaced.
+const TEMPS_CLOUD_ENROLLMENT_CODE_VAR: &str = "TEMPS_CLOUD_ENROLLMENT_CODE";
+
+/// Interprets a raw `std::env::var(TEMPS_CLOUD_ENROLLMENT_CODE_VAR)` result.
+///
+/// Split out (mirroring [`optional_environment_variable_result`] above) so a
+/// test can drive every outcome -- absent, blank, non-unicode, present -- by
+/// passing a synthetic `Result` directly, without mutating the real process
+/// environment, which would race with other tests running in parallel in
+/// this binary.
+fn parse_cloud_enrollment_code_env(result: Result<String, std::env::VarError>) -> Option<String> {
+    match result {
+        Ok(code) if !code.trim().is_empty() => Some(code),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(
+                "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but is not valid UTF-8; skipping \
+                 unattended Temps Cloud enrollment. Unset it, or set it to the enrollment \
+                 code text, and restart to retry."
+            );
+            None
+        }
+    }
+}
+
+/// Upper bound on each network step of one unattended enrollment attempt
+/// (redeeming the code, then fetching the managed-backup credential). The
+/// Cloud client has its own per-request timeouts; this caps each step so a
+/// wedged backend can never leave the task -- and its "enrollment in
+/// progress" log state -- hanging around for the life of the process.
+const CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long graceful shutdown waits for an in-flight unattended enrollment
+/// before letting the runtime drop it. Generous relative to the local audit
+/// write it exists to protect (see [`run_cloud_enrollment_bootstrap`]), tight
+/// relative to the network timeout above: a shutdown must never be held
+/// hostage by an unreachable Cloud backend.
+const CLOUD_ENROLLMENT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Kick off unattended Temps Cloud enrollment from
+/// [`TEMPS_CLOUD_ENROLLMENT_CODE_VAR`], if it is set.
+///
+/// Called once during startup, after plugin services (including
+/// `CloudService`) have finished registering and initializing -- and
+/// deliberately **not awaited** there. The attempt runs on its own task so a
+/// slow or unreachable Cloud backend can never delay the listeners binding
+/// or `/readyz` turning healthy: enrollment is a side effect of startup, not
+/// a precondition for it. Returns the task handle so the caller can join it
+/// (bounded by [`CLOUD_ENROLLMENT_SHUTDOWN_GRACE`]) at graceful shutdown,
+/// and so a test can join it deterministically. Nothing here can fail
+/// startup: every failure mode is logged inside the task and swallowed, per
+/// the ADR's requirement that this be best-effort.
+fn bootstrap_cloud_enrollment_from_env(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let code = parse_cloud_enrollment_code_env(std::env::var(TEMPS_CLOUD_ENROLLMENT_CODE_VAR))?;
+
+    let Some(cloud_service) = service_context.get_service::<CloudService>() else {
+        warn!(
+            "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but this build has no Cloud plugin \
+             registered; skipping unattended enrollment"
+        );
+        return None;
+    };
+    // `get_service`, not `require_service`: the audit logger is registered
+    // by the audit plugin, and a build without one must still be able to
+    // enroll -- the missing trail is reported loudly inside the task.
+    let audit_logger = service_context.get_service::<dyn temps_core::AuditLogger>();
+
+    Some(tokio::spawn(async move {
+        let enroll_service = cloud_service.clone();
+        let provision_service = cloud_service;
+        let link_audit = audit_logger.clone();
+        let backup_audit = audit_logger;
+        run_cloud_enrollment_bootstrap(
+            &code,
+            move |code| async move { enroll_service.enroll_link_if_unlinked(&code).await },
+            move || async move {
+                match &link_audit {
+                    Some(audit_logger) => {
+                        temps_cloud::record_link_connected_audit(
+                            audit_logger.as_ref(),
+                            CloudEnrollmentActor::UnattendedBootstrap,
+                        )
+                        .await;
+                    }
+                    None => error!(
+                        "Unattended Temps Cloud enrollment succeeded but no audit logger is \
+                         registered; the CLOUD_LINK_CONNECTED audit record was not written"
+                    ),
+                }
+            },
+            move || async move {
+                provision_service
+                    .provision_managed_backups_after_enrollment()
+                    .await
+            },
+            move |backup_outcome| async move {
+                if let Some(audit_logger) = &backup_audit {
+                    temps_cloud::record_backup_outcome_audit(
+                        audit_logger.as_ref(),
+                        CloudEnrollmentActor::UnattendedBootstrap,
+                        &backup_outcome,
+                    )
+                    .await;
+                }
+            },
+        )
+        .await;
+    }))
+}
+
+/// Await an in-flight unattended enrollment at graceful shutdown, for at
+/// most [`CLOUD_ENROLLMENT_SHUTDOWN_GRACE`]. Without this the detached task
+/// would simply be dropped with the runtime, which could tear it down in the
+/// narrow window between persisting the Cloud credential and writing its
+/// audit row.
+async fn join_cloud_enrollment_bootstrap(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    if handle.is_finished() {
+        return;
+    }
+    info!("Waiting for an in-flight unattended Temps Cloud enrollment to finish...");
+    match tokio::time::timeout(CLOUD_ENROLLMENT_SHUTDOWN_GRACE, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_error)) => warn!(
+            %join_error,
+            "Unattended Temps Cloud enrollment task ended abnormally during shutdown"
+        ),
+        Err(_elapsed) => warn!(
+            grace_secs = CLOUD_ENROLLMENT_SHUTDOWN_GRACE.as_secs(),
+            "Unattended Temps Cloud enrollment was still waiting on the Cloud backend at \
+             shutdown; abandoning it. If the instance shows as linked after restart but \
+             has no CLOUD_LINK_CONNECTED audit entry, this is why."
+        ),
+    }
+}
+
+/// The testable core of [`bootstrap_cloud_enrollment_from_env`].
+///
+/// Takes every side-effecting step as a parameter (rather than a concrete
+/// `CloudService`) so a unit test can drive every enrollment outcome --
+/// established, already linked, lost the race, failed, timed out -- and
+/// check that the audit hooks fire exactly when state was persisted, without
+/// constructing a real `CloudService`, which needs a live database connection
+/// and managed-backend configuration this module does not otherwise depend on.
+///
+/// Whether the instance is already linked is *not* decided here. It is
+/// decided by `CloudService::enroll_link_if_unlinked`, atomically with the
+/// enrollment itself, because an operator can complete `POST /cloud/enroll`
+/// at any point while this task is waiting on the Cloud backend, and a
+/// snapshot taken out here would let a delayed environment-code enrollment
+/// replace the tenant that operator chose.
+///
+/// Ordering is the point. Enrollment persists state twice, with a network
+/// round-trip in between (`CloudService::enroll_link_if_unlinked`, then
+/// `CloudService::provision_managed_backups_after_enrollment`), so each
+/// network step gets its own [`CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT`] and the
+/// matching audit hook runs *immediately* after the step that persisted
+/// something, unbounded. A timeout on the backup step therefore never
+/// affects the link's audit row -- the link is already recorded -- and the
+/// log it produces says so, rather than claiming no link exists.
+async fn run_cloud_enrollment_bootstrap<
+    E,
+    EnrollFut,
+    L,
+    LinkAuditFut,
+    P,
+    ProvisionFut,
+    B,
+    BackupAuditFut,
+>(
+    code: &str,
+    enroll_link: E,
+    record_link_audit: L,
+    provision_backups: P,
+    record_backup_audit: B,
+) where
+    E: FnOnce(String) -> EnrollFut,
+    EnrollFut: std::future::Future<Output = Result<FirstLinkEnrollment, CloudServiceError>>,
+    L: FnOnce() -> LinkAuditFut,
+    LinkAuditFut: std::future::Future<Output = ()>,
+    P: FnOnce() -> ProvisionFut,
+    ProvisionFut: std::future::Future<Output = ManagedBackupOutcome>,
+    B: FnOnce(ManagedBackupOutcome) -> BackupAuditFut,
+    BackupAuditFut: std::future::Future<Output = ()>,
+{
+    let kind = match tokio::time::timeout(
+        CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT,
+        enroll_link(code.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(FirstLinkEnrollment::Established(kind))) => kind,
+        Ok(Ok(FirstLinkEnrollment::AlreadyLinked)) => {
+            debug!(
+                "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but this instance is already linked \
+                 to Temps Cloud; ignoring it rather than re-enrolling"
+            );
+            return;
+        }
+        Ok(Ok(FirstLinkEnrollment::LostRaceToConcurrentEnrollment)) => {
+            // Nothing was persisted by this task, so there is nothing to
+            // audit here -- the enrollment that won recorded its own trail.
+            warn!(
+                "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} was \
+                 abandoned: another enrollment completed while the code was being redeemed, \
+                 and that link stands. The code has been consumed on the Cloud side, so if the \
+                 Cloud console shows this instance as connected to a tenant it is not actually \
+                 linked to, disconnect it there."
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            warn!(
+                timeout_secs = CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT.as_secs(),
+                "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} \
+                 timed out waiting for the Cloud backend; continuing without a Cloud link. \
+                 This is non-fatal -- mint a fresh code and restart to retry, or connect \
+                 from Settings > Cloud once the backend is reachable."
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            warn!(
+                %error,
+                "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} \
+                 failed; continuing startup without a Cloud link. This is non-fatal -- mint a \
+                 fresh code and restart to retry, or connect from Settings > Cloud once the \
+                 server is up."
+            );
+            return;
+        }
+    };
+    // The credential is on disk from here on: record it before anything
+    // else can go wrong.
+    record_link_audit().await;
+    info!(
+        enrollment = kind.as_str(),
+        "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} succeeded"
+    );
+
+    match tokio::time::timeout(CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT, provision_backups()).await {
+        Ok(backup_outcome) => record_backup_audit(backup_outcome).await,
+        Err(_elapsed) => warn!(
+            timeout_secs = CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT.as_secs(),
+            "The Cloud link is established, but fetching the managed backup credential timed \
+             out; managed backups will be set up on the next credential rotation, or from \
+             Settings > Cloud."
+        ),
+    }
 }
 
 fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
@@ -3021,6 +3305,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("UserService not available, skipping user initialization");
     }
 
+    // Unattended Temps Cloud enrollment via TEMPS_CLOUD_ENROLLMENT_CODE (see
+    // the doc comment on `TEMPS_CLOUD_ENROLLMENT_CODE_VAR` above; ADR 0040 in
+    // the Cloud repo). Deliberately not nested inside the `users.is_empty()`
+    // block above: idempotency comes from the already-linked check inside
+    // `bootstrap_cloud_enrollment_from_env`, not from whether this was the
+    // instance's very first boot, so a restart with a leftover env var is
+    // always safe. Best-effort and off the startup critical path: this spawns
+    // the attempt and returns immediately, so listener binding below never
+    // waits on the Cloud backend. The handle is joined (bounded) by the
+    // graceful-shutdown future further down.
+    let enrollment_bootstrap = bootstrap_cloud_enrollment_from_env(service_context);
+
     // NOTE: The backup scheduler is started by `BackupPlugin` during plugin
     // initialization (see `temps-backup/src/plugin.rs`). Do NOT start it here as
     // well -- spawning a second scheduler loop makes both loops independently
@@ -3999,6 +4295,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Console API received shutdown signal, stopping background services...");
+            join_cloud_enrollment_bootstrap(enrollment_bootstrap).await;
             if let Some(service) = cloud {
                 service.shutdown().await;
                 info!("Managed telemetry mirror shut down");
@@ -4146,6 +4443,7 @@ mod health_tests {
 mod initial_admin_tests {
     use super::*;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn configured_initial_admin_is_optional_for_interactive_starts() {
@@ -4344,6 +4642,283 @@ mod initial_admin_tests {
             bootstrap[3].sql, "ROLLBACK",
             "a failed role assignment must roll back the initial user insert"
         );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_absent_when_the_variable_is_unset() {
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Err(std::env::VarError::NotPresent)),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_absent_when_blank() {
+        assert_eq!(parse_cloud_enrollment_code_env(Ok("".to_string())), None);
+        assert_eq!(parse_cloud_enrollment_code_env(Ok("   ".to_string())), None);
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_degrades_to_absent_on_non_unicode_value() {
+        // Must not panic and must not surface as "present" -- the caller
+        // treats this exactly like the variable being unset, after logging a
+        // warning explaining why.
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from("invalid-value")
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_present_when_set() {
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Ok("ABCD-EFGH".to_string())),
+            Some("ABCD-EFGH".to_string())
+        );
+    }
+
+    /// What one bootstrap run did, step by step, as seen by the injected
+    /// hooks: which network steps were attempted and which audit rows would
+    /// have been written.
+    #[derive(Default)]
+    struct BootstrapProbe {
+        enroll_called: AtomicBool,
+        link_audited: AtomicBool,
+        provision_called: AtomicBool,
+        backup_audited: std::sync::Mutex<Option<ManagedBackupOutcome>>,
+    }
+
+    impl BootstrapProbe {
+        fn backup_audited(&self) -> Option<ManagedBackupOutcome> {
+            self.backup_audited
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    type EnrollResult = Result<FirstLinkEnrollment, CloudServiceError>;
+
+    fn established() -> EnrollResult {
+        Ok(FirstLinkEnrollment::Established(
+            temps_cloud_client::EnrollmentKind::First,
+        ))
+    }
+
+    /// Drive `run_cloud_enrollment_bootstrap` with every hook wired to
+    /// `probe`, using the given enroll and provision futures.
+    async fn drive_bootstrap<EnrollFut, ProvisionFut>(
+        probe: &Arc<BootstrapProbe>,
+        enroll: impl FnOnce() -> EnrollFut,
+        provision: impl FnOnce() -> ProvisionFut,
+    ) where
+        EnrollFut: std::future::Future<Output = EnrollResult>,
+        ProvisionFut: std::future::Future<Output = ManagedBackupOutcome>,
+    {
+        let enroll_probe = probe.clone();
+        let link_probe = probe.clone();
+        let provision_probe = probe.clone();
+        let backup_probe = probe.clone();
+        let enroll_fut = enroll();
+        let provision_fut = provision();
+        run_cloud_enrollment_bootstrap(
+            "the-code",
+            move |code| async move {
+                assert_eq!(code, "the-code");
+                enroll_probe.enroll_called.store(true, Ordering::SeqCst);
+                enroll_fut.await
+            },
+            move || async move {
+                link_probe.link_audited.store(true, Ordering::SeqCst);
+            },
+            move || async move {
+                provision_probe
+                    .provision_called
+                    .store(true, Ordering::SeqCst);
+                provision_fut.await
+            },
+            move |outcome| async move {
+                *backup_probe
+                    .backup_audited
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_succeeds_with_a_valid_code() {
+        let probe = Arc::new(BootstrapProbe::default());
+        drive_bootstrap(
+            &probe,
+            || async { established() },
+            || async { ManagedBackupOutcome::Provisioned },
+        )
+        .await;
+
+        assert!(probe.enroll_called.load(Ordering::SeqCst));
+        assert!(
+            probe.link_audited.load(Ordering::SeqCst),
+            "a persisted link must be audited"
+        );
+        assert!(probe.provision_called.load(Ordering::SeqCst));
+        assert!(
+            matches!(
+                probe.backup_audited(),
+                Some(ManagedBackupOutcome::Provisioned)
+            ),
+            "the provisioned backup credential must be audited with its outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_degrades_to_a_warning_on_an_invalid_code() {
+        let probe = Arc::new(BootstrapProbe::default());
+        // The important assertion is what does NOT happen: no panic, no
+        // propagated error -- server startup must continue exactly as if the
+        // variable had never been set -- no backup provisioning against a
+        // link that does not exist, and no audit row claiming one.
+        drive_bootstrap(
+            &probe,
+            || async {
+                Err(CloudServiceError::InvalidBackend {
+                    reason: "enrollment code expired".to_string(),
+                })
+            },
+            || async { ManagedBackupOutcome::Provisioned },
+        )
+        .await;
+
+        assert!(
+            probe.enroll_called.load(Ordering::SeqCst),
+            "enrollment must still be attempted before failing"
+        );
+        assert!(!probe.link_audited.load(Ordering::SeqCst));
+        assert!(!probe.provision_called.load(Ordering::SeqCst));
+        assert!(probe.backup_audited().is_none());
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_is_a_silent_no_op_when_already_linked() {
+        // The linked decision is the service's, made atomically with the
+        // enrollment; what the bootstrap owes is to persist and audit
+        // nothing when told the instance was already linked.
+        let probe = Arc::new(BootstrapProbe::default());
+        drive_bootstrap(
+            &probe,
+            || async { Ok(FirstLinkEnrollment::AlreadyLinked) },
+            || async { ManagedBackupOutcome::Provisioned },
+        )
+        .await;
+
+        assert!(!probe.link_audited.load(Ordering::SeqCst));
+        assert!(!probe.provision_called.load(Ordering::SeqCst));
+        assert!(probe.backup_audited().is_none());
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_that_lost_the_race_persists_and_audits_nothing() {
+        // An operator enrolled while the environment code was in flight and
+        // that link stands. This task wrote no credential, so it must not
+        // write a CLOUD_LINK_CONNECTED row of its own (the operator's request
+        // recorded theirs) and must not provision backups for a link it does
+        // not own.
+        let probe = Arc::new(BootstrapProbe::default());
+        drive_bootstrap(
+            &probe,
+            || async { Ok(FirstLinkEnrollment::LostRaceToConcurrentEnrollment) },
+            || async { ManagedBackupOutcome::Provisioned },
+        )
+        .await;
+
+        assert!(probe.enroll_called.load(Ordering::SeqCst));
+        assert!(!probe.link_audited.load(Ordering::SeqCst));
+        assert!(!probe.provision_called.load(Ordering::SeqCst));
+        assert!(probe.backup_audited().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unattended_cloud_enrollment_gives_up_on_a_backend_that_never_answers() {
+        // A Cloud backend that accepts the connection and then never replies
+        // to the code redemption. The bootstrap must not hang the task
+        // forever on it: after CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT it logs and
+        // returns, having persisted nothing and therefore audited nothing.
+        // Paused time makes the wait instantaneous in the test.
+        let probe = Arc::new(BootstrapProbe::default());
+        let bootstrap = drive_bootstrap(&probe, std::future::pending::<EnrollResult>, || async {
+            ManagedBackupOutcome::Provisioned
+        });
+
+        tokio::time::timeout(
+            CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT + std::time::Duration::from_secs(1),
+            bootstrap,
+        )
+        .await
+        .expect("the bootstrap must return once its own timeout elapses");
+
+        assert!(!probe.link_audited.load(Ordering::SeqCst));
+        assert!(!probe.provision_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_persisted_link_is_audited_even_if_backup_provisioning_never_answers() {
+        // The case a security audit of this bootstrap called out: the code
+        // is redeemed and the credential persisted, then the *second*
+        // network round-trip (managed backup credential) hangs. The link's
+        // audit row must already be written before that step began, and the
+        // timeout on that step must not undo it.
+        let probe = Arc::new(BootstrapProbe::default());
+        let bootstrap = drive_bootstrap(
+            &probe,
+            || async { established() },
+            std::future::pending::<ManagedBackupOutcome>,
+        );
+
+        tokio::time::timeout(
+            CLOUD_ENROLLMENT_BOOTSTRAP_TIMEOUT + std::time::Duration::from_secs(1),
+            bootstrap,
+        )
+        .await
+        .expect("the bootstrap must return once the backup step's timeout elapses");
+
+        assert!(
+            probe.link_audited.load(Ordering::SeqCst),
+            "CLOUD_LINK_CONNECTED must be recorded before the backup step runs"
+        );
+        assert!(probe.provision_called.load(Ordering::SeqCst));
+        assert!(
+            probe.backup_audited().is_none(),
+            "a backup step that never completed persisted nothing to audit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_an_in_flight_enrollment_but_only_so_long() {
+        // A task that finishes within the grace period is joined...
+        let quick = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        tokio::time::timeout(
+            CLOUD_ENROLLMENT_SHUTDOWN_GRACE,
+            join_cloud_enrollment_bootstrap(Some(quick)),
+        )
+        .await
+        .expect("a quick task is joined within the grace period");
+
+        // ...and one wedged on the network does not hold shutdown hostage.
+        let wedged = tokio::spawn(std::future::pending::<()>());
+        tokio::time::timeout(
+            CLOUD_ENROLLMENT_SHUTDOWN_GRACE + std::time::Duration::from_secs(1),
+            join_cloud_enrollment_bootstrap(Some(wedged)),
+        )
+        .await
+        .expect("shutdown must give up on a wedged enrollment after the grace period");
+
+        // No task at all is a no-op.
+        join_cloud_enrollment_bootstrap(None).await;
     }
 }
 

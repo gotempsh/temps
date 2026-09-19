@@ -283,6 +283,17 @@ jobs:
           COMPOSE_SECURITY_PREBUILT: "1"
         run: scripts/test-compose-security.sh
 
+      # Same harness against the source-free release manifest. The prebuilt
+      # override replaces `services.temps.image`, so this exercises the
+      # release wiring against the image this run just built rather than
+      # whatever tag GHCR currently serves.
+      - name: Validate secure Compose defaults (release manifest)
+        env:
+          COMPOSE_SECURITY_MANIFEST: docker-compose.release.yml
+          COMPOSE_SECURITY_OVERRIDE: .github/compose-security.prebuilt.yml
+          COMPOSE_SECURITY_PREBUILT: "1"
+        run: scripts/test-compose-security.sh
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest

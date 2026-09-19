@@ -62,6 +62,11 @@ pub enum EnvVarError {
     SecretValueRequired { key: String },
 
     #[error(
+        "Secret environment variable '{key}' (id={var_id}) is write-only and cannot be revealed"
+    )]
+    SecretValueCannotBeRevealed { var_id: i32, key: String },
+
+    #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
     )]
     AmbiguousValue { project_id: i32, key: String },
@@ -243,8 +248,8 @@ impl EnvVarService {
                 continue;
             }
 
-            // Secret values are never returned in plaintext from this bulk
-            // API surface. Deployment and explicit reveal use scoped methods.
+            // Marked secrets are omitted from API responses. Deployment reads
+            // use a separate internal path; HTTP reveal rejects secret rows.
             let value = if var.is_secret {
                 None
             } else {
@@ -597,14 +602,9 @@ impl EnvVarService {
         Ok(())
     }
 
-    /// Decrypt one value for an HTTP reveal flow.
-    ///
-    /// This stays crate-private and is deliberately named after its security
-    /// invariant: callers must authorize and durably audit the reveal before
-    /// returning the plaintext outside the process. Returns the decrypted
-    /// value alongside the variable's `is_secret` flag so callers can apply
-    /// the stricter `SecretsRead` gate only to variables actually classified
-    /// as secret, instead of every plaintext variable.
+    /// Read one regular value for an authorized, audited HTTP reveal flow.
+    /// Marked secrets are rejected before decryption. The caller must write
+    /// the audit record before returning plaintext outside the process.
     pub(crate) async fn get_environment_variable_value_for_audited_reveal(
         &self,
         project_id: i32,
@@ -647,6 +647,13 @@ impl EnvVarService {
                 key, project_id
             ))
         })?;
+
+        if var.is_secret {
+            return Err(EnvVarError::SecretValueCannotBeRevealed {
+                var_id: var.id,
+                key: var.key,
+            });
+        }
 
         let is_secret = var.is_secret;
         let value = self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
@@ -1067,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_environment_variable_value_reveals_secret_through_scoped_endpoint() {
+    async fn test_get_environment_variable_value_rejects_secret_through_scoped_endpoint() {
         let encryption_service = make_encryption_service();
         let encrypted = encryption_service
             .encrypt_string("reveal-on-demand")
@@ -1086,13 +1093,18 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let (value, is_secret) = service
+        let error = service
             .get_environment_variable_value_for_audited_reveal(10, "WRITE_ONLY_TOKEN", None, None)
             .await
-            .expect("an authorized audited endpoint must be able to reveal a secret");
+            .expect_err("stored secrets must remain write-only even with scoped access");
 
-        assert_eq!(value, "reveal-on-demand");
-        assert!(is_secret);
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueCannotBeRevealed {
+                var_id: 4,
+                ref key,
+            } if key == "WRITE_ONLY_TOKEN"
+        ));
     }
 
     /// Building a mock that walks the update transaction: SELECT the row,

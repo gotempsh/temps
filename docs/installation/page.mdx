@@ -308,6 +308,11 @@ must be `0444` so the image's non-root UID can read—but not modify—the
 bind-mounted secret on Linux; its `0700` parent directory prevents other host
 users from traversing to it. Rotate the password after first login.
 
+For a pull-based install that skips compiling the Rust workspace on the target
+host, use `docker-compose.release.yml` instead of `docker-compose.yml` — same
+`.env`/secrets setup above, but the `temps` service pulls the published
+`ghcr.io/gotempsh/temps` image (`docker compose -f docker-compose.release.yml up --detach`).
+
 ---
 
 ## Running Temps

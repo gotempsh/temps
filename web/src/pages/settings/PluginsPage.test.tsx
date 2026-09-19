@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -67,7 +68,9 @@ function renderPage() {
   })
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
-      <PluginsPage />
+      <MemoryRouter>
+        <PluginsPage />
+      </MemoryRouter>
     </QueryClientProvider>
   )
 }
@@ -83,8 +86,8 @@ describe('PluginsPage management permissions', () => {
     const markup = renderPage()
 
     expect(reportingEnabledValues).toEqual([])
-    expect(markup).toContain('Verified plugins currently loaded by Temps.')
-    expect(markup).toContain('Ask a system administrator to install one.')
+    expect(markup).toContain('Browse')
+    expect(markup).toContain('system administrator')
     expect(markup).not.toContain('Reload Plugins')
     expect(markup).toContain('Available plugins')
     expect(markup).not.toContain('Build and install')
@@ -98,16 +101,14 @@ describe('PluginsPage management permissions', () => {
     const markup = renderPage()
 
     expect(reportingEnabledValues).toEqual([])
-    expect(markup).toContain('Reload Plugins')
+    expect(markup).not.toContain('Reload plugins')
     expect(markup).toContain('Available plugins')
-    expect(markup).toContain('Advanced')
-    expect(markup).toContain('aria-expanded="false"')
+    expect(markup).toContain('Install from GitHub')
+    expect(markup).toContain('aria-selected="true"')
     expect(markup).not.toContain('Build and install')
     expect(markup).not.toContain('id="plugin-repo"')
     expect(markup).not.toContain('Share installation counts')
-    expect(markup.indexOf('Available plugins')).toBeLessThan(
-      markup.indexOf('running-plugins-title')
-    )
+    expect(markup).not.toContain('running-plugins-title')
   })
 
   test('explains when no catalog plugins support the server platform', () => {

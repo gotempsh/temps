@@ -233,6 +233,28 @@ impl EnrollmentKind {
     }
 }
 
+/// What [`CloudLink::enroll_if_unlinked`] did.
+///
+/// Distinguishes the two ways of "not enrolling" because they leave the
+/// backend in different states, and the caller has to tell the operator which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstLinkEnrollment {
+    /// No credential was held; the code was redeemed and this instance now
+    /// holds the resulting link. Always [`EnrollmentKind::First`] in practice —
+    /// carried so callers log and audit with the same vocabulary as
+    /// [`CloudLink::enroll`].
+    Established(EnrollmentKind),
+    /// A credential was already held when the call started. The code was
+    /// **not** sent to the backend; nothing changed anywhere.
+    AlreadyLinked,
+    /// The instance was unlinked when the call started, but another enrollment
+    /// completed while this code was being redeemed. That link stands; the
+    /// credential returned for this code was discarded unused. The backend
+    /// **has** consumed the code, so its console may now show a link to the
+    /// code's tenant that this instance does not hold.
+    LostRaceToConcurrentEnrollment,
+}
+
 /// The queue behind an open [`SubmissionScope`].
 ///
 /// Owned by [`CloudLink`] rather than by the handle so every path that must
@@ -943,7 +965,54 @@ impl CloudLink {
     /// a `CredentialRejected` — so a caller with a side effect that belongs to
     /// *establishing* a link has no other way to tell the two apart. See
     /// [`EnrollmentKind`] for why guessing is not acceptable.
+    ///
+    /// A caller that must *not* overwrite an existing link — an unattended
+    /// first-boot enrollment — uses [`Self::enroll_if_unlinked`] instead.
     pub async fn enroll(&self, code: &str) -> Result<EnrollmentKind, CloudError> {
+        match self.enroll_with_policy(code, false).await? {
+            FirstLinkEnrollment::Established(kind) => Ok(kind),
+            // Not reachable with `first_link_only = false`; a typed refusal is
+            // still the right answer if that invariant ever breaks, because the
+            // caller's next step is "try again", not "crash the server".
+            FirstLinkEnrollment::AlreadyLinked
+            | FirstLinkEnrollment::LostRaceToConcurrentEnrollment => {
+                Err(CloudError::EnrollmentRefused {
+                    detail: "link state changed while enrollment was in progress; try again".into(),
+                })
+            }
+        }
+    }
+
+    /// Redeem `code` only if this instance holds no credential — and keep
+    /// holding to that even if a credential appears while the code is in
+    /// flight.
+    ///
+    /// This is the enrollment an unattended bootstrap wants. [`Self::enroll`]
+    /// overwrites on purpose (credential recovery); a bootstrap reading a code
+    /// out of the environment has no operator behind it to have made that
+    /// choice, so it must never replace a link an operator established —
+    /// including one established *between* "is this instance linked?" and
+    /// "persist what the backend returned". A check made by the caller before
+    /// calling in cannot close that window; this one is taken under the same
+    /// lock as the pre-request snapshot and re-validated under the same lock
+    /// as the write, alongside the generation guard.
+    ///
+    /// Never sends the code to the backend when the instance is already
+    /// linked at the start, so a stale code left in the environment costs
+    /// nothing. If the race is lost after the round-trip, the code *has*
+    /// been redeemed on the backend and the credential it returned is
+    /// discarded unused; [`FirstLinkEnrollment::LostRaceToConcurrentEnrollment`]
+    /// says so, because the backend now shows a link this instance does not
+    /// hold and only the caller can tell the operator to reconcile that.
+    pub async fn enroll_if_unlinked(&self, code: &str) -> Result<FirstLinkEnrollment, CloudError> {
+        self.enroll_with_policy(code, true).await
+    }
+
+    async fn enroll_with_policy(
+        &self,
+        code: &str,
+        first_link_only: bool,
+    ) -> Result<FirstLinkEnrollment, CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
             return Err(error);
         }
@@ -953,6 +1022,11 @@ impl CloudLink {
         let (base_url, instance_id, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             let s = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
+            // Same guard as the generation snapshot below: a concurrent
+            // enrollment cannot land between "unlinked" and "generation N".
+            if first_link_only && s.is_linked() {
+                return Ok(FirstLinkEnrollment::AlreadyLinked);
+            }
             (
                 s.base_url.clone(),
                 s.instance_id,
@@ -971,6 +1045,11 @@ impl CloudLink {
             .ok_or_else(|| CloudError::EnrollmentRefused {
                 detail: "link state changed while enrollment was in progress; try again".into(),
             })?;
+        // Checked before the generation guard so the caller learns *why* the
+        // write was refused: a link now exists, and it is not ours to replace.
+        if first_link_only && current.is_linked() {
+            return Ok(FirstLinkEnrollment::LostRaceToConcurrentEnrollment);
+        }
         if self.generation.load(Ordering::SeqCst) != generation
             || current.base_url != base_url
             || current.instance_id != instance_id
@@ -999,7 +1078,7 @@ impl CloudLink {
         self.linked.store(true, Ordering::Release);
         self.credential_rejected.store(false, Ordering::SeqCst);
         *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
-        Ok(kind)
+        Ok(FirstLinkEnrollment::Established(kind))
     }
 
     /// Revoke the active credential at its issuing backend.
@@ -2410,5 +2489,184 @@ mod submission_scope_tests {
             "the caller must be told the link went away, not that it drained"
         );
         assert_eq!(stub.scoped_spans.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod first_link_enrollment_tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use temps_cloud_protocol::EnrollRequest;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    /// A backend that answers immediately for any code, except one whose
+    /// code starts with `SLOW-`: that request is parked until the test says
+    /// `release`, which is how the test puts an operator enrollment in the
+    /// middle of an unattended one's round-trip. Every response carries a
+    /// tenant derived from the code so the test can tell whose link stuck.
+    #[derive(Clone, Default)]
+    struct Stub {
+        slow_requests_parked: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+        redeemed: Arc<AtomicUsize>,
+    }
+
+    fn tenant_for(code: &str) -> Uuid {
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, code.as_bytes())
+    }
+
+    async fn serve(stub: Stub) -> Option<String> {
+        let app = Router::new()
+            .route(
+                "/v1/enroll",
+                post(
+                    |State(stub): State<Stub>, Json(request): Json<EnrollRequest>| async move {
+                        if request.enrollment_code.starts_with("SLOW-") {
+                            stub.slow_requests_parked.fetch_add(1, Ordering::SeqCst);
+                            stub.release.notified().await;
+                        }
+                        stub.redeemed.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "tenant_id": tenant_for(&request.enrollment_code),
+                            "instance_token": format!("inst_{}", request.enrollment_code),
+                        }))
+                    },
+                ),
+            )
+            .with_state(stub);
+        let listener = match tokio::net::TcpListener::bind::<SocketAddr>(
+            "127.0.0.1:0".parse().expect("loopback address must parse"),
+        )
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping first-link enrollment network test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("test server must bind: {error}"),
+        };
+        let address = listener.local_addr().expect("test server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{address}"))
+    }
+
+    async fn configured_link(stub: Stub) -> Option<(Arc<CloudLink>, tempfile::TempDir)> {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let backend = serve(stub).await?;
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "first-link-test",
+        ));
+        link.configure(
+            crate::BackendUrl::loopback_development(&backend)
+                .expect("stub backend URL must be accepted"),
+        )
+        .expect("test link must be configured");
+        Some((link, directory))
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..2_000 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_instance_is_linked_by_the_first_link_only_path() {
+        let stub = Stub::default();
+        let Some((link, _directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+
+        let outcome = link
+            .enroll_if_unlinked("first-code")
+            .await
+            .expect("enrollment must succeed against the stub");
+
+        assert_eq!(
+            outcome,
+            FirstLinkEnrollment::Established(EnrollmentKind::First)
+        );
+        assert!(link.is_linked());
+        assert_eq!(link.tenant_id(), Some(tenant_for("FIRST-CODE")));
+    }
+
+    #[tokio::test]
+    async fn an_already_linked_instance_never_sends_the_code_to_the_backend() {
+        let stub = Stub::default();
+        let Some((link, _directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+        link.enroll("operator-code")
+            .await
+            .expect("operator enrollment must succeed");
+        let before = stub.redeemed.load(Ordering::SeqCst);
+
+        let outcome = link
+            .enroll_if_unlinked("stale-env-code")
+            .await
+            .expect("a no-op must not be an error");
+
+        assert_eq!(outcome, FirstLinkEnrollment::AlreadyLinked);
+        assert_eq!(
+            stub.redeemed.load(Ordering::SeqCst),
+            before,
+            "a stale code must not be redeemed on the backend"
+        );
+        assert_eq!(link.tenant_id(), Some(tenant_for("OPERATOR-CODE")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_enrollment_during_the_round_trip_is_never_overwritten() {
+        // The race the first-link-only path exists to close: the instance is
+        // unlinked when the unattended enrollment starts, an operator links
+        // it to *their* tenant while the environment code is still being
+        // redeemed, and the delayed response must not replace that choice.
+        let stub = Stub::default();
+        let Some((link, _directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+
+        let unattended = tokio::spawn({
+            let link = Arc::clone(&link);
+            async move { link.enroll_if_unlinked("slow-env-code").await }
+        });
+        assert!(
+            wait_until(|| stub.slow_requests_parked.load(Ordering::SeqCst) == 1).await,
+            "the unattended enrollment must be in flight before the operator acts"
+        );
+
+        let operator = link
+            .enroll("operator-code")
+            .await
+            .expect("operator enrollment must succeed while the other is parked");
+        assert_eq!(operator, EnrollmentKind::First);
+        assert_eq!(link.tenant_id(), Some(tenant_for("OPERATOR-CODE")));
+
+        stub.release.notify_one();
+        let outcome = unattended
+            .await
+            .expect("unattended task must not panic")
+            .expect("losing the race is an outcome, not an error");
+
+        assert_eq!(outcome, FirstLinkEnrollment::LostRaceToConcurrentEnrollment);
+        assert_eq!(
+            link.tenant_id(),
+            Some(tenant_for("OPERATOR-CODE")),
+            "the operator's tenant must survive the delayed unattended response"
+        );
+        assert!(link.is_linked());
     }
 }

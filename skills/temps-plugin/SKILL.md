@@ -62,8 +62,8 @@ keep package metadata and runtime manifest consistent. Add only tested platforms
 Commit the lockfile. Keep credentials, local databases, logs, auth material, and simulator
 session files out of Git.
 
-For GitHub installation, the plugin lives at repository root. A folder within the
-`gotempsh/plugins` monorepo is an example, not an installable subdirectory URL. Verify
+For GitHub installation, select either the repository root or a self-contained plugin
+subdirectory with `--path`. Use `--ref` for a branch, tag, or commit. Verify
 that a clean checkout compiles through the *host installer* path: lifecycle scripts and
 custom UI build commands are not implicitly run. See the publishing reference for the
 embedded-asset consequence.

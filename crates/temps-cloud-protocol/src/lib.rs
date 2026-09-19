@@ -32,17 +32,21 @@
 pub mod messages;
 
 pub use messages::{
-    BackupCompression, BackupEngine, BackupFormat, BackupLifecycleEventAccepted,
-    BackupLifecycleEventRequest, BackupLifecycleStage, BackupManifest, BackupManifestObjects,
-    EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck, IngestAck,
-    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability, ManagedAiChatRequest,
-    ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence, ManagedAiTask,
-    ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
-    ManagedNotificationSeverity, NativeSnapshot, NativeSnapshotIdentity,
-    NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest, SpanRecord,
-    TelemetryBatch, WalGObjectCompleted, WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget,
-    WalGObjectTargetRequest, WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
-    BACKUP_MANIFEST_VERSION, MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES,
+    truncate_status_text, BackupCompression, BackupEngine, BackupFormat,
+    BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage,
+    BackupManifest, BackupManifestObjects, EnrollRequest, EnrollResponse, Envelope, Heartbeat,
+    HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation,
+    ManagedAiEvidence, ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
+    ManagedNotificationRequest, ManagedNotificationSeverity, NativeSnapshot,
+    NativeSnapshotIdentity, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
+    NativeSnapshotRequest, SpanRecord, StatusAvailableUpdate, StatusReport, StatusRequest,
+    StatusResourceSummary, StatusSelfUpdate, StatusSelfUpdateAttempt,
+    StatusSelfUpdateAttemptOutcome, StatusSelfUpdateBlocker, StatusSelfUpdatePhase,
+    StatusSelfUpdateRestartMode, StatusSupervisorKind, TelemetryBatch, WalGObjectCompleted,
+    WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    WalGSnapshotCompleted, WalGSnapshotRequest, BACKUP_MANIFEST_VERSION,
+    MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES, MAX_STATUS_TEXT_CHARS,
 };
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +80,16 @@ pub enum Capability {
     /// an operator debugging alone needs, because only one of those two is
     /// worth retrying.
     TelemetryQuery,
+    /// Instance reports its own status (version, uptime, resource counts, and
+    /// self-update state) on the management channel, and will honor a
+    /// [`crate::messages::StatusRequest`] nudge to send one sooner (ADR-039).
+    ///
+    /// Strictly advisory in both directions: every field the instance sends
+    /// is a fact it already knows about itself, and every message the backend
+    /// may send back is a request to report sooner, never a directive telling
+    /// the instance what to do. See [`crate::messages::StatusReport`]'s own
+    /// doc comment for why that boundary is load-bearing, not incidental.
+    InstanceStatusReporting,
     /// A capability introduced by a newer peer. Older agents retain the
     /// connection and simply decline to negotiate the unknown feature.
     #[serde(other)]
@@ -234,6 +248,49 @@ mod tests {
             serde_json::from_str::<Capability>(r#""telemetry_query""#)
                 .expect("capability must parse"),
             Capability::TelemetryQuery
+        );
+    }
+
+    #[test]
+    fn instance_status_reporting_is_negotiated_like_any_other_capability() {
+        // ADR-039: a backend that doesn't yet know this capability must not
+        // stop the instance from negotiating everything else it shares.
+        let ours = hello(&[
+            Capability::TelemetryShipping,
+            Capability::InstanceStatusReporting,
+        ]);
+        let old_backend = hello(&[Capability::TelemetryShipping]);
+        assert_eq!(
+            ours.negotiate(&old_backend).unwrap(),
+            vec![Capability::TelemetryShipping]
+        );
+
+        let new_backend = hello(&[
+            Capability::TelemetryShipping,
+            Capability::InstanceStatusReporting,
+        ]);
+        assert_eq!(
+            ours.negotiate(&new_backend).unwrap(),
+            vec![
+                Capability::TelemetryShipping,
+                Capability::InstanceStatusReporting
+            ]
+        );
+    }
+
+    #[test]
+    fn instance_status_reporting_survives_a_serde_round_trip_as_snake_case() {
+        // The wire name is part of the contract with the backend; a rename
+        // would silently read as `Unknown` on the peer.
+        assert_eq!(
+            serde_json::to_string(&Capability::InstanceStatusReporting)
+                .expect("capability must serialize"),
+            r#""instance_status_reporting""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Capability>(r#""instance_status_reporting""#)
+                .expect("capability must parse"),
+            Capability::InstanceStatusReporting
         );
     }
 

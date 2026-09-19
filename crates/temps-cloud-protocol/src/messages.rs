@@ -944,6 +944,261 @@ pub struct HeartbeatAck {
     pub received_at_millis: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Instance status — ADR-039
+//
+// Everything below is a fact the instance already knows about itself,
+// reported upward on its own cadence (slower than [`Heartbeat`]) so Cloud's
+// console can show more than "seen N seconds ago". [`StatusRequest`] is the
+// one thing that flows the other way, and it is a request, never a command:
+// see each type's own doc comment for the boundary this protocol must never
+// cross.
+// ---------------------------------------------------------------------------
+
+/// Upper bound, in characters, on any free-text field inside
+/// [`StatusSelfUpdate`] (`blocker_reason` and
+/// [`StatusSelfUpdateAttempt::error`]).
+///
+/// This data crosses a trust boundary to Cloud: a self-update failure message
+/// can embed arbitrary text (a database error, a filesystem path, output from
+/// a failed download), and none of that is validated or size-bounded at the
+/// point it is generated. Capping it here — rather than trusting every
+/// producer to have done so — is what keeps a single verbose failure from
+/// turning into an oversized frame on the management channel. 2000 characters
+/// comfortably fits every real failure message this codebase produces today.
+pub const MAX_STATUS_TEXT_CHARS: usize = 2000;
+
+/// Bound `input` to [`MAX_STATUS_TEXT_CHARS`], counting characters (never
+/// bytes, so a multi-byte message can never be split into invalid UTF-8) and
+/// appending an explicit marker so a shortened message can never be mistaken
+/// for a complete one.
+pub fn truncate_status_text(input: &str) -> String {
+    if input.chars().count() <= MAX_STATUS_TEXT_CHARS {
+        return input.to_string();
+    }
+    let mut truncated: String = input.chars().take(MAX_STATUS_TEXT_CHARS).collect();
+    truncated.push_str(" …[truncated]");
+    truncated
+}
+
+/// Mirrors `temps_core::self_update::SupervisorKind` on the wire.
+///
+/// Duplicated here rather than depending on `temps-core`: this crate is
+/// deliberately dependency-light and independently readable by an operator
+/// deciding whether to connect anything (see the crate's module docs). The
+/// `temps-cli`/`temps-core` layer maps its own enum onto this one when
+/// building a [`StatusReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSupervisorKind {
+    Systemd,
+    Launchd,
+    Container,
+    None,
+    /// A supervisor kind introduced by a newer instance. Cloud renders it as
+    /// "unknown" rather than failing to decode the whole report.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateRestartMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateRestartMode {
+    Automatic,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateBlocker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateBlocker {
+    DisabledByFlag,
+    DisabledBySetting,
+    NotSupported,
+    BinaryNotWritable,
+    UnsupportedPlatform,
+    InProgress,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdatePhase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdatePhase {
+    Idle,
+    Resolving,
+    Downloading,
+    Verifying,
+    Installing,
+    Migrating,
+    Restarting,
+    PendingRestart,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateStatus` (the outcome of one
+/// attempt). Named `*Outcome` here, rather than `StatusSelfUpdateStatus`, so
+/// it reads clearly as a field of [`StatusSelfUpdateAttempt`] rather than a
+/// second top-level "status" type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateAttemptOutcome {
+    Pending,
+    Succeeded,
+    InstalledPendingRestart,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors the fields of `temps_core::update_status::AvailableUpdate` that are
+/// useful to a Cloud console. `current_version` is intentionally omitted —
+/// [`StatusReport::temps_version`] already carries it, and repeating it here
+/// would just be one more place the two copies could drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusAvailableUpdate {
+    pub latest_version: String,
+    pub channel: String,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+    /// Release-notes page for `latest_version`. Purely informational — a link
+    /// the operator can open, never something the instance is told to act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
+}
+
+/// Mirrors the reportable fields of `temps_core::self_update::SelfUpdateAttempt`.
+///
+/// Deliberately narrower than the source type: `started_at` and
+/// `migrations_applied`/`migrations_total` are left off because they add
+/// nothing a Cloud console needs beyond what `status`/`finished_at` already
+/// convey, and `triggered_by_user_id`/`previous_binary_path` are left off on
+/// purpose — a local user id and a local filesystem path belong to this
+/// instance's own trust domain, not Cloud's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSelfUpdateAttempt {
+    pub status: StatusSelfUpdateAttemptOutcome,
+    pub from_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Operator-facing failure detail. Bounded to [`MAX_STATUS_TEXT_CHARS`]
+    /// by the producer (see [`truncate_status_text`]) before this value is
+    /// ever constructed — this type does not re-validate it, the same way
+    /// none of this crate's other wire types re-validate their own producer's
+    /// output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Mirrors the reportable fields of `temps_core::self_update::SelfUpdateCapability`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSelfUpdate {
+    /// Mirrors `SelfUpdateCapability::can_apply` — whether a one-click update
+    /// would actually run right now.
+    pub enabled: bool,
+    pub supervisor: StatusSupervisorKind,
+    pub restart_mode: StatusSelfUpdateRestartMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<StatusSelfUpdateBlocker>,
+    /// Human-readable detail for `blocker`. Bounded to
+    /// [`MAX_STATUS_TEXT_CHARS`] by the producer, exactly like
+    /// [`StatusSelfUpdateAttempt::error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_reason: Option<String>,
+    pub phase: StatusSelfUpdatePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_update: Option<StatusAvailableUpdate>,
+    /// The most recent attempt, including one resolved on this boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt: Option<StatusSelfUpdateAttempt>,
+}
+
+/// Best-effort host resource summary. Every field is `None` when the instance
+/// cannot compute it (e.g. an unsupported platform, or a sandboxed
+/// environment without `/proc`) — omitted from the wire entirely rather than
+/// reported as a misleading zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResourceSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_used_gb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_gb: Option<u64>,
+}
+
+/// Periodic status report sent by an instance on the management channel, on
+/// its own cadence separate from (and slower than) [`Heartbeat`]. Only ever
+/// sent once both sides have negotiated `Capability::InstanceStatusReporting`
+/// — see `temps-cloud-client::heartbeat` for the send cadence and the
+/// [`StatusRequest`] nudge that can trigger an extra one.
+///
+/// # What this is, and what it must never become (ADR-039)
+///
+/// Every field here is a fact the instance already knows about itself,
+/// reported upward for visibility. **This message must never grow a field
+/// that reads as an instruction for the instance to act on** — no
+/// "install this version" field, no restart command, nothing Cloud could use
+/// to make the instance *do* something rather than *say* something. The
+/// self-update block below reports exactly the same state the instance's own
+/// `SelfUpdater` already decided and already shows the operator locally; it
+/// does not let Cloud change that decision. When every Cloud service is down,
+/// the instance's self-update loop keeps working exactly as it did before
+/// this message existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub instance_id: Uuid,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.55`.
+    pub temps_version: String,
+    pub uptime_seconds: u64,
+    pub deployment_count: u32,
+    pub service_count: u32,
+    pub project_count: u32,
+    /// `None` when the instance cannot compute a resource summary at all
+    /// (rather than reporting one with every field `None`, which the nested
+    /// type already supports for a partial reading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<StatusResourceSummary>,
+    /// `None` on a host with no `SelfUpdater` registered at all (e.g. the
+    /// standalone proxy process), which is a different, permanent state from
+    /// `enabled: false` (self-update exists here but is currently blocked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<StatusSelfUpdate>,
+}
+
+/// A "please report sooner" nudge Cloud may send on the management channel to
+/// one connected instance.
+///
+/// **This is a request, not a command.** The instance may ignore it outright
+/// — e.g. if it never negotiated `Capability::InstanceStatusReporting`, or has
+/// no [`StatusReport`] data source wired up yet — and Cloud must not assume a
+/// `StatusReport` follows within any particular time, or at all. Per this
+/// protocol's core trust rule (ADR-039), this is the only message that flows
+/// Cloud → instance at all, and it asks for information, never for an action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusRequest {
+    /// Which instance Cloud wants a fresher report from. Optional: the
+    /// connection this frame arrives on already identifies the instance, so
+    /// an instance receiving this on its own management connection should act
+    /// on it regardless of whether this field is present or matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,5 +1761,214 @@ mod tests {
             serde_json::to_value(BackupFormat::ObjectSet).unwrap(),
             "object_set"
         );
+    }
+
+    fn full_status_report() -> StatusReport {
+        StatusReport {
+            instance_id: Uuid::new_v4(),
+            temps_version: "v0.3.0".into(),
+            uptime_seconds: 3_600,
+            deployment_count: 4,
+            service_count: 6,
+            project_count: 2,
+            resources: Some(StatusResourceSummary {
+                memory_used_mb: Some(1_024),
+                memory_total_mb: Some(4_096),
+                disk_used_gb: Some(20),
+                disk_total_gb: Some(80),
+            }),
+            self_update: Some(StatusSelfUpdate {
+                enabled: true,
+                supervisor: StatusSupervisorKind::Systemd,
+                restart_mode: StatusSelfUpdateRestartMode::Automatic,
+                blocker: None,
+                blocker_reason: None,
+                phase: StatusSelfUpdatePhase::Idle,
+                available_update: Some(StatusAvailableUpdate {
+                    latest_version: "v0.3.1".into(),
+                    channel: "stable".into(),
+                    checked_at: chrono::Utc::now(),
+                    release_url: Some(
+                        "https://github.com/gotempsh/temps/releases/tag/v0.3.1".into(),
+                    ),
+                }),
+                last_attempt: Some(StatusSelfUpdateAttempt {
+                    status: StatusSelfUpdateAttemptOutcome::Succeeded,
+                    from_version: "v0.2.9".into(),
+                    to_version: Some("v0.3.0".into()),
+                    finished_at: Some(chrono::Utc::now()),
+                    error: None,
+                }),
+            }),
+        }
+    }
+
+    /// The full report -- every optional block populated -- round-trips
+    /// byte-for-byte through JSON, including the nested self-update state a
+    /// Cloud console renders per-instance restart guidance from.
+    #[test]
+    fn status_report_round_trips_with_a_full_self_update_block() {
+        let report = full_status_report();
+        let json = serde_json::to_string(&report).expect("status report must serialize");
+        let decoded: StatusReport = serde_json::from_str(&json).expect("status report must parse");
+        assert_eq!(decoded, report);
+    }
+
+    /// A quiet instance with no resource summary and no self-update state
+    /// (e.g. a host with no `SelfUpdater` registered) must not fabricate
+    /// either block: both keys are entirely absent from the wire, not `null`.
+    #[test]
+    fn status_report_omits_absent_resources_and_self_update() {
+        let report = StatusReport {
+            instance_id: Uuid::nil(),
+            temps_version: "v0.3.0".into(),
+            uptime_seconds: 0,
+            deployment_count: 0,
+            service_count: 0,
+            project_count: 0,
+            resources: None,
+            self_update: None,
+        };
+        let json = serde_json::to_string(&report).expect("status report must serialize");
+        assert!(!json.contains("resources"), "{json}");
+        assert!(!json.contains("self_update"), "{json}");
+        let decoded: StatusReport = serde_json::from_str(&json).expect("status report must parse");
+        assert_eq!(decoded, report);
+    }
+
+    /// A partial resource reading (e.g. memory known, disk unknown on a
+    /// platform without a straightforward disk-usage syscall) must not force
+    /// the whole summary to `None` -- each field degrades independently.
+    #[test]
+    fn status_resource_summary_fields_are_independently_optional() {
+        let summary = StatusResourceSummary {
+            memory_used_mb: Some(512),
+            memory_total_mb: Some(2_048),
+            disk_used_gb: None,
+            disk_total_gb: None,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("disk_used_gb").is_none());
+        assert!(json.get("disk_total_gb").is_none());
+        assert_eq!(json["memory_used_mb"], 512);
+    }
+
+    /// A backend that predates `StatusRequest` -- or one directing the frame
+    /// purely by which connection it arrives on -- sends an empty object.
+    /// That must decode to `instance_id: None`, not fail.
+    #[test]
+    fn status_request_instance_id_is_optional() {
+        let request: StatusRequest = serde_json::from_str("{}").expect("must decode");
+        assert_eq!(request.instance_id, None);
+
+        let id = Uuid::new_v4();
+        let request: StatusRequest =
+            serde_json::from_value(serde_json::json!({ "instance_id": id })).expect("must decode");
+        assert_eq!(request.instance_id, Some(id));
+    }
+
+    /// Wire enums attached to a status report must tolerate a variant added
+    /// by a newer instance than the Cloud build reading it, exactly like
+    /// `Capability` and `Unavailable` already do -- this is a forward, not a
+    /// backward, compatibility case: the *instance* is newer here.
+    #[test]
+    fn self_update_wire_enums_tolerate_an_unknown_variant() {
+        assert_eq!(
+            serde_json::from_value::<StatusSupervisorKind>(serde_json::json!("future_supervisor"))
+                .unwrap(),
+            StatusSupervisorKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdatePhase>(serde_json::json!("future_phase"))
+                .unwrap(),
+            StatusSelfUpdatePhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateBlocker>(serde_json::json!("future_blocker"))
+                .unwrap(),
+            StatusSelfUpdateBlocker::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateAttemptOutcome>(serde_json::json!(
+                "future_outcome"
+            ))
+            .unwrap(),
+            StatusSelfUpdateAttemptOutcome::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateRestartMode>(serde_json::json!(
+                "future_restart_mode"
+            ))
+            .unwrap(),
+            StatusSelfUpdateRestartMode::Unknown
+        );
+    }
+
+    #[test]
+    fn status_wire_enum_names_match_the_documented_snake_case_contract() {
+        assert_eq!(
+            serde_json::to_value(StatusSupervisorKind::Container).unwrap(),
+            "container"
+        );
+        assert_eq!(
+            serde_json::to_value(StatusSelfUpdatePhase::PendingRestart).unwrap(),
+            "pending_restart"
+        );
+        assert_eq!(
+            serde_json::to_value(StatusSelfUpdateAttemptOutcome::InstalledPendingRestart).unwrap(),
+            "installed_pending_restart"
+        );
+    }
+
+    #[test]
+    fn a_short_error_is_left_untouched() {
+        assert_eq!(truncate_status_text("connection reset"), "connection reset");
+    }
+
+    #[test]
+    fn a_string_exactly_at_the_bound_is_left_untouched() {
+        let exact = "a".repeat(MAX_STATUS_TEXT_CHARS);
+        assert_eq!(truncate_status_text(&exact), exact);
+    }
+
+    /// This is the property the size cap exists for: an unbounded free-text
+    /// field crossing the management-channel trust boundary must come out
+    /// bounded, with an explicit marker so a caller can tell it was cut, and
+    /// must never panic on a multi-byte character sitting at the cut point.
+    #[test]
+    fn a_long_multibyte_error_is_bounded_with_an_explicit_marker_and_never_panics() {
+        let long = "é".repeat(MAX_STATUS_TEXT_CHARS + 500);
+        let truncated = truncate_status_text(&long);
+        assert!(
+            truncated.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count()
+        );
+        assert!(
+            truncated.ends_with("…[truncated]"),
+            "must carry an explicit truncation marker: {truncated}"
+        );
+        assert!(
+            truncated.starts_with(&"é".repeat(10)),
+            "must preserve the head of the message"
+        );
+    }
+
+    #[test]
+    fn self_update_block_error_fields_are_capped_by_the_producer_before_construction() {
+        // This type does not itself enforce the cap (see its own doc
+        // comment) -- this test pins that the shared helper the producer must
+        // call actually produces a value that fits, so a future producer
+        // change cannot silently stop calling it without a test noticing the
+        // resulting attempt/blocker payload is unbounded.
+        let raw_error = "x".repeat(10_000);
+        let attempt = StatusSelfUpdateAttempt {
+            status: StatusSelfUpdateAttemptOutcome::Failed,
+            from_version: "v0.2.9".into(),
+            to_version: None,
+            finished_at: None,
+            error: Some(truncate_status_text(&raw_error)),
+        };
+        let error = attempt.error.expect("error must be set");
+        assert!(error.chars().count() < raw_error.chars().count());
+        assert!(error.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count());
     }
 }

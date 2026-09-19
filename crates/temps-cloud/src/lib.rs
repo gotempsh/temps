@@ -12,7 +12,11 @@ mod lifecycle_notify;
 mod plugin;
 mod service;
 
-pub use handler::{cloud_routes, CloudApiDoc};
+pub use handler::{
+    cloud_routes, record_backup_outcome_audit, record_enrollment_audit,
+    record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
+    UNATTENDED_ENROLLMENT_USER_AGENT,
+};
 pub use plugin::CloudPlugin;
 pub use service::{
     CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,

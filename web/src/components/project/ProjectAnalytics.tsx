@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ActivityReportPage } from '@/components/analytics/ActivityReport'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
@@ -1170,6 +1171,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
   return (
     <Routes>
       <Route index element={<ProjectAnalyticsOverview project={project} />} />
+      <Route
+        path="activity"
+        element={<ActivityReportPage project={project} />}
+      />
       <Route path="requests/*" element={<RequestLogs project={project} />} />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
       <Route

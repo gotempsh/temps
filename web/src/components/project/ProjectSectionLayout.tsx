@@ -57,6 +57,7 @@ const sectionIcons: Record<string, LucideIcon> = {
   'errors/alert-rules': Bell,
   analytics: BarChart3,
   'analytics/visitors': Users,
+  'analytics/activity': Activity,
   'analytics/pages': FileText,
   'analytics/replays': Play,
   'analytics/funnels': Filter,

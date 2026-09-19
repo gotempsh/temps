@@ -36,10 +36,11 @@ pub mod query;
 pub mod spool;
 pub mod state;
 pub mod status;
+pub mod status_provider;
 
 pub use link::{
-    CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FlushOutcome,
-    OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
+    CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FirstLinkEnrollment,
+    FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
 };
 pub use outbox::{
     ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox,
@@ -49,6 +50,7 @@ pub use outbox::{
 pub use outbox_worker::{DrainObserver, DrainOutcome, OutboxCapSource};
 pub use state::EnrollmentState;
 pub use status::{LinkStatus, MirrorHealth, TelemetryDurability};
+pub use status_provider::{StatusProvider, StatusSnapshot};
 
 /// Operator-controlled export gates. Linking an account never enables data
 /// export; persisted settings must be applied explicitly after startup.

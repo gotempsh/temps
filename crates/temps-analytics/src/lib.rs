@@ -27,3 +27,5 @@ pub use ingest_keys::{
 pub use plugin::AnalyticsPlugin;
 pub use traits::Analytics;
 pub use types::*;
+
+pub mod activity;

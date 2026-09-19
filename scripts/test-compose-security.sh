@@ -18,9 +18,24 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 0
 fi
 
+# Which production manifest to exercise. Both ship the same topology and the
+# same security contract; they differ only in where the `temps` image comes
+# from (`docker-compose.yml` builds it from source, `docker-compose.release.yml`
+# pulls the published GHCR image). CI runs this script once per manifest so a
+# fix landing in one cannot silently drift out of the other. When testing the
+# release manifest locally, point COMPOSE_SECURITY_OVERRIDE at an override that
+# replaces `services.temps.image` with a locally built image -- otherwise the
+# run tests whatever tag GHCR currently serves, not this checkout.
+manifest="${COMPOSE_SECURITY_MANIFEST:-docker-compose.yml}"
+if [[ ! -f "$manifest" ]]; then
+  echo "COMPOSE_SECURITY_MANIFEST points at a missing file: $manifest" >&2
+  exit 1
+fi
+echo "compose security harness: manifest=$manifest"
+
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-config_compose=(docker compose --project-name "$project" --file docker-compose.yml
+config_compose=(docker compose --project-name "$project" --file "$manifest"
   --file "$script_dir/compose-security.harness.yml")
 compose=("${config_compose[@]}")
 if [[ -n "${COMPOSE_SECURITY_OVERRIDE:-}" ]]; then
@@ -262,7 +277,7 @@ if POSTGRES_PASSWORD="$safe_postgres" \
 fi
 
 if grep -En 'temps_password_change_me' \
-  docker-compose.yml .env.example; then
+  docker-compose.yml docker-compose.release.yml .env.example; then
   echo "compose files contain a known or argv-exposed credential" >&2
   exit 1
 fi

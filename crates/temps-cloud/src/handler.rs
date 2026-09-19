@@ -51,9 +51,57 @@ pub struct CloudFeatureSwitchesRequest {
     pub notifications_enabled: bool,
 }
 
+/// Who performed a Cloud enrollment, for the audit trail.
+///
+/// Both enrollment paths -- an operator at `POST /cloud/enroll`, and the
+/// unattended first-boot path `temps-cli` drives from
+/// `TEMPS_CLOUD_ENROLLMENT_CODE` -- persist the same Cloud credential and
+/// provision the same managed-backup state, so both must leave the same
+/// audit records; see [`record_enrollment_audit`]. `UnattendedBootstrap`
+/// follows the actor-less precedent of the Cloud telemetry backfill and
+/// external-plugin host-operation audits: no user id, no IP, and a fixed
+/// user agent naming the code path.
+#[derive(Debug, Clone)]
+pub enum CloudEnrollmentActor {
+    Operator(AuditContext),
+    UnattendedBootstrap,
+}
+
+/// User agent recorded on audit rows written by
+/// [`CloudEnrollmentActor::UnattendedBootstrap`].
+pub const UNATTENDED_ENROLLMENT_USER_AGENT: &str = "temps-serve/unattended-cloud-enrollment";
+
+/// The actor fields every Cloud audit row carries. Field names match
+/// `AuditContext` so rows written by an operator serialize exactly as they
+/// did before the unattended path existed; only `user_id: null` is new, and
+/// only for that path.
+#[derive(Debug, Clone, Serialize)]
+struct CloudAuditActor {
+    user_id: Option<i32>,
+    ip_address: Option<String>,
+    user_agent: String,
+}
+
+impl From<CloudEnrollmentActor> for CloudAuditActor {
+    fn from(actor: CloudEnrollmentActor) -> Self {
+        match actor {
+            CloudEnrollmentActor::Operator(context) => Self {
+                user_id: Some(context.user_id),
+                ip_address: context.ip_address,
+                user_agent: context.user_agent,
+            },
+            CloudEnrollmentActor::UnattendedBootstrap => Self {
+                user_id: None,
+                ip_address: None,
+                user_agent: UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CloudLinkAudit {
-    context: AuditContext,
+    context: CloudAuditActor,
     action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_features: Option<CloudFeatureAuditValues>,
@@ -128,7 +176,7 @@ impl AuditOperation for CloudLinkAudit {
         self.action.to_string()
     }
     fn user_id(&self) -> Option<i32> {
-        Some(self.context.user_id)
+        self.context.user_id
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -282,38 +330,12 @@ async fn enroll_cloud(
         .enroll(&request.enrollment_code)
         .await
         .map_err(problem)?;
-    audit(&state, &auth, &metadata, "CLOUD_LINK_CONNECTED", None, None).await;
-    match &backup_outcome {
-        ManagedBackupOutcome::Provisioned => {
-            audit(
-                &state,
-                &auth,
-                &metadata,
-                "cloud.backup_credential.issued",
-                None,
-                None,
-            )
-            .await;
-        }
-        // A distinct, loud action name: this should never happen under a
-        // correct backend tenant->bucket contract (see the doc comment on
-        // this variant). Full detail (both bucket names) is already in the
-        // server log via the `tracing::error!` in `provision_managed_backup_source`;
-        // the audit trail just needs to make clear this run differs from a
-        // routine rotation, since it means backups may have been orphaned.
-        ManagedBackupOutcome::ProvisionedBucketChanged { .. } => {
-            audit(
-                &state,
-                &auth,
-                &metadata,
-                "cloud.backup_credential.bucket_changed",
-                None,
-                None,
-            )
-            .await;
-        }
-        ManagedBackupOutcome::NotConfigured { .. } | ManagedBackupOutcome::Unavailable(_) => {}
-    }
+    record_enrollment_audit(
+        state.audit.as_ref(),
+        CloudEnrollmentActor::Operator(audit_context(&auth, &metadata)),
+        &backup_outcome,
+    )
+    .await;
 
     // ADR-042 P3: the telemetry activation the customer just paid for, started
     // here for the same reason the managed backup source above is provisioned
@@ -623,6 +645,14 @@ async fn disconnect_cloud(
     Ok(Json(result))
 }
 
+fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+    AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
 async fn audit(
     state: &CloudState,
     auth: &temps_auth::AuthContext,
@@ -631,18 +661,93 @@ async fn audit(
     previous_features: Option<CloudFeatureSwitches>,
     new_features: Option<CloudFeatureSwitches>,
 ) {
+    write_cloud_link_audit(
+        state.audit.as_ref(),
+        CloudEnrollmentActor::Operator(audit_context(auth, metadata)),
+        action,
+        previous_features,
+        new_features,
+    )
+    .await;
+}
+
+async fn write_cloud_link_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    action: &'static str,
+    previous_features: Option<CloudFeatureSwitches>,
+    new_features: Option<CloudFeatureSwitches>,
+) {
     let event = CloudLinkAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
+        context: actor.into(),
         action,
         previous_features: previous_features.map(Into::into),
         new_features: new_features.map(Into::into),
     };
-    if let Err(error) = state.audit.create_audit_log(&event).await {
+    if let Err(error) = audit.create_audit_log(&event).await {
         tracing::error!(%error, action, "failed to record managed control-plane audit event");
+    }
+}
+
+/// The audit records a successful [`CloudService::enroll`] must leave behind,
+/// whoever triggered it: `CLOUD_LINK_CONNECTED` for the persisted Cloud
+/// credential, plus one of the `cloud.backup_credential.*` events when the
+/// enrollment also provisioned managed-backup state.
+///
+/// Lives here rather than inline in `enroll_cloud` so the unattended
+/// first-boot path in `temps-cli` (`TEMPS_CLOUD_ENROLLMENT_CODE`) records
+/// exactly the same trail as an operator does -- an enrollment that persists
+/// a credential without an audit row is not an acceptable outcome on either
+/// path. Failures to write the audit row are logged, never propagated: the
+/// enrollment itself has already succeeded.
+pub async fn record_enrollment_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    backup_outcome: &ManagedBackupOutcome,
+) {
+    record_link_connected_audit(audit, actor.clone()).await;
+    record_backup_outcome_audit(audit, actor, backup_outcome).await;
+}
+
+/// The `CLOUD_LINK_CONNECTED` half of [`record_enrollment_audit`]: write it
+/// the moment [`CloudService::enroll_link`] returns, before any further
+/// network round-trip, so a persisted credential is never left without its
+/// audit row.
+pub async fn record_link_connected_audit(audit: &dyn AuditLogger, actor: CloudEnrollmentActor) {
+    write_cloud_link_audit(audit, actor, "CLOUD_LINK_CONNECTED", None, None).await;
+}
+
+/// The managed-backup half of [`record_enrollment_audit`]: one of the
+/// `cloud.backup_credential.*` events when
+/// [`CloudService::provision_managed_backups_after_enrollment`] changed
+/// persistent state, nothing otherwise.
+pub async fn record_backup_outcome_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    backup_outcome: &ManagedBackupOutcome,
+) {
+    match backup_outcome {
+        ManagedBackupOutcome::Provisioned => {
+            write_cloud_link_audit(audit, actor, "cloud.backup_credential.issued", None, None)
+                .await;
+        }
+        // A distinct, loud action name: this should never happen under a
+        // correct backend tenant->bucket contract (see the doc comment on
+        // this variant). Full detail (both bucket names) is already in the
+        // server log via the `tracing::error!` in `provision_managed_backup_source`;
+        // the audit trail just needs to make clear this run differs from a
+        // routine rotation, since it means backups may have been orphaned.
+        ManagedBackupOutcome::ProvisionedBucketChanged { .. } => {
+            write_cloud_link_audit(
+                audit,
+                actor,
+                "cloud.backup_credential.bucket_changed",
+                None,
+                None,
+            )
+            .await;
+        }
+        ManagedBackupOutcome::NotConfigured { .. } | ManagedBackupOutcome::Unavailable(_) => {}
     }
 }
 
@@ -1040,11 +1145,7 @@ mod tests {
     #[test]
     fn feature_audit_contains_before_and_after_consent() {
         let audit = CloudLinkAudit {
-            context: AuditContext {
-                user_id: 42,
-                ip_address: Some("127.0.0.1".to_string()),
-                user_agent: "test".to_string(),
-            },
+            context: CloudEnrollmentActor::Operator(context()).into(),
             action: "CLOUD_FEATURES_UPDATED",
             previous_features: Some(
                 CloudFeatureSwitches {
@@ -1127,5 +1228,117 @@ mod tests {
         assert!(!detail.contains("60000"));
         assert!(!detail.contains("42"));
         assert!(detail.contains("server logs"));
+    }
+
+    // ── record_enrollment_audit: one trail, whichever path enrolled ──────
+
+    /// `(operation_type, user_id, ip_address, user_agent)` as an audit row
+    /// would record them.
+    type RecordedActorRow = (String, Option<i32>, Option<String>, String);
+
+    /// Like `RecordingAudit`, but keeps the actor fields too, since the
+    /// point of these tests is who the row says did it.
+    struct ActorRecordingAudit {
+        recorded: Mutex<Vec<RecordedActorRow>>,
+    }
+
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for ActorRecordingAudit {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    operation.operation_type(),
+                    operation.user_id(),
+                    operation.ip_address(),
+                    operation.user_agent().to_string(),
+                ));
+            Ok(())
+        }
+    }
+
+    fn actor_recorder() -> ActorRecordingAudit {
+        ActorRecordingAudit {
+            recorded: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn rows(audit: &ActorRecordingAudit) -> Vec<RecordedActorRow> {
+        audit
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn unattended_enrollment_records_the_link_with_no_user_actor() {
+        let audit = actor_recorder();
+
+        record_enrollment_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &ManagedBackupOutcome::NotConfigured { reason: None },
+        )
+        .await;
+
+        assert_eq!(
+            rows(&audit),
+            vec![(
+                "CLOUD_LINK_CONNECTED".to_string(),
+                None,
+                None,
+                UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_enrollment_records_the_backup_credential_it_provisioned() {
+        let audit = actor_recorder();
+
+        record_enrollment_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &ManagedBackupOutcome::Provisioned,
+        )
+        .await;
+
+        let recorded = rows(&audit);
+        let actions: Vec<&str> = recorded.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["CLOUD_LINK_CONNECTED", "cloud.backup_credential.issued"]
+        );
+        assert!(
+            recorded.iter().all(|row| row.1.is_none()),
+            "no row from the unattended path may claim a user actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_enrollment_records_the_same_trail_under_their_identity() {
+        let audit = actor_recorder();
+
+        record_enrollment_audit(
+            &audit,
+            CloudEnrollmentActor::Operator(context()),
+            &ManagedBackupOutcome::ProvisionedBucketChanged {
+                previous_bucket_name: "old".to_string(),
+                new_bucket_name: "new".to_string(),
+            },
+        )
+        .await;
+
+        let recorded = rows(&audit);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "CLOUD_LINK_CONNECTED");
+        assert_eq!(recorded[1].0, "cloud.backup_credential.bucket_changed");
+        for row in &recorded {
+            assert_eq!(row.1, Some(42));
+            assert_eq!(row.2.as_deref(), Some("127.0.0.1"));
+            assert_eq!(row.3, "test");
+        }
     }
 }

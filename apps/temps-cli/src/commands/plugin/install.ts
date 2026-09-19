@@ -8,6 +8,7 @@ import { promptConfirm } from "../../ui/prompts.js";
 export type Options = {
   name?: string;
   ref?: string;
+  path?: string;
   yes?: boolean;
   grant?: readonly string[];
   aiDailyCalls?: string;
@@ -31,6 +32,7 @@ type InstallBody = {
   repository_url: string;
   name?: string;
   ref_name?: string;
+  path?: string;
   grants?: GrantConfig;
 };
 type Result = {
@@ -61,9 +63,25 @@ export function installBody(repository: string, options: Options): InstallBody {
       "The optional plugin name must match the name declared by its package.",
     );
   validateRef(options.ref);
+  if (
+    options.path !== undefined &&
+    (options.path.length > 512 ||
+      (options.path !== "" &&
+        !options.path
+          .split("/")
+          .every(
+            (part) =>
+              /^[A-Za-z0-9_.-]+$/.test(part) &&
+              ![".", "..", ".git"].includes(part.toLowerCase()),
+          )))
+  )
+    throw new PluginInstallError(
+      "--path must be a relative plugin directory without empty segments, . or ...",
+    );
   const grants = installGrants(options);
   return {
     repository_url: repository,
+    ...(options.path ? { path: options.path } : {}),
     ...(options.name === undefined ? {} : { name: options.name }),
     ...(options.ref === undefined ? {} : { ref_name: options.ref }),
     ...(grants === undefined ? {} : { grants }),
@@ -203,6 +221,10 @@ export function registerPluginInstallCommands(plugin: Command) {
     .command("install <repository>")
     .description(
       "Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker",
+    )
+    .option(
+      "--path <path>",
+      "Plugin subdirectory containing package.json and bun.lock (default: repository root)",
     )
     .option(
       "--name <name>",

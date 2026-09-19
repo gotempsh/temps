@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Search, RefreshCw } from 'lucide-react'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { useQuery } from '@tanstack/react-query'
 import { listRepositoryPluginCatalog } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
@@ -41,30 +49,65 @@ export function RepositoryCatalog({
   const filtered = filterRepositoryCatalog(plugins, search, category)
   return (
     <section className="space-y-4" aria-labelledby="repository-catalog-title">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 space-y-1">
-          <h2 id="repository-catalog-title" className="font-semibold">
-            Available plugins
-          </h2>
-          <p className="text-base text-muted-foreground sm:text-sm">
-            GitHub repositories listed by the community. Only plugins supporting
-            this server’s platform are shown.
-          </p>
-          {catalog.data?.platform && (
-            <p className="text-sm text-muted-foreground">
-              Platform: <code>{catalog.data.platform}</code>
-            </p>
-          )}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+        <h2 id="repository-catalog-title" className="sr-only">
+          Available plugins
+        </h2>
+        <div className="relative min-w-0 flex-1">
+          <Search
+            className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            type="search"
+            name="plugin-catalog-search"
+            aria-label="Search available plugins"
+            className="pl-9"
+            placeholder="Search plugins…"
+            value={search}
+            onChange={(event) => {
+              setSearch(event.target.value)
+              setLimit(24)
+            }}
+          />
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={catalog.isFetching}
-          onClick={() => void catalog.refetch()}
-        >
-          {catalog.isFetching ? 'Checking…' : 'Refresh catalog'}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Select
+            value={category || 'all'}
+            onValueChange={(value) => {
+              setCategory(value === 'all' ? '' : value)
+              setLimit(24)
+            }}
+          >
+            <SelectTrigger
+              className="w-full sm:w-44"
+              aria-label="Plugin category"
+            >
+              <SelectValue placeholder="All categories" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All categories</SelectItem>
+              {categories.map((value) => (
+                <SelectItem key={value} value={value}>
+                  {value}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label="Refresh catalog"
+            title="Refresh catalog"
+            disabled={catalog.isFetching}
+            onClick={() => void catalog.refetch()}
+          >
+            <RefreshCw
+              className={`size-4 ${catalog.isFetching ? 'animate-spin' : ''}`}
+            />
+          </Button>
+        </div>
       </div>
       {catalog.isPending ? (
         <div
@@ -94,39 +137,6 @@ export function RepositoryCatalog({
         </div>
       ) : (
         <>
-          <Input
-            type="search"
-            name="plugin-catalog-search"
-            aria-label="Search available plugins"
-            placeholder="Search plugins, authors, repositories…"
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value)
-              setLimit(24)
-            }}
-          />
-          <div className="flex flex-wrap gap-2" aria-label="Plugin categories">
-            {['', ...categories].map((value) => (
-              <Button
-                type="button"
-                key={value}
-                variant="outline"
-                size="sm"
-                aria-pressed={category === value}
-                className={
-                  category === value
-                    ? 'bg-accent text-accent-foreground hover:bg-accent hover:text-accent-foreground'
-                    : ''
-                }
-                onClick={() => {
-                  setCategory(value)
-                  setLimit(24)
-                }}
-              >
-                {value || 'All'}
-              </Button>
-            ))}
-          </div>
           {!canInstall && (
             <p className="text-sm text-muted-foreground">
               A system administrator can install these plugins.
@@ -153,13 +163,13 @@ export function RepositoryCatalog({
               )}
             </div>
           ) : (
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <div className="divide-y rounded-lg border bg-card">
               {filtered.slice(0, limit).map((plugin) => (
                 <article
                   key={plugin.name}
-                  className="flex min-w-0 flex-col gap-3 rounded-lg border p-4"
+                  className="flex min-w-0 flex-col gap-4 p-4 sm:flex-row sm:items-center sm:gap-6 sm:p-5"
                 >
-                  <div className="flex items-start gap-3">
+                  <div className="flex min-w-0 flex-1 items-start gap-3">
                     <Avatar className="size-10 shrink-0 rounded-md">
                       {plugin.logoUrl && (
                         <AvatarImage
@@ -177,22 +187,20 @@ export function RepositoryCatalog({
                       <h3 className="break-words font-semibold">
                         {plugin.title}
                       </h3>
-                      <p className="text-sm text-muted-foreground">
-                        v{plugin.latestVersion} · {plugin.category}
+                      <p className="mt-1 text-pretty break-words text-sm text-muted-foreground">
+                        {plugin.summary}
+                      </p>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        {plugin.category} · By {plugin.author} · v
+                        {plugin.latestVersion}
                       </p>
                     </div>
                   </div>
-                  <p className="text-pretty break-words text-base text-muted-foreground sm:text-sm">
-                    {plugin.summary}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    By {plugin.author}
-                  </p>
-                  <div className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t pt-3">
+                  <div className="flex shrink-0 flex-wrap items-center gap-3">
                     <div className="text-sm">
                       <a
                         className="underline underline-offset-4"
-                        href={`${plugin.repository}/tree/${plugin.commit}`}
+                        href={`${plugin.repository}/tree/${plugin.commit}${plugin.path ? `/${plugin.path.split('/').map(encodeURIComponent).join('/')}` : ''}`}
                         target="_blank"
                         rel="noopener noreferrer"
                       >
@@ -231,8 +239,13 @@ export function RepositoryCatalog({
             </Button>
           )}
           <p className="text-sm text-muted-foreground">
-            Listing and build checks are not a security audit. You must
-            explicitly trust a repository before installation.
+            {catalog.data?.platform && (
+              <>
+                Compatible with <code>{catalog.data.platform}</code>.{' '}
+              </>
+            )}
+            Community listings are not a security audit; review access before
+            installing.
           </p>
         </>
       )}

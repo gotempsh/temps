@@ -1,5 +1,17 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { Badge } from '@/components/ui/badge'
+import {
+  Sparkles,
+  Folder,
+  Layers,
+  Rocket,
+  Radio,
+  Eye,
+  Pencil,
+  ShieldCheck,
+} from 'lucide-react'
+import { type PluginPermissionRequirement } from '@/lib/plugin-grants'
 import { useId } from 'react'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -15,22 +27,49 @@ export function PluginGrantFields({
   onChange,
   disabled,
   requested,
+  requirements,
 }: {
   value: PluginGrantsValues
   onChange: (value: PluginGrantsValues) => void
   disabled?: boolean
   requested?: PluginGrantsValues['permissions']
+  requirements?: PluginPermissionRequirement[] | null
 }) {
   const id = useId()
+  const icons = {
+    ai_generate: Sparkles,
+    projects_read: Folder,
+    environments_read: Layers,
+    deployments_read: Rocket,
+    events_read: Radio,
+    api_read: Eye,
+    api_write: Pencil,
+  }
+  const visible = requirements
+    ? pluginPermissionValues.filter((p) =>
+        requirements.some((r) => r.permission === p)
+      )
+    : pluginPermissionValues
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
-        Choose which Temps services this plugin may use. Nothing is granted by
-        default. These controls protect host API access; they do not sandbox
-        native plugin code.
+        {requirements
+          ? 'Approve the access you want to grant. Optional permissions enable extra features.'
+          : 'Permission requirements are not published. Review the source before choosing access.'}{' '}
+        Nothing is granted by default.
       </p>
+      {requirements?.length === 0 && (
+        <p className="flex items-center gap-2 text-sm">
+          <ShieldCheck className="size-4 text-muted-foreground" />
+          No host API permissions requested.
+        </p>
+      )}
       <div className="divide-y rounded-lg border">
-        {pluginPermissionValues.map((permission) => {
+        {visible.map((permission) => {
+          const requirement = requirements?.find(
+            (r) => r.permission === permission
+          )
+          const Icon = icons[permission]
           const text = pluginPermissionLabels[permission]
           const declared = !requested || requested.includes(permission)
           return (
@@ -59,12 +98,23 @@ export function PluginGrantFields({
                 }
               />
               <div className="min-w-0 space-y-1">
-                <Label htmlFor={`${id}-${permission}`}>{text.label}</Label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Icon
+                    className="size-4 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                  <Label htmlFor={`${id}-${permission}`}>{text.label}</Label>
+                  {requirement && (
+                    <Badge variant="secondary">
+                      {requirement.required ? 'Required' : 'Optional'}
+                    </Badge>
+                  )}
+                </div>
                 <p
                   id={`${id}-${permission}-description`}
                   className="text-sm text-muted-foreground"
                 >
-                  {text.description}
+                  {requirement?.reason || text.description}
                   {!declared && ' Not requested by this plugin.'}
                 </p>
               </div>

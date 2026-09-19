@@ -90,7 +90,7 @@ for (const width of [1440, 390]) {
       exact: true,
     })
     await expect(
-      control.getByRole('button', { name: '1d', exact: true })
+      control.getByRole('button', { name: '24h', exact: true })
     ).toHaveAttribute('aria-pressed', 'true')
     const paging = waitForLogs(page, (q) => q.get('page') === '2')
     await page
@@ -230,7 +230,7 @@ test('delayed preset selections use current time atomically and paging keeps it'
   for (const [preset, hours, end] of [
     ['6h', 6, '2026-09-14T11:00:00.000Z'],
     ['6h', 6, '2026-09-14T12:00:00.000Z'],
-    ['1d', 24, '2026-09-14T13:00:00.000Z'],
+    ['24h', 24, '2026-09-14T13:00:00.000Z'],
   ] as const) {
     await page.clock.setFixedTime(new Date(end))
     requests.length = 0

@@ -9,7 +9,9 @@ use std::{
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;
 use std::sync::OnceLock;
-use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind};
+use temps_cloud_client::{
+    BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind, FirstLinkEnrollment,
+};
 use temps_cloud_protocol::{
     ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
 };
@@ -484,6 +486,14 @@ impl CloudService {
     /// [`temps_cloud_client::CloudLink::is_linked`] every cycle, so it starts
     /// working the moment the instance links and goes quiet (cheaply) the
     /// moment it disconnects, with no separate start/stop wiring needed.
+    ///
+    /// This same connection also negotiates `Capability::InstanceStatusReporting`
+    /// (ADR-039), but no `StatusProvider` is wired up here yet: counting
+    /// deployments/services/projects and reading resource usage needs
+    /// database and system access this crate does not have reason to hold
+    /// just for this. Passing `None` is a deliberately silent no-op — the
+    /// capability is still offered, and status reporting activates with no
+    /// further wiring once a provider is registered.
     pub fn start_heartbeat_sender(&self) {
         let mut task = self
             .heartbeat_task
@@ -494,7 +504,7 @@ impl CloudService {
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
             *task = Some(tokio::spawn(async move {
-                temps_cloud_client::heartbeat::run(link, cancel).await;
+                temps_cloud_client::heartbeat::run(link, cancel, None).await;
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
@@ -783,6 +793,60 @@ impl CloudService {
         &self,
         code: &str,
     ) -> Result<(CloudStatus, ManagedBackupOutcome, EnrollmentKind), CloudServiceError> {
+        let enrollment = self.enroll_link(code).await?;
+        let backup_outcome = self.provision_managed_backups_after_enrollment().await;
+        let status = self.status().await?;
+        Ok((status, backup_outcome, enrollment))
+    }
+
+    /// The first half of [`Self::enroll`]: redeem `code` and persist the
+    /// resulting Cloud credential. Once this returns `Ok`, the instance *is*
+    /// linked, whatever happens next.
+    ///
+    /// Exposed separately (with [`Self::provision_managed_backups_after_enrollment`])
+    /// for callers that must do something the moment the credential lands --
+    /// the unattended first-boot path in `temps-cli` writes its
+    /// `CLOUD_LINK_CONNECTED` audit row here, *before* the second network
+    /// round-trip for managed backups, so no timeout or shutdown can leave a
+    /// persisted link without its audit record.
+    pub async fn enroll_link(&self, code: &str) -> Result<EnrollmentKind, CloudServiceError> {
+        self.configure_link_for_enrollment().await?;
+        self.link
+            .enroll(code)
+            .await
+            .map_err(CloudServiceError::Client)
+    }
+
+    /// [`Self::enroll_link`] for a caller with no operator behind it: redeems
+    /// `code` only if this instance holds no credential, and never replaces
+    /// one that appears while the code is in flight. The check is made inside
+    /// [`temps_cloud_client::CloudLink::enroll_if_unlinked`], under the same
+    /// lock as the write — a check made out here first would leave the window
+    /// this method exists to close.
+    ///
+    /// The cheap pre-check is still worth doing: it keeps a stale code from
+    /// re-running [`Self::configure_link_for_enrollment`] — which bumps the
+    /// link generation and would spuriously refuse an operator's enrollment
+    /// that happens to be in flight — on an instance that is already linked.
+    /// It is not what makes this safe.
+    pub async fn enroll_link_if_unlinked(
+        &self,
+        code: &str,
+    ) -> Result<FirstLinkEnrollment, CloudServiceError> {
+        if self.link.is_linked() {
+            return Ok(FirstLinkEnrollment::AlreadyLinked);
+        }
+        self.configure_link_for_enrollment().await?;
+        self.link
+            .enroll_if_unlinked(code)
+            .await
+            .map_err(CloudServiceError::Client)
+    }
+
+    /// Point the link at the configured backend and apply the feature
+    /// switches from settings, so the enrollment that follows persists a
+    /// credential for the right origin with the right exports enabled.
+    async fn configure_link_for_enrollment(&self) -> Result<(), CloudServiceError> {
         let settings = self.config.get_settings().await?;
         let backend = parse_backend(
             &settings.cloud.backend_url,
@@ -801,16 +865,16 @@ impl CloudService {
                 backups: settings.cloud.backups_enabled,
                 notifications: settings.cloud.notifications_enabled,
             })
-            .map_err(CloudServiceError::State)?;
-        let enrollment = self
-            .link
-            .enroll(code)
-            .await
-            .map_err(CloudServiceError::Client)?;
+            .map_err(CloudServiceError::State)
+    }
+
+    /// The second half of [`Self::enroll`]: fetch the tenant's managed backup
+    /// credential (if the plan includes one) and record the resulting setup
+    /// state. Never fails -- see [`ManagedBackupOutcome`].
+    pub async fn provision_managed_backups_after_enrollment(&self) -> ManagedBackupOutcome {
         let backup_outcome = self.provision_managed_backup_source().await;
         self.set_managed_backup_setup(managed_backup_setup_from_outcome(&backup_outcome));
-        let status = self.status().await?;
-        Ok((status, backup_outcome, enrollment))
+        backup_outcome
     }
 
     /// Fetch (or refresh) the tenant's managed backup credential and upsert

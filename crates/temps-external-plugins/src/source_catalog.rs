@@ -6,7 +6,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use temps_core::external_plugin::channel::PluginHostPermission;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use utoipa::ToSchema;
@@ -26,6 +27,10 @@ pub struct RepositoryCatalogPlugin {
     pub author: String,
     pub category: String,
     pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
     pub docs_url: Option<String>,
     pub logo_url: Option<String>,
     pub screenshots: Vec<RepositoryScreenshot>,
@@ -34,6 +39,32 @@ pub struct RepositoryCatalogPlugin {
     pub commit: String,
     pub readme_url: Option<String>,
     pub validation: RepositoryValidation,
+    /// Author-declared capabilities for display only; never used to grant access.
+    /// None means the legacy catalog did not declare permissions.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_permissions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(nullable = false)]
+    pub permissions: Option<Vec<RepositoryCatalogPermission>>,
+}
+
+fn deserialize_permissions<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<RepositoryCatalogPermission>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RepositoryCatalogPermission>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCatalogPermission {
+    pub permission: PluginHostPermission,
+    pub required: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -187,7 +218,7 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
         serde_json::from_slice(body).map_err(|error| SourceCatalogError::Invalid {
             reason: error.to_string(),
         })?;
-    if document.schema_version != 1 || document.plugins.len() > 100 {
+    if !matches!(document.schema_version, 1 | 2) || document.plugins.len() > 100 {
         return Err(SourceCatalogError::Invalid {
             reason: "unsupported schema version or too many entries".into(),
         });
@@ -197,6 +228,12 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
     for plugin in &document.plugins {
         let valid = crate::install::validate_plugin_name(&plugin.name).is_ok()
             && crate::repository::parse_repository(&plugin.repository).is_ok()
+            && (document.schema_version == 2 || plugin.path.is_none())
+            && matches!(crate::repository::normalize_path(plugin.path.as_deref(), &plugin.repository), Ok(path) if path == plugin.path)
+            && plugin
+                .ref_name
+                .as_deref()
+                .is_none_or(crate::repository::valid_git_ref)
             && plugin.commit.len() == 40
             && plugin.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
             && bounded_text(&plugin.title, 160)
@@ -220,6 +257,18 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
             && plugin.readme_url.as_deref().is_none_or(valid_https_url)
             && plugin.docs_url.as_deref().is_none_or(valid_https_url)
             && plugin.logo_url.as_deref().is_none_or(valid_https_url)
+            && plugin.permissions.as_ref().is_none_or(|permissions| {
+                permissions.len() <= 7
+                    && permissions.iter().all(|entry| {
+                        !entry.reason.trim().is_empty() && entry.reason.chars().count() <= 500
+                    })
+                    && permissions
+                        .iter()
+                        .map(|entry| entry.permission)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == permissions.len()
+            })
             && plugin.screenshots.len() <= 8
             && plugin.screenshots.iter().all(|shot| {
                 valid_https_url(&shot.url)
@@ -231,7 +280,7 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
             });
         if !valid
             || !names.insert(plugin.name.clone())
-            || !repositories.insert(plugin.repository.to_ascii_lowercase())
+            || !repositories.insert((plugin.repository.to_ascii_lowercase(), plugin.path.clone()))
         {
             return Err(SourceCatalogError::Invalid {
                 reason: format!("unsafe or duplicate plugin entry '{}'", plugin.name),
@@ -293,6 +342,105 @@ mod tests {
             parse_document(&unsafe_body),
             Err(SourceCatalogError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn permission_metadata_distinguishes_legacy_unknown_from_declared_empty() {
+        let base = serde_json::json!({"name":"demo","title":"Demo","summary":"Summary","description":"Description","author":"Team","category":"Development","repository":"https://github.com/example/demo","docsUrl":null,"logoUrl":null,"screenshots":[],"latestVersion":"1.0.0","platforms":["linux-amd64-gnu"],"commit":"a".repeat(40),"readmeUrl":null,"validation":{"metadata":"passed","build":"not_run"}});
+        let encode = |entry| {
+            serde_json::to_vec(&serde_json::json!({"schema_version":2,"plugins":[entry]}))
+                .expect("catalog JSON")
+        };
+        let legacy = parse_document(&encode(base.clone())).expect("legacy catalog");
+        assert!(legacy[0].permissions.is_none());
+        assert!(serde_json::to_value(&legacy[0])
+            .expect("serialized legacy")
+            .get("permissions")
+            .is_none());
+        let mut declared = base;
+        declared["permissions"] = serde_json::Value::Null;
+        assert!(matches!(
+            parse_document(&encode(declared.clone())),
+            Err(SourceCatalogError::Invalid { .. })
+        ));
+        declared["permissions"] = serde_json::json!([]);
+        let empty = parse_document(&encode(declared.clone())).expect("empty declaration");
+        assert!(empty[0].permissions.as_ref().is_some_and(Vec::is_empty));
+        assert_eq!(
+            serde_json::to_value(&empty[0]).expect("serialized empty")["permissions"],
+            serde_json::json!([])
+        );
+        declared["permissions"] = serde_json::json!([
+            {"permission":"projects_read","required":true,"reason":"Lists the projects you select"},
+            {"permission":"events_read","required":false,"reason":"Enables event summaries"}
+        ]);
+        let parsed = parse_document(&encode(declared)).expect("valid permissions");
+        assert_eq!(
+            parsed[0].permissions.as_ref().expect("declaration").len(),
+            2
+        );
+        let mut unicode = serde_json::to_value(&parsed[0]).expect("catalog plugin JSON");
+        unicode["permissions"][0]["reason"] = "é".repeat(500).into();
+        assert!(parse_document(&encode(unicode)).is_ok());
+    }
+
+    #[test]
+    fn permission_metadata_rejects_duplicates_unknown_names_and_bad_reasons() {
+        let mut entry = serde_json::json!({"name":"demo","title":"Demo","summary":"Summary","description":"Description","author":"Team","category":"Development","repository":"https://github.com/example/demo","docsUrl":null,"logoUrl":null,"screenshots":[],"latestVersion":"1.0.0","platforms":["linux-amd64-gnu"],"commit":"a".repeat(40),"readmeUrl":null,"validation":{"metadata":"passed","build":"not_run"}});
+        let encode = |entry: &serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({"schema_version":2,"plugins":[entry]}))
+                .expect("catalog JSON")
+        };
+        let mut verify_rejected = |permissions: serde_json::Value| {
+            entry["permissions"] = permissions;
+            assert!(matches!(
+                parse_document(&encode(&entry)),
+                Err(SourceCatalogError::Invalid { .. })
+            ));
+        };
+        verify_rejected(
+            serde_json::json!([{"permission":"projects_read","required":true,"reason":"One"},{"permission":"projects_read","required":false,"reason":"Two"}]),
+        );
+        verify_rejected(
+            serde_json::json!([{"permission":"network_all","required":true,"reason":"Unknown"}]),
+        );
+        verify_rejected(
+            serde_json::json!([{"permission":"projects_read","required":true,"reason":"   "}]),
+        );
+        verify_rejected(
+            serde_json::json!([{"permission":"projects_read","required":true,"reason":"é".repeat(501)}]),
+        );
+        verify_rejected(
+            serde_json::json!([{"permission":"projects_read","reason":"Missing required flag"}]),
+        );
+        verify_rejected(
+            serde_json::json!([{"permission":"projects_read","required":"yes","reason":"Wrong type"}]),
+        );
+        verify_rejected(serde_json::json!((0..8).map(|_| serde_json::json!({"permission":"projects_read","required":true,"reason":"Too many"})).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn schema_two_allows_sibling_paths_and_rejects_unsafe_or_duplicate_paths() {
+        let base = serde_json::json!({"name":"one","title":"One","summary":"Summary","description":"Description","author":"Team","category":"Development","repository":"https://github.com/example/plugins","path":"plugins/one","ref":"release/v1","docsUrl":null,"logoUrl":null,"screenshots":[],"latestVersion":"1.0.0","platforms":["linux-amd64-gnu"],"commit":"a".repeat(40),"readmeUrl":null,"validation":{"metadata":"passed","build":"not_run"}});
+        let mut sibling = base.clone();
+        sibling["name"] = "two".into();
+        sibling["path"] = "plugins/two".into();
+        let encoded = |version, plugins| {
+            serde_json::to_vec(&serde_json::json!({"schema_version":version,"plugins":plugins}))
+                .expect("catalog JSON")
+        };
+        assert_eq!(
+            parse_document(&encoded(2, vec![base.clone(), sibling.clone()]))
+                .expect("siblings")
+                .len(),
+            2
+        );
+        assert!(parse_document(&encoded(1, vec![base.clone()])).is_err());
+        sibling["path"] = base["path"].clone();
+        assert!(parse_document(&encoded(2, vec![base.clone(), sibling])).is_err());
+        let mut unsafe_entry = base;
+        unsafe_entry["path"] = "plugins/../other".into();
+        assert!(parse_document(&encoded(2, vec![unsafe_entry])).is_err());
     }
 
     #[tokio::test]

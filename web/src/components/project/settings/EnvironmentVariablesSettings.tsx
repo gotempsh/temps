@@ -114,8 +114,7 @@ function EnvironmentVariableRow({
   const [isRevealing, setIsRevealing] = useState(false)
   const revealScope = `${project.id}:${variable.id}:${variable.updated_at}`
   const revealGuard = useRef(createCredentialRevealGuard())
-  // Secret env vars stay masked in list responses. Plaintext is fetched only
-  // after an explicit reveal through the permission-checked, audited endpoint.
+  // Secret values remain write-only. Regular values can be revealed on demand.
   const isSecret = variable.is_secret ?? false
 
   useEffect(() => {
@@ -129,6 +128,7 @@ function EnvironmentVariableRow({
   }, [revealScope])
 
   const revealValue = async (): Promise<string | undefined> => {
+    if (isSecret) return undefined
     // Capture the guard instance once: revealGuard.current gets swapped to a
     // fresh guard (new, empty request map) whenever revealScope changes, which
     // happens as soon as this row's own edit is saved and the list refetches.
@@ -156,15 +156,12 @@ function EnvironmentVariableRow({
 
   useEffect(() => {
     revealGuard.current.cancel('value')
-    // Bulk reveal intentionally excludes secrets. A secret must be revealed
-    // through its own audited per-variable action, while "Hide all" still
-    // re-masks any secret that was revealed individually.
+    // Bulk reveal excludes secrets, including a row promoted since the last
+    // list refresh.
     if (isSecret) {
-      if (!showAllValues) {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setIsVisible(false)
-        setRevealedValue(undefined)
-      }
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsVisible(false)
+      setRevealedValue(undefined)
       return
     }
 
@@ -181,6 +178,7 @@ function EnvironmentVariableRow({
   const dataValue = credentialValueForScope(revealedValue, revealScope) ?? ''
 
   const toggleVisibility = async () => {
+    if (isSecret) return
     if (isVisible) {
       revealGuard.current.cancel('value')
       setIsVisible(false)
@@ -236,9 +234,8 @@ function EnvironmentVariableRow({
     variable.include_in_preview ?? false
   )
   // Whether the edit box actually holds the variable's current value. False
-  // when it has not been explicitly revealed, or when reveal was denied (it
-  // needs SecretsRead on top of EnvironmentsWrite) or failed. This
-  // distinguishes "cleared on purpose" from "never loaded" when saving.
+  // when it has not been explicitly revealed, or when reveal was denied or
+  // failed. This distinguishes "cleared on purpose" from "never loaded".
   const [valueLoaded, setValueLoaded] = useState(false)
   // Opt-in conversion of an existing plain variable into a masked secret.
   // The classification stays one-way so a later list response cannot
@@ -343,7 +340,7 @@ function EnvironmentVariableRow({
               <p className="font-medium break-all">{variable.key}</p>
               {isSecret && (
                 <span
-                  title="Sensitive value — masked by default; reveals are audited"
+                  title="Sensitive value — write-only"
                   className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
                 >
                   Secret
@@ -378,28 +375,30 @@ function EnvironmentVariableRow({
         <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
-              {isVisible
+              {isVisible && !isSecret
                 ? isRevealing && !dataValue
                   ? 'Revealing…'
                   : dataValue || '••••••••••••'
                 : '••••••••••••'}
             </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void toggleVisibility()}
-              disabled={isRevealing}
-              aria-label={
-                isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
-              }
-              title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
-            >
-              {isVisible ? (
-                <EyeOff className="h-4 w-4" />
-              ) : (
-                <Eye className="h-4 w-4" />
-              )}
-            </Button>
+            {!isSecret && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void toggleVisibility()}
+                disabled={isRevealing}
+                aria-label={
+                  isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
+                }
+                title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
+              >
+                {isVisible ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
+                )}
+              </Button>
+            )}
           </div>
           <Button
             variant="outline"
@@ -502,9 +501,8 @@ function EnvironmentVariableRow({
                 )}
                 {isSecret && (
                   <p className="text-xs text-muted-foreground">
-                    This secret stays masked unless explicitly revealed. Leave
-                    the value blank to change only environments or preview
-                    settings.
+                    Stored secret values cannot be revealed. Enter a replacement
+                    value to rotate it, or leave this blank to keep it.
                   </p>
                 )}
               </div>
@@ -567,8 +565,8 @@ function EnvironmentVariableRow({
                     </Label>
                     <p className="text-sm text-muted-foreground">
                       {convertToSecret
-                        ? `On save, ${variable.key} becomes a secret: it stays masked in lists and can only be viewed through an explicit, permission-checked, audited reveal. To make it a regular variable again you must delete it and create it anew.`
-                        : 'Mask this value by default and require explicit, audited access to reveal it. One-way: converting back means deleting and recreating the variable.'}
+                        ? `On save, ${variable.key} becomes write-only. To make it a regular variable again you must delete it and create it anew.`
+                        : 'Make this value write-only. Converting back requires deleting and recreating the variable.'}
                     </p>
                   </div>
                   <Switch
@@ -935,9 +933,9 @@ function AddEnvironmentVariableDialog({
                   Secret
                 </Label>
                 <p className="text-sm text-muted-foreground">
-                  Mask the value by default. Viewing it requires an explicit,
-                  audited reveal. Once enabled this classification cannot be
-                  reverted — the value can still be rotated.
+                  Stored secret values cannot be viewed after saving. This
+                  classification cannot be reverted; the value can still be
+                  rotated.
                 </p>
               </div>
               <Switch

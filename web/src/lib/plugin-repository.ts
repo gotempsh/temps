@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { z } from 'zod'
-import { pluginGrantsSchema } from './plugin-grants'
+import {
+  type PluginPermissionRequirement,
+  pluginGrantsSchema,
+} from './plugin-grants'
 
 export const repositoryInstallSchema = z.object({
   name: z
@@ -29,6 +32,22 @@ export const repositoryInstallSchema = z.object({
     )
     .or(z.literal(''))
     .optional(),
+  path: z
+    .string()
+    .max(512)
+    .refine(
+      (value) =>
+        value === '' ||
+        value
+          .split('/')
+          .every(
+            (part) =>
+              /^[A-Za-z0-9_.-]+$/.test(part) &&
+              !['.', '..', '.git'].includes(part.toLowerCase())
+          ),
+      'Use a relative plugin directory without empty segments, . or ...'
+    )
+    .optional(),
   trusted: z
     .boolean()
     .refine(Boolean, 'Confirm you trust this plugin before installing.'),
@@ -40,6 +59,9 @@ export type RepositorySelection = {
   name: string
   repository: string
   commit: string
+  path?: string | null
+  ref?: string | null
+  permissions?: PluginPermissionRequirement[] | null
 }
 
 /** Catalog selection pins the reviewed revision, but never grants execution consent. */
@@ -50,6 +72,7 @@ export function repositorySelectionValues(
     name: selection?.name ?? '',
     repository_url: selection?.repository ?? '',
     ref_name: selection?.commit ?? '',
+    ...(selection?.path ? { path: selection.path } : {}),
     trusted: false,
   }
 }
@@ -57,6 +80,7 @@ export function repositorySelectionValues(
 export function repositoryInstallBody(values: RepositoryInstallValues) {
   return {
     repository_url: values.repository_url,
+    ...(values.path ? { path: values.path } : {}),
     ...(values.name ? { name: values.name } : {}),
     ...(values.ref_name ? { ref_name: values.ref_name } : {}),
     ...(values.grants ? { grants: values.grants } : {}),

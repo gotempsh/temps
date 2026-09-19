@@ -11,9 +11,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use temps_ai::{
-    AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    NativeSessionExport, NativeSessionExportRequest, ProviderCapabilities, RefreshPolicy,
-    RuntimeProcessRequest, RuntimeProcessResponse, TokenStream, ToolExecutor, TurnServices,
+    AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, ChatTurnRequest, ChatTurnResponse,
+    ChatTurnStream, NativeSessionExport, NativeSessionExportRequest, ProviderCapabilities,
+    RefreshPolicy, RuntimeProcessRequest, RuntimeProcessResponse, TokenStream, ToolExecutor,
+    TurnServices,
 };
 
 /// Read seam for instance-wide server-authored summary defaults.
@@ -148,6 +149,18 @@ impl AiService for AiProviderRegistry {
             Some(service) => service.is_available_for(provider).await,
             None => false,
         }
+    }
+
+    async fn route_metadata(
+        &self,
+        provider: Option<&str>,
+        project_id: Option<i32>,
+        model: Option<&str>,
+    ) -> Option<AiRouteMetadata> {
+        self.routed(provider)
+            .await?
+            .route_metadata(provider, project_id, model)
+            .await
     }
 
     async fn chat_capable(&self) -> bool {

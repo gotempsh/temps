@@ -5,19 +5,9 @@ import type { ReloadFailureResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { PageHeader, Status } from '@temps-sdk/ds'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
 import {
   AlertDialog,
   AlertDialogContent,
@@ -43,25 +33,22 @@ import {
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   AlertCircle,
-  ChevronDown,
+  Plus,
   Loader2,
   Puzzle,
   RefreshCw,
   Shield,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
-import {
-  RepositoryInstall,
-  type RepositorySelection,
-} from '@/components/plugins/RepositoryInstall'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import { RepositoryUpdate } from '@/components/plugins/RepositoryUpdate'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
 
 export function PluginsPage() {
+  const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
   const canManagePlugins = canManageExternalPlugins(user?.role)
@@ -73,12 +60,8 @@ export function PluginsPage() {
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
-  const [catalogSelection, setCatalogSelection] =
-    useState<RepositorySelection | null>(null)
-  const [repositoryInstalling, setRepositoryInstalling] = useState(false)
-  const [advancedOpen, setAdvancedOpen] = useState(false)
-  const managementPending =
-    reloadPlugins.isPending || uninstallPlugin.isPending || repositoryInstalling
+  const [tab, setTab] = useState('browse')
+  const managementPending = reloadPlugins.isPending || uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -127,7 +110,7 @@ export function PluginsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       <PluginPermissionsDialog
         name={permissionsName}
         open={canManagePlugins && permissionsName !== null}
@@ -170,71 +153,64 @@ export function PluginsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <CardTitle>Plugins</CardTitle>
-              <CardDescription>
-                Discover plugins for your Temps instance.
-              </CardDescription>
-            </div>
-            {canManagePlugins && (
-              <Button
-                variant="outline"
-                onClick={handleReload}
-                disabled={managementPending}
-              >
-                {reloadPlugins.isPending ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="mr-2 h-4 w-4" />
-                )}
-                <span className="hidden sm:inline">Reload Plugins</span>
-                <span className="sm:hidden">Reload</span>
-              </Button>
-            )}
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          {canManagePlugins && reloadFailures.length > 0 && (
-            <Alert variant="destructive">
-              <AlertCircle className="size-4" />
-              <AlertTitle>Some plugins could not be reloaded</AlertTitle>
-              <AlertDescription>
-                <ul className="list-disc space-y-1 pl-4">
-                  {reloadFailures.map((failure, index) => (
-                    <li
-                      key={`${failure.plugin}-${index}`}
-                      className="break-words"
-                    >
-                      <strong>{failure.plugin || 'Plugin registry'}:</strong>{' '}
-                      {failure.reason}
-                    </li>
-                  ))}
-                </ul>
-              </AlertDescription>
-            </Alert>
-          )}
+      <PageHeader
+        title="Plugins"
+        description="Extend Temps with tools for your deployments."
+        actions={
+          canManagePlugins && (
+            <Button
+              onClick={() => {
+                navigate('/settings/plugins/install')
+              }}
+              disabled={managementPending}
+            >
+              <Plus className="mr-2 size-4" /> Install from GitHub
+            </Button>
+          )
+        }
+      />
+      <Tabs value={tab} onValueChange={setTab} className="space-y-6">
+        <TabsList aria-label="Plugin views">
+          <TabsTrigger value="browse">Browse</TabsTrigger>
+          <TabsTrigger value="running">
+            Running{' '}
+            <span className="ml-2 text-xs tabular-nums">
+              {pluginsLoading ? '…' : plugins.length}
+            </span>
+          </TabsTrigger>
+        </TabsList>
+        {canManagePlugins && reloadFailures.length > 0 && (
+          <Alert variant="destructive">
+            <AlertCircle className="size-4" />
+            <AlertTitle>Some plugins could not be reloaded</AlertTitle>
+            <AlertDescription>
+              <ul className="list-disc space-y-1 pl-4">
+                {reloadFailures.map((failure, index) => (
+                  <li
+                    key={`${failure.plugin}-${index}`}
+                    className="break-words"
+                  >
+                    <strong>{failure.plugin || 'Plugin registry'}:</strong>{' '}
+                    {failure.reason}
+                  </li>
+                ))}
+              </ul>
+            </AlertDescription>
+          </Alert>
+        )}
+        <TabsContent value="browse" className="space-y-4">
           <RepositoryCatalog
             canInstall={canManagePlugins}
             disabled={managementPending}
             installedNames={plugins.map((plugin) => plugin.name)}
             onSelect={(plugin) => {
-              setAdvancedOpen(false)
-              setCatalogSelection(plugin)
+              navigate(
+                `/settings/plugins/install?plugin=${encodeURIComponent(plugin.name)}&commit=${plugin.commit}`
+              )
             }}
           />
-          {canManagePlugins && catalogSelection && (
-            <RepositoryInstall
-              disabled={managementPending}
-              onSensitiveError={handleSensitiveActionError}
-              selection={catalogSelection}
-              onClearSelection={() => setCatalogSelection(null)}
-              onPendingChange={setRepositoryInstalling}
-            />
-          )}
-
+        </TabsContent>
+        <TabsContent value="running">
           <section
             className="space-y-3"
             aria-labelledby="running-plugins-title"
@@ -248,15 +224,25 @@ export function PluginsPage() {
                   Verified plugins currently loaded by Temps.
                 </p>
               </div>
-              <span className="shrink-0 text-sm text-muted-foreground">
-                {plugins.length} {plugins.length === 1 ? 'plugin' : 'plugins'}
-              </span>
+              {canManagePlugins && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleReload}
+                  disabled={managementPending}
+                >
+                  <RefreshCw
+                    className={`mr-2 size-4 ${reloadPlugins.isPending ? 'animate-spin' : ''}`}
+                  />
+                  {reloadPlugins.isPending ? 'Reloading…' : 'Reload plugins'}
+                </Button>
+              )}
             </div>
 
             {pluginsLoading ? (
               <RunningPluginsSkeleton />
             ) : plugins.length === 0 ? (
-              <div className="rounded-lg border border-dashed px-4 py-8 text-center">
+              <div className="rounded-lg border bg-card px-4 py-8 text-center">
                 <Puzzle className="mx-auto size-5 text-muted-foreground" />
                 <p className="mt-3 font-medium">
                   No verified plugins are running.
@@ -266,6 +252,14 @@ export function PluginsPage() {
                     ? 'Choose a plugin from the catalog to get started.'
                     : 'Ask a system administrator to install one.'}
                 </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-4"
+                  onClick={() => setTab('browse')}
+                >
+                  Browse plugins
+                </Button>
               </div>
             ) : (
               <div className="space-y-2">
@@ -280,9 +274,7 @@ export function PluginsPage() {
                           {plugin.display_name || plugin.name}
                         </p>
                         <Badge variant="secondary">v{plugin.version}</Badge>
-                        <Badge className="border-green-500/20 bg-green-500/15 text-green-700 hover:bg-green-500/20 dark:text-green-400">
-                          Running
-                        </Badge>
+                        <Status tone="ok" label="Running" />
                       </div>
                       {plugin.description && (
                         <p className="mt-1 text-sm text-muted-foreground">
@@ -291,7 +283,7 @@ export function PluginsPage() {
                       )}
                       <PluginNavigationHint nav={plugin.nav} />
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
                       {canManagePlugins && (
                         <Button
                           variant="ghost"
@@ -334,40 +326,8 @@ export function PluginsPage() {
               </div>
             )}
           </section>
-          {canManagePlugins && !catalogSelection && (
-            <Collapsible
-              open={advancedOpen}
-              onOpenChange={(open) => {
-                if (!managementPending) setAdvancedOpen(open)
-              }}
-              className="border-t pt-4"
-            >
-              <CollapsibleTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={managementPending}
-                  className="group gap-2"
-                >
-                  Advanced
-                  <ChevronDown
-                    aria-hidden="true"
-                    className="size-4 shrink-0 transition-transform group-data-[state=open]:rotate-180"
-                  />
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="pt-4">
-                <RepositoryInstall
-                  disabled={managementPending}
-                  onSensitiveError={handleSensitiveActionError}
-                  onPendingChange={setRepositoryInstalling}
-                />
-              </CollapsibleContent>
-            </Collapsible>
-          )}
-        </CardContent>
-      </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

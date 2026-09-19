@@ -73,10 +73,10 @@ pub struct CreateEnvironmentVariableRequest {
     #[serde(default = "default_include_in_preview")]
     #[schema(default = false)]
     pub include_in_preview: bool,
-    /// When true the variable is masked in list responses and can only be
-    /// viewed through the permission-checked, audited per-variable reveal
-    /// endpoint. Updates that omit the value preserve the existing ciphertext.
-    /// The flag is one-way — secret vars cannot be demoted to regular vars.
+    /// When true the stored value is write-only: it is omitted from API
+    /// responses and cannot be revealed, even by an administrator. Updates
+    /// that omit the value preserve the existing ciphertext. The flag is
+    /// one-way — secret vars cannot be demoted to regular vars.
     #[serde(default)]
     pub is_secret: bool,
 }
@@ -108,16 +108,17 @@ fn default_include_in_preview() -> bool {
 pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
-    /// Plaintext value for non-secret vars (or `"***"` mask for list responses).
-    /// `None` for secret vars; use the audited per-variable reveal endpoint.
+    /// Plaintext for regular variables in create/update responses, or `"***"`
+    /// in list responses. Always `None` for marked secrets. Only regular
+    /// variables can be read through the audited per-variable reveal endpoint.
     pub value: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<EnvironmentInfo>,
     /// Include this environment variable in preview environments
     pub include_in_preview: bool,
-    /// Whether the variable is a secret. Secrets always have `value: None` in
-    /// list responses.
+    /// Whether the stored value is write-only. Marked secrets always have
+    /// `value: None` in API responses and cannot be revealed.
     pub is_secret: bool,
 }
 
@@ -132,8 +133,8 @@ pub struct EnvironmentInfo {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct GetEnvironmentVariablesQuery {
     pub environment_id: Option<i32>,
-    /// Exact manual env-var row to reveal. Required by the dashboard so
-    /// duplicate keys on disjoint environments cannot cross-reveal.
+    /// Exact manual env-var row to read when it is not marked secret. Required
+    /// by the dashboard so duplicate keys cannot select a different row.
     pub var_id: Option<i32>,
     /// Required by integration-value reveals to bind the plaintext response to
     /// the exact service displayed by the client.
@@ -250,6 +251,8 @@ pub struct AddEnvironmentDomainRequest {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct EnvironmentVariableValueResponse {
+    /// Plaintext for a regular manual or integration-sourced variable.
+    /// Marked secret manual variables never produce this response.
     pub value: String,
 }
 
@@ -284,8 +287,8 @@ pub struct EnvVarIntegrationInfo {
 
 /// One entry in the computed env-var view that merges manual and integration
 /// sources and tags each result with its origin. `value_preview` is always
-/// masked — plaintext must be fetched per-key via the existing reveal endpoint,
-/// which is audit-logged.
+/// masked. Regular manual values and integration values can be fetched per-key
+/// through an audited endpoint; marked secret manual values are write-only.
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct ResolvedEnvVarResponse {
     pub key: String,

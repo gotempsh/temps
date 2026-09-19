@@ -212,6 +212,8 @@ pub(crate) struct RepositoryReceipt {
     pub source: String,
     pub repository: String,
     pub ref_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub commit: String,
     pub builder: String,
     pub plugin_name: String,
@@ -1548,6 +1550,7 @@ async fn verify_repository_active(
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
         || receipt.ref_name.contains("..")
+        || !matches!(crate::repository::normalize_path(receipt.path.as_deref(), &receipt.repository), Ok(path) if path == receipt.path)
         || receipt.commit.len() != 40
         || !receipt.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
         || receipt.builder != crate::repository::BUILDER_IMAGE
@@ -2135,6 +2138,7 @@ mod tests {
             source: "github".into(),
             repository: "https://github.com/example/plugin".into(),
             ref_name: "main".into(),
+            path: None,
             commit: "a".repeat(40),
             builder: crate::repository::BUILDER_IMAGE.into(),
             plugin_name: name.into(),
@@ -2180,6 +2184,7 @@ mod tests {
             .expect("read source")
             .expect("repository receipt");
         assert_eq!(source.ref_name, "main");
+        assert_eq!(source.path, None, "legacy root receipt defaults to root");
         assert_eq!(source.commit, "a".repeat(40));
         #[cfg(unix)]
         tokio::fs::set_permissions(
@@ -2220,13 +2225,26 @@ mod tests {
         let mut source: RepositoryReceipt =
             serde_json::from_slice(&tokio::fs::read(&receipt_path).await.expect("read receipt"))
                 .expect("parse receipt");
-        source.builder = "oven/bun@sha256:invalid".into();
+        source.path = Some("../escape".into());
         tokio::fs::write(
             &receipt_path,
             serde_json::to_vec(&source).expect("serialize receipt"),
         )
         .await
         .expect("tamper receipt");
+        let discovered = discover_active(temp.path(), &config).await;
+        assert!(matches!(
+            &discovered[0],
+            Err(InstallError::InvalidReceipt { .. })
+        ));
+        source.path = None;
+        source.builder = "oven/bun@sha256:invalid".into();
+        tokio::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&source).expect("serialize receipt"),
+        )
+        .await
+        .expect("tamper builder");
         let discovered = discover_active(temp.path(), &config).await;
         assert!(matches!(
             &discovered[0],

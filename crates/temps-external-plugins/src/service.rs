@@ -22,6 +22,9 @@ use crate::install::{
     normalize_digest, platform_target, validate_plugin_name, validate_release_for_install,
     validate_version, InstallError, PluginInstaller, RepositoryReceipt,
 };
+use crate::install_progress::{
+    InstallProgressStore, ProgressError, ProgressHandle, ProgressSnapshot, Stage,
+};
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
 use crate::repository::{self, RepositoryError};
@@ -47,6 +50,7 @@ pub struct ExternalPluginsService {
     /// must be committed in a single monotonic order with installations.
     registry_state: tokio::sync::Mutex<()>,
     source_catalog: crate::source_catalog::SourceCatalog,
+    install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     closing: AtomicBool,
@@ -118,6 +122,9 @@ impl SelectedRepository {
     pub fn repository(&self) -> &str {
         &self.source.repository
     }
+    pub fn path(&self) -> Option<&str> {
+        self.source.path.as_deref()
+    }
     pub fn source_commit(&self) -> &str {
         &self.source.commit
     }
@@ -136,7 +143,65 @@ pub struct RepositoryInstallOutcome {
     pub actor_id: String,
 }
 
+pub struct RepositoryInstallPreparation {
+    pub progress: Option<ProgressHandle>,
+    pub requested_source: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryInstallPreparationError {
+    #[error("Install progress ID must be a UUID")]
+    InvalidProgressId,
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Progress(#[from] ProgressError),
+}
+
 impl ExternalPluginsService {
+    pub async fn prepare_repository_install(
+        &self,
+        repository_url: &str,
+        path: Option<&str>,
+        progress_id: Option<&str>,
+    ) -> Result<RepositoryInstallPreparation, RepositoryInstallPreparationError> {
+        let id = progress_id
+            .map(|raw| {
+                uuid::Uuid::parse_str(raw)
+                    .map(|id| id.to_string())
+                    .map_err(|_| RepositoryInstallPreparationError::InvalidProgressId)
+            })
+            .transpose()?;
+        let source = (|| {
+            let (owner, repo) = repository::parse_repository(repository_url)?;
+            let canonical = format!("https://github.com/{owner}/{repo}");
+            let path = repository::normalize_path(path, &canonical)?;
+            Ok::<_, RepositoryError>(crate::manager::repository_actor_source(
+                &canonical,
+                path.as_deref(),
+            ))
+        })();
+        // Calls without a progress ID keep the existing sync install behavior:
+        // selection reports source errors after the requested audit is recorded.
+        let requested_source = if id.is_some() {
+            Some(source?)
+        } else {
+            source.ok()
+        };
+        let progress = match id {
+            Some(id) => Some(self.install_progress.register(id).await?),
+            None => None,
+        };
+        Ok(RepositoryInstallPreparation {
+            progress,
+            requested_source,
+        })
+    }
+
+    pub async fn repository_install_progress(&self, id: &str) -> Option<ProgressSnapshot> {
+        self.install_progress.snapshot(id).await
+    }
+
     pub async fn plugin_grants(
         &self,
         name: &str,
@@ -183,6 +248,7 @@ impl ExternalPluginsService {
         &self,
         name: &str,
         repository_url: &str,
+        path: Option<&str>,
     ) -> Result<(), ExternalPluginsError> {
         let (owner, repo) = repository::parse_repository(repository_url)?;
         let canonical = format!("https://github.com/{owner}/{repo}");
@@ -192,13 +258,13 @@ impl ExternalPluginsService {
             .await
             .is_ok();
         if active_exists
-            && existing
-                .as_ref()
-                .is_none_or(|source| source.repository != canonical)
+            && existing.as_ref().is_none_or(|source| {
+                source.repository != canonical || source.path.as_deref() != path
+            })
         {
             return Err(repository::RepositoryError::SourceConflict {
                 name: name.to_string(),
-                repository: canonical,
+                repository: format!("{canonical} (path '{}')", path.unwrap_or("/")),
             }
             .into());
         }
@@ -218,6 +284,19 @@ impl ExternalPluginsService {
         requested_name: Option<&str>,
         repository_url: &str,
         reference: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<SelectedRepository, ExternalPluginsError> {
+        self.select_repository_with_progress(requested_name, repository_url, reference, path, None)
+            .await
+    }
+
+    pub async fn select_repository_with_progress(
+        &self,
+        requested_name: Option<&str>,
+        repository_url: &str,
+        reference: Option<&str>,
+        path: Option<&str>,
+        progress: Option<&ProgressHandle>,
     ) -> Result<SelectedRepository, ExternalPluginsError> {
         if let Some(name) = requested_name {
             validate_plugin_name(name)?;
@@ -243,16 +322,24 @@ impl ExternalPluginsService {
                 path: staging.display().to_string(),
                 reason: error.to_string(),
             })?;
-        let source = repository::fetch_source(
+        if let Some(progress) = progress {
+            progress.advance(Stage::FetchingSource).await;
+        }
+        let source = repository::fetch_source_with_progress(
             repository_url,
             reference,
+            path,
             temporary.path().join("source"),
             requested_name,
+            progress,
         )
         .await?;
         validate_plugin_name(&source.name)?;
-        self.ensure_repository_identity(&source.name, repository_url)
+        self.ensure_repository_identity(&source.name, repository_url, source.path.as_deref())
             .await?;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         Ok(SelectedRepository {
             name: source.name.clone(),
             source,
@@ -264,14 +351,35 @@ impl ExternalPluginsService {
         &self,
         selected: SelectedRepository,
     ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        self.install_repository_with_progress(selected, None).await
+    }
+
+    pub async fn install_repository_with_progress(
+        &self,
+        selected: SelectedRepository,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        if let Some(progress) = progress {
+            progress.advance(Stage::WaitingForLifecycle).await;
+        }
         let _lifecycle = self.lifecycle.lock().await;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        self.ensure_repository_identity(&selected.name, &selected.source.repository)
-            .await?;
+        self.ensure_repository_identity(
+            &selected.name,
+            &selected.source.repository,
+            selected.source.path.as_deref(),
+        )
+        .await?;
         let output = selected._temporary.path().join("plugin");
-        repository::build(&selected.source, &output).await?;
+        repository::build_with_progress(&selected.source, &output, progress).await?;
+        if let Some(progress) = progress {
+            progress.complete_current().await;
+        }
         let sha256 = crate::install::hash_regular_file_capped(
             &selected.name,
             &output,
@@ -283,6 +391,7 @@ impl ExternalPluginsService {
             source: "github".to_string(),
             repository: selected.source.repository.clone(),
             ref_name: selected.source.ref_name.clone(),
+            path: selected.source.path.clone(),
             commit: selected.source.commit.clone(),
             builder: repository::BUILDER_IMAGE.to_string(),
             plugin_name: selected.name.clone(),
@@ -296,6 +405,9 @@ impl ExternalPluginsService {
             &output,
         )
         .await?;
+        if let Some(progress) = progress {
+            progress.advance(Stage::StartingPlugin).await;
+        }
         let pending = match self
             .manager
             .prepare_candidate(
@@ -303,7 +415,10 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::repository_actor_source(&selected.source.repository),
+                crate::manager::repository_actor_source(
+                    &selected.source.repository,
+                    selected.source.path.as_deref(),
+                ),
             )
             .await
         {
@@ -338,6 +453,9 @@ impl ExternalPluginsService {
                     });
                 }
             };
+        if let Some(progress) = progress {
+            progress.advance(Stage::PromotingPlugin).await;
+        }
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         let activation_rollback = match installer.capture_activation(&candidate).await {
             Ok(rollback) => rollback,
@@ -424,6 +542,7 @@ impl ExternalPluginsService {
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
+            install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
         }
     }
@@ -514,6 +633,7 @@ impl ExternalPluginsService {
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
+            install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
         }
     }
@@ -1023,6 +1143,166 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
+    async fn repository_install_preparation_validates_before_reserving_progress() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = ExternalPluginsService::new_empty(
+            ExternalPluginConfig::new(
+                temp.path().to_path_buf(),
+                "postgres://localhost/test".into(),
+            ),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        let source = "https://github.com/example/plugin";
+        let id = uuid::Uuid::from_u128(1).to_string();
+        assert!(matches!(
+            service
+                .prepare_repository_install(source, Some("../escape"), Some(&id))
+                .await,
+            Err(RepositoryInstallPreparationError::Repository(
+                RepositoryError::UnsafePath { .. }
+            ))
+        ));
+        assert!(matches!(
+            service
+                .prepare_repository_install("https://evil.example/plugin", None, Some(&id))
+                .await,
+            Err(RepositoryInstallPreparationError::Repository(
+                RepositoryError::UnsafeUrl
+            ))
+        ));
+        assert!(service.repository_install_progress(&id).await.is_none());
+        assert!(matches!(
+            service
+                .prepare_repository_install(source, None, Some("not-a-uuid"))
+                .await,
+            Err(RepositoryInstallPreparationError::InvalidProgressId)
+        ));
+        let legacy = service
+            .prepare_repository_install("https://evil.example/plugin", None, None)
+            .await
+            .expect("legacy request proceeds to selection");
+        assert!(legacy.progress.is_none());
+        assert!(legacy.requested_source.is_none());
+        let prepared = service
+            .prepare_repository_install(source, Some("plugins/first"), Some(&id))
+            .await
+            .expect("valid reservation");
+        assert_eq!(
+            prepared.requested_source.as_deref(),
+            Some("repository:https://github.com/example/plugin/tree/plugins/first")
+        );
+        assert!(prepared.progress.is_some());
+        assert!(matches!(
+            service
+                .prepare_repository_install(source, None, Some(&id))
+                .await,
+            Err(RepositoryInstallPreparationError::Progress(
+                ProgressError::Duplicate { .. }
+            ))
+        ));
+        for index in 2..=64 {
+            let id = uuid::Uuid::from_u128(index).to_string();
+            service
+                .prepare_repository_install(source, None, Some(&id))
+                .await
+                .expect("fill active slots");
+        }
+        let overflow = uuid::Uuid::from_u128(65).to_string();
+        assert!(matches!(
+            service
+                .prepare_repository_install(source, None, Some(&overflow))
+                .await,
+            Err(RepositoryInstallPreparationError::Progress(
+                ProgressError::Full
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn repository_install_reports_actual_lifecycle_wait() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        ));
+        let progress = service
+            .install_progress
+            .register("queued-install".into())
+            .await
+            .expect("register progress");
+        progress.advance(Stage::FetchingSource).await;
+        progress.complete_current().await;
+        let gate = service.lifecycle.lock().await;
+        let selected = SelectedRepository {
+            source: repository::RepositorySource {
+                repository: "https://github.com/example/plugin".into(),
+                name: "fixture-plugin".into(),
+                ref_name: "main".into(),
+                path: None,
+                commit: "a".repeat(40),
+                version: "1.0.0".into(),
+                source_dir: temp.path().to_path_buf(),
+            },
+            _temporary: tempfile::tempdir().expect("staging dir"),
+            name: "fixture-plugin".into(),
+        };
+        let installing_service = service.clone();
+        let installing_progress = progress.clone();
+        let install = tokio::spawn(async move {
+            installing_service
+                .install_repository_with_progress(selected, Some(&installing_progress))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = service
+                    .repository_install_progress("queued-install")
+                    .await
+                    .expect("progress exists");
+                if snapshot.stages.len() == 2 {
+                    assert_eq!(
+                        snapshot.stages[0].status,
+                        crate::install_progress::ProgressStatus::Completed
+                    );
+                    assert_eq!(snapshot.stages[1].stage, "waiting_for_lifecycle");
+                    assert_eq!(
+                        snapshot.stages[1].status,
+                        crate::install_progress::ProgressStatus::Running
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting stage visible before lock acquisition");
+        service.closing.store(true, Ordering::Release);
+        drop(gate);
+        assert!(matches!(
+            install.await.expect("install task"),
+            Err(ExternalPluginsError::ShuttingDown)
+        ));
+        let snapshot = service
+            .repository_install_progress("queued-install")
+            .await
+            .expect("progress remains");
+        assert_eq!(
+            snapshot.stages[1].status,
+            crate::install_progress::ProgressStatus::Completed
+        );
+    }
+
+    #[tokio::test]
     async fn registry_install_cannot_replace_repository_source() {
         let temp = tempfile::tempdir().expect("tempdir");
         let signing = SigningKey::from_bytes(&[42; 32]);
@@ -1046,6 +1326,7 @@ mod tests {
             source: "github".into(),
             repository: "https://github.com/example/plugin".into(),
             ref_name: "main".into(),
+            path: Some("plugins/first".into()),
             commit: "a".repeat(40),
             builder: repository::BUILDER_IMAGE.into(),
             plugin_name: "fixture-plugin".into(),
@@ -1061,6 +1342,38 @@ mod tests {
             .activate(&candidate)
             .await
             .expect("activate repo");
+        assert!(service
+            .ensure_repository_identity(
+                "fixture-plugin",
+                "https://github.com/example/plugin",
+                Some("plugins/first")
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            service
+                .ensure_repository_identity(
+                    "fixture-plugin",
+                    "https://github.com/example/plugin",
+                    Some("plugins/sibling")
+                )
+                .await,
+            Err(ExternalPluginsError::Repository(
+                RepositoryError::SourceConflict { .. }
+            ))
+        ));
+        assert!(matches!(
+            service
+                .ensure_repository_identity(
+                    "fixture-plugin",
+                    "https://github.com/example/plugin",
+                    None
+                )
+                .await,
+            Err(ExternalPluginsError::Repository(
+                RepositoryError::SourceConflict { .. }
+            ))
+        ));
         let selected = selected_plugin(
             "http://127.0.0.1/artifact".into(),
             b"fixture",
