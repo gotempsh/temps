@@ -19,6 +19,7 @@ pub use handler::{
 };
 pub use plugin::CloudPlugin;
 pub use service::{
-    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
-    ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction, ManagedBackupSetupStatus,
+    BootstrapBackendUrlOutcome, CloudAiCapability, CloudCapability, CloudService,
+    CloudServiceError, CloudStatus, ManagedBackupOutcome, ManagedBackupSetup,
+    ManagedBackupSetupAction, ManagedBackupSetupStatus,
 };
