@@ -275,8 +275,13 @@ impl BackupExecutor {
                 engine: params.engine.clone(),
                 reason: reason.clone(),
             };
-            self.finalize_failed(params.backup_id, &params.engine, &err.to_string())
-                .await;
+            // Propagate a DB failure here rather than logging it: the
+            // processor treats `EngineUnavailableHere` as handled and the
+            // queue does not redeliver, so a row that failed to flip would
+            // stay `pending` (and keep its schedule blocked) while looking
+            // reported.
+            self.try_finalize_failed(params.backup_id, &params.engine, &err.to_string())
+                .await?;
             return Err(err);
         }
 
@@ -566,16 +571,43 @@ UPDATE external_service_backups
         Ok(())
     }
 
+    /// Terminal failure for a task that has no caller left to report to: the
+    /// state transition is attempted, a DB error is logged, and the
+    /// out-of-band signals fire regardless so an operator still hears about
+    /// the failed backup even when the row could not be updated.
     async fn finalize_failed(&self, backup_id: i32, engine_key: &str, reason: &str) {
-        if let Err(e) = self.mark_backup_failed(backup_id, reason).await {
+        if let Err(e) = self
+            .try_finalize_failed(backup_id, engine_key, reason)
+            .await
+        {
             error!(
                 backup_id,
                 error = %e,
                 "BackupExecutor: finalize_failed UPDATE failed",
             );
+            self.announce_failure(backup_id, engine_key, reason);
         }
-        let _ = mark_schedule_run_finished_if_done(self.inner.db.as_ref(), backup_id).await;
+    }
 
+    /// Terminal failure where the caller can act on a DB error: the row is
+    /// flipped to `failed` first, and only once that has succeeded does the
+    /// notifier / event publisher announce it. Announcing a failure whose row
+    /// is still `pending` would tell the operator the backup is over while it
+    /// is still counted as in flight by the schedule fan-out.
+    async fn try_finalize_failed(
+        &self,
+        backup_id: i32,
+        engine_key: &str,
+        reason: &str,
+    ) -> Result<(), sea_orm::DbErr> {
+        self.mark_backup_failed(backup_id, reason).await?;
+        let _ = mark_schedule_run_finished_if_done(self.inner.db.as_ref(), backup_id).await;
+        self.announce_failure(backup_id, engine_key, reason);
+        Ok(())
+    }
+
+    /// Fire-and-forget the failure notification and `BackupFailed` event.
+    fn announce_failure(&self, backup_id: i32, engine_key: &str, reason: &str) {
         // Fire-and-forget the failure notification. The notifier is
         // responsible for its own error handling; we never await the
         // spawned task so a slow SMTP/webhook cannot stall the finalize
@@ -1001,6 +1033,43 @@ mod tests {
             close_sql.contains("UPDATE schedule_runs"),
             "the parent schedule run must be closed, not left in flight: {close_sql}",
         );
+    }
+
+    /// If the row cannot be flipped, `spawn` must say so. The processor treats
+    /// `EngineUnavailableHere` as fully handled and the queue never redelivers,
+    /// so swallowing the DB error here would leave a `pending` row that looks
+    /// reported while still counting as in flight for its schedule.
+    #[tokio::test]
+    async fn an_unavailable_engine_whose_row_cannot_be_failed_reports_the_db_error() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(
+                    "connection reset by peer".to_string(),
+                )])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_unavailable_engines(
+                ["postgres_pgdump"],
+                "this process has no local Docker daemon",
+            )
+            .build();
+
+        let error = executor
+            .spawn(SpawnParams {
+                backup_id: 42,
+                engine: "postgres_pgdump".to_string(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })
+            .await
+            .expect_err("a failed state transition must not be reported as handled");
+
+        assert!(
+            matches!(error, SpawnError::Database(_)),
+            "expected the DB error to propagate, got {error:?}",
+        );
+        assert!(executor.inner.in_flight.lock().await.is_empty());
     }
 
     /// The counterpart: a key nothing in the product answers to really is a
