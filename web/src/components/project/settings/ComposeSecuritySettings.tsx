@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ComposeSecurityCheckDefinition } from '@/api/client'
 import {
-  getComposeSecurityOptions,
-  updateComposeSecurityMutation,
-} from '@/api/client/@tanstack/react-query.gen'
+  updateComposeSecurity,
+  type ComposeSecurityCheckDefinition,
+  type UpdateComposeSecurityData,
+} from '@/api/client'
+import { getComposeSecurityOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
   AlertDialog,
   AlertDialogContent,
@@ -39,13 +40,8 @@ import { ChevronDown, ShieldAlert } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
-export function ComposeSecuritySettings({
-  projectId,
-  hasLegacyExceptions = false,
-}: {
-  projectId: number
-  hasLegacyExceptions?: boolean
-}) {
+export function ComposeSecuritySettings({ projectId }: { projectId: number }) {
+  const [legacyAcknowledged, setLegacyAcknowledged] = useState(false)
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [pending, setPending] = useState<ComposeSecurityCheckDefinition | null>(
@@ -56,7 +52,25 @@ export function ComposeSecuritySettings({
   const options = getComposeSecurityOptions({ path: { id: projectId } })
   const query = useQuery(options)
   const mutation = useMutation({
-    ...updateComposeSecurityMutation(),
+    retry: false,
+    mutationFn: async (request: {
+      path: UpdateComposeSecurityData['path']
+      body: UpdateComposeSecurityData['body']
+    }) => {
+      // Problem Details responses omit their status field; preserve the HTTP status.
+      const result = await updateComposeSecurity({
+        ...request,
+        throwOnError: false,
+        responseStyle: 'fields',
+      })
+      if (!result.data) {
+        throw Object.assign(
+          new Error('Could not save Compose security settings'),
+          { status: result.response?.status }
+        )
+      }
+      return result.data
+    },
     onSuccess: (data) => {
       queryClient.setQueryData(options.queryKey, data)
       setPending(null)
@@ -65,10 +79,21 @@ export function ComposeSecuritySettings({
         'Compose security settings saved. Applies on the next deployment.'
       )
     },
-    onError: () =>
-      toast.error(
-        'Could not save Compose security settings. Refresh and try again.'
-      ),
+    onError: (error) => {
+      setPending(null)
+      setAcknowledged(false)
+      setLegacyAcknowledged(false)
+      if ((error as { status?: number })?.status === 409) {
+        toast.error(
+          'Another administrator changed these settings. Review the refreshed policy and try again.'
+        )
+        void query.refetch()
+      } else {
+        toast.error(
+          'Could not save Compose security settings. Refresh and try again.'
+        )
+      }
+    },
   })
   const canEdit = query.data?.can_edit ?? false
   const disabled = query.data?.policy.disabled_checks ?? []
@@ -92,6 +117,7 @@ export function ComposeSecuritySettings({
       path: { id: projectId },
       body: {
         policy: { disabled_checks: next },
+        expected_policy: query.data.policy,
         acknowledge_risks: !enforce && acknowledged,
       },
     })
@@ -128,7 +154,7 @@ export function ComposeSecuritySettings({
           />
         </button>
       </CollapsibleTrigger>
-      {hasLegacyExceptions && (
+      {query.data?.legacy_migration_pending && (
         <p
           role="note"
           className="px-4 pb-4 text-sm text-amber-700 dark:text-amber-400"
@@ -174,6 +200,40 @@ export function ComposeSecuritySettings({
               <p className="text-sm text-muted-foreground">
                 Only instance administrators can change these settings.
               </p>
+            )}
+            {query.data.legacy_migration_pending && canEdit && (
+              <div className="space-y-2 rounded-md border p-3">
+                <label className="flex items-start gap-2 text-sm">
+                  <Checkbox
+                    checked={legacyAcknowledged}
+                    onCheckedChange={(checked) =>
+                      setLegacyAcknowledged(checked === true)
+                    }
+                    disabled={mutation.isPending}
+                  />
+                  I have reviewed the exceptions this project needs for its next
+                  deployment.
+                </label>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!legacyAcknowledged || mutation.isPending}
+                  onClick={() => {
+                    if (!query.data) return
+                    mutation.mutate({
+                      path: { id: projectId },
+                      body: {
+                        policy: query.data.policy,
+                        expected_policy: query.data.policy,
+                        acknowledge_risks: false,
+                        acknowledge_legacy_migration: true,
+                      },
+                    })
+                  }}
+                >
+                  Complete legacy migration
+                </Button>
+              </div>
             )}
             <Input
               aria-label="Search Compose security checks"

@@ -3880,6 +3880,7 @@ export type ComposeSecurityPolicy = {
 export type ComposeSecurityResponse = {
     can_edit: boolean;
     checks: Array<ComposeSecurityCheckDefinition>;
+    legacy_migration_pending: boolean;
     policy: ComposeSecurityPolicy;
 };
 
@@ -11814,7 +11815,6 @@ export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
     path?: string | null;
-    progressId?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -15859,22 +15859,6 @@ export type ProblemDetails = {
     type?: string | null;
 };
 
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
-
 export type ProjectAccessResponse = {
     created_at: string;
     granted_by: number;
@@ -17748,12 +17732,6 @@ export type RepointContinuousArchiveSourceRequest = {
     new_s3_source_id: number;
 };
 
-export type RepositoryCatalogPermission = {
-    permission: PluginHostPermission;
-    reason: string;
-    required: boolean;
-};
-
 export type RepositoryCatalogPlugin = {
     author: string;
     category: string;
@@ -17764,11 +17742,6 @@ export type RepositoryCatalogPlugin = {
     logoUrl?: string | null;
     name: string;
     path?: string | null;
-    /**
-     * Author-declared capabilities for display only; never used to grant access.
-     * None means the legacy catalog did not declare permissions.
-     */
-    permissions?: Array<RepositoryCatalogPermission>;
     platforms: Array<string>;
     readmeUrl?: string | null;
     ref?: string | null;
@@ -23046,7 +23019,12 @@ export type UpdateCloudflareProviderRequest = {
 };
 
 export type UpdateComposeSecurityRequest = {
+    acknowledge_legacy_migration?: boolean;
     acknowledge_risks?: boolean;
+    /**
+     * Policy read by the editor; compared while holding the project lock.
+     */
+    expected_policy: ComposeSecurityPolicy;
     policy: ComposeSecurityPolicy;
 };
 
@@ -46383,6 +46361,10 @@ export type UpdateComposeSecurityErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Policy changed; refresh before retrying
+     */
+    409: unknown;
 };
 
 export type UpdateComposeSecurityResponses = {
@@ -62928,30 +62910,6 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
-
-export type GetRepositoryInstallProgressData = {
-    body?: never;
-    path: {
-        /**
-         * Client-generated installation UUID
-         */
-        id: string;
-    };
-    query?: never;
-    url: '/x/plugins/install/progress/{id}';
-};
-
-export type GetRepositoryInstallProgressErrors = {
-    404: ProblemDetails;
-};
-
-export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
-
-export type GetRepositoryInstallProgressResponses = {
-    200: ProgressSnapshot;
-};
-
-export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
 
 export type InstallRepositoryData = {
     body: InstallRepositoryRequest;

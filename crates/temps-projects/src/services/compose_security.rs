@@ -7,12 +7,14 @@ use sea_orm::{
 };
 use temps_core::problemdetails::Problem;
 use temps_entities::{
-    compose_security::ComposeSecurityPolicy, compose_security_policies,
-    compose_security_policy_changes, projects,
+    compose_security::ComposeSecurityPolicy, compose_security_legacy_migrations,
+    compose_security_policies, compose_security_policy_changes, projects,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum ComposeSecurityError {
+    #[error("Compose security settings for project {project_id} changed since they were loaded. Refresh and review the current policy before retrying.")]
+    Conflict { project_id: i32 },
     #[error("Project {project_id} was not found while accessing Compose security settings")]
     NotFound { project_id: i32 },
     #[error("Project {project_id} does not use Docker Compose")]
@@ -30,6 +32,7 @@ pub enum ComposeSecurityError {
 impl From<ComposeSecurityError> for Problem {
     fn from(error: ComposeSecurityError) -> Self {
         let status = match &error {
+            ComposeSecurityError::Conflict { .. } => StatusCode::CONFLICT,
             ComposeSecurityError::NotFound { .. } => StatusCode::NOT_FOUND,
             ComposeSecurityError::NotCompose { .. }
             | ComposeSecurityError::AcknowledgementRequired { .. } => StatusCode::BAD_REQUEST,
@@ -93,6 +96,8 @@ pub async fn update(
     actor: i32,
     policy: ComposeSecurityPolicy,
     acknowledged: bool,
+    expected_policy: ComposeSecurityPolicy,
+    acknowledge_legacy_migration: bool,
 ) -> Result<ComposeSecurityPolicy, ComposeSecurityError> {
     let tx = db
         .begin()
@@ -116,6 +121,9 @@ pub async fn update(
         .map_err(|e| db_error(project_id, "read previous", e))?
         .map(|row| row.policy)
         .unwrap_or_default();
+    if previous != expected_policy {
+        return Err(ComposeSecurityError::Conflict { project_id });
+    }
     if policy
         .disabled_checks
         .difference(&previous.disabled_checks)
@@ -154,10 +162,29 @@ pub async fn update(
     .exec_without_returning(&tx)
     .await
     .map_err(|e| db_error(project_id, "record grant history for", e))?;
+    if acknowledge_legacy_migration {
+        compose_security_legacy_migrations::Entity::delete_by_id(project_id)
+            .exec(&tx)
+            .await
+            .map_err(|e| db_error(project_id, "acknowledge legacy migration for", e))?;
+    }
     tx.commit()
         .await
         .map_err(|e| db_error(project_id, "commit", e))?;
     Ok(previous)
+}
+
+pub async fn legacy_migration_pending(
+    db: &temps_database::DbConnection,
+    project_id: i32,
+) -> Result<bool, ComposeSecurityError> {
+    Ok(
+        compose_security_legacy_migrations::Entity::find_by_id(project_id)
+            .one(db)
+            .await
+            .map_err(|e| db_error(project_id, "read legacy migration for", e))?
+            .is_some(),
+    )
 }
 
 #[cfg(test)]
@@ -246,7 +273,16 @@ mod tests {
             .append_query_results([Vec::<compose_security_policies::Model>::new()])
             .into_connection();
         assert!(matches!(
-            update(&db, 7, 1, granted(), false).await,
+            update(
+                &db,
+                7,
+                1,
+                granted(),
+                false,
+                ComposeSecurityPolicy::default(),
+                false
+            )
+            .await,
             Err(ComposeSecurityError::AcknowledgementRequired { project_id: 7 })
         ));
         let log = format!("{:?}", db.into_transaction_log());
@@ -271,7 +307,17 @@ mod tests {
             ])
             .into_connection();
         assert_eq!(
-            update(&db, 7, 1, granted(), true).await.unwrap(),
+            update(
+                &db,
+                7,
+                1,
+                granted(),
+                true,
+                ComposeSecurityPolicy::default(),
+                false
+            )
+            .await
+            .unwrap(),
             ComposeSecurityPolicy::default()
         );
         let log = format!("{:?}", db.into_transaction_log());
@@ -292,7 +338,16 @@ mod tests {
             .append_exec_errors([sea_orm::DbErr::Custom("history unavailable".into())])
             .into_connection();
         assert!(matches!(
-            update(&db, 7, 1, granted(), true).await,
+            update(
+                &db,
+                7,
+                1,
+                granted(),
+                true,
+                ComposeSecurityPolicy::default(),
+                false
+            )
+            .await,
             Err(ComposeSecurityError::Database {
                 operation: "record grant history for",
                 ..
@@ -320,10 +375,58 @@ mod tests {
             ])
             .into_connection();
         assert_eq!(
-            update(&db, 7, 1, ComposeSecurityPolicy::default(), false)
-                .await
-                .unwrap(),
+            update(
+                &db,
+                7,
+                1,
+                ComposeSecurityPolicy::default(),
+                false,
+                granted(),
+                false
+            )
+            .await
+            .unwrap(),
             granted()
         );
+    }
+    #[tokio::test]
+    async fn stale_editor_cannot_restore_a_revoked_privileged_exception() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[project("docker-compose")]])
+            .append_query_results([[row(ComposeSecurityPolicy::default())]])
+            .into_connection();
+        let stale = ComposeSecurityPolicy {
+            disabled_checks: [ComposeSecurityCheck::Privileged].into(),
+        };
+        let mut proposed = stale.clone();
+        proposed
+            .disabled_checks
+            .insert(ComposeSecurityCheck::Extends);
+        assert!(matches!(
+            update(&db, 7, 1, proposed, true, stale, false).await,
+            Err(ComposeSecurityError::Conflict { project_id: 7 })
+        ));
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("ROLLBACK"));
+        assert!(!log.contains("INSERT"));
+    }
+    #[tokio::test]
+    async fn durable_legacy_notice_reads_pending_completed_and_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[compose_security_legacy_migrations::Model { project_id: 7 }]])
+            .append_query_results([Vec::<compose_security_legacy_migrations::Model>::new()])
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "migration notice unavailable".into(),
+            )])
+            .into_connection();
+        assert!(legacy_migration_pending(&db, 7).await.unwrap());
+        assert!(!legacy_migration_pending(&db, 7).await.unwrap());
+        assert!(matches!(
+            legacy_migration_pending(&db, 7).await,
+            Err(ComposeSecurityError::Database {
+                operation: "read legacy migration for",
+                ..
+            })
+        ));
     }
 }

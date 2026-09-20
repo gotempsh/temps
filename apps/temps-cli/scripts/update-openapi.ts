@@ -20,6 +20,7 @@
  */
 
 import { SPEC_PATH, pathCount, serialize } from './openapi-canonical'
+import { coreOpenApi } from './core-openapi'
 
 const DEFAULT_URL = 'http://localhost:8080/api/api-docs/openapi.json'
 
@@ -64,8 +65,8 @@ if (!response.ok) {
   process.exit(1)
 }
 
-const spec = await response.json()
-const paths = pathCount(spec)
+const fetched = await response.json()
+const paths = pathCount(fetched)
 if (paths === 0) {
   // A spec with no paths means the server answered but the doc was not
   // assembled — writing it would silently delete the entire committed client.
@@ -73,6 +74,7 @@ if (paths === 0) {
   process.exit(1)
 }
 
+const spec = coreOpenApi(fetched, await Bun.file(SPEC_PATH).json())
 await Bun.write(SPEC_PATH, serialize(spec))
-console.log(`Wrote ${SPEC_PATH} (${paths} paths)`)
+console.log(`Wrote ${SPEC_PATH} (${pathCount(spec)} paths)`)
 console.log('Now run: bun run generate:api')

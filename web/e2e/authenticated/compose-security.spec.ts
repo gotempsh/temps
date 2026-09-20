@@ -30,6 +30,7 @@ test('Compose policy exceptions require acknowledgment and persist independently
     const denied = await page.request.put(endpoint, {
       data: {
         policy: { disabled_checks: ['extends'] },
+        expected_policy: catalog.policy,
         acknowledge_risks: false,
       },
     })
@@ -68,8 +69,35 @@ test('Compose policy exceptions require acknowledgment and persist independently
       (await (await page.request.get(endpoint)).json()).policy.disabled_checks
     ).toEqual([])
 
+    // Another administrator changes the server policy while this editor remains stale.
+    const currentPolicy = (await (await page.request.get(endpoint)).json())
+      .policy
+    const otherAdmin = await page.request.put(endpoint, {
+      data: {
+        expected_policy: currentPolicy,
+        policy: { disabled_checks: ['external_volumes'] },
+        acknowledge_risks: true,
+      },
+    })
+    expect(otherAdmin.ok()).toBe(true)
+    await check.click()
+    await dialog.getByRole('checkbox').check()
+    await confirm.click()
+    await expect(
+      page.getByText(
+        'Another administrator changed these settings. Review the refreshed policy and try again.'
+      )
+    ).toBeVisible()
+    await expect(dialog).not.toBeVisible()
+    await expect(check).toBeChecked()
+    expect(
+      (await (await page.request.get(endpoint)).json()).policy.disabled_checks
+    ).toEqual(['external_volumes'])
+
     await search.fill('external volumes')
-    await expect(page.locator('#compose-check-external_volumes')).toBeChecked()
+    await expect(
+      page.locator('#compose-check-external_volumes')
+    ).not.toBeChecked()
     await search.fill('no-matching-policy')
     await expect(
       page.getByText('No security checks match your search.')
@@ -82,20 +110,38 @@ test('Compose policy exceptions require acknowledgment and persist independently
       )
     ).toBe(true)
 
+    let migrationPending = true
+    await page.route(`**${endpoint}`, async (route) => {
+      if (route.request().method() === 'PUT') {
+        expect(
+          route.request().postDataJSON().acknowledge_legacy_migration
+        ).toBe(true)
+        migrationPending = false
+      }
+      await route.fulfill({
+        json: { ...catalog, legacy_migration_pending: migrationPending },
+      })
+    })
+    await page.reload()
+    await expect(page.getByRole('note')).toBeVisible()
+    await trigger.click()
+    const completeMigration = page.getByRole('button', {
+      name: 'Complete legacy migration',
+    })
+    await expect(completeMigration).toBeDisabled()
+    await page
+      .getByRole('checkbox', {
+        name: 'I have reviewed the exceptions this project needs for its next deployment.',
+      })
+      .check()
+    await completeMigration.click()
+    await expect(page.getByRole('note')).not.toBeVisible()
+    expect(migrationPending).toBe(false)
+    await page.unroute(`**${endpoint}`)
+
     await page.route(`**${endpoint}`, (route) =>
       route.fulfill({
-        json: { ...catalog, can_edit: false },
-      })
-    )
-    await page.route(`**/api/projects/by-slug/${project.slug}`, (route) =>
-      route.fulfill({
-        json: {
-          ...project,
-          preset_config: {
-            preset: 'docker-compose',
-            unsandboxedServices: ['proxy'],
-          },
-        },
+        json: { ...catalog, can_edit: false, legacy_migration_pending: true },
       })
     )
     await page.reload()

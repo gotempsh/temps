@@ -20,11 +20,16 @@ pub struct ComposeSecurityResponse {
     pub policy: ComposeSecurityPolicy,
     pub checks: Vec<ComposeSecurityCheckDefinition>,
     pub can_edit: bool,
+    pub legacy_migration_pending: bool,
 }
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateComposeSecurityRequest {
     pub policy: ComposeSecurityPolicy,
+    /// Policy read by the editor; compared while holding the project lock.
+    pub expected_policy: ComposeSecurityPolicy,
+    #[serde(default)]
+    pub acknowledge_legacy_migration: bool,
     #[serde(default)]
     pub acknowledge_risks: bool,
 }
@@ -42,6 +47,10 @@ pub async fn get_compose_security(
     let policy = state.project_service.compose_security_policy(id).await?;
     Ok(Json(ComposeSecurityResponse {
         policy,
+        legacy_migration_pending: state
+            .project_service
+            .compose_security_legacy_migration_pending(id)
+            .await?,
         checks: ComposeSecurityCheck::catalog(),
         can_edit: auth.is_admin() && auth.has_permission(&temps_auth::Permission::ProjectsWrite),
     }))
@@ -49,7 +58,7 @@ pub async fn get_compose_security(
 
 #[utoipa::path(put, path = "/projects/{id}/compose-security", tag = "Projects",
     params(("id" = i32, Path, description = "Project ID")), request_body = UpdateComposeSecurityRequest,
-    responses((status = 200, body = ComposeSecurityResponse), (status = 400, description = "Invalid settings or missing acknowledgement"), (status = 403, description = "Instance administrator required"), (status = 404, description = "Project not found")))]
+    responses((status = 200, body = ComposeSecurityResponse), (status = 400, description = "Invalid settings or missing acknowledgement"), (status = 409, description = "Policy changed; refresh before retrying"), (status = 403, description = "Instance administrator required"), (status = 404, description = "Project not found")))]
 pub async fn update_compose_security(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
@@ -67,6 +76,8 @@ pub async fn update_compose_security(
             auth.user_id(),
             request.policy.clone(),
             request.acknowledge_risks,
+            request.expected_policy,
+            request.acknowledge_legacy_migration,
         )
         .await?;
     let event = ComposeSecurityAudit {
@@ -76,12 +87,17 @@ pub async fn update_compose_security(
         user_agent: metadata.user_agent,
         previous,
         policy: request.policy.clone(),
+        acknowledged_legacy_migration: request.acknowledge_legacy_migration,
     };
     if let Err(error) = state.audit_service.create_audit_log(&event).await {
         tracing::error!(project_id = id, actor = auth.user_id(), %error, "Failed to record Compose security policy audit event");
     }
     Ok(Json(ComposeSecurityResponse {
         policy: request.policy,
+        legacy_migration_pending: state
+            .project_service
+            .compose_security_legacy_migration_pending(id)
+            .await?,
         checks: ComposeSecurityCheck::catalog(),
         can_edit: true,
     }))
@@ -104,6 +120,7 @@ struct ComposeSecurityAudit {
     user_agent: String,
     previous: ComposeSecurityPolicy,
     policy: ComposeSecurityPolicy,
+    acknowledged_legacy_migration: bool,
 }
 impl AuditOperation for ComposeSecurityAudit {
     fn operation_type(&self) -> String {

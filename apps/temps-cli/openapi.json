@@ -8426,6 +8426,9 @@
             },
             "type": "array"
           },
+          "legacy_migration_pending": {
+            "type": "boolean"
+          },
           "policy": {
             "$ref": "#/components/schemas/ComposeSecurityPolicy"
           }
@@ -8433,7 +8436,8 @@
         "required": [
           "policy",
           "checks",
-          "can_edit"
+          "can_edit",
+          "legacy_migration_pending"
         ],
         "type": "object"
       },
@@ -25893,12 +25897,6 @@
               "null"
             ]
           },
-          "progressId": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "ref_name": {
             "type": [
               "string",
@@ -34864,67 +34862,6 @@
         ],
         "type": "object"
       },
-      "ProgressSnapshot": {
-        "properties": {
-          "elapsed_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "id": {
-            "type": "string"
-          },
-          "stages": {
-            "items": {
-              "$ref": "#/components/schemas/ProgressStage"
-            },
-            "type": "array"
-          },
-          "status": {
-            "$ref": "#/components/schemas/ProgressStatus"
-          }
-        },
-        "required": [
-          "id",
-          "status",
-          "elapsed_ms",
-          "stages"
-        ],
-        "type": "object"
-      },
-      "ProgressStage": {
-        "properties": {
-          "elapsed_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "message": {
-            "type": "string"
-          },
-          "stage": {
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/ProgressStatus"
-          }
-        },
-        "required": [
-          "stage",
-          "message",
-          "status",
-          "elapsed_ms"
-        ],
-        "type": "object"
-      },
-      "ProgressStatus": {
-        "enum": [
-          "running",
-          "completed",
-          "failed"
-        ],
-        "type": "string"
-      },
       "ProjectAccessResponse": {
         "properties": {
           "created_at": {
@@ -38877,26 +38814,6 @@
         ],
         "type": "object"
       },
-      "RepositoryCatalogPermission": {
-        "additionalProperties": false,
-        "properties": {
-          "permission": {
-            "$ref": "#/components/schemas/PluginHostPermission"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "required": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "permission",
-          "required",
-          "reason"
-        ],
-        "type": "object"
-      },
       "RepositoryCatalogPlugin": {
         "properties": {
           "author": {
@@ -38934,13 +38851,6 @@
               "string",
               "null"
             ]
-          },
-          "permissions": {
-            "description": "Author-declared capabilities for display only; never used to grant access.\nNone means the legacy catalog did not declare permissions.",
-            "items": {
-              "$ref": "#/components/schemas/RepositoryCatalogPermission"
-            },
-            "type": "array"
           },
           "platforms": {
             "items": {
@@ -50522,15 +50432,23 @@
       "UpdateComposeSecurityRequest": {
         "additionalProperties": false,
         "properties": {
+          "acknowledge_legacy_migration": {
+            "type": "boolean"
+          },
           "acknowledge_risks": {
             "type": "boolean"
+          },
+          "expected_policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Policy read by the editor; compared while holding the project lock."
           },
           "policy": {
             "$ref": "#/components/schemas/ComposeSecurityPolicy"
           }
         },
         "required": [
-          "policy"
+          "policy",
+          "expected_policy"
         ],
         "type": "object"
       },
@@ -90999,6 +90917,9 @@
           },
           "404": {
             "description": "Project not found"
+          },
+          "409": {
+            "description": "Policy changed; refresh before retrying"
           }
         },
         "tags": [
@@ -117418,52 +117339,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryCatalogResponse"
-                }
-              }
-            },
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "External Plugins"
-        ]
-      }
-    },
-    "/x/plugins/install/progress/{id}": {
-      "get": {
-        "operationId": "getRepositoryInstallProgress",
-        "parameters": [
-          {
-            "description": "Client-generated installation UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProgressSnapshot"
-                }
-              }
-            },
-            "description": ""
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

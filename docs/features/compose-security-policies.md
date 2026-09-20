@@ -25,12 +25,12 @@ The volume must already exist on the same Docker daemon. The producer can use an
 
 ## Compatibility
 
-These settings replace the former `unsandboxedServices` option. Existing deployments keep running, but the next deployment enforces the new policy. Administrators must acknowledge any exceptions they still need before redeploying. Generic project updates and templates cannot grant legacy sandbox exceptions.
+These settings replace the former `unsandboxedServices` option. Existing deployments keep running, but the next deployment enforces the new policy. Administrators must acknowledge any exceptions they still need before redeploying. Generic project updates and templates cannot grant legacy sandbox exceptions. A durable migration notice survives unrelated project edits and policy toggles. After reviewing the required exceptions, an administrator can explicitly complete the migration with `acknowledge_legacy_migration: true`; the notice is cleared in the same audited transaction.
 
 ## API and enforcement
 
 - `GET /api/projects/{id}/compose-security` returns the policy, check catalog, and `can_edit`.
-- `PUT /api/projects/{id}/compose-security` accepts `policy.disabled_checks` and `acknowledge_risks`. Newly disabled checks require acknowledgment; restoring checks does not.
+- `PUT /api/projects/{id}/compose-security` accepts `policy.disabled_checks`, the required `expected_policy` snapshot, and `acknowledge_risks`. Newly disabled checks require acknowledgment; restoring checks does not. The server compares `expected_policy` with the current policy while holding the project lock and returns `409 Conflict` on a mismatch. Refresh and review before retrying; stale requests never restore revoked exceptions.
 - Only effective instance-administrator credentials with project write access can change grants. Deployment tokens and project-writer API keys cannot.
 - Policy changes and their actor/previous state are committed atomically in an audit-history transaction. Grants are stored separately from imported project configuration.
 - Referenced Compose files are resolved and the resulting configuration is checked before deployment. Allowing `extends` or `include` does not waive checks on inherited fields.

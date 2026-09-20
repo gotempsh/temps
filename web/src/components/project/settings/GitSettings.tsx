@@ -1237,15 +1237,7 @@ function GitSettingsInline({
               isUploadedSource={isUploadedSource}
             />
 
-            <ComposeSecuritySettings
-              projectId={project.id}
-              hasLegacyExceptions={Boolean(
-                (
-                  composeConfig.unsandboxedServices ??
-                  composeConfig.unsandboxed_services
-                )?.length
-              )}
-            />
+            <ComposeSecuritySettings projectId={project.id} />
 
             {!isUploadedSource && (
               <Collapsible

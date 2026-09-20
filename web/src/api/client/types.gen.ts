@@ -3880,6 +3880,7 @@ export type ComposeSecurityPolicy = {
 export type ComposeSecurityResponse = {
     can_edit: boolean;
     checks: Array<ComposeSecurityCheckDefinition>;
+    legacy_migration_pending: boolean;
     policy: ComposeSecurityPolicy;
 };
 
@@ -23046,7 +23047,12 @@ export type UpdateCloudflareProviderRequest = {
 };
 
 export type UpdateComposeSecurityRequest = {
+    acknowledge_legacy_migration?: boolean;
     acknowledge_risks?: boolean;
+    /**
+     * Policy read by the editor; compared while holding the project lock.
+     */
+    expected_policy: ComposeSecurityPolicy;
     policy: ComposeSecurityPolicy;
 };
 
@@ -46383,6 +46389,10 @@ export type UpdateComposeSecurityErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Policy changed; refresh before retrying
+     */
+    409: unknown;
 };
 
 export type UpdateComposeSecurityResponses = {
