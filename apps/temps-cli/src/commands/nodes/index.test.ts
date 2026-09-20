@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { describeCapability, type NodeCapabilityResponse } from './index.js'
+import { capabilityRemedy, describeCapability } from './index.js'
+import type { NodeCapabilityResponse } from '../../api/types.gen.js'
 
 function makeCapability(overrides: Partial<NodeCapabilityResponse> = {}): NodeCapabilityResponse {
   return {
@@ -11,9 +12,32 @@ function makeCapability(overrides: Partial<NodeCapabilityResponse> = {}): NodeCa
     schedulable: true,
     reason: null,
     setup_path: '/settings/nodes',
+    can_manage_nodes: true,
     ...overrides,
   }
 }
+
+describe('capabilityRemedy', () => {
+  test('tells an operator who can manage nodes how to add one', () => {
+    const remedy = capabilityRemedy(
+      makeCapability({ local_workloads: false, schedulable: false })
+    )
+    expect(remedy).toContain('temps join')
+    expect(remedy).toContain('/settings/nodes')
+  })
+
+  test('does not send a credential without node permissions to a page that refuses it', () => {
+    const remedy = capabilityRemedy(
+      makeCapability({
+        local_workloads: false,
+        schedulable: false,
+        can_manage_nodes: false,
+      })
+    )
+    expect(remedy).toContain('Ask an administrator')
+    expect(remedy).not.toContain('temps join')
+  })
+})
 
 describe('describeCapability', () => {
   test('a single-binary install runs workloads on this host', () => {

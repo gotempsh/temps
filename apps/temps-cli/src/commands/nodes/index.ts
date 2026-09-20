@@ -3,37 +3,11 @@
 
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
-import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import type { ProblemDetails } from '../../api/types.gen.js'
+import { setupClient, getErrorMessage } from '../../lib/api-client.js'
+import { nodeCapabilityGet } from '../../api/sdk.gen.js'
+import type { NodeCapabilityResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { newline, header, icons, json, colors, keyValue } from '../../ui/output.js'
-
-// ============================================================================
-// Hand-written request/response shapes
-// ============================================================================
-//
-// `GET /api/nodes/capability` is implemented in `temps-deployments` (core, not
-// a plugin) so it belongs in the generated OpenAPI client in principle.
-// Generating requires `bun run spec:update` against a live server, which
-// wasn't available when this command was added — see root CLAUDE.md's
-// "Regenerating the OpenAPI clients". This interface is hand-maintained to
-// mirror `crates/temps-deployments/src/handlers/nodes.rs`'s
-// `NodeCapabilityResponse` exactly. Once the spec is regenerated against a
-// running server, switch this command to the generated types/functions and
-// delete this. Same arrangement as `commands/cluster/index.ts`.
-
-export interface NodeCapabilityResponse {
-  /** Whether the control plane itself may run containers, builds and services. */
-  local_workloads: boolean
-  /** Active, heartbeating worker nodes. Excludes the control plane. */
-  active_worker_nodes: number
-  /** Whether a workload can be placed at all. */
-  schedulable: boolean
-  /** Why nothing can be placed, when `schedulable` is false. */
-  reason: string | null
-  /** Console path where an operator joins a worker node. */
-  setup_path: string
-}
 
 // ============================================================================
 // Presentation (unit tested)
@@ -52,6 +26,22 @@ export function describeCapability(capability: NodeCapabilityResponse): string {
     )
   }
   return targets.join(' + ')
+}
+
+/**
+ * What to do about an unschedulable install, addressed to whoever is holding
+ * this credential.
+ *
+ * A token without Settings permissions cannot mint an enrollment token, so
+ * telling its owner to "configure one at /settings/nodes" sends them to a page
+ * that refuses them. Say who to ask instead — the operator running this CLI
+ * has no support channel to work that out from.
+ */
+export function capabilityRemedy(capability: NodeCapabilityResponse): string {
+  if (!capability.can_manage_nodes) {
+    return 'Ask an administrator to add a worker node — this credential cannot manage nodes.'
+  }
+  return `Join a worker node with \`temps join\`, or configure one at ${capability.setup_path}`
 }
 
 // ============================================================================
@@ -80,9 +70,7 @@ async function capabilityAction(options: { json?: boolean }): Promise<void> {
   await setupClient()
 
   const result = await withSpinner('Checking workload placement capability...', async () => {
-    const { data, error } = await client.get<NodeCapabilityResponse, ProblemDetails>({
-      url: 'nodes/capability',
-    })
+    const { data, error } = await nodeCapabilityGet()
     if (error || !data) {
       throw new Error(getErrorMessage(error))
     }
@@ -110,9 +98,7 @@ async function capabilityAction(options: { json?: boolean }): Promise<void> {
   if (!result.schedulable) {
     newline()
     console.log(`  ${colors.error(result.reason ?? 'Nothing can be scheduled.')}`)
-    console.log(
-      `  ${colors.muted(`Join a worker node with \`temps join\`, or configure one at ${result.setup_path}`)}`
-    )
+    console.log(`  ${colors.muted(capabilityRemedy(result))}`)
   }
 
   newline()
