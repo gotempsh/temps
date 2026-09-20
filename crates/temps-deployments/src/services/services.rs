@@ -184,9 +184,6 @@ pub enum DeploymentError {
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
-    #[error(transparent)]
-    DockerUnavailable(#[from] temps_core::DockerUnavailable),
-
     #[error("Other error: {0}")]
     Other(String),
 }

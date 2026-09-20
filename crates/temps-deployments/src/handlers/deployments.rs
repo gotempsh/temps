@@ -484,9 +484,6 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
-            DeploymentError::DockerUnavailable(_) => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Docker Unavailable")
-                .with_detail(err.to_string()),
         }
     }
 }
