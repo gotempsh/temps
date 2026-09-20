@@ -11795,6 +11795,7 @@ export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
     path?: string | null;
+    progressId?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -15839,6 +15840,22 @@ export type ProblemDetails = {
     type?: string | null;
 };
 
+export type ProgressSnapshot = {
+    elapsed_ms: number;
+    id: string;
+    stages: Array<ProgressStage>;
+    status: ProgressStatus;
+};
+
+export type ProgressStage = {
+    elapsed_ms: number;
+    message: string;
+    stage: string;
+    status: ProgressStatus;
+};
+
+export type ProgressStatus = 'running' | 'completed' | 'failed';
+
 export type ProjectAccessResponse = {
     created_at: string;
     granted_by: number;
@@ -17712,6 +17729,12 @@ export type RepointContinuousArchiveSourceRequest = {
     new_s3_source_id: number;
 };
 
+export type RepositoryCatalogPermission = {
+    permission: PluginHostPermission;
+    reason: string;
+    required: boolean;
+};
+
 export type RepositoryCatalogPlugin = {
     author: string;
     category: string;
@@ -17722,6 +17745,11 @@ export type RepositoryCatalogPlugin = {
     logoUrl?: string | null;
     name: string;
     path?: string | null;
+    /**
+     * Author-declared capabilities for display only; never used to grant access.
+     * None means the legacy catalog did not declare permissions.
+     */
+    permissions?: Array<RepositoryCatalogPermission>;
     platforms: Array<string>;
     readmeUrl?: string | null;
     ref?: string | null;
@@ -43866,7 +43894,16 @@ export type GetGenaiTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/genai/traces/{project_id}/{trace_id}';
 };
 
@@ -44002,7 +44039,16 @@ export type GetUnifiedTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/global/traces/{trace_id}';
 };
 
@@ -44978,7 +45024,16 @@ export type GetTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/traces/{project_id}/{trace_id}';
 };
 
@@ -62814,6 +62869,30 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
+
+export type GetRepositoryInstallProgressData = {
+    body?: never;
+    path: {
+        /**
+         * Client-generated installation UUID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/x/plugins/install/progress/{id}';
+};
+
+export type GetRepositoryInstallProgressErrors = {
+    404: ProblemDetails;
+};
+
+export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
+
+export type GetRepositoryInstallProgressResponses = {
+    200: ProgressSnapshot;
+};
+
+export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
 
 export type InstallRepositoryData = {
     body: InstallRepositoryRequest;

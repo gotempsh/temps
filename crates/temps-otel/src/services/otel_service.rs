@@ -1119,6 +1119,32 @@ impl OtelService {
         self.storage.get_trace(project_id, trace_id).await
     }
 
+    pub async fn get_trace_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SpanRecord>, OtelError> {
+        self.storage
+            .get_trace_in_window(project_id, trace_id, start, end)
+            .await
+    }
+
+    pub async fn trace_window_hint(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, OtelError> {
+        Ok(self
+            .storage
+            .get_trace_ref_projects(trace_id)
+            .await?
+            .into_iter()
+            .find(|reference| reference.project_id == project_id)
+            .map(|reference| reference.first_seen))
+    }
+
     /// Per-operation latency statistics for the queried window.
     ///
     /// Validates the window here rather than in the handler so every caller —
@@ -1202,6 +1228,18 @@ impl OtelService {
             .await
     }
 
+    pub async fn get_genai_trace_spans_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<GenAiSpanDetail>, OtelError> {
+        self.storage
+            .get_genai_trace_spans_in_window(project_id, trace_id, start, end)
+            .await
+    }
+
     pub async fn count_genai_traces(&self, query: TraceQuery) -> Result<u64, OtelError> {
         self.storage.count_genai_traces(query).await
     }
@@ -1213,6 +1251,18 @@ impl OtelService {
     ) -> Result<Vec<GenAiEvent>, OtelError> {
         self.storage
             .get_genai_trace_events(project_id, trace_id)
+            .await
+    }
+
+    pub async fn get_genai_trace_events_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<GenAiEvent>, OtelError> {
+        self.storage
+            .get_genai_trace_events_in_window(project_id, trace_id, start, end)
             .await
     }
 

@@ -400,6 +400,49 @@ fn discovery_window(
     (start, end)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TraceDetailWindowParams {
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
+async fn detail_window(
+    state: &OtelAppState,
+    project_id: i32,
+    trace_id: &str,
+    params: &TraceDetailWindowParams,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), Problem> {
+    let invalid = || {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Invalid Trace Time Range")
+        .with_detail("Provide both start_time and end_time as RFC 3339 dates, with a window greater than zero and no longer than 31 days")
+    };
+    match (&params.start_time, &params.end_time) {
+        (Some(start), Some(end)) => {
+            let start = parse_datetime(start).ok_or_else(invalid)?;
+            let end = parse_datetime(end).ok_or_else(invalid)?;
+            if start >= end || end - start > chrono::Duration::days(31) {
+                return Err(invalid());
+            }
+            Ok((start, end))
+        }
+        (None, None) => {
+            let hint = state
+                .otel_service
+                .trace_window_hint(project_id, trace_id)
+                .await?;
+            if let Some(first_seen) = hint {
+                let start = first_seen - chrono::Duration::minutes(5);
+                Ok((start, start + chrono::Duration::hours(24)))
+            } else {
+                let end = Utc::now();
+                Ok((end - chrono::Duration::hours(24), end))
+            }
+        }
+        _ => Err(invalid()),
+    }
+}
+
 pub(super) fn parse_attributes(s: &str) -> BTreeMap<String, String> {
     s.split(',')
         .filter_map(|pair| {
@@ -1106,6 +1149,8 @@ fn parse_span_status_param(s: &str) -> Option<SpanStatusCode> {
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("trace_id" = String, Path, description = "Trace ID (hex)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); pair with end_time, max 31 days"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); pair with start_time, max 31 days"),
     ),
     responses(
         (status = 200, description = "Trace spans tree", body = TracesResponse),
@@ -1119,6 +1164,7 @@ pub async fn get_trace(
     RequireAuth(auth): RequireAuth,
     State(state): State<OtelAppState>,
     Path((project_id, trace_id)): Path<(i32, String)>,
+    Query(params): Query<TraceDetailWindowParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
     // Confine a project-scoped deployment token to its own project (no-op for
@@ -1126,7 +1172,11 @@ pub async fn get_trace(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    let data = state.otel_service.get_trace(project_id, &trace_id).await?;
+    let (start, end) = detail_window(&state, project_id, &trace_id, &params).await?;
+    let data = state
+        .otel_service
+        .get_trace_in_window(project_id, &trace_id, start, end)
+        .await?;
     let count = data.len();
 
     Ok(Json(TracesResponse { data, count }))
@@ -1626,11 +1676,35 @@ pub async fn query_genai_traces(
         attrs.insert("gen_ai.request.model".to_string(), model.clone());
     }
 
+    let parsed_start = params
+        .start_time
+        .as_deref()
+        .map(|value| {
+            parse_datetime(value).ok_or_else(|| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid GenAI Time Range")
+                    .with_detail("start_time must be an RFC 3339 date")
+            })
+        })
+        .transpose()?;
+    let parsed_end = params
+        .end_time
+        .as_deref()
+        .map(|value| {
+            parse_datetime(value).ok_or_else(|| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid GenAI Time Range")
+                    .with_detail("end_time must be an RFC 3339 date")
+            })
+        })
+        .transpose()?;
+    let (start_time, end_time) = trace_summary_window(false, parsed_start, parsed_end, Utc::now())?;
+
     let query = TraceQuery {
         project_id: params.project_id,
         service_name: params.service_name,
-        start_time: params.start_time.as_deref().and_then(parse_datetime),
-        end_time: params.end_time.as_deref().and_then(parse_datetime),
+        start_time,
+        end_time,
         attributes: if attrs.is_empty() {
             None
         } else {
@@ -1669,6 +1743,8 @@ pub async fn query_genai_traces(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("trace_id" = String, Path, description = "Trace ID (hex)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); pair with end_time, max 31 days"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); pair with start_time, max 31 days"),
     ),
     responses(
         (status = 200, description = "GenAI trace span details", body = GenAiTraceDetailResponse),
@@ -1682,6 +1758,7 @@ pub async fn get_genai_trace(
     RequireAuth(auth): RequireAuth,
     State(state): State<OtelAppState>,
     Path((project_id, trace_id)): Path<(i32, String)>,
+    Query(params): Query<TraceDetailWindowParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
     // Confine a project-scoped deployment token to its own project (no-op for
@@ -1689,15 +1766,16 @@ pub async fn get_genai_trace(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    let (start, end) = detail_window(&state, project_id, &trace_id, &params).await?;
     let spans = state
         .otel_service
-        .get_genai_trace_spans(project_id, &trace_id)
+        .get_genai_trace_spans_in_window(project_id, &trace_id, start, end)
         .await?;
     let span_count = spans.len();
 
     let events = state
         .otel_service
-        .get_genai_trace_events(project_id, &trace_id)
+        .get_genai_trace_events_in_window(project_id, &trace_id, start, end)
         .await?;
     let event_count = events.len();
 
@@ -1984,6 +2062,8 @@ pub async fn get_cross_project_trace_siblings(
     operation_id = "getUnifiedTrace",
     params(
         ("trace_id" = String, Path, description = "Trace ID (32 lowercase hex characters)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); pair with end_time, max 31 days"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); pair with start_time, max 31 days"),
     ),
     responses(
         (status = 200, description = "Unified cross-project trace waterfall",
@@ -2002,6 +2082,7 @@ pub async fn get_unified_trace(
     State(state): State<OtelAppState>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(trace_id): Path<String>,
+    Query(params): Query<TraceDetailWindowParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
     deny_deployment_token!(auth);
@@ -2031,9 +2112,30 @@ pub async fn get_unified_trace(
         );
     }
 
+    let window = match (&params.start_time, &params.end_time) {
+        (Some(start), Some(end)) => {
+            let invalid = || {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Trace Time Range")
+                .with_detail("Provide both start_time and end_time as RFC 3339 dates, with a window greater than zero and no longer than 31 days")
+            };
+            let start = parse_datetime(start).ok_or_else(invalid)?;
+            let end = parse_datetime(end).ok_or_else(invalid)?;
+            if start >= end || end - start > chrono::Duration::days(31) {
+                return Err(invalid());
+            }
+            Some((start, end))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Trace Time Range")
+                .with_detail("start_time and end_time must both be provided"))
+        }
+    };
     let mut unified: UnifiedTrace = state
         .cross_project_service
-        .get_unified_trace(&trace_id)
+        .get_unified_trace_in_window(&trace_id, window)
         .await
         .map_err(Problem::from)?;
 

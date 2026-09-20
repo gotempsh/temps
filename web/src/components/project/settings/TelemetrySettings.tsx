@@ -41,6 +41,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  CLOUD_AI_METADATA_KEYS,
+  cloudAiMetadataMissing,
+  withCloudAiMetadata,
+} from '@/lib/cloud-ai-metadata'
 import { Label } from '@/components/ui/label'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
@@ -133,6 +139,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   const [writeMode, setWriteMode] = useState<CloudTelemetryWriteMode>('local')
   const [fidelity, setFidelity] = useState<CloudTelemetryFidelity>('metered')
+  const [aiMetadata, setAiMetadata] = useState(false)
 
   useEffect(() => {
     if (!settings) return
@@ -140,6 +147,11 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setWriteMode(settings.write_mode)
     setFidelity(settings.fidelity)
+    setAiMetadata(
+      CLOUD_AI_METADATA_KEYS.every((key) =>
+        settings.attribute_allowlist.includes(key)
+      )
+    )
   }, [settings])
 
   const save = useMutation({
@@ -217,8 +229,13 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   }
 
   const cloudAvailable = settings.cloud_write_mode_available
+  const savedAiMetadata = CLOUD_AI_METADATA_KEYS.every((key) =>
+    settings.attribute_allowlist.includes(key)
+  )
   const dirty =
-    writeMode !== settings.write_mode || fidelity !== settings.fidelity
+    writeMode !== settings.write_mode ||
+    fidelity !== settings.fidelity ||
+    aiMetadata !== savedAiMetadata
   // Lowering fidelity while Cloud-primary is refused by the server; saying so
   // here is cheaper for the operator than a round trip that ends in an error.
   const downgradeBlocked = writeMode === 'cloud' && fidelity === 'metered'
@@ -381,6 +398,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       {/* ── Fidelity ───────────────────────────────────────────────── */}
       <SettingsSection
         title="Span fidelity"
+        defaultOpen={cloudAiMetadataMissing(settings)}
         description="Control how much of each span leaves this instance for Temps Cloud"
         icon={CloudUpload}
       >
@@ -416,6 +434,27 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               )
             })}
           </RadioGroup>
+
+          <div className="flex items-start gap-3 rounded-lg border p-4">
+            <Checkbox
+              id="cloud-ai-metadata"
+              checked={aiMetadata}
+              onCheckedChange={(value) => setAiMetadata(value === true)}
+              disabled={fidelity !== 'queryable'}
+            />
+            <div className="space-y-1">
+              <Label htmlFor="cloud-ai-metadata">
+                Allow AI metadata in Cloud
+              </Label>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Send provider, model, operation, and token counts so AI Activity
+                can identify model calls. This option adds no prompts,
+                responses, or tool content. It applies to new spans after
+                saving; attributes omitted from older spans cannot be recovered.
+                Requires queryable fidelity.
+              </p>
+            </div>
+          </div>
 
           {settings.attribute_allowlist.length > 0 && (
             <div className="rounded-md border bg-muted/30 p-3">
@@ -456,6 +495,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               onClick={() => {
                 setWriteMode(settings.write_mode)
                 setFidelity(settings.fidelity)
+                setAiMetadata(savedAiMetadata)
               }}
               disabled={save.isPending}
             >
@@ -466,7 +506,18 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
             onClick={() =>
               save.mutate({
                 path: { project_id: project.id },
-                body: { fidelity, write_mode: writeMode },
+                body: {
+                  fidelity,
+                  write_mode: writeMode,
+                  ...(aiMetadata !== savedAiMetadata
+                    ? {
+                        attribute_allowlist: withCloudAiMetadata(
+                          settings.attribute_allowlist,
+                          aiMetadata
+                        ),
+                      }
+                    : {}),
+                },
               })
             }
             disabled={!dirty || downgradeBlocked || save.isPending}

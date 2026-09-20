@@ -97,6 +97,30 @@ pub trait CloudSpanSource: Send + Sync {
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64>;
     async fn has_traces(&self, project_id: i32) -> StorageResult<bool>;
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
+    async fn get_trace_in_window(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {
+        self.query_spans(query).await
+    }
+    async fn query_genai_trace_summaries(
+        &self,
+        _query: TraceQuery,
+    ) -> StorageResult<Vec<GenAiTraceSummary>> {
+        Err(OtelError::Validation {
+            message: "Cloud GenAI summaries are unavailable from this source".into(),
+        })
+    }
+    async fn count_genai_traces(&self, _query: TraceQuery) -> StorageResult<u64> {
+        Err(OtelError::Validation {
+            message: "Cloud GenAI count is unavailable from this source".into(),
+        })
+    }
+    async fn get_genai_trace_spans_in_window(
+        &self,
+        _query: TraceQuery,
+    ) -> StorageResult<Vec<GenAiSpanDetail>> {
+        Err(OtelError::Validation {
+            message: "Cloud GenAI detail is unavailable from this source".into(),
+        })
+    }
     async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>>;
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64>;
 }
@@ -157,6 +181,15 @@ pub struct CloudRoutedOtelStorage {
     /// raised to `cloud`.
     cloud_metrics: Option<Arc<dyn CloudMetricSource>>,
     write_modes: Arc<TelemetryWriteModeService>,
+}
+
+fn validate_genai_window(query: &TraceQuery) -> StorageResult<()> {
+    match (query.start_time, query.end_time) {
+        (Some(start), Some(end)) if start < end && end - start <= chrono::Duration::days(31) => Ok(()),
+        _ => Err(OtelError::Validation {
+            message: format!("GenAI trace query for project {} requires a time window greater than zero and no longer than 31 days", query.project_id),
+        }),
+    }
 }
 
 impl CloudRoutedOtelStorage {
@@ -531,6 +564,40 @@ impl OtelStorage for CloudRoutedOtelStorage {
         }
     }
 
+    async fn get_trace_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let resolution = self.resolve(project_id, Some(start), Some(end)).await;
+        let query = Self::clamped(
+            TraceQuery {
+                project_id,
+                trace_id: Some(trace_id.into()),
+                start_time: Some(start),
+                end_time: Some(end),
+                limit: Some(5_000),
+                ..Default::default()
+            },
+            &resolution,
+        );
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_trace_in_window(
+                        project_id,
+                        trace_id,
+                        query.start_time.unwrap_or(start),
+                        end,
+                    )
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => self.cloud.get_trace_in_window(query).await,
+        }
+    }
+
     async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
         match self.resolve_span_stats(&query).await? {
             CloudTelemetryWriteMode::Local => self.local.query_span_stats(query).await,
@@ -559,19 +626,33 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local.get_trace_ref_projects(trace_id).await
     }
 
-    // ── GenAI: local only ────────────────────────────────────────────────
-    //
-    // The `Queryable` projection ships an allowlisted attribute subset, and
-    // `gen_ai.*` attributes are not on any default allowlist. Routing these to
-    // Cloud would answer a confident empty rather than "this view needs local
-    // spans", so they stay local and the emptiness is at least honest about
-    // which store it came from.
+    // ── GenAI reads follow the spans ledger ───────────────────────────────
 
     async fn query_genai_trace_summaries(
         &self,
-        query: TraceQuery,
+        mut query: TraceQuery,
     ) -> StorageResult<Vec<GenAiTraceSummary>> {
-        self.local.query_genai_trace_summaries(query).await
+        let end = query.end_time.unwrap_or_else(chrono::Utc::now);
+        query
+            .start_time
+            .get_or_insert(end - chrono::Duration::hours(24));
+        query.end_time = Some(end);
+        validate_genai_window(&query)?;
+        let resolution = self
+            .resolve(query.project_id, query.start_time, query.end_time)
+            .await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .query_genai_trace_summaries(Self::clamped(query, &resolution))
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                self.cloud
+                    .query_genai_trace_summaries(Self::clamped(query, &resolution))
+                    .await
+            }
+        }
     }
 
     async fn get_genai_trace_spans(
@@ -582,8 +663,64 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local.get_genai_trace_spans(project_id, trace_id).await
     }
 
-    async fn count_genai_traces(&self, query: TraceQuery) -> StorageResult<u64> {
-        self.local.count_genai_traces(query).await
+    async fn get_genai_trace_spans_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiSpanDetail>> {
+        let resolution = self.resolve(project_id, Some(start), Some(end)).await;
+        let query = Self::clamped(
+            TraceQuery {
+                project_id,
+                trace_id: Some(trace_id.into()),
+                start_time: Some(start),
+                end_time: Some(end),
+                limit: Some(5_000),
+                ..Default::default()
+            },
+            &resolution,
+        );
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_genai_trace_spans_in_window(
+                        project_id,
+                        trace_id,
+                        query.start_time.unwrap_or(start),
+                        end,
+                    )
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                self.cloud.get_genai_trace_spans_in_window(query).await
+            }
+        }
+    }
+
+    async fn count_genai_traces(&self, mut query: TraceQuery) -> StorageResult<u64> {
+        let end = query.end_time.unwrap_or_else(chrono::Utc::now);
+        query
+            .start_time
+            .get_or_insert(end - chrono::Duration::hours(24));
+        query.end_time = Some(end);
+        validate_genai_window(&query)?;
+        let resolution = self
+            .resolve(query.project_id, query.start_time, query.end_time)
+            .await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .count_genai_traces(Self::clamped(query, &resolution))
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                self.cloud
+                    .count_genai_traces(Self::clamped(query, &resolution))
+                    .await
+            }
+        }
     }
 
     async fn get_genai_trace_events(
@@ -594,6 +731,26 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local
             .get_genai_trace_events(project_id, trace_id)
             .await
+    }
+
+    async fn get_genai_trace_events_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiEvent>> {
+        let resolution = self.resolve(project_id, Some(start), Some(end)).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_genai_trace_events_in_window(project_id, trace_id, start, end)
+                    .await
+            }
+            // The Cloud projection stores consented span attributes but no
+            // span events. Never query unrelated local history for this view.
+            CloudTelemetryWriteMode::Cloud => Ok(Vec::new()),
+        }
     }
 
     // ── Everything else delegates ────────────────────────────────────────
@@ -893,6 +1050,9 @@ mod tests {
         query_spans: AtomicUsize,
         get_trace: AtomicUsize,
         has_traces: AtomicUsize,
+        genai_summaries: AtomicUsize,
+        genai_count: AtomicUsize,
+        genai_detail: AtomicUsize,
     }
 
     #[test]
@@ -949,6 +1109,27 @@ mod tests {
 
     #[async_trait]
     impl CloudSpanSource for CountingCloudSource {
+        async fn query_genai_trace_summaries(
+            &self,
+            query: TraceQuery,
+        ) -> StorageResult<Vec<GenAiTraceSummary>> {
+            assert!(query.start_time.is_some() && query.end_time.is_some());
+            self.genai_summaries.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn count_genai_traces(&self, query: TraceQuery) -> StorageResult<u64> {
+            assert!(query.start_time.is_some() && query.end_time.is_some());
+            self.genai_count.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+        async fn get_genai_trace_spans_in_window(
+            &self,
+            query: TraceQuery,
+        ) -> StorageResult<Vec<GenAiSpanDetail>> {
+            assert!(query.start_time.is_some() && query.end_time.is_some());
+            self.genai_detail.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
         async fn query_spans(&self, _query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {
             self.query_spans.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
@@ -1026,6 +1207,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn genai_window_rejects_unbounded_or_reversed_queries() {
+        let end = chrono::Utc::now();
+        let mut query = TraceQuery {
+            project_id: 7,
+            end_time: Some(end),
+            ..Default::default()
+        };
+        assert!(validate_genai_window(&query).is_err());
+        query.start_time = Some(end - chrono::Duration::days(32));
+        assert!(validate_genai_window(&query).is_err());
+        query.start_time = Some(end + chrono::Duration::minutes(1));
+        assert!(validate_genai_window(&query).is_err());
+        query.start_time = Some(end - chrono::Duration::days(31));
+        assert!(validate_genai_window(&query).is_ok());
+    }
+
     #[tokio::test]
     async fn the_cloud_source_trait_is_reachable_from_every_routed_read() {
         // Guards against the failure this module exists to prevent: a routed
@@ -1038,6 +1236,72 @@ mod tests {
         assert_eq!(cloud.query_spans.load(Ordering::SeqCst), 1);
         assert_eq!(cloud.get_trace.load(Ordering::SeqCst), 1);
         assert_eq!(cloud.has_traces.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn genai_reads_follow_cloud_ledger_and_do_not_fetch_local_events() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::project_telemetry_write_intervals::{
+            Model, TelemetrySignalGroup, TelemetryWriteIntervalReason,
+        };
+        let now = chrono::Utc::now();
+        let interval = Model {
+            id: 1,
+            project_id: 7,
+            signal_group: TelemetrySignalGroup::Spans,
+            mode: CloudTelemetryWriteMode::Cloud,
+            effective_from: now - chrono::Duration::days(2),
+            effective_to: None,
+            reason: TelemetryWriteIntervalReason::Operator,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![interval.clone()]])
+                .append_query_results([vec![interval.clone()]])
+                .append_query_results([vec![interval.clone()]])
+                .append_query_results([vec![interval]])
+                .into_connection(),
+        );
+        let cloud = Arc::new(CountingCloudSource::default());
+        let local = Arc::new(crate::test_support::MockOtelStorage::default());
+        let routed = CloudRoutedOtelStorage::new(
+            local,
+            cloud.clone(),
+            Arc::new(TelemetryWriteModeService::new(db)),
+        );
+        let query = TraceQuery {
+            project_id: 7,
+            start_time: Some(now - chrono::Duration::hours(1)),
+            end_time: Some(now),
+            ..Default::default()
+        };
+        routed
+            .query_genai_trace_summaries(query.clone())
+            .await
+            .expect("Cloud summaries");
+        routed.count_genai_traces(query).await.expect("Cloud count");
+        routed
+            .get_genai_trace_spans_in_window(
+                7,
+                "synthetic-trace",
+                now - chrono::Duration::hours(1),
+                now,
+            )
+            .await
+            .expect("Cloud detail");
+        assert!(routed
+            .get_genai_trace_events_in_window(
+                7,
+                "synthetic-trace",
+                now - chrono::Duration::hours(1),
+                now
+            )
+            .await
+            .expect("Cloud events absent by projection")
+            .is_empty());
+        assert_eq!(cloud.genai_summaries.load(Ordering::SeqCst), 1);
+        assert_eq!(cloud.genai_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cloud.genai_detail.load(Ordering::SeqCst), 1);
     }
 
     // ── Metric routing (ADR-043 §3) ───────────────────────────────────────
