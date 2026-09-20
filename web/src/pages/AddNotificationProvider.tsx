@@ -14,17 +14,10 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import {
-  ArrowLeft,
-  ArrowRight,
-  Cloud,
-  Mail,
-  MoreHorizontal,
-  Webhook,
-} from 'lucide-react'
+import { ArrowLeft, ArrowRight, MoreHorizontal } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { FaSlack } from 'react-icons/fa'
+import { NotificationProviderIcon } from '@/components/monitoring/NotificationProviderIcon'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
@@ -57,14 +50,14 @@ const providerOptions: ProviderOption[] = [
     id: 'email',
     name: 'Email',
     description: 'Send notifications via SMTP email server',
-    icon: <Mail className="h-6 w-6" />,
+    icon: <NotificationProviderIcon provider="email" className="size-6" />,
     available: true,
   },
   {
     id: 'slack',
     name: 'Slack',
     description: 'Send notifications to Slack channels via webhooks',
-    icon: <FaSlack className="h-6 w-6" />,
+    icon: <NotificationProviderIcon provider="slack" className="size-6" />,
     available: true,
   },
   {
@@ -72,7 +65,7 @@ const providerOptions: ProviderOption[] = [
     name: 'Webhook',
     description:
       'Send JSON payloads to any HTTP endpoint for custom integrations',
-    icon: <Webhook className="h-6 w-6" />,
+    icon: <NotificationProviderIcon provider="webhook" className="size-6" />,
     available: true,
   },
   {
@@ -80,7 +73,7 @@ const providerOptions: ProviderOption[] = [
     name: 'Cloudflare Email',
     description:
       'Send notification emails through Cloudflare Email Sending (no SMTP required)',
-    icon: <Cloud className="h-6 w-6" />,
+    icon: <NotificationProviderIcon provider="cloudflare" className="size-6" />,
     available: true,
   },
   {

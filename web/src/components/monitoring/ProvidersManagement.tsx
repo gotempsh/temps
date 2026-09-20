@@ -35,19 +35,13 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import {
-  Bell,
-  EllipsisVertical,
-  Mail,
-  Hash,
-  Webhook,
-  Cloud,
-} from 'lucide-react'
+import { Bell, EllipsisVertical } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderForm } from './ProviderForm'
+import { NotificationProviderIcon } from './NotificationProviderIcon'
 import { ProviderFormData, providerUpdateSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
@@ -371,14 +365,6 @@ export function ProvidersManagement() {
           {providers?.map((provider) => {
             const typedProvider = provider as ExtendedNotificationProvider
             const config = typedProvider.config
-            const Icon =
-              provider.provider_type === 'email'
-                ? Mail
-                : provider.provider_type === 'slack'
-                  ? Hash
-                  : provider.provider_type === 'cloudflare'
-                    ? Cloud
-                    : Webhook
             const destination =
               provider.provider_type === 'email' ||
               provider.provider_type === 'cloudflare'
@@ -400,10 +386,7 @@ export function ProvidersManagement() {
                 className="flex flex-wrap items-start gap-4 p-4 sm:items-center sm:p-5"
               >
                 <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                  <Icon
-                    className="size-4 text-muted-foreground"
-                    aria-hidden="true"
-                  />
+                  <NotificationProviderIcon provider={provider.provider_type} />
                 </span>
                 <div className="min-w-0 flex-1 basis-48 space-y-1">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
