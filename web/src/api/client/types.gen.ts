@@ -13582,6 +13582,47 @@ export type NixpacksPresetConfig = {
  */
 export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
+/**
+ * Whether this installation can run a workload anywhere, and if not, why.
+ */
+export type NodeCapabilityResponse = {
+    /**
+     * Worker nodes that are active and heartbeating. Excludes the control
+     * plane, which `local_workloads` already reports.
+     */
+    active_worker_nodes: number;
+    /**
+     * Whether *this caller* can act on `setup_path`.
+     *
+     * The capability itself is readable by every authenticated session, but
+     * the remedy is not: the Worker Nodes page needs `SettingsRead` to list
+     * the node inventory and `SettingsWrite` to mint an enrollment token.
+     * Sending a caller without both to that page produces "Failed to load
+     * worker nodes" — an advertised fix that denies the user who followed it.
+     * Clients render a non-admin variant ("ask an administrator") when this
+     * is false rather than a dead link.
+     */
+    can_manage_nodes: boolean;
+    /**
+     * Whether the control plane itself may run containers, builds and
+     * managed services (false in the `control-plane` serve profile).
+     */
+    local_workloads: boolean;
+    /**
+     * Why nothing can be placed, when `schedulable` is false. Rendered
+     * verbatim by the client.
+     */
+    reason?: string | null;
+    /**
+     * Whether a workload can be placed at all.
+     */
+    schedulable: boolean;
+    /**
+     * Console path that fixes it: where an operator joins a worker node.
+     */
+    setup_path: string;
+};
+
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
     total: number;
@@ -41788,6 +41829,37 @@ export type GetUptimeHistoryResponses = {
 };
 
 export type GetUptimeHistoryResponse = GetUptimeHistoryResponses[keyof GetUptimeHistoryResponses];
+
+export type NodeCapabilityGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/capability';
+};
+
+export type NodeCapabilityGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeCapabilityGetResponses = {
+    /**
+     * Scheduling capability of this install
+     */
+    200: NodeCapabilityResponse;
+};
+
+export type NodeCapabilityGetResponse = NodeCapabilityGetResponses[keyof NodeCapabilityGetResponses];
 
 export type NodeMetricsGetRangeData = {
     body?: never;
