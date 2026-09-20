@@ -28,7 +28,8 @@ use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
 use temps_cloud::{
     BootstrapBackendUrlOutcome, CloudEnrollmentActor, CloudPlugin, CloudService, CloudServiceError,
-    ManagedBackupOutcome,
+    ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ManagedBackupOutcome,
+    CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
@@ -919,6 +920,88 @@ fn parse_cloud_backend_url_env(result: Result<String, std::env::VarError>) -> Op
                  Unset it, or set it to the backend URL text, and restart to retry."
             );
             None
+        }
+    }
+}
+
+/// Consume `<TEMPS_DATA_DIR>/cloud-oidc.json` at boot, if a Cloud-hosted
+/// control plane dropped one before this instance's first start (ADR-045
+/// §4). The OIDC analogue of [`bootstrap_cloud_enrollment_from_env`]: a
+/// one-shot first-boot *input*, never re-read to decide runtime behaviour,
+/// whose result (the managed console-access `oidc_providers` row) is what
+/// persists. Called synchronously and awaited, unlike the enrollment
+/// bootstrap above -- this does no network I/O of its own (it is a local
+/// file read plus one DB upsert), and the managed SSO provider must be in
+/// place before the console is reachable, so there is nothing to gain by
+/// deferring it to a background task.
+///
+/// A build with no Cloud plugin registered skips silently (debug log only):
+/// this file only ever exists on a Cloud-hosted instance. Applying it is an
+/// upsert, so it is safe to run on a boot where the instance is already
+/// enrolled (re-provision, image upgrade) -- it does not depend on
+/// enrollment having happened first.
+async fn bootstrap_console_oidc_from_file(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    data_dir: &std::path::Path,
+) {
+    let Some(cloud_service) = service_context.get_service::<CloudService>() else {
+        debug!(
+            "No Cloud plugin registered on this build; skipping the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} \
+             bootstrap file check"
+        );
+        return;
+    };
+    let path = data_dir.join(CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+    let outcome = match cloud_service.apply_console_oidc_bootstrap_file(&path).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            match &error {
+                ConsoleOidcBootstrapError::Parse { .. } => error!(
+                    %error,
+                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file exists but could not be \
+                     parsed; it has been left in place for inspection. Console access will start \
+                     without the Cloud-managed SSO provider until this is fixed and the server is \
+                     restarted."
+                ),
+                ConsoleOidcBootstrapError::Read { .. }
+                | ConsoleOidcBootstrapError::Apply { .. } => {
+                    error!(
+                        %error,
+                        "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                         console access will start without the Cloud-managed SSO provider until \
+                         this is fixed and the server is restarted."
+                    )
+                }
+            }
+            return;
+        }
+    };
+
+    match outcome {
+        ConsoleOidcBootstrapOutcome::NotPresent => {}
+        ConsoleOidcBootstrapOutcome::Applied { issuer, client_id } => {
+            info!(
+                issuer = %issuer,
+                client_id = %client_id,
+                "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
+                 is now configured"
+            );
+            match service_context.get_service::<dyn temps_core::AuditLogger>() {
+                Some(audit_logger) => {
+                    temps_cloud::record_console_oidc_bootstrapped_audit(
+                        audit_logger.as_ref(),
+                        CloudEnrollmentActor::UnattendedBootstrap,
+                        &issuer,
+                        &client_id,
+                    )
+                    .await;
+                }
+                None => error!(
+                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
+                     logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record was \
+                     not written"
+                ),
+            }
         }
     }
 }
@@ -3483,6 +3566,14 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     } else {
         debug!("UserService not available, skipping user initialization");
     }
+
+    // Cloud console-access SSO bootstrap from `<TEMPS_DATA_DIR>/cloud-oidc.json`
+    // (ADR-045 §4; see the doc comment on `bootstrap_console_oidc_from_file`).
+    // Runs, and is awaited, before the unattended enrollment bootstrap below:
+    // the managed SSO provider must be in place by the time the console is
+    // reachable, and unlike enrollment this does no network I/O of its own,
+    // so there is nothing to gain by deferring it.
+    bootstrap_console_oidc_from_file(service_context, &config.data_dir).await;
 
     // Unattended Temps Cloud enrollment via TEMPS_CLOUD_ENROLLMENT_CODE (see
     // the doc comment on `TEMPS_CLOUD_ENROLLMENT_CODE_VAR` above; ADR 0040 in
