@@ -481,6 +481,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
+            DeploymentError::DockerUnavailable(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Docker Unavailable")
+                .with_detail(err.to_string()),
         }
     }
 }
@@ -4389,9 +4392,8 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
         );
-        let docker_log_service = Arc::new(DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let docker_log_service = Arc::new(DockerLogService::new(docker_handle.clone()));
 
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
@@ -4428,7 +4430,7 @@ mod tests {
             config_service.clone(),
             queue_service.clone(),
             docker_log_service,
-            docker.clone(),
+            docker_handle,
             deployer,
             encryption_service.clone(),
         ));
@@ -4478,7 +4480,7 @@ mod tests {
                 .expect("enc"),
             ),
         ));
-        let blob_service = Arc::new(temps_blob::BlobService::new(rustfs_service));
+        let blob_service = Some(Arc::new(temps_blob::BlobService::new(rustfs_service)));
 
         // Use noop screenshot provider via env var
         // SAFETY: This is test-only code; tests are run single-threaded or this env var
@@ -4522,7 +4524,9 @@ mod tests {
                 db.clone(),
             )),
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker")),
+            Arc::new(temps_core::DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults().expect("docker"),
+            ))),
         ));
 
         let failure_report_service = Arc::new(

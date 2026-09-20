@@ -10,11 +10,10 @@
 use async_trait::async_trait;
 use bollard::auth::DockerCredentials;
 use bollard::query_parameters::CreateImageOptionsBuilder;
-use bollard::Docker;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, error, info};
 use url::Url;
@@ -69,8 +68,11 @@ pub struct PullExternalImageJob {
     image_ref: String,
     /// Optional external image ID (from external_images table)
     external_image_id: Option<i32>,
-    /// Docker client
-    docker: Arc<Docker>,
+    /// Process-wide Docker handle. Resolved lazily in `execute`, so this job
+    /// can be constructed on a process with no local daemon (`--profile
+    /// control-plane`) and fail with a typed error only if it is ever
+    /// actually dispatched there.
+    docker_handle: Arc<DockerHandle>,
     /// Log service for streaming logs
     log_service: Option<Arc<LogService>>,
     /// Log ID for this job's logs
@@ -95,13 +97,13 @@ impl PullExternalImageJob {
         job_id: String,
         image_ref: String,
         external_image_id: Option<i32>,
-        docker: Arc<Docker>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             job_id,
             image_ref,
             external_image_id,
-            docker,
+            docker_handle,
             log_service: None,
             log_id: None,
             registry_credentials: None,
@@ -214,6 +216,10 @@ impl WorkflowTask for PullExternalImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        let docker = self
+            .docker_handle
+            .require()
+            .map_err(|e| WorkflowError::LocalWorkloadsDisabled(e.to_string()))?;
         let (registry, _image_name, tag) = self.parse_image_ref();
 
         info!(
@@ -242,7 +248,7 @@ impl WorkflowTask for PullExternalImageJob {
             .from_image(&self.image_ref)
             .build();
 
-        let mut stream = self.docker.create_image(
+        let mut stream = docker.create_image(
             Some(create_image_options),
             None,
             self.registry_credentials.clone(),
@@ -318,16 +324,12 @@ impl WorkflowTask for PullExternalImageJob {
         // Inspect the image to get details
         self.log(LogLevel::Info, "🔍 Inspecting image...").await;
 
-        let image_inspect = self
-            .docker
-            .inspect_image(&self.image_ref)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to inspect image {}: {}",
-                    self.image_ref, e
-                ))
-            })?;
+        let image_inspect = docker.inspect_image(&self.image_ref).await.map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to inspect image {}: {}",
+                self.image_ref, e
+            ))
+        })?;
 
         let image_id = image_inspect.id.unwrap_or_default();
         let size_bytes = image_inspect.size.unwrap_or(0) as u64;
@@ -375,9 +377,9 @@ mod tests {
 
     #[test]
     fn test_parse_image_ref_with_registry_and_tag() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job = PullExternalImageJob::new(
             "test".to_string(),
             "ghcr.io/org/app:v1.0".to_string(),
@@ -393,9 +395,9 @@ mod tests {
 
     #[test]
     fn test_parse_image_ref_docker_hub() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job =
             PullExternalImageJob::new("test".to_string(), "nginx:latest".to_string(), None, docker);
 
@@ -407,9 +409,9 @@ mod tests {
 
     #[test]
     fn test_parse_image_ref_with_port() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job = PullExternalImageJob::new(
             "test".to_string(),
             "localhost:5000/myapp:v2".to_string(),
@@ -425,9 +427,9 @@ mod tests {
 
     #[test]
     fn test_parse_image_ref_no_tag() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job = PullExternalImageJob::new(
             "test".to_string(),
             "myregistry.io/app".to_string(),
@@ -528,7 +530,7 @@ mod tests {
             "local-image".to_string(),
             local_only.clone(),
             None,
-            docker.clone(),
+            Arc::new(DockerHandle::available(docker.clone())),
         );
         let context = crate::test_utils::create_test_context("run-1".into(), 1, 1, 1);
         let result = job.execute(context).await.expect("job should not error");
@@ -602,8 +604,12 @@ mod tests {
             .await
             .expect("tagging a present image should succeed");
 
-        let job =
-            PullExternalImageJob::new("planted".to_string(), planted.clone(), None, docker.clone());
+        let job = PullExternalImageJob::new(
+            "planted".to_string(),
+            planted.clone(),
+            None,
+            Arc::new(DockerHandle::available(docker.clone())),
+        );
         let context = crate::test_utils::create_test_context("run-3".into(), 1, 1, 1);
         let result = job.execute(context).await.expect("job should not error");
 
@@ -644,7 +650,7 @@ mod tests {
             "missing-image".to_string(),
             missing.clone(),
             None,
-            Arc::new(docker),
+            Arc::new(DockerHandle::available(Arc::new(docker))),
         );
         let context = crate::test_utils::create_test_context("run-2".into(), 1, 1, 1);
         let result = job.execute(context).await.expect("job should not error");

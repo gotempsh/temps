@@ -99,20 +99,25 @@ impl TempsPlugin for BackupPlugin {
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
-            // Postgres major-upgrade service.
-            let docker = context.require_service::<bollard::Docker>();
+            // Postgres major-upgrade service. The handle is always registered
+            // (every profile, including `control-plane`, which never has a
+            // local Docker daemon); the lifecycle adapter and upgrade service
+            // resolve the daemon lazily, at the point of use, and return a
+            // typed `DockerUnavailable` there instead of this registration
+            // step panicking.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
             let log_service = context.require_service::<temps_logs::LogService>();
             let backup_provider: Arc<dyn PreUpgradeBackupProvider> = backup_service.clone();
             let lifecycle: Arc<dyn PostgresContainerLifecycle> =
                 Arc::new(PostgresLifecycleAdapter::new(
                     db.clone(),
-                    docker.clone(),
+                    docker_handle.clone(),
                     external_service_manager.clone(),
                     encryption_service.clone(),
                 ));
             let pg_upgrade_service = Arc::new(PostgresUpgradeService::new(
                 db.clone(),
-                docker.clone(),
+                docker_handle.clone(),
                 backup_provider,
                 lifecycle,
                 log_service,
@@ -134,16 +139,25 @@ impl TempsPlugin for BackupPlugin {
             // and dispatches to the executor.
             let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
-            let executor = Arc::new(
-                BackupExecutorBuilder::new(db.clone())
-                    .with_max_concurrent(executor_max_concurrent)
-                    .with_notifier(executor_notifier)
-                    .with_event_publisher(Arc::clone(&job_queue))
-                    .register_engine(Arc::new(ControlPlaneEngine::new(ControlPlaneDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        config_service: config_service.clone(),
-                    })))
+            let mut executor_builder = BackupExecutorBuilder::new(db.clone())
+                .with_max_concurrent(executor_max_concurrent)
+                .with_notifier(executor_notifier)
+                .with_event_publisher(Arc::clone(&job_queue))
+                .register_engine(Arc::new(ControlPlaneEngine::new(ControlPlaneDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    config_service: config_service.clone(),
+                })));
+
+            // Every other engine drives a local Docker container end to end
+            // (dump/restore inside it, snapshot its volume, etc.), so there is
+            // nothing useful to register when this process has no daemon —
+            // unlike the Postgres upgrade path above, these have no
+            // Docker-independent behaviour to keep working. Log this once,
+            // clearly, rather than registering engines that would fail every
+            // job with an opaque error the first time one is dispatched.
+            if let Some(docker) = docker_handle.cloned() {
+                executor_builder = executor_builder
                     .register_engine(Arc::new(RedisEngine::new(RedisDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -183,15 +197,24 @@ impl TempsPlugin for BackupPlugin {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
-                    })))
-                    .build(),
-            );
+                    })));
 
-            info!(
-                "BackupExecutor: registered 9 engines: control_plane, redis, \
-                 postgres_pgdump, postgres_walg, postgres_cluster, mongodb, \
-                 mariadb_physical, mariadb_dump, s3_mirror",
-            );
+                info!(
+                    "BackupExecutor: registered 9 engines: control_plane, redis, \
+                     postgres_pgdump, postgres_walg, postgres_cluster, mongodb, \
+                     mariadb_physical, mariadb_dump, s3_mirror",
+                );
+            } else {
+                warn!(
+                    "BackupExecutor: registered only the control_plane engine — this process has \
+                     no local Docker daemon (see GET /api/platform/features), so the \
+                     Docker-backed backup engines (redis, postgres_pgdump, postgres_walg, \
+                     postgres_cluster, mongodb, mariadb_physical, mariadb_dump, s3_mirror) are \
+                     unavailable here; run them on a worker node joined with `temps join`",
+                );
+            }
+
+            let executor = Arc::new(executor_builder.build());
 
             // Wire the JobQueue into BackupService so trigger paths can
             // publish Job::BackupRequested messages.
@@ -390,6 +413,14 @@ impl TempsPlugin for BackupPlugin {
                     info!(resumed = n, "resumed Postgres major upgrades after restart",)
                 }
                 Ok(_) => {}
+                Err(temps_providers::externalsvc::postgres_upgrade::PostgresUpgradeError::DockerUnavailable(e)) => {
+                    // Expected on every boot of a profile with no local
+                    // Docker daemon — not a failure, so don't log it as one.
+                    // Any upgrade left `pending`/`running` by a previous
+                    // process stays that way until this process (or one with
+                    // a daemon) resumes it.
+                    info!("Postgres major-upgrade resume skipped: {}", e);
+                }
                 Err(e) => error!("Failed to resume Postgres major upgrades on boot: {}", e),
             }
 
@@ -405,6 +436,11 @@ impl TempsPlugin for BackupPlugin {
                             removed = n,
                             "swept expired Postgres-upgrade rollback volumes"
                         ),
+                        Err(temps_providers::externalsvc::postgres_upgrade::PostgresUpgradeError::DockerUnavailable(e)) => {
+                            // Expected on every tick of a profile with no
+                            // local Docker daemon — nothing to sweep here.
+                            info!("Rollback-volume sweep skipped: {}", e);
+                        }
                         Err(e) => {
                             error!("Rollback-volume sweep failed (will retry next tick): {}", e)
                         }

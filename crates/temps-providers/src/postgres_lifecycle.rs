@@ -16,10 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
-use temps_core::EncryptionService;
+use temps_core::{DockerHandle, EncryptionService};
 use temps_entities::external_services;
 
 use crate::externalsvc::postgres::{
@@ -34,7 +33,7 @@ use crate::utils::ensure_network_exists;
 /// (which handles encryption/decryption of the config blob).
 pub struct PostgresLifecycleAdapter {
     db: Arc<DatabaseConnection>,
-    docker: Arc<Docker>,
+    docker_handle: Arc<DockerHandle>,
     manager: Arc<ExternalServiceManager>,
     encryption_service: Arc<EncryptionService>,
 }
@@ -42,13 +41,13 @@ pub struct PostgresLifecycleAdapter {
 impl PostgresLifecycleAdapter {
     pub fn new(
         db: Arc<DatabaseConnection>,
-        docker: Arc<Docker>,
+        docker_handle: Arc<DockerHandle>,
         manager: Arc<ExternalServiceManager>,
         encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
             db,
-            docker,
+            docker_handle,
             manager,
             encryption_service,
         }
@@ -102,8 +101,8 @@ impl PostgresLifecycleAdapter {
         cmd: Vec<String>,
         env: Option<Vec<String>>,
     ) -> Result<(Option<i64>, String), String> {
-        let exec = self
-            .docker
+        let docker = self.docker_handle.require().map_err(|e| e.to_string())?;
+        let exec = docker
             .create_exec(
                 container_name,
                 bollard::models::ExecConfig {
@@ -119,7 +118,7 @@ impl PostgresLifecycleAdapter {
 
         let mut output_text = String::new();
         if let Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) =
-            self.docker.start_exec(&exec.id, None).await
+            docker.start_exec(&exec.id, None).await
         {
             while let Some(chunk) = output.next().await {
                 match chunk {
@@ -129,8 +128,7 @@ impl PostgresLifecycleAdapter {
             }
         }
 
-        let inspect = self
-            .docker
+        let inspect = docker
             .inspect_exec(&exec.id)
             .await
             .map_err(|e| format!("inspect_exec({}) failed: {}", container_name, e))?;
@@ -138,7 +136,11 @@ impl PostgresLifecycleAdapter {
     }
 
     async fn container_logs(&self, container_name: &str) -> String {
-        self.docker
+        let docker = match self.docker_handle.require() {
+            Ok(docker) => docker,
+            Err(e) => return format!("<failed to read logs: {}>", e),
+        };
+        docker
             .logs(
                 container_name,
                 Some(
@@ -211,14 +213,14 @@ impl PostgresLifecycleAdapter {
         container_name: &str,
         timeout: Duration,
     ) -> Result<(), String> {
+        let docker = self.docker_handle.require().map_err(|e| e.to_string())?;
         let deadline = Instant::now() + timeout;
         let mut last_state = String::new();
         let mut last_health = String::new();
         let mut last_error = String::new();
 
         while Instant::now() < deadline {
-            let inspect = match self
-                .docker
+            let inspect = match docker
                 .inspect_container(
                     container_name,
                     None::<bollard::query_parameters::InspectContainerOptions>,
@@ -368,18 +370,17 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
     }
 
     async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {
+        let docker = self.docker_handle.require().map_err(|e| e.to_string())?;
         let svc = self.load_service_row(service_id).await?;
         let container_name = format!("postgres-{}", svc.name);
 
-        let _ = self
-            .docker
+        let _ = docker
             .stop_container(
                 &container_name,
                 None::<bollard::query_parameters::StopContainerOptions>,
             )
             .await;
-        let remove = self
-            .docker
+        let remove = docker
             .remove_container(
                 &container_name,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -410,12 +411,13 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         let container_name = format!("postgres-{}", svc.name);
         let volume_name = format!("{}_data", container_name);
         let pgdata_path = Self::pgdata_path_for(image)?;
+        let docker = self.docker_handle.require().map_err(|e| e.to_string())?;
 
         // Pull image first for clear fail-fast errors.
-        crate::utils::pull_image_with_retry(&self.docker, image, None).await?;
+        crate::utils::pull_image_with_retry(&docker, image, None).await?;
 
         // Create volume if missing — idempotent.
-        self.docker
+        docker
             .create_volume(bollard::models::VolumeCreateRequest {
                 name: Some(volume_name.clone()),
                 ..Default::default()
@@ -423,7 +425,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             .await
             .map_err(|e| format!("create_volume({}) failed: {:?}", volume_name, e))?;
 
-        ensure_network_exists(&self.docker)
+        ensure_network_exists(&docker)
             .await
             .map_err(|e| format!("ensure_network_exists: {:?}", e))?;
 
@@ -511,15 +513,13 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
 
         // Remove any pre-existing container with the same name so create
         // doesn't 409.
-        let _ = self
-            .docker
+        let _ = docker
             .stop_container(
                 &container_name,
                 None::<bollard::query_parameters::StopContainerOptions>,
             )
             .await;
-        let _ = self
-            .docker
+        let _ = docker
             .remove_container(
                 &container_name,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -529,7 +529,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             )
             .await;
 
-        self.docker
+        docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -541,7 +541,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             .await
             .map_err(|e| format!("create_container({}) failed: {}", container_name, e))?;
 
-        self.docker
+        docker
             .start_container(
                 &container_name,
                 None::<bollard::query_parameters::StartContainerOptions>,

@@ -244,6 +244,9 @@ pub enum PostgresUpgradeError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 /// Escape a string for safe interpolation into a `sed` BRE/ERE pattern.
@@ -2351,6 +2354,10 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
                     .with_detail(error.to_string())
             }
 
+            PostgresUpgradeError::DockerUnavailable(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Docker Unavailable")
+                .with_detail(error.to_string()),
+
             internal_error @ (PostgresUpgradeError::PreBackupFailed { .. }
             | PostgresUpgradeError::SnapshotFailed { .. }
             | PostgresUpgradeError::DumpFailed { .. }
@@ -3497,7 +3504,7 @@ mod tests {
                 ));
                 let lifecycle_adapter = Arc::new(PostgresLifecycleAdapter::new(
                     db.clone(),
-                    docker.clone(),
+                    Arc::new(temps_core::DockerHandle::available(docker.clone())),
                     manager.clone(),
                     encryption_service.clone(),
                 ));

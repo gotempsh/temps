@@ -622,7 +622,7 @@ pub struct WorkflowExecutionService {
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
-    docker: Arc<bollard::Docker>,
+    docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
@@ -648,7 +648,7 @@ impl WorkflowExecutionService {
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
-        docker: Arc<bollard::Docker>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             db,
@@ -663,7 +663,7 @@ impl WorkflowExecutionService {
             agent_sync_service,
             config_service,
             screenshot_service,
-            docker,
+            docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
             encryption_service: OnceCell::new(),
@@ -1995,12 +1995,7 @@ impl WorkflowExecutionService {
                     download_job_id,
                     build_job_id,
                     self.db.clone(),
-                    // This service always owns a real Docker client today
-                    // (see the `docker: Arc<bollard::Docker>` field above);
-                    // wrap it so `TrivyScanner` gets a `DockerUnavailable`
-                    // error instead of a panic on the day this service is
-                    // itself constructed without one.
-                    Arc::new(DockerHandle::available(self.docker.clone())),
+                    self.docker_handle.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
@@ -2364,7 +2359,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     external_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2430,7 +2425,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     expected_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2633,8 +2628,9 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or_default();
 
+                let docker = self.docker_handle.require()?;
                 let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
-                    self.docker.clone(),
+                    docker,
                     self.config_service.data_dir(),
                 ));
 
@@ -3479,6 +3475,9 @@ pub enum WorkflowExecutionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 impl From<anyhow::Error> for WorkflowExecutionError {
@@ -4244,10 +4243,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let _service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4288,10 +4287,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4366,10 +4365,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4461,7 +4460,9 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
         );
         let telemetry = Arc::new(CapturingTelemetryReporter::default());
         service.set_telemetry(telemetry.clone());
@@ -4850,10 +4851,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
 
         let service = WorkflowExecutionService::new(
             db.clone(),
