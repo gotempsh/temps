@@ -1280,13 +1280,6 @@ import type {
   GetPlatformInfoData,
   GetPlatformInfoErrors,
   GetPlatformInfoResponses,
-  GetPluginGrantsData,
-  GetPluginGrantsResponses,
-  GetPluginInstallationReportingData,
-  GetPluginInstallationReportingResponses,
-  GetPluginStatusData,
-  GetPluginStatusErrors,
-  GetPluginStatusResponses,
   GetPostgresWalHealthData,
   GetPostgresWalHealthErrors,
   GetPostgresWalHealthResponses,
@@ -1418,9 +1411,6 @@ import type {
   GetRepositoryEnvExampleLiveData,
   GetRepositoryEnvExampleLiveErrors,
   GetRepositoryEnvExampleLiveResponses,
-  GetRepositoryInstallProgressData,
-  GetRepositoryInstallProgressErrors,
-  GetRepositoryInstallProgressResponses,
   GetRepositoryPresetByNameData,
   GetRepositoryPresetByNameErrors,
   GetRepositoryPresetByNameResponses,
@@ -1723,9 +1713,6 @@ import type {
   InspectDropArchiveData,
   InspectDropArchiveErrors,
   InspectDropArchiveResponses,
-  InstallRepositoryData,
-  InstallRepositoryErrors,
-  InstallRepositoryResponses,
   IssueRuntimeCredentialsData,
   IssueRuntimeCredentialsErrors,
   IssueRuntimeCredentialsResponses,
@@ -1913,9 +1900,6 @@ import type {
   ListExternalImagesData,
   ListExternalImagesErrors,
   ListExternalImagesResponses,
-  ListExternalPluginsData,
-  ListExternalPluginsErrors,
-  ListExternalPluginsResponses,
   ListExternalServiceBackupsData,
   ListExternalServiceBackupsErrors,
   ListExternalServiceBackupsResponses,
@@ -2007,9 +1991,6 @@ import type {
   ListPgUpgradesData,
   ListPgUpgradesErrors,
   ListPgUpgradesResponses,
-  ListPluginCatalogData,
-  ListPluginCatalogErrors,
-  ListPluginCatalogResponses,
   ListPresetsData,
   ListPresetsErrors,
   ListPresetsResponses,
@@ -2060,8 +2041,6 @@ import type {
   ListRepositoriesByProviderData,
   ListRepositoriesByProviderErrors,
   ListRepositoriesByProviderResponses,
-  ListRepositoryPluginCatalogData,
-  ListRepositoryPluginCatalogResponses,
   ListRestoreRunsForServiceData,
   ListRestoreRunsForServiceErrors,
   ListRestoreRunsForServiceResponses,
@@ -2167,6 +2146,9 @@ import type {
   MkdirData,
   MkdirErrors,
   MkdirResponses,
+  NodeCapabilityGetData,
+  NodeCapabilityGetErrors,
+  NodeCapabilityGetResponses,
   NodeDockerDiskUsageGetData,
   NodeDockerDiskUsageGetErrors,
   NodeDockerDiskUsageGetResponses,
@@ -2237,8 +2219,6 @@ import type {
   PushExternalImageData,
   PushExternalImageErrors,
   PushExternalImageResponses,
-  PutPluginGrantsData,
-  PutPluginGrantsResponses,
   QueryDataData,
   QueryDataErrors,
   QueryDataResponses,
@@ -2325,9 +2305,6 @@ import type {
   RejectUserPendingActionData,
   RejectUserPendingActionErrors,
   RejectUserPendingActionResponses,
-  ReloadPluginsData,
-  ReloadPluginsErrors,
-  ReloadPluginsResponses,
   RemoveClusterMemberData,
   RemoveClusterMemberErrors,
   RemoveClusterMemberResponses,
@@ -2577,8 +2554,6 @@ import type {
   SetFlagEnvironmentData,
   SetFlagEnvironmentErrors,
   SetFlagEnvironmentResponses,
-  SetPluginInstallationReportingData,
-  SetPluginInstallationReportingResponses,
   SetPreviewPasswordData,
   SetPreviewPasswordErrors,
   SetPreviewPasswordResponses,
@@ -2732,9 +2707,6 @@ import type {
   TriggerWeeklyDigestData,
   TriggerWeeklyDigestErrors,
   TriggerWeeklyDigestResponses,
-  UninstallPluginData,
-  UninstallPluginErrors,
-  UninstallPluginResponses,
   UnlinkApplicationProjectData,
   UnlinkApplicationProjectErrors,
   UnlinkApplicationProjectResponses,
@@ -2877,9 +2849,6 @@ import type {
   UpdateProviderModelErrors,
   UpdateProviderModelResponses,
   UpdateProviderResponses,
-  UpdateRepositoryData,
-  UpdateRepositoryErrors,
-  UpdateRepositoryResponses,
   UpdateRouteData,
   UpdateRouteErrors,
   UpdateRouteResponses,
@@ -12341,6 +12310,32 @@ export const getUptimeHistory = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/monitors/{monitor_id}/uptime",
+    ...options,
+  });
+
+/**
+ * Report whether this install can schedule workloads.
+ *
+ * A control plane with no local workloads and no joined worker node accepts
+ * deploys it can never run. Rather than letting every surface learn that by
+ * failing, this endpoint states it up front so the console can render an
+ * onboarding state with a link to join a node — and so a client can tell
+ * "not set up" apart from "not built", which a 404 or a 500 cannot.
+ */
+export const nodeCapabilityGet = <ThrowOnError extends boolean = false>(
+  options?: Options<NodeCapabilityGetData, ThrowOnError>,
+): RequestResult<
+  NodeCapabilityGetResponses,
+  NodeCapabilityGetErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    NodeCapabilityGetResponses,
+    NodeCapabilityGetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/capability",
     ...options,
   });
 
@@ -22848,254 +22843,6 @@ export const triggerWeeklyDigest = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/weekly-digest/trigger",
     ...options,
-  });
-
-/**
- * List all running external plugins and their manifests.
- *
- * Requires only a valid session/token (no specific permission) since the
- * manifest drives sidebar navigation rendering for every authenticated
- * user, not just admins.
- */
-export const listExternalPlugins = <ThrowOnError extends boolean = false>(
-  options?: Options<ListExternalPluginsData, ThrowOnError>,
-): RequestResult<
-  ListExternalPluginsResponses,
-  ListExternalPluginsErrors,
-  ThrowOnError
-> =>
-  (options?.client ?? client).get<
-    ListExternalPluginsResponses,
-    ListExternalPluginsErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins",
-    ...options,
-  });
-
-export const listPluginCatalog = <ThrowOnError extends boolean = false>(
-  options?: Options<ListPluginCatalogData, ThrowOnError>,
-): RequestResult<
-  ListPluginCatalogResponses,
-  ListPluginCatalogErrors,
-  ThrowOnError
-> =>
-  (options?.client ?? client).get<
-    ListPluginCatalogResponses,
-    ListPluginCatalogErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/catalog",
-    ...options,
-  });
-
-export const listRepositoryPluginCatalog = <
-  ThrowOnError extends boolean = false,
->(
-  options?: Options<ListRepositoryPluginCatalogData, ThrowOnError>,
-): RequestResult<ListRepositoryPluginCatalogResponses, unknown, ThrowOnError> =>
-  (options?.client ?? client).get<
-    ListRepositoryPluginCatalogResponses,
-    unknown,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/catalog/repositories",
-    ...options,
-  });
-
-export const getRepositoryInstallProgress = <
-  ThrowOnError extends boolean = false,
->(
-  options: Options<GetRepositoryInstallProgressData, ThrowOnError>,
-): RequestResult<
-  GetRepositoryInstallProgressResponses,
-  GetRepositoryInstallProgressErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).get<
-    GetRepositoryInstallProgressResponses,
-    GetRepositoryInstallProgressErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/install/progress/{id}",
-    ...options,
-  });
-
-export const installRepository = <ThrowOnError extends boolean = false>(
-  options: Options<InstallRepositoryData, ThrowOnError>,
-): RequestResult<
-  InstallRepositoryResponses,
-  InstallRepositoryErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).post<
-    InstallRepositoryResponses,
-    InstallRepositoryErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/install/repository",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-export const getPluginInstallationReporting = <
-  ThrowOnError extends boolean = false,
->(
-  options?: Options<GetPluginInstallationReportingData, ThrowOnError>,
-): RequestResult<
-  GetPluginInstallationReportingResponses,
-  unknown,
-  ThrowOnError
-> =>
-  (options?.client ?? client).get<
-    GetPluginInstallationReportingResponses,
-    unknown,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/installation-reporting",
-    ...options,
-  });
-
-export const setPluginInstallationReporting = <
-  ThrowOnError extends boolean = false,
->(
-  options: Options<SetPluginInstallationReportingData, ThrowOnError>,
-): RequestResult<
-  SetPluginInstallationReportingResponses,
-  unknown,
-  ThrowOnError
-> =>
-  (options.client ?? client).put<
-    SetPluginInstallationReportingResponses,
-    unknown,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/installation-reporting",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-/**
- * Reload all external plugins.
- *
- * Stops all running plugin processes, re-scans the plugins directory,
- * starts any discovered binaries, and hot-swaps the proxy router so new
- * and removed plugins take effect immediately without a server restart.
- *
- * Requires `SystemAdmin` permission.
- */
-export const reloadPlugins = <ThrowOnError extends boolean = false>(
-  options?: Options<ReloadPluginsData, ThrowOnError>,
-): RequestResult<ReloadPluginsResponses, ReloadPluginsErrors, ThrowOnError> =>
-  (options?.client ?? client).post<
-    ReloadPluginsResponses,
-    ReloadPluginsErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/reload",
-    ...options,
-  });
-
-export const getPluginGrants = <ThrowOnError extends boolean = false>(
-  options: Options<GetPluginGrantsData, ThrowOnError>,
-): RequestResult<GetPluginGrantsResponses, unknown, ThrowOnError> =>
-  (options.client ?? client).get<
-    GetPluginGrantsResponses,
-    unknown,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/{name}/grants",
-    ...options,
-  });
-
-export const putPluginGrants = <ThrowOnError extends boolean = false>(
-  options: Options<PutPluginGrantsData, ThrowOnError>,
-): RequestResult<PutPluginGrantsResponses, unknown, ThrowOnError> =>
-  (options.client ?? client).put<
-    PutPluginGrantsResponses,
-    unknown,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/{name}/grants",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-export const getPluginStatus = <ThrowOnError extends boolean = false>(
-  options: Options<GetPluginStatusData, ThrowOnError>,
-): RequestResult<
-  GetPluginStatusResponses,
-  GetPluginStatusErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).get<
-    GetPluginStatusResponses,
-    GetPluginStatusErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/{name}/status",
-    ...options,
-  });
-
-/**
- * Stop and deactivate a plugin while preserving all installed releases and data.
- */
-export const uninstallPlugin = <ThrowOnError extends boolean = false>(
-  options: Options<UninstallPluginData, ThrowOnError>,
-): RequestResult<
-  UninstallPluginResponses,
-  UninstallPluginErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).post<
-    UninstallPluginResponses,
-    UninstallPluginErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/{name}/uninstall",
-    ...options,
-  });
-
-export const updateRepository = <ThrowOnError extends boolean = false>(
-  options: Options<UpdateRepositoryData, ThrowOnError>,
-): RequestResult<
-  UpdateRepositoryResponses,
-  UpdateRepositoryErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).post<
-    UpdateRepositoryResponses,
-    UpdateRepositoryErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/{name}/update",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
   });
 
 /**

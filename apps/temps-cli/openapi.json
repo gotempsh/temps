@@ -31069,6 +31069,10 @@
           "jit_provisioning": {
             "type": "boolean"
           },
+          "managed_by_cloud": {
+            "description": "ADR-045 §4: true only for the provider Temps Cloud provisions for\nconsole access. The admin UI should disable edit/delete controls for\nsuch a row — the API itself refuses those requests regardless\n(`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -31099,7 +31103,8 @@
           "group_claim",
           "role_claim",
           "default_role",
-          "trust_idp_email"
+          "trust_idp_email",
+          "managed_by_cloud"
         ],
         "type": "object"
       },
