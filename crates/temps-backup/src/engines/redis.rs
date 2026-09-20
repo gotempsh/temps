@@ -38,7 +38,7 @@ use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "redis";
+pub(crate) const ENGINE_KEY: &str = "redis";
 const DUMP_FILE_SUFFIX: &str = "dump.rdb.gz";
 const REDIS_SIDECAR_IMAGE: &str =
     "redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2";

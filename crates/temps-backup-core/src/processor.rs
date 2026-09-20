@@ -121,6 +121,24 @@ impl BackupJobProcessor {
                              flipped row to failed",
                         );
                     }
+                    Err(SpawnError::EngineUnavailableHere {
+                        backup_id,
+                        engine,
+                        reason,
+                    }) => {
+                        // Not a failure of this backup — a capability this
+                        // process does not have. The executor left the row
+                        // `pending` with the reason attached; another process
+                        // (or this one, once it has a local Docker daemon) can
+                        // still run it.
+                        warn!(
+                            backup_id,
+                            engine = %engine,
+                            reason = %reason,
+                            "BackupJobProcessor: declined BackupRequested; the backup stays \
+                             pending with the reason recorded on the row",
+                        );
+                    }
                     Err(SpawnError::Database(e)) => {
                         error!(
                             backup_id = req.backup_id,

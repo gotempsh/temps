@@ -38,6 +38,45 @@ use temps_providers::externalsvc::postgres_upgrade::{
 use temps_providers::postgres_lifecycle::PostgresLifecycleAdapter;
 use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 
+/// Every engine that drives a local Docker container end to end, and so can
+/// only run in a process that owns a Docker daemon.
+///
+/// Sourced from each engine's own `ENGINE_KEY` rather than re-spelled here, so
+/// a renamed engine cannot silently drop out of the unavailable set and start
+/// failing backups on a Dockerless control plane again.
+const DOCKER_BACKED_ENGINES: [&str; 8] = [
+    crate::engines::redis::ENGINE_KEY,
+    crate::engines::postgres_pgdump::ENGINE_KEY,
+    crate::engines::postgres_walg::ENGINE_KEY,
+    crate::engines::postgres_cluster::ENGINE_KEY,
+    crate::engines::mongodb::ENGINE_KEY,
+    crate::engines::mariadb_physical::ENGINE_KEY,
+    crate::engines::mariadb_dump::ENGINE_KEY,
+    crate::engines::s3_mirror::ENGINE_KEY,
+];
+
+/// Why [`DOCKER_BACKED_ENGINES`] cannot run in this process, phrased for the
+/// operator who finds it on a waiting backup in the console.
+///
+/// The `DockerHandle`'s own message already names the profile and the reason;
+/// this adds what it means for backups specifically and where the capability
+/// does exist, because a self-hosted operator reading a stuck backup row has
+/// nobody to ask what to do next.
+fn docker_engine_unavailable_reason(handle: &temps_core::DockerHandle) -> String {
+    let cause = match handle.unavailable_error() {
+        Some(error) => error.to_string(),
+        // Unreachable via the call site (only taken when the handle has no
+        // client), but stating the condition beats an empty sentence.
+        None => "this process has no local Docker daemon".to_string(),
+    };
+    format!(
+        "{cause}. Container-backed backups (the {} engines) run only where the database's \
+         container runs; start this instance with the full profile on a host with Docker, or \
+         run the backup from the node hosting the service",
+        DOCKER_BACKED_ENGINES.join(", ")
+    )
+}
+
 /// Backup Plugin: registers backup services + the in-process executor.
 pub struct BackupPlugin;
 
@@ -156,6 +195,10 @@ impl TempsPlugin for BackupPlugin {
             // Docker-independent behaviour to keep working. Log this once,
             // clearly, rather than registering engines that would fail every
             // job with an opaque error the first time one is dispatched.
+            //
+            // They are still *declared* to the executor as unavailable (see
+            // the `else` arm), so a request for one is declined and left
+            // pending rather than mistaken for a typo and failed.
             if let Some(docker) = docker_handle.cloned() {
                 executor_builder = executor_builder
                     .register_engine(Arc::new(RedisEngine::new(RedisDeps {
@@ -205,12 +248,16 @@ impl TempsPlugin for BackupPlugin {
                      mariadb_physical, mariadb_dump, s3_mirror",
                 );
             } else {
+                let reason = docker_engine_unavailable_reason(&docker_handle);
+                executor_builder = executor_builder
+                    .with_unavailable_engines(DOCKER_BACKED_ENGINES, reason.clone());
+
                 warn!(
-                    "BackupExecutor: registered only the control_plane engine — this process has \
-                     no local Docker daemon (see GET /api/platform/features), so the \
-                     Docker-backed backup engines (redis, postgres_pgdump, postgres_walg, \
-                     postgres_cluster, mongodb, mariadb_physical, mariadb_dump, s3_mirror) are \
-                     unavailable here; run them on a worker node joined with `temps join`",
+                    engines = %DOCKER_BACKED_ENGINES.join(", "),
+                    "BackupExecutor: registered only the control_plane engine — {}. Backups \
+                     requesting one of these engines are left pending with that reason on the \
+                     row rather than failed here",
+                    reason,
                 );
             }
 
@@ -594,5 +641,43 @@ mod tests {
     async fn test_backup_plugin_name() {
         let backup_plugin = BackupPlugin::new();
         assert_eq!(backup_plugin.name(), "backup");
+    }
+
+    /// The control-plane engine is the one engine that needs no daemon, so it
+    /// must never appear in the unavailable set — otherwise a Dockerless
+    /// control plane could not back up its own database either.
+    #[test]
+    fn control_plane_engine_is_not_docker_backed() {
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::control_plane::ENGINE_KEY),
+            "the control-plane engine runs without a daemon and must stay available",
+        );
+        assert_eq!(
+            DOCKER_BACKED_ENGINES.len(),
+            DOCKER_BACKED_ENGINES
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "engine keys must be unique",
+        );
+    }
+
+    /// The reason attached to a waiting backup is the only explanation a
+    /// self-hosted operator gets, so it has to name the cause *and* the fix.
+    #[test]
+    fn unavailable_reason_names_the_cause_and_the_remedy() {
+        let handle = temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        );
+
+        let reason = docker_engine_unavailable_reason(&handle);
+
+        assert!(reason.contains("control-plane"), "{reason}");
+        assert!(reason.contains("postgres_pgdump"), "{reason}");
+        assert!(
+            reason.contains("full profile") || reason.contains("node hosting the service"),
+            "the reason must tell the operator where the backup can run: {reason}",
+        );
     }
 }
