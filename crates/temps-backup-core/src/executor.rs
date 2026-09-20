@@ -77,8 +77,8 @@ struct ExecutorInner {
     engines: HashMap<&'static str, Arc<dyn BackupEngine>>,
     /// Engine keys this build of the process knows about but deliberately
     /// cannot run — see [`BackupExecutorBuilder::with_unavailable_engines`].
-    /// Distinct from "unknown": a request for one of these is a request this
-    /// process must decline without destroying it.
+    /// Distinct from "unknown": a request for one of these fails with the
+    /// capability reason (and its remedy), not with a "no such engine" typo.
     unavailable_engines: HashMap<&'static str, String>,
     semaphore: Arc<Semaphore>,
     in_flight: Mutex<HashMap<i32, JobHandle>>,
@@ -152,15 +152,19 @@ impl BackupExecutorBuilder {
     /// equipped for — today, the container-backed engines on a `serve
     /// --profile control-plane` host with no local Docker daemon. Registering
     /// them would be a lie (every job would fail on first contact with the
-    /// daemon), and leaving them merely unregistered is worse: `spawn` would
-    /// treat a valid request as a typo and destroy the backup by flipping its
-    /// row to `failed`.
+    /// daemon), and leaving them merely unregistered would make `spawn` report
+    /// a valid request as a typo ("no engine registered for key") — which sends
+    /// the operator hunting for a misconfiguration that does not exist.
     ///
-    /// Declaring them instead makes `spawn` decline without consuming the
-    /// request: the `backups` row keeps its `pending` state and gets `reason`
-    /// recorded in `error_message`, so the operator sees exactly which
-    /// capability is missing and where it does exist, and a process that *can*
-    /// run the engine can still pick the row up.
+    /// Declaring them instead makes `spawn` fail the request *with `reason`*
+    /// rather than with "unknown engine": the row goes to `failed` carrying
+    /// exactly which capability is missing and where it does exist. It is a
+    /// terminal transition on purpose. Nothing hands a `pending` row to another
+    /// process, so leaving it `pending` would not be "deferred", it would be
+    /// stuck — and because the schedule fan-out treats any `pending` child as
+    /// an in-flight run, one such row silently stops every later tick of that
+    /// schedule until a restart sweeps it. Failing fast keeps the schedule
+    /// ticking and keeps the operator looking at a real error with a remedy.
     pub fn with_unavailable_engines(
         mut self,
         keys: impl IntoIterator<Item = &'static str>,
@@ -260,26 +264,19 @@ impl BackupExecutor {
     /// can propagate it.
     pub async fn spawn(&self, params: SpawnParams) -> Result<(), SpawnError> {
         // A known-but-unavailable engine is a capability gap in this process,
-        // not a bad request, so the backup must survive it: record the reason
-        // on the row and leave it `pending`. Checked before the registry
-        // lookup below so it can never be mistaken for a typo and failed.
+        // not a typo, so it fails with the capability reason rather than the
+        // "unknown engine" one. Checked before the registry lookup below for
+        // that reason. It is still a terminal failure: see
+        // `with_unavailable_engines` for why a `pending` row would be a
+        // stuck row, not a deferred one.
         if let Some(reason) = self.inner.unavailable_engines.get(params.engine.as_str()) {
             let err = SpawnError::EngineUnavailableHere {
                 backup_id: params.backup_id,
                 engine: params.engine.clone(),
                 reason: reason.clone(),
             };
-            if let Err(e) = self
-                .mark_backup_deferred(params.backup_id, &err.to_string())
-                .await
-            {
-                error!(
-                    backup_id = params.backup_id,
-                    error = %e,
-                    "BackupExecutor: could not record why this backup is waiting; the row \
-                     stays pending with no reason attached",
-                );
-            }
+            self.finalize_failed(params.backup_id, &params.engine, &err.to_string())
+                .await;
             return Err(err);
         }
 
@@ -535,42 +532,6 @@ UPDATE external_service_backups
                 DatabaseBackend::Postgres,
                 sql,
                 vec![SValue::from(backup_id)],
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// Attach a reason to a backup that this process declined to run, without
-    /// moving it out of `pending`.
-    ///
-    /// Deliberately not a terminal transition: the work is still outstanding
-    /// and a process with the missing capability can still perform it. The
-    /// `state IN ('pending')` guard means a row that has since started or
-    /// finished elsewhere is never stamped with a stale reason.
-    async fn mark_backup_deferred(
-        &self,
-        backup_id: i32,
-        reason: &str,
-    ) -> Result<(), sea_orm::DbErr> {
-        let sql = r#"
-WITH updated_backup AS (
-    UPDATE backups
-       SET error_message = $1
-     WHERE id            = $2
-       AND state         = 'pending'
-     RETURNING id
-)
-UPDATE external_service_backups
-   SET error_message = $1
- WHERE backup_id IN (SELECT id FROM updated_backup)
-   AND state         = 'pending'
-        "#;
-        self.inner
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
             ))
             .await?;
         Ok(())
@@ -964,18 +925,25 @@ mod tests {
         assert!(sql.contains("state         = 'failed'"));
     }
 
-    /// An engine this process cannot run must not be mistaken for a typo.
-    /// `spawn` has to decline it, record why, and leave the row `pending` —
-    /// destroying a perfectly valid backup request because *this* host lacks a
-    /// capability would be a data-loss-adjacent bug for the operator.
+    /// An engine this process cannot run must not be mistaken for a typo:
+    /// `spawn` has to fail the row *with the capability reason*. And it must
+    /// be a real failure, not a `pending` row with a note on it — nothing else
+    /// picks a `pending` row up, and the schedule fan-out treats one as an
+    /// in-flight run, so "deferred" would block that schedule for good.
     #[tokio::test]
-    async fn an_unavailable_engine_is_declined_and_the_backup_stays_pending() {
+    async fn an_unavailable_engine_fails_the_backup_with_the_capability_reason() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 2,
-                }])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
                 .into_connection(),
         );
         let executor = BackupExecutorBuilder::new(db.clone())
@@ -1012,16 +980,26 @@ mod tests {
         // Nothing was started, so nothing can be cancelled or double-spawned.
         assert!(executor.inner.in_flight.lock().await.is_empty());
 
-        let sql = executed_sql(executor, db);
-        assert!(sql.contains("UPDATE backups"));
-        assert!(sql.contains("UPDATE external_service_backups"));
-        assert!(
-            sql.contains("SET error_message"),
-            "the reason must land on the row: {sql}",
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert_eq!(
+            log.len(),
+            2,
+            "the row is failed atomically, then its schedule run is closed"
         );
+        let fail_sql = log[0].statements()[0].sql.clone();
+        assert!(fail_sql.contains("UPDATE backups"));
+        assert!(fail_sql.contains("UPDATE external_service_backups"));
         assert!(
-            !sql.contains("'failed'"),
-            "a declined backup must not be failed by this process: {sql}",
+            fail_sql.contains("state         = 'failed'"),
+            "the row must reach a terminal state so its schedule keeps ticking: {fail_sql}",
+        );
+        let close_sql = log[1].statements()[0].sql.clone();
+        assert!(
+            close_sql.contains("UPDATE schedule_runs"),
+            "the parent schedule run must be closed, not left in flight: {close_sql}",
         );
     }
 

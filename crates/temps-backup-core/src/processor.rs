@@ -126,17 +126,17 @@ impl BackupJobProcessor {
                         engine,
                         reason,
                     }) => {
-                        // Not a failure of this backup — a capability this
-                        // process does not have. The executor left the row
-                        // `pending` with the reason attached; another process
-                        // (or this one, once it has a local Docker daemon) can
-                        // still run it.
+                        // A capability this process does not have. The
+                        // executor already failed the row with that reason
+                        // (and its remedy) and closed the schedule run, so
+                        // the schedule keeps ticking and the operator sees
+                        // a real error rather than a row that never moves.
                         warn!(
                             backup_id,
                             engine = %engine,
                             reason = %reason,
-                            "BackupJobProcessor: declined BackupRequested; the backup stays \
-                             pending with the reason recorded on the row",
+                            "BackupJobProcessor: BackupRequested for an engine this process \
+                             cannot run; executor already flipped row to failed with the reason",
                         );
                     }
                     Err(SpawnError::Database(e)) => {

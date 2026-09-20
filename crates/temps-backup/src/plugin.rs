@@ -255,8 +255,8 @@ impl TempsPlugin for BackupPlugin {
                 warn!(
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
                     "BackupExecutor: registered only the control_plane engine — {}. Backups \
-                     requesting one of these engines are left pending with that reason on the \
-                     row rather than failed here",
+                     requesting one of these engines fail here with that reason recorded on \
+                     the row, so their schedules keep ticking and stay visible",
                     reason,
                 );
             }
