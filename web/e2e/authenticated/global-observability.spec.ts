@@ -182,7 +182,10 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       if (kind === 'traces')
         await expect(
           page.getByRole('link', { name: 'Cross-project waterfall' })
-        ).toHaveAttribute('href', `/traces/global/${traceId}`)
+        ).toHaveAttribute(
+          'href',
+          new RegExp(`^/traces/global/${traceId}\\?start_time=.+&end_time=.+`)
+        )
       if (kind === 'errors')
         await expect(
           page.getByRole('link', { name: 'Checkout failed' })
@@ -258,7 +261,7 @@ test('scan-budget exhaustion asks for a narrower search instead of claiming no l
       })
   )
   await page.goto('/logs')
-  await expect(page.getByText(/Scan limit reached/)).toBeVisible()
+  await expect(page.getByText(/No matching lines in this scan/)).toBeVisible()
   await expect(page.getByText('No logs in this view')).toHaveCount(0)
   await expect(
     page.getByRole('button', { name: 'Next page', exact: true })
@@ -286,12 +289,9 @@ for (const width of [1440, 390]) {
         })
     )
     await page.goto('/logs')
-    const warning = page
-      .getByRole('status')
-      .filter({ hasText: 'Scan limit reached' })
-    await expect(warning).toBeVisible()
-    await expect(warning).toContainText('Showing partial results.')
-    await expect(warning).toContainText('Use Next page to continue')
+    await page.getByRole('button', { name: 'About partial results' }).click()
+    await expect(page.getByText(/This scan reached its limit/)).toBeVisible()
+    await page.keyboard.press('Escape')
     await expect(
       page.getByRole('cell', { name: 'Checkout request failed', exact: false })
     ).toBeVisible()
