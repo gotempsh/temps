@@ -98588,6 +98588,9 @@
           "404": {
             "description": "Project or environment not found"
           },
+          "409": {
+            "description": "A container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -98650,6 +98653,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98725,6 +98731,9 @@
           },
           "404": {
             "description": "Container or environment variable not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98893,6 +98902,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -99105,6 +99117,9 @@
           "404": {
             "description": "Container not found"
           },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -99163,6 +99178,9 @@
           "404": {
             "description": "Container not found"
           },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -99220,6 +99238,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -99287,6 +99308,9 @@
           },
           "404": {
             "description": "Project or environment not found"
+          },
+          "409": {
+            "description": "Claiming a local daemon image needs a local Docker daemon, which this process has none of"
           },
           "500": {
             "description": "Internal server error"
