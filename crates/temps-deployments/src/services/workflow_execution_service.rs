@@ -12,8 +12,8 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_core::{
-    DockerHandle, Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError,
-    WorkflowExecutor,
+    DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
+    WorkflowError, WorkflowExecutor,
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
@@ -774,64 +774,48 @@ impl WorkflowExecutionService {
         workflow_builder = workflow_builder.with_var("repo_owner", &project.repo_owner)?;
         workflow_builder = workflow_builder.with_var("repo_name", &project.repo_name)?;
 
-        // Convert database job records to actual job instances
-        // Create log paths for each job
-        for db_job in &db_jobs {
-            // Create log path for this job
-            self.log_service
-                .create_log_path(&db_job.log_id)
-                .await
-                .map_err(|e| {
-                    WorkflowExecutionError::JobCreationFailed(format!(
-                        "Failed to create log path for job {}: {}",
-                        db_job.job_id, e
-                    ))
-                })?;
-
-            debug!(
-                "📝 Created log path for job {} at {}",
-                db_job.job_id, db_job.log_id
-            );
-
-            let job = self
-                .create_job_from_record(&project, &environment, &deployment, db_job)
-                .await?;
-
-            // Parse dependencies from database record
-            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
-                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
-                    warn!(
-                        "Failed to parse dependencies for job {}: {}",
-                        db_job.job_id, e
-                    );
-                    vec![]
-                })
-            } else {
-                vec![]
-            };
-
-            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
-            let required_for_completion = db_job
-                .job_config
-                .as_ref()
-                .and_then(|config| config.get("_required_for_completion"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            workflow_builder =
-                workflow_builder.with_job_config(job, dependencies, required_for_completion);
-        }
-
-        let workflow = workflow_builder.build()?;
-
-        info!("Built workflow with {} jobs", workflow.jobs.len());
-
-        // Create job tracker for updating deployment_jobs table
+        // Create the job tracker before anything can fail below. The planner
+        // has already inserted one `pending` `deployment_jobs` row per job, and
+        // only the tracker ever moves those rows out of `pending` — so any
+        // failure between here and `WorkflowExecutor` running must go through
+        // it, or the deployment ends up terminally failed while its job
+        // timeline shows every step still "pending" forever.
         let job_tracker = Arc::new(DeploymentJobTracker::new(
             self.db.clone(),
             deployment_id,
             self.log_service.clone(),
         ));
+
+        // Convert database job records to actual job instances
+        let workflow_builder = match self
+            .add_jobs_to_workflow(
+                workflow_builder,
+                &project,
+                &environment,
+                &deployment,
+                &db_jobs,
+            )
+            .await
+        {
+            Ok(builder) => builder,
+            Err(e) => {
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        let workflow = match workflow_builder.build() {
+            Ok(workflow) => workflow,
+            Err(e) => {
+                let e = WorkflowExecutionError::from(e);
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        info!("Built workflow with {} jobs", workflow.jobs.len());
 
         // Execute workflow
         let executor = WorkflowExecutor::new(Some(job_tracker));
@@ -1061,6 +1045,98 @@ impl WorkflowExecutionService {
             .order_by_asc(deployment_jobs::Column::ExecutionOrder)
             .all(self.db.as_ref())
             .await?)
+    }
+
+    /// Turn every planned `deployment_jobs` row into a runnable job and add it
+    /// to the workflow.
+    ///
+    /// Split out of `execute_deployment_workflow` so the caller has one
+    /// fallible unit to recover from: every error raised here happens *before*
+    /// `WorkflowExecutor` exists, which is the only component that otherwise
+    /// moves `deployment_jobs` rows out of `pending`.
+    async fn add_jobs_to_workflow(
+        &self,
+        mut workflow_builder: WorkflowBuilder,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        db_jobs: &[deployment_jobs::Model],
+    ) -> Result<WorkflowBuilder, WorkflowExecutionError> {
+        for db_job in db_jobs {
+            // Create log path for this job
+            self.log_service
+                .create_log_path(&db_job.log_id)
+                .await
+                .map_err(|e| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Failed to create log path for job {}: {}",
+                        db_job.job_id, e
+                    ))
+                })?;
+
+            debug!(
+                "📝 Created log path for job {} at {}",
+                db_job.job_id, db_job.log_id
+            );
+
+            let job = self
+                .create_job_from_record(project, environment, deployment, db_job)
+                .await?;
+
+            // Parse dependencies from database record
+            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
+                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to parse dependencies for job {}: {}",
+                        db_job.job_id, e
+                    );
+                    vec![]
+                })
+            } else {
+                vec![]
+            };
+
+            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
+            let required_for_completion = db_job
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("_required_for_completion"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            workflow_builder =
+                workflow_builder.with_job_config(job, dependencies, required_for_completion);
+        }
+
+        Ok(workflow_builder)
+    }
+
+    /// Close out the planned-but-never-started `deployment_jobs` rows when the
+    /// workflow could not be assembled at all.
+    ///
+    /// Without this the deployment is marked `failed` by the job processor
+    /// while every one of its job rows stays `pending` — a timeline that never
+    /// resolves, on a page the operator is watching for an answer. Best-effort:
+    /// the setup error is what the caller returns, and failing to tidy the rows
+    /// must not replace it with a less informative one.
+    async fn cancel_pending_jobs_after_setup_failure(
+        &self,
+        job_tracker: &DeploymentJobTracker,
+        deployment_id: i32,
+        error: &WorkflowExecutionError,
+    ) {
+        let reason = format!("Deployment {} could not start: {}", deployment_id, error);
+        if let Err(cancel_error) = job_tracker
+            .cancel_pending_jobs(&format!("deployment-{}", deployment_id), reason)
+            .await
+        {
+            error!(
+                deployment_id,
+                error = %cancel_error,
+                "Failed to cancel pending deployment jobs after workflow setup failure; \
+                 the job timeline may show rows stuck in pending",
+            );
+        }
     }
 
     async fn create_job_from_record(
@@ -2628,11 +2704,24 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or_default();
 
-                let docker = self.docker_handle.require()?;
-                let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
-                    docker,
-                    self.config_service.data_dir(),
-                ));
+                // Build the executor from the handle rather than from a
+                // resolved client: `ComposeExecutor` already carries the
+                // "no daemon here" case (`docker_available()`), and
+                // `DeployComposeJob::execute_locked` uses it to refuse with a
+                // `LocalWorkloadsDisabled` failure naming the remedy.
+                //
+                // Resolving the daemon *here* instead would abort job
+                // construction, which happens before `WorkflowExecutor`
+                // exists — so the deployment would be failed by the outer
+                // processor while its already-inserted `deployment_jobs` rows
+                // stayed `pending` forever, with no per-job reason anywhere in
+                // the UI. Constructing unconditionally keeps the refusal on
+                // the job's own execution path, where the tracker records it.
+                let compose_executor =
+                    Arc::new(temps_deployer::compose::ComposeExecutor::new_with_handle(
+                        self.docker_handle.clone(),
+                        self.config_service.data_dir(),
+                    ));
 
                 let job = crate::jobs::DeployComposeJobBuilder::new()
                     .job_id(db_job.job_id.clone())
@@ -3475,9 +3564,6 @@ pub enum WorkflowExecutionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
-
-    #[error(transparent)]
-    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 impl From<anyhow::Error> for WorkflowExecutionError {
@@ -4265,6 +4351,140 @@ mod tests {
         );
 
         // Service should be created successfully - compilation itself is the test
+
+        Ok(())
+    }
+
+    /// Build the service under test with an explicit Docker handle, so the
+    /// Dockerless (`--profile control-plane`) paths can be exercised without a
+    /// daemon on the machine running the tests.
+    async fn service_with_docker_handle(
+        db: Arc<DbConnection>,
+        docker_handle: Arc<DockerHandle>,
+    ) -> Result<WorkflowExecutionService, Box<dyn std::error::Error>> {
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+
+        Ok(WorkflowExecutionService::new(
+            db,
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker_handle,
+        ))
+    }
+
+    fn disabled_docker_handle() -> Arc<DockerHandle> {
+        Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ))
+    }
+
+    /// Building a Compose job must not need a daemon.
+    ///
+    /// `DeployComposeJob` already refuses Dockerless hosts from inside its own
+    /// `execute`, where the workflow executor records the refusal against the
+    /// job row. Resolving the daemon at *construction* time instead would fail
+    /// the deployment before the executor exists — leaving every planned
+    /// `deployment_jobs` row `pending` forever with no reason anywhere.
+    #[tokio::test]
+    async fn a_compose_job_is_built_without_a_local_docker_daemon(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+
+        let compose_job = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("deploy_compose".to_string()),
+            job_type: Set("DeployComposeJob".to_string()),
+            name: Set("Deploy Compose".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-deploy_compose", deployment.id)),
+            job_config: Set(Some(serde_json::json!({ "compose_path": "compose.yaml" }))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        service
+            .create_job_from_record(&project, &environment, &deployment, &compose_job)
+            .await
+            .expect("compose job construction must not depend on a local daemon");
+
+        Ok(())
+    }
+
+    /// Whatever stops a workflow from being assembled, the planned job rows
+    /// must not be left saying "pending" on a deployment that is over. A
+    /// self-hosted operator staring at a timeline that never resolves has no
+    /// way to tell a stuck deployment from a slow one.
+    #[tokio::test]
+    async fn planned_jobs_are_closed_out_when_the_workflow_cannot_be_built(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
+
+        // `BuildStaticJob` is a planned-but-unimplemented type: constructing it
+        // always fails, which is exactly the shape of a setup failure.
+        let doomed = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("build_static".to_string()),
+            job_type: Set("BuildStaticJob".to_string()),
+            name: Set("Build Static".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-build_static", deployment.id)),
+            job_config: Set(Some(serde_json::json!({}))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        let error = service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect_err("an unbuildable workflow must fail the deployment");
+
+        let row = deployment_jobs::Entity::find_by_id(doomed.id)
+            .one(db.as_ref())
+            .await?
+            .expect("the planned job row still exists");
+
+        assert_ne!(
+            row.status,
+            JobStatus::Pending,
+            "a planned job must never be left pending after the deployment is over",
+        );
+        let reason = row
+            .error_message
+            .clone()
+            .expect("the closed-out row must say why it never ran");
+        assert!(
+            reason.contains(&deployment.id.to_string()),
+            "the reason must identify the deployment: {reason}",
+        );
+        assert!(
+            reason.contains(&error.to_string()),
+            "the reason must carry the underlying setup failure: {reason}",
+        );
 
         Ok(())
     }
