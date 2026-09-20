@@ -75,11 +75,26 @@ const EVENTS_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Log Aggregator Plugin for structured log collection, storage, search, and streaming
 pub struct LogAggregatorPlugin {
     storage_config: StorageConfig,
+    /// ClickHouse connection for the ADR-047 line index, resolved once by
+    /// the composition root from `ServerConfig` (the single home of the
+    /// instance's ClickHouse connection, shared with analytics, OTel, proxy
+    /// logs and metrics — ADR-012). `None` = index disabled; the explorer
+    /// then shows the onboarding state.
+    line_index_config: Option<ClickHouseConfig>,
 }
 
 impl LogAggregatorPlugin {
     pub fn new(storage_config: StorageConfig) -> Self {
-        Self { storage_config }
+        Self {
+            storage_config,
+            line_index_config: None,
+        }
+    }
+
+    /// Enable the ClickHouse line index with the instance's connection.
+    pub fn with_line_index(mut self, config: Option<ClickHouseConfig>) -> Self {
+        self.line_index_config = config;
+        self
     }
 }
 
@@ -150,7 +165,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // enough. Any reason it is unavailable is kept verbatim so the
             // explorer can tell the operator what to fix (never a silent
             // downgrade).
-            let line_index: Arc<dyn LineIndex> = match ClickHouseConfig::from_env() {
+            let line_index: Arc<dyn LineIndex> = match self.line_index_config.as_ref() {
                 None => {
                     tracing::info!(
                         "log line index disabled: ClickHouse not configured (attribute \
@@ -160,7 +175,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                         IndexUnavailable::NotConfigured.to_string(),
                     ))
                 }
-                Some(config) => match ClickHouseLineIndex::connect(&config).await {
+                Some(config) => match ClickHouseLineIndex::connect(config).await {
                     Ok(index) => index,
                     Err(reason) => {
                         tracing::warn!(%reason, "log line index disabled");

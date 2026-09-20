@@ -296,8 +296,11 @@ reads `GREATEST` of both.
 
 ### 7. Version gate
 
-At startup, when `TEMPS_CLICKHOUSE_*` is set, the plugin runs
-`SELECT version()`; if `< 25.3` the line index is disabled with a logged,
+The index uses the instance's one ClickHouse connection — `ServerConfig`
+(ADR-012), the same connection analytics, OTel, proxy logs and metrics use;
+the composition root hands it to the plugin, which never reads the
+environment itself. At startup, when that connection is configured, the
+plugin runs `SELECT version()`; if `< 25.3` the line index is disabled with a logged,
 user-visible reason ("ClickHouse 24.8 found; log analytics needs ≥ 25.3
 for the JSON column type") surfaced through the capabilities endpoint.
 Spans and metrics are unaffected.

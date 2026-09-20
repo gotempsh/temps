@@ -17,5 +17,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-serial_test = "4.0"
 tokio = { workspace = true }

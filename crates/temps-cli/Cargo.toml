@@ -67,6 +67,7 @@ temps-git = { path = "../temps-git" }
 temps-import = { path = "../temps-import" }
 temps-infra = { path = "../temps-infra" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 temps-logs = { path = "../temps-logs" }
 temps-mcp-server = { path = "../temps-mcp-server" }
 temps-migrations = { path = "../temps-migrations" }

@@ -42,8 +42,11 @@ use clickhouse::error::Error as ChError;
 
 /// Connection configuration for a ClickHouse-backed store.
 ///
-/// All four fields are required for a store to be considered "configured" —
-/// see [`ClickHouseConfig::from_env`] for the fail-closed rule.
+/// All four fields are required for a store to be considered "configured".
+/// The instance's connection lives once in `temps_config::ServerConfig`
+/// (`is_clickhouse_enabled` is the fail-closed rule: partial configuration
+/// is "off"); the composition root builds this from it and hands it to each
+/// ClickHouse-backed store. Stores never read the environment themselves.
 #[derive(Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -81,33 +84,6 @@ impl ClickHouseConfig {
             user: user.into(),
             password: password.into(),
         }
-    }
-
-    /// Read `TEMPS_CLICKHOUSE_{URL,DATABASE,USER,PASSWORD}` from the process
-    /// environment.
-    ///
-    /// Returns `Some(config)` only when `URL`, `USER`, and `PASSWORD` are all
-    /// set and non-empty (fail-closed: partial configuration is treated as
-    /// disabled, so a half-configured operator never silently loses data to
-    /// a store that isn't really there). `DATABASE` defaults to `"temps"`
-    /// when `URL` is set but `DATABASE` is not, so all ClickHouse-backed
-    /// telemetry lives in one database by default; operators only need to
-    /// set `TEMPS_CLICKHOUSE_DATABASE` if they want a different name.
-    pub fn from_env() -> Option<Self> {
-        let url = std::env::var("TEMPS_CLICKHOUSE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let database = std::env::var("TEMPS_CLICKHOUSE_DATABASE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "temps".to_string());
-        let user = std::env::var("TEMPS_CLICKHOUSE_USER")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let password = std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        Some(Self::new(url, database, user, password))
     }
 
     /// Build a `clickhouse::Client` scoped to this config's URL, database,
@@ -235,7 +211,6 @@ pub async fn server_version(client: &clickhouse::Client) -> Result<ServerVersion
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     // ── ServerVersion ────────────────────────────────────────────────────
 
@@ -319,78 +294,6 @@ mod tests {
             patch: 2,
         };
         assert!(a < b);
-    }
-
-    // ── ClickHouseConfig::from_env ──────────────────────────────────────────
-
-    const ENV_KEYS: &[&str] = &[
-        "TEMPS_CLICKHOUSE_URL",
-        "TEMPS_CLICKHOUSE_DATABASE",
-        "TEMPS_CLICKHOUSE_USER",
-        "TEMPS_CLICKHOUSE_PASSWORD",
-    ];
-
-    fn clear_env() {
-        for k in ENV_KEYS {
-            std::env::remove_var(k);
-        }
-    }
-
-    #[test]
-    #[serial(clickhouse_env)]
-    fn from_env_none_when_unset() {
-        clear_env();
-        assert!(ClickHouseConfig::from_env().is_none());
-    }
-
-    #[test]
-    #[serial(clickhouse_env)]
-    fn from_env_none_when_partially_set() {
-        clear_env();
-        std::env::set_var("TEMPS_CLICKHOUSE_URL", "http://localhost:8123");
-        std::env::set_var("TEMPS_CLICKHOUSE_USER", "default");
-        // password missing -> still disabled
-        assert!(ClickHouseConfig::from_env().is_none());
-        clear_env();
-    }
-
-    #[test]
-    #[serial(clickhouse_env)]
-    fn from_env_none_when_value_is_empty_string() {
-        clear_env();
-        std::env::set_var("TEMPS_CLICKHOUSE_URL", "http://localhost:8123");
-        std::env::set_var("TEMPS_CLICKHOUSE_USER", "default");
-        std::env::set_var("TEMPS_CLICKHOUSE_PASSWORD", "");
-        assert!(ClickHouseConfig::from_env().is_none());
-        clear_env();
-    }
-
-    #[test]
-    #[serial(clickhouse_env)]
-    fn from_env_defaults_database_to_temps() {
-        clear_env();
-        std::env::set_var("TEMPS_CLICKHOUSE_URL", "http://localhost:8123");
-        std::env::set_var("TEMPS_CLICKHOUSE_USER", "default");
-        std::env::set_var("TEMPS_CLICKHOUSE_PASSWORD", "secret");
-        let cfg = ClickHouseConfig::from_env().unwrap();
-        assert_eq!(cfg.database, "temps");
-        assert_eq!(cfg.url, "http://localhost:8123");
-        assert_eq!(cfg.user, "default");
-        assert_eq!(cfg.password, "secret");
-        clear_env();
-    }
-
-    #[test]
-    #[serial(clickhouse_env)]
-    fn from_env_respects_explicit_database() {
-        clear_env();
-        std::env::set_var("TEMPS_CLICKHOUSE_URL", "http://localhost:8123");
-        std::env::set_var("TEMPS_CLICKHOUSE_DATABASE", "custom_db");
-        std::env::set_var("TEMPS_CLICKHOUSE_USER", "default");
-        std::env::set_var("TEMPS_CLICKHOUSE_PASSWORD", "secret");
-        let cfg = ClickHouseConfig::from_env().unwrap();
-        assert_eq!(cfg.database, "custom_db");
-        clear_env();
     }
 
     #[test]

@@ -10919,6 +10919,7 @@ dependencies = [
  "temps-auth",
  "temps-backup",
  "temps-blob",
+ "temps-clickhouse",
  "temps-cloud",
  "temps-cloud-client",
  "temps-config",
@@ -10988,7 +10989,6 @@ version = "0.1.0-beta.56"
 dependencies = [
  "clickhouse",
  "serde",
- "serial_test",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
