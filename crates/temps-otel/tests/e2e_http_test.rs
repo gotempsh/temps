@@ -370,9 +370,16 @@ fn build_trace_request(
     trace_id: &[u8; 16],
     service_name: &str,
 ) -> temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest {
+    build_trace_request_at(trace_id, service_name, 1_700_000_000_000_000_000)
+}
+
+fn build_trace_request_at(
+    trace_id: &[u8; 16],
+    service_name: &str,
+    base: u64,
+) -> temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest {
     let root_id: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
     let child_id: [u8; 8] = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
-    let base = 1_700_000_000_000_000_000_u64;
 
     temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest {
         resource_spans: vec![temps_otel::proto::trace::v1::ResourceSpans {
@@ -440,6 +447,41 @@ fn build_trace_request(
             schema_url: String::new(),
         }],
     }
+}
+
+/// Match the UI contract: historical trace detail carries the trace's own window.
+fn trace_detail_uri(
+    project_id: i32,
+    trace_id: &str,
+    request: &temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest,
+) -> String {
+    let spans: Vec<_> = request
+        .resource_spans
+        .iter()
+        .flat_map(|resource| &resource.scope_spans)
+        .flat_map(|scope| &scope.spans)
+        .collect();
+    let start = spans
+        .iter()
+        .map(|span| span.start_time_unix_nano)
+        .min()
+        .expect("fixture has spans");
+    let end = spans
+        .iter()
+        .map(|span| span.end_time_unix_nano)
+        .max()
+        .expect("fixture has spans");
+    let start = chrono::DateTime::from_timestamp_nanos(
+        i64::try_from(start).expect("fixture timestamp fits i64"),
+    ) - chrono::Duration::seconds(1);
+    let end = chrono::DateTime::from_timestamp_nanos(
+        i64::try_from(end).expect("fixture timestamp fits i64"),
+    ) + chrono::Duration::seconds(1);
+    format!(
+        "/otel/traces/{project_id}/{trace_id}?start_time={}&end_time={}",
+        start.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        end.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    )
 }
 
 /// Helper: build a protobuf ExportMetricsServiceRequest.
@@ -551,6 +593,7 @@ async fn test_e2e_ingest_traces_and_query_back() {
 
     // Step 1: POST protobuf traces (like an OTel SDK would)
     let request = build_trace_request(&trace_id, "my-web-app");
+    let detail_uri = trace_detail_uri(project_id, &trace_id_hex, &request);
     let body = request.encode_to_vec();
 
     let response = router
@@ -588,7 +631,7 @@ async fn test_e2e_ingest_traces_and_query_back() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/otel/traces/{project_id}/{trace_id_hex}"))
+                .uri(detail_uri)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -621,6 +664,15 @@ async fn test_e2e_ingest_traces_and_query_back() {
 
 #[tokio::test]
 async fn test_e2e_ingest_error_trace_always_stored() {
+    assert_error_trace_stored(true).await;
+}
+
+#[tokio::test]
+async fn test_e2e_recent_error_trace_uses_default_window() {
+    assert_error_trace_stored(false).await;
+}
+
+async fn assert_error_trace_stored(historical: bool) {
     let Some((_db, router, project_id)) = setup_e2e().await else {
         return;
     };
@@ -629,7 +681,23 @@ async fn test_e2e_ingest_error_trace_always_stored() {
     let trace_id_hex = hex::encode(trace_id);
 
     // Build a trace with an ERROR span (always kept by sampler)
-    let mut request = build_trace_request(&trace_id, "error-app");
+    let mut request = if historical {
+        build_trace_request(&trace_id, "error-app")
+    } else {
+        let recent = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let base = u64::try_from(
+            recent
+                .timestamp_nanos_opt()
+                .expect("recent timestamp fits i64"),
+        )
+        .expect("recent timestamp is after the Unix epoch");
+        build_trace_request_at(&trace_id, "error-app", base)
+    };
+    let detail_uri = if historical {
+        trace_detail_uri(project_id, &trace_id_hex, &request)
+    } else {
+        format!("/otel/traces/{project_id}/{trace_id_hex}")
+    };
     // Set the root span to ERROR status
     request.resource_spans[0].scope_spans[0].spans[0]
         .status
@@ -656,13 +724,41 @@ async fn test_e2e_ingest_error_trace_always_stored() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Query back — error spans are always kept
+    if historical {
+        // No hint writer is configured in this harness. An omitted window is
+        // recent-only, so it must not return the fixed historical fixture.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/otel/traces/{project_id}/{trace_id_hex}"))
+                    .body(Body::empty())
+                    .expect("valid default-window request"),
+            )
+            .await
+            .expect("default-window response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read default-window response")
+            .to_bytes();
+        let result: serde_json::Value =
+            serde_json::from_slice(&body).expect("valid trace response");
+        assert_eq!(
+            result["count"], 0,
+            "historical spans must not leak into the recent default window"
+        );
+    }
+
+    // Query back — error spans are always kept inside the requested window.
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/otel/traces/{project_id}/{trace_id_hex}"))
+                .uri(detail_uri)
                 .body(Body::empty())
                 .unwrap(),
         )

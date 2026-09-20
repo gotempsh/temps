@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  traceDetailPath,
+  traceTimeBoundsFromSearch,
+} from '@/lib/traces-time-window'
 import { useMemo } from 'react'
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { useQuery } from '@tanstack/react-query'
 import { getUnifiedTraceOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -120,7 +124,9 @@ function UnifiedSpanDetail({
       </div>
 
       <Button asChild variant="outline" size="sm" className="w-full gap-1.5">
-        <Link to={`/projects/${projectSlug}/traces/${traceId}`}>
+        <Link
+          to={`/projects/${projectSlug}/traces/${traceDetailPath({ ...span, trace_id: traceId })}`}
+        >
           <ExternalLink className="h-3.5 w-3.5" />
           View in {projectName}
         </Link>
@@ -131,9 +137,13 @@ function UnifiedSpanDetail({
 
 export default function CrossProjectTraceDetail() {
   const { traceId } = useParams()
+  const [searchParams] = useSearchParams()
 
   const { data, isPending, isError, error } = useQuery({
-    ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
+    ...getUnifiedTraceOptions({
+      path: { trace_id: traceId || '' },
+      query: traceTimeBoundsFromSearch(searchParams),
+    }),
     enabled: !!traceId,
     retry: false,
   })

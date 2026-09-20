@@ -1,7 +1,24 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import {
+  getGenaiTraceOptions,
+  queryGenaiTracesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import type {
+  GenAiSpanDetail,
+  GenAiEvent,
+  GenAiTraceDetailResponse,
+  GenAiTraceSummary,
+} from '@/api/client/types.gen'
+import {
+  traceTimeBounds,
+  traceTimeBoundsFromSearch,
+  type TraceTimeBounds,
+} from '@/lib/traces-time-window'
 import { HighlightedCode } from '@/components/ui/code-block'
 
+import { CloudAiMetadataNotice } from '@/components/ai/CloudAiMetadataNotice'
+import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
@@ -1652,142 +1669,6 @@ export function UsageAnalytics() {
 // GenAI Agent Activity Types & Component
 // ============================================================================
 
-interface GenAiTraceSummary {
-  trace_id: string
-  root_span_name: string
-  service_name: string
-  gen_ai_system: string | null
-  gen_ai_model: string | null
-  gen_ai_operation: string | null
-  start_time: string
-  duration_ms: number
-  span_count: number
-  error_count: number
-  total_input_tokens: number | null
-  total_output_tokens: number | null
-  total_cache_creation_input_tokens: number | null
-  total_cache_read_input_tokens: number | null
-}
-
-interface GenAiSpanDetail {
-  span_id: string
-  parent_span_id: string | null
-  name: string
-  kind: string
-  start_time: string
-  duration_ms: number
-  status_code: string
-
-  // Core identification
-  gen_ai_system: string | null
-  gen_ai_operation: string | null
-
-  // Model
-  gen_ai_model: string | null
-  gen_ai_response_model: string | null
-
-  // Request parameters
-  request_temperature: number | null
-  request_max_tokens: number | null
-  request_top_p: number | null
-  request_top_k: number | null
-  request_frequency_penalty: number | null
-  request_presence_penalty: number | null
-  request_stop_sequences: string[] | null
-  request_seed: number | null
-  request_choice_count: number | null
-
-  // Response
-  response_id: string | null
-  response_finish_reasons: string[] | null
-  output_type: string | null
-
-  // Token usage
-  input_tokens: number | null
-  output_tokens: number | null
-  cache_creation_input_tokens: number | null
-  cache_read_input_tokens: number | null
-
-  // Conversation / Error / Server
-  conversation_id: string | null
-  error_type: string | null
-  server_address: string | null
-  server_port: number | null
-
-  // Agent
-  agent_id: string | null
-  agent_name: string | null
-  agent_description: string | null
-  agent_version: string | null
-
-  // Tool
-  tool_name: string | null
-  tool_call_id: string | null
-  tool_type: string | null
-  tool_description: string | null
-
-  // Embeddings
-  embeddings_dimension_count: number | null
-  request_encoding_formats: string[] | null
-
-  // Retrieval
-  data_source_id: string | null
-
-  // Provider-specific
-  openai_api_type: string | null
-  openai_request_service_tier: string | null
-  openai_response_service_tier: string | null
-  openai_system_fingerprint: string | null
-  aws_bedrock_guardrail_id: string | null
-  aws_bedrock_knowledge_base_id: string | null
-  azure_resource_provider_namespace: string | null
-
-  // Opt-in content
-  input_messages: string | null
-  output_messages: string | null
-  system_instructions: string | null
-  tool_definitions: string | null
-  tool_call_arguments: string | null
-  tool_call_result: string | null
-  retrieval_query_text: string | null
-  retrieval_documents: string | null
-
-  attributes: Record<string, string>
-}
-
-interface GenAiEvent {
-  span_id: string
-  trace_id: string
-  event_name: string
-  timestamp: string
-  attributes: Record<string, string>
-}
-
-interface GenAiTraceSummariesResponse {
-  data: GenAiTraceSummary[]
-  total: number
-}
-
-interface GenAiTraceDetailResponse {
-  trace_id: string
-  spans: GenAiSpanDetail[]
-  span_count: number
-  events: GenAiEvent[]
-  event_count: number
-}
-
-function buildOtelUrl(
-  path: string,
-  params: Record<string, string | number | undefined>
-) {
-  const searchParams = new URLSearchParams()
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) searchParams.set(key, String(value))
-  }
-  const qs = searchParams.toString()
-  return `/api/otel/${path}${qs ? `?${qs}` : ''}`
-}
-
 // ── Span tree helpers ───────────────────────────────────────────────
 
 interface SpanTreeNode {
@@ -2376,10 +2257,10 @@ function SpanDetailSheet({
           s.parent_span_id === span.span_id)
     )
     .map((s) => ({
-      tool_name: s.tool_name,
-      tool_call_id: s.tool_call_id,
-      tool_call_arguments: s.tool_call_arguments,
-      tool_call_result: s.tool_call_result,
+      tool_name: s.tool_name ?? null,
+      tool_call_id: s.tool_call_id ?? null,
+      tool_call_arguments: s.tool_call_arguments ?? null,
+      tool_call_result: s.tool_call_result ?? null,
       duration_ms: s.duration_ms,
     }))
 
@@ -2650,9 +2531,9 @@ function SpanDetailSheet({
                   Conversation
                 </h4>
                 <FullConversationView
-                  systemInstructions={span.system_instructions}
-                  inputMessages={span.input_messages}
-                  outputMessages={span.output_messages}
+                  systemInstructions={span.system_instructions ?? null}
+                  inputMessages={span.input_messages ?? null}
+                  outputMessages={span.output_messages ?? null}
                   toolSpans={siblingToolSpans}
                 />
               </div>
@@ -2669,9 +2550,18 @@ function SpanDetailSheet({
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
                   Tool Content
                 </h4>
-                <JsonBlock label="Arguments" value={span.tool_call_arguments} />
-                <JsonBlock label="Result" value={span.tool_call_result} />
-                <JsonBlock label="Definitions" value={span.tool_definitions} />
+                <JsonBlock
+                  label="Arguments"
+                  value={span.tool_call_arguments ?? null}
+                />
+                <JsonBlock
+                  label="Result"
+                  value={span.tool_call_result ?? null}
+                />
+                <JsonBlock
+                  label="Definitions"
+                  value={span.tool_definitions ?? null}
+                />
               </div>
             </>
           )}
@@ -2687,7 +2577,10 @@ function SpanDetailSheet({
                 {span.retrieval_query_text && (
                   <DetailRow label="Query" value={span.retrieval_query_text} />
                 )}
-                <JsonBlock label="Documents" value={span.retrieval_documents} />
+                <JsonBlock
+                  label="Documents"
+                  value={span.retrieval_documents ?? null}
+                />
               </div>
             </>
           )}
@@ -2804,10 +2697,10 @@ function computeInvocations(spans: GenAiSpanDetail[]): InvocationSet {
       ) {
         used.add(t.span_id)
         list.push({
-          tool_name: t.tool_name,
-          tool_call_id: t.tool_call_id,
-          tool_call_arguments: t.tool_call_arguments,
-          tool_call_result: t.tool_call_result,
+          tool_name: t.tool_name ?? null,
+          tool_call_id: t.tool_call_id ?? null,
+          tool_call_arguments: t.tool_call_arguments ?? null,
+          tool_call_result: t.tool_call_result ?? null,
           duration_ms: t.duration_ms,
         })
       }
@@ -2949,9 +2842,9 @@ function InvocationCard({
           <div className="border-t bg-muted/20 p-3">
             {hasContent ? (
               <FullConversationView
-                systemInstructions={span.system_instructions}
-                inputMessages={span.input_messages}
-                outputMessages={span.output_messages}
+                systemInstructions={span.system_instructions ?? null}
+                inputMessages={span.input_messages ?? null}
+                outputMessages={span.output_messages ?? null}
                 toolSpans={toolSpans}
               />
             ) : (
@@ -3040,11 +2933,13 @@ function TraceDetailView({
   traceId,
   traceDetail,
   isLoading: detailLoading,
+  error,
   events,
   onBack,
 }: {
   traceId: string
   traceDetail: GenAiTraceDetailResponse | undefined
+  error: unknown
   isLoading: boolean
   events: GenAiEvent[]
   onBack: () => void
@@ -3135,6 +3030,15 @@ function TraceDetailView({
           <Skeleton className="h-12 w-full" />
           <Skeleton className="h-12 w-full" />
         </div>
+      ) : error ? (
+        <EmptyState
+          icon={Bot}
+          title="Unable to load trace"
+          description={problemDetail(
+            error,
+            'The trace request failed. Go back and try again, or check the telemetry storage connection.'
+          )}
+        />
       ) : !traceDetail || traceDetail.spans.length === 0 ? (
         <EmptyState
           icon={Bot}
@@ -3334,6 +3238,12 @@ export function AgentActivity() {
   const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
+  const [selectedTraceBounds, setSelectedTraceBounds] =
+    useState<TraceTimeBounds>({})
+  const selectTrace = (trace: GenAiTraceSummary) => {
+    setSelectedTraceBounds(traceTimeBounds(trace))
+    setSelectedTraceId(trace.trace_id)
+  }
 
   const projectId = selectedProjectId ?? projects[0]?.id
 
@@ -3343,33 +3253,32 @@ export function AgentActivity() {
     return { from, to }
   }, [endMs, timeRange])
 
-  const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: [
-      'genaiTraces',
-      projectId,
-      timeParams.from,
-      timeParams.to,
-      systemFilter,
-    ],
-    queryFn: () =>
-      fetchJson<GenAiTraceSummariesResponse>(
-        buildOtelUrl('genai/traces', {
-          project_id: projectId,
-          start_time: timeParams.from,
-          end_time: timeParams.to,
-          gen_ai_system: systemFilter || undefined,
-          limit: 50,
-        })
-      ),
+  const {
+    data: tracesResponse,
+    isLoading: tracesLoading,
+    error: tracesError,
+  } = useQuery({
+    ...queryGenaiTracesOptions({
+      query: {
+        project_id: projectId,
+        start_time: timeParams.from,
+        end_time: timeParams.to,
+        gen_ai_system: systemFilter || undefined,
+        limit: 50,
+      },
+    }),
     enabled: !!projectId,
   })
 
-  const { data: traceDetail, isLoading: detailLoading } = useQuery({
-    queryKey: ['genaiTraceDetail', projectId, selectedTraceId],
-    queryFn: () =>
-      fetchJson<GenAiTraceDetailResponse>(
-        buildOtelUrl(`genai/traces/${projectId}/${selectedTraceId}`, {})
-      ),
+  const {
+    data: traceDetail,
+    isLoading: detailLoading,
+    error: detailError,
+  } = useQuery({
+    ...getGenaiTraceOptions({
+      path: { project_id: projectId ?? 0, trace_id: selectedTraceId ?? '' },
+      query: selectedTraceBounds,
+    }),
     enabled: !!projectId && !!selectedTraceId,
   })
 
@@ -3383,6 +3292,7 @@ export function AgentActivity() {
         traceId={selectedTraceId}
         traceDetail={traceDetail}
         isLoading={detailLoading}
+        error={detailError}
         events={events}
         onBack={() => setSelectedTraceId(null)}
       />
@@ -3428,6 +3338,15 @@ export function AgentActivity() {
         </div>
       </div>
 
+      {projectId && (
+        <CloudAiMetadataNotice
+          projectId={projectId}
+          projectSlug={
+            projects.find((project) => project.id === projectId)?.slug
+          }
+        />
+      )}
+
       {/* Traces list */}
       {!projectId ? (
         <EmptyState
@@ -3441,6 +3360,15 @@ export function AgentActivity() {
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
         </div>
+      ) : tracesError ? (
+        <EmptyState
+          icon={Bot}
+          title="Unable to load AI traces"
+          description={problemDetail(
+            tracesError,
+            'The trace request failed. Try refreshing or check the telemetry storage connection.'
+          )}
+        />
       ) : traces.length === 0 ? (
         <AiActivityEmptyState setupHref="/ai-gateway/setup" />
       ) : (
@@ -3480,7 +3408,7 @@ export function AgentActivity() {
                       <TableRow
                         key={trace.trace_id}
                         className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => setSelectedTraceId(trace.trace_id)}
+                        onClick={() => selectTrace(trace)}
                       >
                         <TableCell>
                           <div>
@@ -3615,18 +3543,34 @@ export function AgentActivity() {
 
 // ── ProjectAgentActivity (exported for project detail page) ─────────
 
-export function ProjectAgentActivity({ projectId }: { projectId: number }) {
+export function ProjectAgentActivity({
+  projectId,
+  projectSlug,
+}: {
+  projectId: number
+  projectSlug: string
+}) {
   const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
 
-  const setSelectedTraceId = (traceId: string | null) => {
-    if (traceId) {
-      setSearchParams({ trace: traceId })
-    } else {
-      setSearchParams({})
-    }
+  const selectedTraceBounds = traceTimeBoundsFromSearch(searchParams)
+  const setSelectedTraceId = (
+    traceId: string | null,
+    bounds: TraceTimeBounds = {}
+  ) => {
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous)
+      for (const key of ['trace', 'start_time', 'end_time']) next.delete(key)
+      if (traceId) next.set('trace', traceId)
+      if (bounds.start_time) next.set('start_time', bounds.start_time)
+      if (bounds.end_time) next.set('end_time', bounds.end_time)
+      return next
+    })
+  }
+  const selectTrace = (trace: GenAiTraceSummary) => {
+    setSelectedTraceId(trace.trace_id, traceTimeBounds(trace))
   }
 
   const timeParams = useMemo(() => {
@@ -3635,33 +3579,32 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
     return { from, to }
   }, [endMs, timeRange])
 
-  const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: [
-      'genaiTraces',
-      projectId,
-      timeParams.from,
-      timeParams.to,
-      systemFilter,
-    ],
-    queryFn: () =>
-      fetchJson<GenAiTraceSummariesResponse>(
-        buildOtelUrl('genai/traces', {
-          project_id: projectId,
-          start_time: timeParams.from,
-          end_time: timeParams.to,
-          gen_ai_system: systemFilter || undefined,
-          limit: 50,
-        })
-      ),
+  const {
+    data: tracesResponse,
+    isLoading: tracesLoading,
+    error: tracesError,
+  } = useQuery({
+    ...queryGenaiTracesOptions({
+      query: {
+        project_id: projectId,
+        start_time: timeParams.from,
+        end_time: timeParams.to,
+        gen_ai_system: systemFilter || undefined,
+        limit: 50,
+      },
+    }),
     enabled: !!projectId,
   })
 
-  const { data: traceDetail, isLoading: detailLoading } = useQuery({
-    queryKey: ['genaiTraceDetail', projectId, selectedTraceId],
-    queryFn: () =>
-      fetchJson<GenAiTraceDetailResponse>(
-        buildOtelUrl(`genai/traces/${projectId}/${selectedTraceId}`, {})
-      ),
+  const {
+    data: traceDetail,
+    isLoading: detailLoading,
+    error: detailError,
+  } = useQuery({
+    ...getGenaiTraceOptions({
+      path: { project_id: projectId ?? 0, trace_id: selectedTraceId ?? '' },
+      query: selectedTraceBounds,
+    }),
     enabled: !!projectId && !!selectedTraceId,
   })
 
@@ -3674,6 +3617,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
         traceId={selectedTraceId}
         traceDetail={traceDetail}
         isLoading={detailLoading}
+        error={detailError}
         events={events}
         onBack={() => setSelectedTraceId(null)}
       />
@@ -3701,12 +3645,23 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
         </div>
       </div>
 
+      <CloudAiMetadataNotice projectId={projectId} projectSlug={projectSlug} />
+
       {tracesLoading ? (
         <div className="space-y-2">
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
         </div>
+      ) : tracesError ? (
+        <EmptyState
+          icon={Bot}
+          title="Unable to load AI traces"
+          description={problemDetail(
+            tracesError,
+            'The trace request failed. Try refreshing or check the telemetry storage connection.'
+          )}
+        />
       ) : traces.length === 0 ? (
         <AiActivityEmptyState setupHref="../traces#traces-setup" />
       ) : (
@@ -3746,7 +3701,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                       <TableRow
                         key={trace.trace_id}
                         className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => setSelectedTraceId(trace.trace_id)}
+                        onClick={() => selectTrace(trace)}
                       >
                         <TableCell>
                           <div>

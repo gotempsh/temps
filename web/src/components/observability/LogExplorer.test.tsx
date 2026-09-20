@@ -67,3 +67,31 @@ for (const mode of ['list', 'patterns', 'service']) {
     }
   })
 }
+
+for (const [query, visible] of [
+  ['', true],
+  ['?facets=0', false],
+  ['?facets=1', true],
+] as const) {
+  test(`desktop facet counts respect the URL preference: ${query || 'default'}`, () => {
+    const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: { location: { href: 'http://localhost/logs' } },
+    })
+    try {
+      const html = renderToStaticMarkup(
+        <MemoryRouter initialEntries={[`/logs${query}`]}>
+          <LogExplorer lines={[]} onFilter={() => {}} />
+        </MemoryRouter>
+      )
+      expect(html.includes('aria-label="Log facets"')).toBe(visible)
+      expect(html.includes('aria-expanded="true"')).toBe(visible)
+      if (visible) expect(html).toContain('Counts from this page only.')
+    } finally {
+      if (previousWindow)
+        Object.defineProperty(globalThis, 'window', previousWindow)
+      else Reflect.deleteProperty(globalThis, 'window')
+    }
+  })
+}

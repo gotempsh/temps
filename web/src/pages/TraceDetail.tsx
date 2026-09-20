@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { traceTimeBoundsFromSearch } from '@/lib/traces-time-window'
+
 import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
   createFacetMutation,
@@ -553,6 +555,12 @@ function CrossProjectBar({
   showUnified: boolean
   onSetView: (v: 'project' | 'unified') => void
 }) {
+  const [searchParams] = useSearchParams()
+  const bounds = new URLSearchParams()
+  for (const key of ['start_time', 'end_time']) {
+    const value = searchParams.get(key)
+    if (value) bounds.set(key, value)
+  }
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/10 dark:text-blue-200">
       <Info className="h-4 w-4 shrink-0" />
@@ -560,7 +568,7 @@ function CrossProjectBar({
       {siblings.map((s) => (
         <Link
           key={s.project_id}
-          to={`/projects/${s.project_slug}/traces/${traceId}`}
+          to={`/projects/${s.project_slug}/traces/${traceId}?${bounds.toString()}`}
           className="rounded bg-blue-100 px-1.5 py-0.5 font-medium underline-offset-2 hover:underline dark:bg-blue-900/40"
         >
           {s.project_name}
@@ -601,11 +609,14 @@ function CrossProjectBar({
 
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const timeBounds = traceTimeBoundsFromSearch(searchParams)
   const navigate = useNavigate()
   const goBack = useGoBack(`/projects/${project.slug}/traces`)
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     ...getTraceOptions({
+      query: timeBounds,
       path: {
         project_id: project.id!,
         trace_id: traceId || '',
@@ -654,7 +665,6 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   // projects we default to the merged trace inline; `?view=project` collapses to
   // just this project. The param keeps the view shareable and is written with
   // `replace` so it never stacks history.
-  const [searchParams, setSearchParams] = useSearchParams()
   const isCrossProject = siblings.length > 0
   const showUnified = isCrossProject && searchParams.get('view') !== 'project'
   const setView = useCallback(
@@ -672,7 +682,10 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   )
 
   const { data: unifiedData } = useQuery({
-    ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
+    ...getUnifiedTraceOptions({
+      path: { trace_id: traceId || '' },
+      query: timeBounds,
+    }),
     enabled: !!traceId && showUnified,
     retry: false,
   })

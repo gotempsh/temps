@@ -486,6 +486,14 @@ impl CrossProjectTraceService {
         &self,
         trace_id: &str,
     ) -> Result<UnifiedTrace, CrossProjectTraceError> {
+        self.get_unified_trace_in_window(trace_id, None).await
+    }
+
+    pub async fn get_unified_trace_in_window(
+        &self,
+        trace_id: &str,
+        window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    ) -> Result<UnifiedTrace, CrossProjectTraceError> {
         // 1. Discover all projects for this trace.
         let all_projects = self.find_trace_projects(trace_id).await?;
 
@@ -524,7 +532,13 @@ impl CrossProjectTraceService {
             let tid = trace_id_str.clone();
             let st = storage.clone();
             async move {
-                let result = st.get_trace(proj.project_id, &tid).await;
+                let result = match window {
+                    Some((start, end)) => {
+                        st.get_trace_in_window(proj.project_id, &tid, start, end)
+                            .await
+                    }
+                    None => st.get_trace(proj.project_id, &tid).await,
+                };
                 match result {
                     Ok(spans) => (proj.project_id, proj.project_name, proj.project_slug, spans),
                     Err(e) => {
@@ -841,6 +855,54 @@ mod tests {
             vec![1, 2, 3]
         );
         assert!(!all[1].sharing);
+    }
+
+    #[tokio::test]
+    async fn unified_trace_uses_explicit_historical_window_for_each_project() {
+        use crate::test_support::MockOtelStorage;
+        use sea_orm::MockDatabase;
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let storage = Arc::new(MockOtelStorage::new());
+        storage
+            .record_trace_refs(&[trace_id.to_string()], 7)
+            .await
+            .unwrap();
+        storage
+            .record_trace_refs(&[trace_id.to_string()], 8)
+            .await
+            .unwrap();
+        storage.spans.lock().unwrap().extend([
+            make_span(7, trace_id, SpanStatusCode::Ok, 0, 12.0),
+            make_span(8, trace_id, SpanStatusCode::Ok, 100, 8.0),
+            make_span(7, trace_id, SpanStatusCode::Ok, 86_400_000, 9.0),
+        ]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![
+                    meta_row(7, "alpha", "alpha", true),
+                    meta_row(8, "beta", "beta", true),
+                ]])
+                .into_connection(),
+        );
+        let service = CrossProjectTraceService::new(db, storage);
+        let start =
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap() - Duration::minutes(1);
+        let end = start + Duration::hours(1);
+        let unified = service
+            .get_unified_trace_in_window(trace_id, Some((start, end)))
+            .await
+            .unwrap();
+        assert_eq!(
+            unified.spans.len(),
+            2,
+            "later child must be excluded by the requested window"
+        );
+        assert_eq!(
+            unified.projects.len(),
+            2,
+            "both projects must use the same historical window"
+        );
     }
 
     #[test]

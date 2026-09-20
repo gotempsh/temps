@@ -1,65 +1,59 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from 'bun:test'
-import { coreOpenApi } from './core-openapi'
+import { coreOpenApi, isPluginPath } from './core-openapi'
+
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` })
-test('refresh imports core changes but not plugin routes or transitive plugin schemas', () => {
-  const before = {
-    paths: { '/x/old': ref('OldPlugin') },
-    components: { schemas: { OldPlugin: { type: 'string' } } },
-  }
-  const fetched = {
+
+test('removes plugin operations and exclusive transitive schemas while retaining shared core definitions', () => {
+  const spec = {
+    openapi: '3.1.0',
     paths: {
-      '/projects/security': ref('Policy'),
-      '/x/new': ref('PluginProgress'),
-      '/x/old': ref('PluginProgress'),
+      '/projects': ref('Core'),
+      '/x/plugins': ref('Plugin'),
+      '/x/plugins/install/progress/{id}': ref('Progress'),
+      '/xray': ref('Xray'),
     },
     components: {
       schemas: {
-        Policy: ref('Check'),
-        Check: { enum: ['extends'] },
-        PluginProgress: ref('PluginCatalog'),
-        PluginCatalog: { type: 'object' },
+        Core: ref('Shared'),
+        Shared: { type: 'string' },
+        Plugin: {
+          allOf: [ref('Shared'), ref('PluginChild'), ref('OrphanDependency')],
+        },
+        PluginChild: ref('Plugin'),
+        Progress: { type: 'object' },
+        Xray: { type: 'string' },
+        Orphan: ref('OrphanDependency'),
+        OrphanDependency: { type: 'number' },
       },
     },
   }
-  const result = coreOpenApi(fetched, before)
-  expect(result.paths).toEqual({
-    '/projects/security': ref('Policy'),
-    '/x/old': ref('OldPlugin'),
-  })
-  expect(result.components?.schemas).toEqual({
-    OldPlugin: { type: 'string' },
-    Policy: ref('Check'),
-    Check: { enum: ['extends'] },
-  })
+  const original = structuredClone(spec)
+  const result = coreOpenApi(spec) as typeof spec
+  expect(Object.keys(result.paths)).toEqual(['/projects', '/xray'])
+  expect(Object.keys(result.components.schemas).sort()).toEqual([
+    'Core',
+    'Orphan',
+    'OrphanDependency',
+    'Shared',
+    'Xray',
+  ])
+  expect(spec).toEqual(original)
+  expect(coreOpenApi(result)).toEqual(result)
 })
 
-test('refresh removes deleted and renamed schemas while retaining transitive dependencies', () => {
-  const before = {
-    paths: { '/project': ref('OldProject'), '/x/old': ref('LegacyPlugin') },
-    components: {
-      schemas: {
-        OldProject: { type: 'string' },
-        Deleted: { type: 'object' },
-        LegacyPlugin: ref('LegacyDependency'),
-        LegacyDependency: { type: 'string' },
-      },
-    },
-  }
-  const fetched = {
-    paths: { '/project': ref('Project') },
-    components: {
-      schemas: {
-        Project: ref('ProjectId'),
-        ProjectId: { type: 'integer' },
-      },
-    },
-  }
-  expect(coreOpenApi(fetched, before).components?.schemas).toEqual({
-    Project: ref('ProjectId'),
-    ProjectId: { type: 'integer' },
-    LegacyPlugin: ref('LegacyDependency'),
-    LegacyDependency: { type: 'string' },
+test('recognizes only the external plugin namespace', () => {
+  expect(['/x', '/x/plugins', '/x/plugins/a/grants'].every(isPluginPath)).toBe(
+    true,
+  )
+  expect(['/xray', '/api/x', '/projects'].some(isPluginPath)).toBe(false)
+})
+
+test('preserves documents without components and lets the caller reject malformed paths', () => {
+  expect(coreOpenApi({ paths: { '/core': {}, '/x': {} } })).toEqual({
+    paths: { '/core': {} },
   })
+  for (const spec of [null, {}, { paths: null }])
+    expect(coreOpenApi(spec)).toEqual(spec)
 })

@@ -32,6 +32,7 @@ import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
   computeTracesTimeWindow,
+  traceDetailPath,
   tracesListTimeBounds,
   type TracesTimeRange,
 } from '@/lib/traces-time-window'
@@ -1315,7 +1316,7 @@ export default function TracesList({ project }: TracesListProps) {
                       <TableRow
                         key={trace.trace_id}
                         className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => navigate(trace.trace_id)}
+                        onClick={() => navigate(traceDetailPath(trace))}
                       >
                         <TableCell>
                           <div className="flex flex-col gap-0.5">

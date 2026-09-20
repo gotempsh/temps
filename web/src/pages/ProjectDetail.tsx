@@ -584,7 +584,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="ai-gateway"
-                element={<ProjectAgentActivity projectId={project.id} />}
+                element={
+                  <ProjectAgentActivity
+                    projectId={project.id}
+                    projectSlug={project.slug}
+                  />
+                }
               />
               <Route
                 path="revenue"

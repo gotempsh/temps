@@ -2,9 +2,23 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import type { Command } from "commander";
 import { requireAuth } from "../../config/store.js";
-import { setupClient, getErrorMessage } from "../../lib/api-client.js";
-import { getPluginGrants, putPluginGrants } from "../../api/sdk.gen.js";
+import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
 import { installGrants, PluginInstallError, type Options } from "./install.js";
+
+// Plugin APIs intentionally use local interfaces, outside the canonical core SDK.
+interface PluginGrantsResponse {
+  actor: { id: string; name: string; active: boolean };
+  ai: {
+    configured: boolean;
+    daily_call_limit: number;
+    max_output_tokens: number;
+    max_prompt_bytes: number;
+    reason?: string | null;
+    setup_path: string;
+  };
+  permissions: string[];
+  requested_permissions: string[];
+}
 
 type GrantOptions = Options & { clear?: boolean };
 
@@ -48,8 +62,12 @@ export function registerPluginGrantCommands(plugin: Command) {
       await requireAuth();
       await setupClient();
       try {
-        const result = await getPluginGrants({
-          path: { name },
+        const result = await client.get<
+          { 200: PluginGrantsResponse },
+          unknown,
+          true
+        >({
+          url: `/x/plugins/${name}/grants`,
           throwOnError: true,
         });
         console.log(JSON.stringify(result.data, null, 2));
@@ -75,8 +93,13 @@ export function registerPluginGrantCommands(plugin: Command) {
       await requireAuth();
       await setupClient();
       try {
-        const result = await putPluginGrants({
-          path: { name },
+        const result = await client.put<
+          { 200: PluginGrantsResponse },
+          unknown,
+          true
+        >({
+          url: `/x/plugins/${name}/grants`,
+          headers: { "Content-Type": "application/json" },
           body,
           throwOnError: true,
         });

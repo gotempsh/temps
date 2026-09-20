@@ -3,7 +3,13 @@
 import { HighlightedCode } from '@/components/ui/code-block'
 import { AnsiLogMessage } from './AnsiLogMessage'
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react'
 import type { GlobalLogLine } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -32,6 +38,16 @@ import { groupLogLines } from '@/lib/log-explorer'
 
 type Patch = Record<string, string | undefined>
 const identity = (line: GlobalLogLine) => `${line.chunk_id}:${line.line_offset}`
+
+// Keep the default panel visibility aligned with the two-column layout.
+const desktopQuery = '(min-width: 1280px)'
+function subscribeDesktop(onChange: () => void) {
+  const query = window.matchMedia(desktopQuery)
+  query.addEventListener('change', onChange)
+  return () => query.removeEventListener('change', onChange)
+}
+const desktopSnapshot = () => window.matchMedia(desktopQuery).matches
+const serverDesktopSnapshot = () => true
 
 /** Dense cross-project log list with page-scoped facets and an adjacent record inspector. */
 export function LogExplorer({
@@ -77,7 +93,14 @@ export function LogExplorer({
   const opener = useRef<HTMLButtonElement | null>(null)
   const [selected, setSelected] = useState<string>()
   const wrap = params.get('wrap') === '1'
-  const showFacets = params.get('facets') === '1'
+  const isDesktop = useSyncExternalStore(
+    subscribeDesktop,
+    desktopSnapshot,
+    serverDesktopSnapshot
+  )
+  const facetPreference = params.get('facets')
+  const showFacets =
+    facetPreference === '1' || (facetPreference !== '0' && isDesktop)
   useEffect(() => {
     if (selected) inspector.current?.focus()
   }, [selected])

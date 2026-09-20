@@ -43924,7 +43924,16 @@ export type GetGenaiTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/genai/traces/{project_id}/{trace_id}';
 };
 
@@ -44060,7 +44069,16 @@ export type GetUnifiedTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/global/traces/{trace_id}';
 };
 
@@ -45036,7 +45054,16 @@ export type GetTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/traces/{project_id}/{trace_id}';
 };
 

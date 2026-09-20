@@ -244,6 +244,20 @@ pub trait OtelStorage: Send + Sync {
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
+    /// Fetch a trace in a bounded window. Local backends filter their existing
+    /// trace lookup; the Cloud router applies the bounds in SQL.
+    async fn get_trace_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let mut spans = self.get_trace(project_id, trace_id).await?;
+        spans.retain(|span| span.start_time >= start && span.start_time <= end);
+        Ok(spans)
+    }
+
     /// Aggregate spans into per-operation latency statistics — one row per
     /// `(project, service, span name)` — for the queried window.
     ///
@@ -295,6 +309,18 @@ pub trait OtelStorage: Send + Sync {
         trace_id: &str,
     ) -> StorageResult<Vec<GenAiSpanDetail>>;
 
+    async fn get_genai_trace_spans_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiSpanDetail>> {
+        let mut spans = self.get_genai_trace_spans(project_id, trace_id).await?;
+        spans.retain(|span| span.start_time >= start && span.start_time <= end);
+        Ok(spans)
+    }
+
     /// Count distinct GenAI traces matching the given filters.
     async fn count_genai_traces(&self, query: TraceQuery) -> StorageResult<u64>;
 
@@ -305,6 +331,18 @@ pub trait OtelStorage: Send + Sync {
         project_id: i32,
         trace_id: &str,
     ) -> StorageResult<Vec<GenAiEvent>>;
+
+    async fn get_genai_trace_events_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiEvent>> {
+        let mut events = self.get_genai_trace_events(project_id, trace_id).await?;
+        events.retain(|event| event.timestamp >= start && event.timestamp <= end);
+        Ok(events)
+    }
 
     // ── Insights ────────────────────────────────────────────────────
 

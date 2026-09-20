@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { traceDetailPath } from '@/lib/traces-time-window'
 import { Layers } from 'lucide-react'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
@@ -147,7 +148,7 @@ export default function GlobalTraces() {
                     </p>
                     <Link
                       className="font-medium hover:underline"
-                      to={`/projects/${encodeURIComponent(trace.project_slug)}/traces/${trace.trace_id}`}
+                      to={`/projects/${encodeURIComponent(trace.project_slug)}/traces/${traceDetailPath(trace)}`}
                     >
                       {trace.root_span_name}
                     </Link>
@@ -166,7 +167,7 @@ export default function GlobalTraces() {
                     </p>
                     <Link
                       className="text-xs text-muted-foreground underline whitespace-nowrap"
-                      to={`/traces/global/${trace.trace_id}`}
+                      to={`/traces/global/${traceDetailPath(trace)}`}
                     >
                       Cross-project waterfall
                     </Link>
