@@ -764,6 +764,72 @@ pub async fn record_backup_outcome_audit(
     }
 }
 
+/// Audit action recorded when the `<TEMPS_DATA_DIR>/cloud-oidc.json`
+/// first-boot bootstrap file (ADR-045 §4) is consumed: the sibling of
+/// `CLOUD_LINK_CONNECTED` for the managed console-access OIDC provider.
+pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPPED";
+
+/// The `cloud-oidc.json` bootstrap file's audit shape. A dedicated struct
+/// rather than reusing [`CloudLinkAudit`] because this event carries the
+/// issuer and client id it provisioned -- context an operator needs to
+/// confirm the right IdP was applied -- and, unlike every other Cloud audit
+/// event here, never a `previous_features`/`new_features` pair. The client
+/// secret is never included.
+#[derive(Debug, Serialize)]
+struct CloudConsoleOidcBootstrapAudit {
+    context: CloudAuditActor,
+    action: &'static str,
+    issuer: String,
+    client_id: String,
+}
+
+impl AuditOperation for CloudConsoleOidcBootstrapAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
+
+/// Record that this boot consumed the `cloud-oidc.json` bootstrap file and
+/// applied the managed console-access OIDC provider it described. Called
+/// exactly once per successful application, from `temps-cli`'s startup
+/// sequence (mirroring [`record_link_connected_audit`] for
+/// `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
+/// an operator can confirm which IdP was applied; the client secret never
+/// is. Failures to write the audit row are logged, never propagated: the
+/// provider has already been persisted.
+pub async fn record_console_oidc_bootstrapped_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    issuer: &str,
+    client_id: &str,
+) {
+    let event = CloudConsoleOidcBootstrapAudit {
+        context: actor.into(),
+        action: CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            action = CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+            "failed to record managed console-access OIDC bootstrap audit event"
+        );
+    }
+}
+
 /// The Cloud routes.
 ///
 /// `activation` is optional and has **no route of its own** — it is reachable

@@ -277,6 +277,24 @@ impl CloudService {
         Ok(oidc.revoke_managed_cloud_provider().await?)
     }
 
+    /// Consume the `<TEMPS_DATA_DIR>/cloud-oidc.json` first-boot bootstrap
+    /// file at `path`, if present: parse it, apply it via
+    /// [`Self::apply_console_oidc_config`], and delete it. A thin wrapper
+    /// around [`crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with`]
+    /// so that function stays testable without a real `CloudService`.
+    pub async fn apply_console_oidc_bootstrap_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<
+        crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome,
+        crate::console_oidc_bootstrap::ConsoleOidcBootstrapError,
+    > {
+        crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
+            self.apply_console_oidc_config(config)
+        })
+        .await
+    }
+
     /// Wire the backup scheduler in once it is registered. Idempotent.
     pub fn set_schedule_provisioner(&self, provisioner: Arc<dyn ManagedBackupScheduleProvisioner>) {
         let _ = self.schedule_provisioner.set(provisioner);
