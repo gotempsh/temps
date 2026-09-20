@@ -179,7 +179,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             let chunk_writer = context.require_service::<ChunkWriterService>();
             let metadata_service = context.require_service::<LogMetadataService>();
             let collector = context.require_service::<CollectorService>();
-            let docker = context.require_service::<bollard::Docker>();
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let retention_service = context.require_service::<RetentionService>();
             let retention_metadata = context.require_service::<LogMetadataService>();
@@ -261,253 +261,17 @@ impl TempsPlugin for LogAggregatorPlugin {
                 );
             }
 
-            // ── Container discovery: startup scan ───────────────────────
-            // Find already-running containers and start streaming. Two label
-            // families are collected: deployment/application containers
-            // (`sh.temps.project_id`) and imported/managed external-service
-            // containers (`temps.service_type`). Docker's `label` filter ANDs
-            // multiple values, so each family needs its own list call; the IDs
-            // are unioned. Retries with exponential backoff if Docker is
-            // temporarily unavailable.
-            let startup_collector = collector.clone();
-            let startup_docker = docker.clone();
-            let startup_db = db.clone();
-            tokio::spawn(async move {
-                use bollard::query_parameters::ListContainersOptions;
-                use std::collections::{HashMap, HashSet};
-
-                let scan_labels = ["sh.temps.project_id", "temps.service_type"];
-
-                let mut delay = STARTUP_SCAN_BASE_DELAY;
-                for attempt in 0..=STARTUP_SCAN_MAX_RETRIES {
-                    let mut scan_result: Result<HashSet<String>, bollard::errors::Error> =
-                        Ok(HashSet::new());
-                    for label in scan_labels {
-                        let mut filters = HashMap::new();
-                        filters.insert("status".to_string(), vec!["running".to_string()]);
-                        filters.insert("label".to_string(), vec![label.to_string()]);
-                        let options = ListContainersOptions {
-                            all: false,
-                            filters: Some(filters),
-                            ..Default::default()
-                        };
-                        match startup_docker.list_containers(Some(options)).await {
-                            Ok(containers) => {
-                                if let Ok(ids) = scan_result.as_mut() {
-                                    ids.extend(containers.into_iter().filter_map(|c| c.id));
-                                }
-                            }
-                            Err(e) => {
-                                scan_result = Err(e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Imported external-service containers carry NO temps.*
-                    // labels, so the label scans above miss them. Discover them
-                    // by the plaintext container names recorded at import time
-                    // and add any that are running by name filter.
-                    if let Ok(ids) = scan_result.as_mut() {
-                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-                        let imported_names: Vec<String> =
-                            temps_entities::external_services::Entity::find()
-                                .filter(
-                                    temps_entities::external_services::Column::ContainerName
-                                        .is_not_null(),
-                                )
-                                .select_only()
-                                .column(temps_entities::external_services::Column::ContainerName)
-                                .into_tuple::<Option<String>>()
-                                .all(startup_db.as_ref())
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .flatten()
-                                .collect();
-                        for name in imported_names {
-                            let mut filters = HashMap::new();
-                            filters.insert("status".to_string(), vec!["running".to_string()]);
-                            filters.insert("name".to_string(), vec![name.clone()]);
-                            let options = ListContainersOptions {
-                                all: false,
-                                filters: Some(filters),
-                                ..Default::default()
-                            };
-                            if let Ok(containers) =
-                                startup_docker.list_containers(Some(options)).await
-                            {
-                                ids.extend(containers.into_iter().filter_map(|c| c.id));
-                            }
-                        }
-                    }
-
-                    // Local cluster members (monitor/primary/replica) carry
-                    // deployment-style `sh.temps.service.*` labels the scans
-                    // above don't target, and their names live in
-                    // `service_members`, not on the service row. Discover the
-                    // control-plane-local ones (node_id IS NULL) by name — the
-                    // collector resolves each to its owning service via
-                    // `service_members.container_name`. Remote members are
-                    // handled separately by the remote collector.
-                    if let Ok(ids) = scan_result.as_mut() {
-                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-                        let member_names: Vec<String> =
-                            temps_entities::service_members::Entity::find()
-                                .filter(temps_entities::service_members::Column::NodeId.is_null())
-                                .select_only()
-                                .column(temps_entities::service_members::Column::ContainerName)
-                                .into_tuple::<String>()
-                                .all(startup_db.as_ref())
-                                .await
-                                .unwrap_or_default();
-                        for name in member_names {
-                            let mut filters = HashMap::new();
-                            filters.insert("status".to_string(), vec!["running".to_string()]);
-                            filters.insert("name".to_string(), vec![name.clone()]);
-                            let options = ListContainersOptions {
-                                all: false,
-                                filters: Some(filters),
-                                ..Default::default()
-                            };
-                            if let Ok(containers) =
-                                startup_docker.list_containers(Some(options)).await
-                            {
-                                ids.extend(containers.into_iter().filter_map(|c| c.id));
-                            }
-                        }
-                    }
-
-                    match scan_result {
-                        Ok(ids) => {
-                            let count = ids.len();
-                            for id in ids {
-                                if let Err(e) = startup_collector.start_streaming(&id).await {
-                                    tracing::warn!(
-                                        container_id = %id,
-                                        error = %e,
-                                        "Failed to start streaming for existing container"
-                                    );
-                                }
-                            }
-                            tracing::info!(
-                                container_count = count,
-                                "Startup scan complete: discovered running containers"
-                            );
-                            return; // Success — exit the retry loop
-                        }
-                        Err(e) => {
-                            if attempt < STARTUP_SCAN_MAX_RETRIES {
-                                tracing::warn!(
-                                    error = %e,
-                                    attempt = attempt + 1,
-                                    max_retries = STARTUP_SCAN_MAX_RETRIES,
-                                    retry_delay_secs = delay.as_secs(),
-                                    "Startup scan failed, retrying"
-                                );
-                                tokio::time::sleep(delay).await;
-                                delay = std::cmp::min(delay * 2, Duration::from_secs(30));
-                            } else {
-                                tracing::error!(
-                                    error = %e,
-                                    "Startup scan failed after {} retries, giving up. \
-                                     Running containers will be discovered via Docker events instead.",
-                                    STARTUP_SCAN_MAX_RETRIES
-                                );
-                            }
-                        }
-                    }
+            // ── Container discovery (local daemon only) ─────────────────
+            // The startup scan and the Docker events listener stream logs
+            // from containers on THIS host's daemon. On a `control-plane`
+            // profile there is no daemon and no local workload to tail; the
+            // remote collector above already covers worker-node containers.
+            match local_discovery_plan(&docker_handle) {
+                LocalDiscoveryPlan::Start(docker) => {
+                    spawn_local_container_discovery(docker, collector.clone(), db.clone())
                 }
-            });
-
-            // ── Container discovery: Docker events listener ─────────────
-            // Listen for container start/stop events to dynamically start/stop streaming.
-            //
-            // Outer loop: if the events stream ends (returns None) or Docker goes
-            // down, we wait and restart the stream. This task never exits unless
-            // the tokio runtime is shut down.
-            let events_collector = collector.clone();
-            let events_docker = docker.clone();
-            tokio::spawn(async move {
-                use bollard::models::EventMessageTypeEnum;
-
-                loop {
-                    tracing::debug!("Opening Docker events stream");
-                    let options = bollard::query_parameters::EventsOptionsBuilder::new().build();
-                    let mut stream = events_docker.events(Some(options));
-
-                    // Inner loop: process events from this stream instance
-                    loop {
-                        match stream.next().await {
-                            Some(Ok(event)) => {
-                                let is_container =
-                                    event.typ == Some(EventMessageTypeEnum::CONTAINER);
-                                if !is_container {
-                                    continue;
-                                }
-                                let action = event.action.as_deref().unwrap_or("");
-                                let container_id = event
-                                    .actor
-                                    .as_ref()
-                                    .and_then(|a| a.id.as_deref())
-                                    .unwrap_or("");
-
-                                if container_id.is_empty() {
-                                    continue;
-                                }
-
-                                match action {
-                                    "start" => {
-                                        tracing::debug!(
-                                            container_id = container_id,
-                                            "Docker event: container started"
-                                        );
-                                        if let Err(e) =
-                                            events_collector.start_streaming(container_id).await
-                                        {
-                                            tracing::debug!(
-                                                container_id = container_id,
-                                                error = %e,
-                                                "Failed to start streaming (may not have temps labels)"
-                                            );
-                                        }
-                                    }
-                                    "stop" | "die" | "kill" => {
-                                        tracing::debug!(
-                                            container_id = container_id,
-                                            action = action,
-                                            "Docker event: container stopped"
-                                        );
-                                        events_collector.stop_streaming(container_id).await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Docker events stream error, reconnecting in {:?}",
-                                    EVENTS_RECONNECT_DELAY
-                                );
-                                // Break inner loop to restart from outer loop
-                                break;
-                            }
-                            None => {
-                                // Stream returned None — Docker may have closed the connection.
-                                tracing::warn!(
-                                    "Docker events stream ended, reconnecting in {:?}",
-                                    EVENTS_RECONNECT_DELAY
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    // Wait before restarting the events stream
-                    tokio::time::sleep(EVENTS_RECONNECT_DELAY).await;
-                }
-            });
-            tracing::info!("Container discovery started (events listener + startup scan)");
+                LocalDiscoveryPlan::Skip { reason } => tracing::info!("{}", reason),
+            }
 
             // ── Retention scheduler ─────────────────────────────────────
             // Run retention cleanup once every 24 hours
@@ -573,6 +337,291 @@ impl TempsPlugin for LogAggregatorPlugin {
     }
 }
 
+/// Discover containers on the local Docker daemon and stream their logs:
+/// a one-shot startup scan of already-running containers plus a
+/// self-restarting Docker events listener. Only ever spawned when the
+/// process actually has a daemon (see `initialize_plugin_services`).
+/// What `initialize_plugin_services` should do about local container-log
+/// discovery in this process.
+///
+/// A decision value rather than an inline branch so the "no daemon here" case
+/// is testable, and so the explanation an operator reads in the logs is one
+/// string produced in one place instead of prose stranded inside a `match`.
+#[derive(Debug)]
+enum LocalDiscoveryPlan {
+    /// A daemon exists: tail this host's containers.
+    Start(Arc<bollard::Docker>),
+    /// No daemon exists, and this is what that means for log collection.
+    Skip { reason: String },
+}
+
+/// Decide whether to run the startup scan + Docker events listener.
+///
+/// Both stream logs from containers on *this* host's daemon. On a profile with
+/// no daemon there is neither a daemon to ask nor a local workload to tail —
+/// but worker-node containers are still collected, by the remote collector
+/// started above, so the skip must say so rather than read like logs are off.
+fn local_discovery_plan(handle: &temps_core::DockerHandle) -> LocalDiscoveryPlan {
+    match handle.cloned() {
+        Some(docker) => LocalDiscoveryPlan::Start(docker),
+        None => {
+            let cause = handle
+                .unavailable_error()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "this process has no local Docker daemon".to_string());
+            LocalDiscoveryPlan::Skip {
+                reason: format!(
+                    "Local container log discovery disabled: {cause}. Logs from containers on \
+                     worker nodes are still collected, by the remote log collector"
+                ),
+            }
+        }
+    }
+}
+
+fn spawn_local_container_discovery(
+    docker: Arc<bollard::Docker>,
+    collector: Arc<CollectorService>,
+    db: Arc<sea_orm::DatabaseConnection>,
+) {
+    // ── Container discovery: startup scan ───────────────────────
+    // Find already-running containers and start streaming. Two label
+    // families are collected: deployment/application containers
+    // (`sh.temps.project_id`) and imported/managed external-service
+    // containers (`temps.service_type`). Docker's `label` filter ANDs
+    // multiple values, so each family needs its own list call; the IDs
+    // are unioned. Retries with exponential backoff if Docker is
+    // temporarily unavailable.
+    let startup_collector = collector.clone();
+    let startup_docker = docker.clone();
+    let startup_db = db.clone();
+    tokio::spawn(async move {
+        use bollard::query_parameters::ListContainersOptions;
+        use std::collections::{HashMap, HashSet};
+
+        let scan_labels = ["sh.temps.project_id", "temps.service_type"];
+
+        let mut delay = STARTUP_SCAN_BASE_DELAY;
+        for attempt in 0..=STARTUP_SCAN_MAX_RETRIES {
+            let mut scan_result: Result<HashSet<String>, bollard::errors::Error> =
+                Ok(HashSet::new());
+            for label in scan_labels {
+                let mut filters = HashMap::new();
+                filters.insert("status".to_string(), vec!["running".to_string()]);
+                filters.insert("label".to_string(), vec![label.to_string()]);
+                let options = ListContainersOptions {
+                    all: false,
+                    filters: Some(filters),
+                    ..Default::default()
+                };
+                match startup_docker.list_containers(Some(options)).await {
+                    Ok(containers) => {
+                        if let Ok(ids) = scan_result.as_mut() {
+                            ids.extend(containers.into_iter().filter_map(|c| c.id));
+                        }
+                    }
+                    Err(e) => {
+                        scan_result = Err(e);
+                        break;
+                    }
+                }
+            }
+
+            // Imported external-service containers carry NO temps.*
+            // labels, so the label scans above miss them. Discover them
+            // by the plaintext container names recorded at import time
+            // and add any that are running by name filter.
+            if let Ok(ids) = scan_result.as_mut() {
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                let imported_names: Vec<String> = temps_entities::external_services::Entity::find()
+                    .filter(temps_entities::external_services::Column::ContainerName.is_not_null())
+                    .select_only()
+                    .column(temps_entities::external_services::Column::ContainerName)
+                    .into_tuple::<Option<String>>()
+                    .all(startup_db.as_ref())
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                for name in imported_names {
+                    let mut filters = HashMap::new();
+                    filters.insert("status".to_string(), vec!["running".to_string()]);
+                    filters.insert("name".to_string(), vec![name.clone()]);
+                    let options = ListContainersOptions {
+                        all: false,
+                        filters: Some(filters),
+                        ..Default::default()
+                    };
+                    if let Ok(containers) = startup_docker.list_containers(Some(options)).await {
+                        ids.extend(containers.into_iter().filter_map(|c| c.id));
+                    }
+                }
+            }
+
+            // Local cluster members (monitor/primary/replica) carry
+            // deployment-style `sh.temps.service.*` labels the scans
+            // above don't target, and their names live in
+            // `service_members`, not on the service row. Discover the
+            // control-plane-local ones (node_id IS NULL) by name — the
+            // collector resolves each to its owning service via
+            // `service_members.container_name`. Remote members are
+            // handled separately by the remote collector.
+            if let Ok(ids) = scan_result.as_mut() {
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                let member_names: Vec<String> = temps_entities::service_members::Entity::find()
+                    .filter(temps_entities::service_members::Column::NodeId.is_null())
+                    .select_only()
+                    .column(temps_entities::service_members::Column::ContainerName)
+                    .into_tuple::<String>()
+                    .all(startup_db.as_ref())
+                    .await
+                    .unwrap_or_default();
+                for name in member_names {
+                    let mut filters = HashMap::new();
+                    filters.insert("status".to_string(), vec!["running".to_string()]);
+                    filters.insert("name".to_string(), vec![name.clone()]);
+                    let options = ListContainersOptions {
+                        all: false,
+                        filters: Some(filters),
+                        ..Default::default()
+                    };
+                    if let Ok(containers) = startup_docker.list_containers(Some(options)).await {
+                        ids.extend(containers.into_iter().filter_map(|c| c.id));
+                    }
+                }
+            }
+
+            match scan_result {
+                Ok(ids) => {
+                    let count = ids.len();
+                    for id in ids {
+                        if let Err(e) = startup_collector.start_streaming(&id).await {
+                            tracing::warn!(
+                                container_id = %id,
+                                error = %e,
+                                "Failed to start streaming for existing container"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        container_count = count,
+                        "Startup scan complete: discovered running containers"
+                    );
+                    return; // Success — exit the retry loop
+                }
+                Err(e) => {
+                    if attempt < STARTUP_SCAN_MAX_RETRIES {
+                        tracing::warn!(
+                            error = %e,
+                            attempt = attempt + 1,
+                            max_retries = STARTUP_SCAN_MAX_RETRIES,
+                            retry_delay_secs = delay.as_secs(),
+                            "Startup scan failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_secs(30));
+                    } else {
+                        tracing::error!(
+                            error = %e,
+                            "Startup scan failed after {} retries, giving up. \
+                             Running containers will be discovered via Docker events instead.",
+                            STARTUP_SCAN_MAX_RETRIES
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    // ── Container discovery: Docker events listener ─────────────
+    // Listen for container start/stop events to dynamically start/stop streaming.
+    //
+    // Outer loop: if the events stream ends (returns None) or Docker goes
+    // down, we wait and restart the stream. This task never exits unless
+    // the tokio runtime is shut down.
+    let events_collector = collector.clone();
+    let events_docker = docker.clone();
+    tokio::spawn(async move {
+        use bollard::models::EventMessageTypeEnum;
+
+        loop {
+            tracing::debug!("Opening Docker events stream");
+            let options = bollard::query_parameters::EventsOptionsBuilder::new().build();
+            let mut stream = events_docker.events(Some(options));
+
+            // Inner loop: process events from this stream instance
+            loop {
+                match stream.next().await {
+                    Some(Ok(event)) => {
+                        let is_container = event.typ == Some(EventMessageTypeEnum::CONTAINER);
+                        if !is_container {
+                            continue;
+                        }
+                        let action = event.action.as_deref().unwrap_or("");
+                        let container_id = event
+                            .actor
+                            .as_ref()
+                            .and_then(|a| a.id.as_deref())
+                            .unwrap_or("");
+
+                        if container_id.is_empty() {
+                            continue;
+                        }
+
+                        match action {
+                            "start" => {
+                                tracing::debug!(
+                                    container_id = container_id,
+                                    "Docker event: container started"
+                                );
+                                if let Err(e) = events_collector.start_streaming(container_id).await
+                                {
+                                    tracing::debug!(
+                                        container_id = container_id,
+                                        error = %e,
+                                        "Failed to start streaming (may not have temps labels)"
+                                    );
+                                }
+                            }
+                            "stop" | "die" | "kill" => {
+                                tracing::debug!(
+                                    container_id = container_id,
+                                    action = action,
+                                    "Docker event: container stopped"
+                                );
+                                events_collector.stop_streaming(container_id).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Docker events stream error, reconnecting in {:?}",
+                            EVENTS_RECONNECT_DELAY
+                        );
+                        // Break inner loop to restart from outer loop
+                        break;
+                    }
+                    None => {
+                        // Stream returned None — Docker may have closed the connection.
+                        tracing::warn!(
+                            "Docker events stream ended, reconnecting in {:?}",
+                            EVENTS_RECONNECT_DELAY
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Wait before restarting the events stream
+            tokio::time::sleep(EVENTS_RECONNECT_DELAY).await;
+        }
+    });
+    tracing::info!("Container discovery started (events listener + startup scan)");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +633,49 @@ mod tests {
             base_path: PathBuf::from("/tmp/test-logs"),
         });
         assert_eq!(plugin.name(), "log-aggregator");
+    }
+
+    /// A process with no local daemon must skip local discovery instead of
+    /// trying to reach one — and must say why, plus that remote logs are
+    /// unaffected, because "my logs are empty" is otherwise indistinguishable
+    /// from a broken install.
+    #[test]
+    fn local_discovery_is_skipped_with_an_explanation_when_there_is_no_daemon() {
+        let handle = temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        );
+
+        match local_discovery_plan(&handle) {
+            LocalDiscoveryPlan::Skip { reason } => {
+                assert!(reason.contains("control-plane"), "{reason}");
+                assert!(
+                    reason.contains("remote log collector"),
+                    "the operator must learn worker logs still arrive: {reason}",
+                );
+            }
+            LocalDiscoveryPlan::Start(_) => {
+                panic!("a disabled handle must never start local discovery")
+            }
+        }
+    }
+
+    /// The other half of the branch: a handle with a client still tails this
+    /// host, exactly as before the profile split.
+    #[test]
+    fn local_discovery_starts_when_a_client_exists() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            // No socket path configured on this machine. A bollard client is a
+            // lazy descriptor, so this only happens when there is nothing to
+            // describe; the disabled arm above is the one under test anyway.
+            println!("No Docker socket path available, skipping");
+            return;
+        };
+        let handle = temps_core::DockerHandle::available(Arc::new(docker));
+
+        assert!(matches!(
+            local_discovery_plan(&handle),
+            LocalDiscoveryPlan::Start(_)
+        ));
     }
 }

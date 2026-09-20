@@ -230,6 +230,30 @@ pub struct OidcRoleMappingDeletedAudit {
     pub mapping_id: i32,
 }
 
+/// ADR-045 §4: a login that resolved to a real IdP identity but was refused
+/// by the instance-side role gate (`admin_only_role_required` on a
+/// Cloud-managed provider) or, in a later phase, the WebSocket-upgrade
+/// Origin check. Distinct from `LoginAudit { success: false }`, whose
+/// meaning is "credentials never resolved to a user at all" -- this row
+/// means "resolved, then refused by policy", which is worth its own trail
+/// entry precisely because the attempt got further than an ordinary
+/// failure.
+///
+/// `user_id: None` follows the actor-less audit precedent
+/// (`temps_cloud::handler::CloudEnrollmentActor::UnattendedBootstrap`): a
+/// denied login never resolves to a local user account, so there is no
+/// `AuditContext` to attach to.
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcLoginDeniedAudit {
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub provider_id: i32,
+    pub provider_name: String,
+    /// e.g. `"insufficient_role"`, `"origin_mismatch"` (ADR-045 §4).
+    pub reason: &'static str,
+}
+
 // Implement AuditOperation for each struct
 impl AuditOperation for LoginAudit {
     fn operation_type(&self) -> String {
@@ -682,6 +706,29 @@ impl_oidc_audit_op!(OidcProviderUpdatedAudit, "OIDC_PROVIDER_UPDATED");
 impl_oidc_audit_op!(OidcProviderDeletedAudit, "OIDC_PROVIDER_DELETED");
 impl_oidc_audit_op!(OidcRoleMappingCreatedAudit, "OIDC_ROLE_MAPPING_CREATED");
 impl_oidc_audit_op!(OidcRoleMappingDeletedAudit, "OIDC_ROLE_MAPPING_DELETED");
+
+impl AuditOperation for OidcLoginDeniedAudit {
+    fn operation_type(&self) -> String {
+        "OIDC_LOGIN_DENIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
 
 /// Aggregated authorization-guard denials. Only stable, server-derived
 /// principal metadata is recorded: credential names and secrets are never

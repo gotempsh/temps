@@ -30,7 +30,7 @@ use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "postgres_pgdump";
+pub(crate) const ENGINE_KEY: &str = "postgres_pgdump";
 const DUMP_FILE_SUFFIX: &str = "dump.sql.gz";
 
 pub struct PostgresPgDumpDeps {

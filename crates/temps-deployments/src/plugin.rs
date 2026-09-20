@@ -68,14 +68,16 @@ impl TempsPlugin for DeploymentsPlugin {
             RequiredService::of::<temps_logs::LogService>(),
             RequiredService::of::<temps_logs::DockerLogService>(),
             RequiredService::of::<temps_config::ConfigService>(),
-            RequiredService::of::<bollard::Docker>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
             RequiredService::of::<dyn temps_deployer::ContainerDeployer>(),
             RequiredService::of::<dyn temps_deployer::ImageBuilder>(),
             RequiredService::of::<dyn temps_deployer::static_deployer::StaticDeployer>(),
             RequiredService::of::<temps_screenshots::ScreenshotService>(),
             RequiredService::of::<temps_providers::ExternalServiceManager>(),
             RequiredService::of::<temps_error_tracking::DSNService>(),
-            RequiredService::of::<temps_blob::BlobService>(),
+            // Deliberately absent: `temps_blob::BlobService` is optional (see
+            // `AppState::blob_service`) -- `BlobPlugin` skips registering it
+            // when this process has no local Docker daemon.
         ]
     }
 
@@ -90,7 +92,11 @@ impl TempsPlugin for DeploymentsPlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
             let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
-            let docker = context.require_service::<bollard::Docker>();
+            // Always registered, in every profile; the daemon behind it is
+            // not always there. Resolved lazily via `.require()` at each
+            // point of use, so a control-plane process (no local daemon)
+            // never panics here at registration.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
             // Whether this process may run containers itself. Absent in
             // embeddings that never register one, which keeps the historical
             // single-binary behaviour (see `LocalWorkloadPolicy::default`).
@@ -116,7 +122,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.clone(),
                 queue_service.clone(),
                 docker_log_service,
-                docker.clone(),
+                docker_handle.clone(),
                 deployer.clone(),
                 encryption_service.clone(),
             ));
@@ -282,26 +288,29 @@ impl TempsPlugin for DeploymentsPlugin {
             let static_deployer =
                 context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
-            // Container operations reuse the process-wide Docker handle taken
-            // from the registry above. This used to open a SECOND client with
-            // `connect_with_local_defaults().expect(...)`, which both ignored
-            // the daemon the rest of the process was configured against
-            // (DOCKER_HOST) and turned an unreachable/absent socket into a
-            // panic in plugin registration instead of a typed startup error.
-            let docker = Arc::clone(&docker);
-
-            // Late-bind the Compose executor onto DeploymentService now that
-            // the Docker client exists (DeploymentService itself is
-            // constructed earlier, before `docker` is available). Lets
-            // project/environment deletion clean up Compose-managed
-            // volumes/networks, not just containers -- see
-            // `DeploymentService::cleanup_containers`.
-            deployment_service.set_compose_executor(Arc::new(
-                temps_deployer::compose::ComposeExecutor::new(
-                    docker.clone(),
-                    config_service.data_dir(),
-                ),
-            ));
+            // Late-bind the Compose executor onto DeploymentService, but only
+            // when this process actually has a local Docker daemon. A
+            // Compose-based cleanup has no daemon-independent behaviour to
+            // keep working (see `PostgresUpgradeService` for a contrast
+            // where most methods don't need Docker at all), so on
+            // `--profile control-plane` there is nothing to construct here:
+            // `DeploymentService::cleanup_containers` already treats an unset
+            // compose executor as "nothing Compose-managed to sweep" and
+            // skips it, rather than needing an `Option` threaded through.
+            if let Some(docker) = docker_handle.cloned() {
+                deployment_service.set_compose_executor(Arc::new(
+                    temps_deployer::compose::ComposeExecutor::new(
+                        docker,
+                        config_service.data_dir(),
+                    ),
+                ));
+            } else {
+                tracing::info!(
+                    "local workloads are disabled for this process; Compose-managed \
+                     volumes/networks will not be cleaned up locally on project/environment \
+                     deletion (worker nodes clean up their own)"
+                );
+            }
 
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
@@ -319,7 +328,7 @@ impl TempsPlugin for DeploymentsPlugin {
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
                 config_service.clone(),
                 screenshot_service,
-                docker,
+                docker_handle,
             ));
 
             // Wire SourceMapService for auto-capture during deployments (optional)
@@ -587,8 +596,13 @@ impl TempsPlugin for DeploymentsPlugin {
         // Get ImageBuilder for uploading Docker image tarballs
         let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
 
-        // Get BlobService for static bundle uploads
-        let blob_service = context.require_service::<temps_blob::BlobService>();
+        // Get BlobService for static bundle uploads. Not registered by
+        // `BlobPlugin` when this process has no local Docker daemon
+        // (`--profile control-plane`) or Blob isn't enabled -- `get_service`
+        // rather than `require_service` so that absence degrades to local
+        // storage instead of failing plugin initialization for the whole
+        // process.
+        let blob_service = context.get_service::<temps_blob::BlobService>();
 
         // Get audit service for logging write operations
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();

@@ -43,6 +43,11 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -50,6 +55,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
+  Cloud,
   KeyRound,
   ShieldCheck,
   Trash2,
@@ -58,6 +64,14 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+
+/**
+ * ADR-045 §4: tooltip shown on the disabled delete control for the provider
+ * Temps Cloud provisions for console access — matches the wording used on
+ * the SSO provider list (`AuthSettingsPage.tsx`).
+ */
+const MANAGED_BY_CLOUD_TOOLTIP =
+  'Managed by Temps Cloud. Turn off "Console access through Temps Cloud" on the Temps Cloud settings page to remove it.'
 
 function formatDate(iso: string): string {
   try {
@@ -210,6 +224,12 @@ export function OidcProviderDetailPage() {
                 {provider.name}
               </h1>
               <Badge variant="outline">{provider.template}</Badge>
+              {provider.managed_by_cloud && (
+                <Badge className="gap-1">
+                  <Cloud className="h-3 w-3" aria-hidden="true" />
+                  Managed by Temps Cloud
+                </Badge>
+              )}
               {!provider.enabled && <Badge variant="secondary">Disabled</Badge>}
             </div>
             <p className="text-sm text-muted-foreground">
@@ -367,6 +387,7 @@ function ProviderEditor({
           onSubmit={handleSubmit}
           submitting={saving}
           submitLabel="Save"
+          disabled={provider.managed_by_cloud}
           footer={
             <div className="space-y-4">
               <div className="flex flex-wrap gap-2">
@@ -378,15 +399,29 @@ function ProviderEditor({
                 >
                   {testing ? 'Testing…' : 'Test connection'}
                 </Button>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  onClick={onDelete}
-                  disabled={deleting}
-                >
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete provider
-                </Button>
+                {provider.managed_by_cloud ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button type="button" variant="destructive" disabled>
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          Delete provider
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>{MANAGED_BY_CLOUD_TOOLTIP}</TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={onDelete}
+                    disabled={deleting}
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    Delete provider
+                  </Button>
+                )}
               </div>
               {testResult && (
                 <Alert variant={testResult.success ? 'default' : 'destructive'}>

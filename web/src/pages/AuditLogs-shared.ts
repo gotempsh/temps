@@ -49,6 +49,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     operations: [
       { value: 'LOGIN_SUCCESS', label: 'Login Success' },
       { value: 'LOGIN_FAILURE', label: 'Login Failure' },
+      { value: 'OIDC_LOGIN_DENIED', label: 'SSO Login Denied' },
       { value: 'USER_LOGOUT', label: 'User Logout' },
       { value: 'PASSWORD_RESET', label: 'Password Reset' },
       { value: 'EMAIL_VERIFIED', label: 'Email Verified' },

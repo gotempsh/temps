@@ -48,6 +48,8 @@ pub enum CloudServiceError {
     ManagedBackupCredential(#[from] temps_entities::s3_sources::S3SourceCredentialError),
     #[error("Could not set up the backup schedule for the managed destination: {0}")]
     ManagedBackupSchedule(#[from] temps_core::ManagedBackupScheduleError),
+    #[error("Could not provision the managed console-access OIDC provider: {0}")]
+    ConsoleOidcProvisioning(#[from] temps_auth::oidc_errors::OidcError),
 }
 
 /// Outcome of attempting to provision a Cloud-managed backup source as part
@@ -81,6 +83,23 @@ pub enum ManagedBackupOutcome {
     /// succeeded; the reason is logged and available here for the caller to
     /// decide whether to surface it.
     Unavailable(String),
+}
+
+/// What [`CloudService::apply_bootstrap_backend_url`] did.
+///
+/// A `TEMPS_CLOUD_BACKEND_URL` bootstrap has no operator behind it, so
+/// "someone linked this instance first" is a normal outcome rather than an
+/// error: the operator's choice of backend wins and the bootstrap input is
+/// dropped. Distinguishing the two is what lets the caller log which
+/// happened instead of reporting a silent success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapBackendUrlOutcome {
+    /// `cloud.backend_url` now holds the bootstrap value, and the instance
+    /// was still unlinked when it was written.
+    Applied,
+    /// A link already existed, so nothing was written. The established
+    /// link's backend stands.
+    AlreadyLinked,
 }
 
 /// Outcome of upserting the local `managed_by_cloud` row, distinguishing a
@@ -185,6 +204,24 @@ pub struct CloudService {
     configuration_issue: RwLock<Option<String>>,
     managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
     managed_backup_reconcile_lock: AsyncMutex<()>,
+    /// Serializes everything that decides *which backend this instance is
+    /// linked to*: [`Self::enroll_link`], [`Self::enroll_link_if_unlinked`]
+    /// and [`Self::apply_bootstrap_backend_url`].
+    ///
+    /// `CloudLink` already makes the credential write itself atomic, but the
+    /// backend URL that enrollment redeems against lives in the settings row,
+    /// one layer out. Without this lock an operator enrollment could complete
+    /// between the bootstrap's "is this instance linked?" check and its
+    /// `cloud.backend_url` write, leaving the settings row naming one backend
+    /// and the persisted credential another -- which the next boot rejects as
+    /// `BackendChangeRequiresDisconnect` -- i.e. `configuration_invalid`,
+    /// blocking Cloud entirely.
+    ///
+    /// Held across the enrollment round-trip on purpose: the window to close
+    /// *is* that round-trip. It is bounded by the Cloud client's own request
+    /// timeout, and enrollment happens at most a handful of times in an
+    /// instance's life, so nothing on a hot path ever waits here.
+    enrollment_lock: AsyncMutex<()>,
     /// Creates the nightly schedule for the managed destination (ADR-044).
     /// Registered by the backup plugin and handed over once every service
     /// exists, so the two crates stay independent.
@@ -195,6 +232,15 @@ pub struct CloudService {
     /// Cloud answered without a figure (older backend), so the default
     /// applies.
     managed_backup_retention_days: RwLock<Option<Option<u16>>>,
+    /// ADR-045 §4: provisions/revokes the managed `oidc_providers` row for
+    /// console access. `OnceLock` rather than a constructor argument because
+    /// `temps-auth`'s `OidcService` is registered by a different plugin;
+    /// two-phase plugin init hands it over once both exist (see
+    /// `CloudPlugin::initialize_plugin_services`), the same pattern
+    /// `schedule_provisioner` above already uses for `temps-backup`. `None`
+    /// on a build with no auth plugin registered (never happens in practice,
+    /// but this degrades to "no managed provider" rather than panicking).
+    oidc_provisioner: OnceLock<Arc<temps_auth::oidc_service::OidcService>>,
 }
 
 impl CloudService {
@@ -222,9 +268,49 @@ impl CloudService {
             configuration_issue: RwLock::new(None),
             managed_backup_setup: RwLock::new(None),
             managed_backup_reconcile_lock: AsyncMutex::new(()),
+            enrollment_lock: AsyncMutex::new(()),
             schedule_provisioner: OnceLock::new(),
             managed_backup_retention_days: RwLock::new(None),
+            oidc_provisioner: OnceLock::new(),
         }
+    }
+
+    /// Wire the managed-OIDC provisioner in once `temps-auth` has registered
+    /// it. Idempotent, mirroring [`Self::set_schedule_provisioner`].
+    pub fn set_oidc_service(&self, oidc_service: Arc<temps_auth::oidc_service::OidcService>) {
+        let _ = self.oidc_provisioner.set(oidc_service);
+    }
+
+    /// Upsert the managed console-access `oidc_providers` row from a
+    /// `ConsoleOidcConfig` frame (ADR-045 §4), delivered at enrollment or
+    /// provisioning time by a later change. A `None` [`Self::oidc_provisioner`]
+    /// (no auth plugin registered) degrades to a logged no-op rather than an
+    /// error — there is no console to authenticate into on such a build.
+    pub async fn apply_console_oidc_config(
+        &self,
+        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
+    ) -> Result<(), CloudServiceError> {
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            tracing::error!(
+                "received a managed console-access OIDC configuration but no OidcService is \
+                 registered on this build; console access cannot be authenticated"
+            );
+            return Ok(());
+        };
+        oidc.upsert_managed_cloud_provider(config).await?;
+        Ok(())
+    }
+
+    /// Delete the managed console-access `oidc_providers` row and invalidate
+    /// every session it issued (ADR-045 §4). Idempotent: a build with no
+    /// managed row, or no `OidcService` registered, returns `Ok(false)`
+    /// rather than erroring, since "there was nothing to revoke" is a normal
+    /// outcome.
+    pub async fn revoke_console_oidc_provider(&self) -> Result<bool, CloudServiceError> {
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            return Ok(false);
+        };
+        Ok(oidc.revoke_managed_cloud_provider().await?)
     }
 
     /// Wire the backup scheduler in once it is registered. Idempotent.
@@ -809,7 +895,12 @@ impl CloudService {
     /// `CLOUD_LINK_CONNECTED` audit row here, *before* the second network
     /// round-trip for managed backups, so no timeout or shutdown can leave a
     /// persisted link without its audit record.
+    /// Takes [`Self::enrollment_lock`] for the whole attempt -- reading
+    /// `cloud.backend_url`, pointing the link at it, and redeeming the code --
+    /// so a concurrent `TEMPS_CLOUD_BACKEND_URL` bootstrap cannot repoint the
+    /// settings row at a different backend halfway through.
     pub async fn enroll_link(&self, code: &str) -> Result<EnrollmentKind, CloudServiceError> {
+        let _enrollment = self.enrollment_lock.lock().await;
         self.configure_link_for_enrollment().await?;
         self.link
             .enroll(code)
@@ -833,6 +924,7 @@ impl CloudService {
         &self,
         code: &str,
     ) -> Result<FirstLinkEnrollment, CloudServiceError> {
+        let _enrollment = self.enrollment_lock.lock().await;
         if self.link.is_linked() {
             return Ok(FirstLinkEnrollment::AlreadyLinked);
         }
@@ -841,6 +933,54 @@ impl CloudService {
             .enroll_if_unlinked(code)
             .await
             .map_err(CloudServiceError::Client)
+    }
+
+    /// Apply the `TEMPS_CLOUD_BACKEND_URL` one-shot bootstrap input: validate
+    /// `url` with the same rule [`Self::status`]/[`Self::capability`] apply to
+    /// `cloud.backend_url`, then persist it via
+    /// [`ConfigService::set_cloud_backend_url`] so the enrollment that follows
+    /// (`enroll_link_if_unlinked`, via [`Self::configure_link_for_enrollment`])
+    /// reads it back from settings and points the link at it.
+    ///
+    /// Deliberately does not itself decide whether enrollment should run --
+    /// that is `run_cloud_enrollment_bootstrap`'s job in `temps-cli`, kept
+    /// thin by calling this and then the existing enroll path. Returns
+    /// [`CloudServiceError::InvalidBackend`] without writing anything if `url`
+    /// fails validation, so an operator's typo in the bootstrap input can
+    /// never point this instance's default Cloud settings at an unreachable
+    /// or malicious host.
+    ///
+    /// The already-linked decision is made *here*, under
+    /// [`Self::enrollment_lock`] and in the same critical section as the
+    /// write, not by the caller. An operator enrollment (`POST /cloud/enroll`
+    /// -> [`Self::enroll_link`]) holds that lock for its whole round-trip, so
+    /// this call either wins -- and the enrollment that follows reads the URL
+    /// it just wrote -- or finds a link already established and returns
+    /// [`BootstrapBackendUrlOutcome::AlreadyLinked`] having written nothing.
+    /// A caller-side check could not give that guarantee: a link established
+    /// between the check and the write would leave `cloud.backend_url` naming
+    /// a backend the persisted credential does not belong to, which the next
+    /// boot refuses to reconcile (`configuration_invalid`) and which takes an
+    /// operator disconnect to clear.
+    pub async fn apply_bootstrap_backend_url(
+        &self,
+        url: &str,
+    ) -> Result<BootstrapBackendUrlOutcome, CloudServiceError> {
+        // Validated before the lock: a rejected URL is never written, so it
+        // has no ordering relationship with enrollment to protect.
+        parse_backend(
+            url,
+            self.allow_loopback_development || self.link.allows_loopback_development(),
+        )
+        .map_err(|error| CloudServiceError::InvalidBackend {
+            reason: error.to_string(),
+        })?;
+        let _enrollment = self.enrollment_lock.lock().await;
+        if self.link.is_linked() {
+            return Ok(BootstrapBackendUrlOutcome::AlreadyLinked);
+        }
+        self.config.set_cloud_backend_url(url).await?;
+        Ok(BootstrapBackendUrlOutcome::Applied)
     }
 
     /// Point the link at the configured backend and apply the feature
@@ -1023,7 +1163,10 @@ impl CloudService {
     /// Disconnect this instance and remove any Cloud-managed backup source.
     /// Returns whether a managed source was found and removed, so the caller
     /// can decide whether to audit a credential revocation.
-    pub async fn disconnect(&self) -> Result<(CloudStatus, bool), CloudServiceError> {
+    /// Disconnects this instance, releasing everything the link provisioned.
+    /// Returns `(status, backup_credential_revoked, console_oidc_revoked)` so
+    /// the caller can audit each independently.
+    pub async fn disconnect(&self) -> Result<(CloudStatus, bool, bool), CloudServiceError> {
         if !self.link.is_linked() {
             // Nothing to revoke, so nothing to release either: the answer
             // `revoke` would give, before any schedule is touched.
@@ -1034,6 +1177,19 @@ impl CloudService {
         // cleanup below refuses to remove a destination a schedule still
         // points at. A failure here leaves the link intact and is reported.
         self.release_managed_backup_schedules().await?;
+        // ADR-045 §4: revoke the managed console-access OIDC provider (and
+        // its sessions) before the credential itself, the same ordering
+        // `remove_managed_backup_source` already follows below.
+        //
+        // SECURITY: a failure here is fatal to the disconnect, like the
+        // schedule release above. Swallowing it would report a successful
+        // disconnect while the enabled provider and every session it issued
+        // stayed live — Cloud identities keeping console access on an
+        // instance the operator believes they just cut loose, with no audit
+        // row recording a revocation and nothing to retry. Leaving the link
+        // intact instead means the operator sees the error and can retry the
+        // disconnect once the database is reachable again.
+        let console_oidc_revoked = self.revoke_console_oidc_provider().await?;
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),
@@ -1042,7 +1198,7 @@ impl CloudService {
         let removed = self.remove_managed_backup_source().await?;
         self.set_managed_backup_setup(default_managed_backup_setup(false));
         let status = self.status().await?;
-        Ok((status, removed))
+        Ok((status, removed, console_oidc_revoked))
     }
 
     async fn has_managed_backup_source(&self) -> Result<bool, CloudServiceError> {
@@ -1653,5 +1809,332 @@ mod tests {
                 panic!("expected a bucket-changed outcome")
             }
         }
+    }
+
+    /// A [`CloudService`] whose link is already enrolled, so `disconnect`
+    /// runs its full release sequence instead of returning `NotEnrolled`.
+    /// Returns the `TempDir` too: dropping it removes the state file the link
+    /// reads and writes.
+    fn linked_cloud_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> (tempfile::TempDir, CloudService) {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": uuid::Uuid::new_v4(),
+                "base_url": "http://127.0.0.1:9/",
+                "allow_loopback_development": true,
+                "token": "test-link-token",
+                "tenant_id": serde_json::Value::Null,
+                "account_email": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("state file");
+
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        let config = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db.clone(),
+        ));
+        let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
+        (temp, CloudService::new(link, config, db, encryption, true))
+    }
+
+    /// SECURITY: disconnecting must not report success while the managed
+    /// console-access provider — and every session it issued — is still
+    /// live. If revocation fails, the link stays intact so the operator sees
+    /// the failure and can retry, rather than being told the instance is
+    /// disconnected while Cloud identities keep console access.
+    #[tokio::test]
+    async fn disconnect_fails_when_the_managed_console_provider_cannot_be_revoked() {
+        // The service's own DB: one lookup for the managed backup source,
+        // which finds nothing, so schedule release is a no-op.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db);
+
+        // The auth DB fails the moment revocation touches it.
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "connection reset while revoking the managed provider".to_string(),
+                )])
+                .into_connection(),
+        );
+        let oidc = Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("oidc-revocation-test")),
+            Arc::new(temps_auth::UserService::new(oidc_db)),
+        ));
+        service.set_oidc_service(oidc);
+
+        let error = service
+            .disconnect()
+            .await
+            .expect_err("a failed console-provider revocation must fail the disconnect");
+        assert!(
+            matches!(error, CloudServiceError::ConsoleOidcProvisioning(_)),
+            "expected the revocation failure to surface, got {error}"
+        );
+        assert!(
+            service.link.is_linked(),
+            "the link must stay intact so the operator can retry the disconnect"
+        );
+    }
+}
+
+/// [`CloudService::apply_bootstrap_backend_url`] -- in particular that its
+/// already-linked decision and its write happen together, so an operator
+/// enrollment that lands mid-flight can never leave `cloud.backend_url`
+/// naming a backend the persisted credential does not belong to.
+#[cfg(test)]
+mod bootstrap_backend_url_tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use temps_cloud_client::CloudLink;
+    use temps_cloud_protocol::EnrollRequest;
+    use temps_core::AppSettings;
+
+    use super::*;
+
+    /// Some other Cloud than the one the settings row names, so "was this
+    /// written?" is unambiguous.
+    const BOOTSTRAP_URL: &str = "http://127.0.0.1:65000";
+
+    /// A managed backend that answers any enrollment immediately, except a
+    /// code starting with `SLOW-`, which it parks until the test releases it.
+    /// That park is the enrollment round-trip the bootstrap must not be able
+    /// to slip a settings write into.
+    #[derive(Clone, Default)]
+    struct Stub {
+        parked: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    /// `None` when the sandbox refuses the bind, matching the convention in
+    /// `temps-cloud-client`'s enrollment tests: a test that cannot listen
+    /// skips rather than failing the suite for an environment reason.
+    async fn serve(stub: Stub) -> Option<String> {
+        let app = Router::new()
+            .route(
+                "/v1/enroll",
+                post(
+                    |State(stub): State<Stub>, Json(request): Json<EnrollRequest>| async move {
+                        if request.enrollment_code.starts_with("SLOW-") {
+                            stub.parked.fetch_add(1, Ordering::SeqCst);
+                            stub.release.notified().await;
+                        }
+                        Json(serde_json::json!({
+                            "tenant_id": Uuid::new_v5(
+                                &Uuid::NAMESPACE_OID,
+                                request.enrollment_code.as_bytes(),
+                            ),
+                            "instance_token": format!("inst_{}", request.enrollment_code),
+                        }))
+                    },
+                ),
+            )
+            .with_state(stub);
+        let listener = match tokio::net::TcpListener::bind::<SocketAddr>(
+            "127.0.0.1:0".parse().expect("loopback address must parse"),
+        )
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping bootstrap backend URL race test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("test backend must bind: {error}"),
+        };
+        let address = listener.local_addr().expect("test backend has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{address}"))
+    }
+
+    fn settings_row(backend_url: &str) -> temps_entities::settings::Model {
+        let mut settings = AppSettings::default();
+        settings.cloud.backend_url = backend_url.to_string();
+        let now = chrono::Utc::now();
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
+        Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db,
+        ))
+    }
+
+    fn service(link: Arc<CloudLink>, db: Arc<DatabaseConnection>) -> Arc<CloudService> {
+        Arc::new(CloudService::new(
+            link,
+            config_service(db),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            Arc::new(EncryptionService::new_from_password("bootstrap-test")),
+            true,
+        ))
+    }
+
+    fn unlinked_link() -> (Arc<CloudLink>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "bootstrap-test",
+        ));
+        (link, directory)
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..2_000 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_instance_persists_the_bootstrap_backend_url() {
+        let (link, _directory) = unlinked_link();
+        // Two rows: the locked read inside the write, then the row the
+        // Postgres `UPDATE ... RETURNING` hands back.
+        let row = settings_row("https://app.temps.sh");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+
+        let outcome = service(link, db)
+            .apply_bootstrap_backend_url(BOOTSTRAP_URL)
+            .await
+            .expect("a valid URL on an unlinked instance must be persisted");
+
+        assert_eq!(outcome, BootstrapBackendUrlOutcome::Applied);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_bootstrap_backend_url_is_rejected_before_anything_is_written() {
+        let (link, _directory) = unlinked_link();
+        // Deliberately no query or exec results: any attempt to touch the
+        // settings row would surface as a database error instead of the
+        // validation error asserted below.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let error = service(link, db)
+            .apply_bootstrap_backend_url("not a url")
+            .await
+            .expect_err("an unparsable backend URL must be refused");
+
+        assert!(
+            matches!(error, CloudServiceError::InvalidBackend { .. }),
+            "expected a validation error, got {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enrollment_that_lands_mid_flight_makes_the_bootstrap_a_no_op() {
+        // The race: the instance is unlinked when the unattended bootstrap
+        // starts, an operator enrollment is already in flight against the
+        // backend the settings row names, and it completes before the
+        // bootstrap's write. If the bootstrap wrote anyway, the settings row
+        // would name one backend and the persisted credential another, and
+        // the next boot would refuse to reconcile them.
+        let stub = Stub::default();
+        let Some(backend) = serve(stub.clone()).await else {
+            return;
+        };
+        let (link, _directory) = unlinked_link();
+        // A single row for the enrollment's settings read, and no exec
+        // results at all: if the bootstrap ever attempted its write, it would
+        // fail with a database error rather than returning `AlreadyLinked`.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![settings_row(&backend)]])
+                .into_connection(),
+        );
+        let service = service(Arc::clone(&link), db);
+
+        let operator = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.enroll_link("SLOW-operator-code").await }
+        });
+        assert!(
+            wait_until(|| stub.parked.load(Ordering::SeqCst) == 1).await,
+            "the operator enrollment must be in flight before the bootstrap runs"
+        );
+
+        let bootstrap = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.apply_bootstrap_backend_url(BOOTSTRAP_URL).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !bootstrap.is_finished(),
+            "the bootstrap must not be able to decide 'unlinked' and write while an \
+             enrollment is redeeming a code"
+        );
+
+        stub.release.notify_one();
+        let kind = operator
+            .await
+            .expect("the operator enrollment task must not panic")
+            .expect("the operator enrollment must succeed against the stub");
+        assert_eq!(kind, EnrollmentKind::First);
+        assert!(link.is_linked());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), bootstrap)
+            .await
+            .expect("the bootstrap must proceed once the enrollment releases the lock")
+            .expect("the bootstrap task must not panic")
+            .expect("losing to an operator's link is an outcome, not an error");
+
+        assert_eq!(
+            outcome,
+            BootstrapBackendUrlOutcome::AlreadyLinked,
+            "the established link's backend must stand, with nothing written"
+        );
     }
 }

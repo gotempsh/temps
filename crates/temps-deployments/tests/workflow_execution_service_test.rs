@@ -441,9 +441,9 @@ async fn test_workflow_execution_service_with_real_jobs() {
     );
 
     // Create Docker client for test
-    let docker = Arc::new(
+    let docker = Arc::new(temps_core::DockerHandle::available(Arc::new(
         bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-    );
+    )));
 
     // Create queue for test
     let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);

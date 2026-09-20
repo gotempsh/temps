@@ -57,6 +57,70 @@ pub enum OidcError {
     #[error("Invalid SSO role {role}: must be 'admin' or 'user'")]
     InvalidRole { role: String },
 
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud and cannot be edited manually"
+    )]
+    ManagedByCloudEdit { provider_id: i32, name: String },
+
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud and cannot be deleted manually"
+    )]
+    ManagedByCloudDelete { provider_id: i32, name: String },
+
+    /// ADR-045 §4 role gate: the provider requires `admin_only_role_required`
+    /// and the role resolved from claims was not `admin`. Refused outright
+    /// rather than falling through to `default_role`.
+    #[error(
+        "OIDC provider {provider_id} requires an admin-level role for login, but the resolved role was '{resolved_role}'"
+    )]
+    InsufficientRole {
+        provider_id: i32,
+        resolved_role: String,
+    },
+
+    /// SECURITY: refuses an ordinary provider create/edit that would point
+    /// its `issuer_url` at the same issuer as the Cloud-managed
+    /// console-access provider, which would create a second, unguarded
+    /// relying-party registration for that IdP -- see
+    /// `OidcService::assert_issuer_not_shadowing_managed_cloud_provider`.
+    #[error(
+        "Issuer URL '{issuer_url}' matches the Temps Cloud managed provider's issuer; a second provider on this issuer would not enforce its admin-only role gate"
+    )]
+    IssuerMatchesManagedCloudProvider { issuer_url: String },
+
+    /// SECURITY: refuses a hand-made change to the Cloud-managed provider's
+    /// role mappings -- those rows *are* the admin-only gate, so adding a
+    /// `member -> admin` row (or removing `owner -> admin`) rewrites who may
+    /// sign in. Only `OidcService::sync_managed_cloud_role_mappings` writes
+    /// them.
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud; its role mappings define its admin-only sign-in gate and cannot be changed manually"
+    )]
+    ManagedByCloudRoleMapping { provider_id: i32, name: String },
+
+    /// SECURITY: refuses to provision the Cloud-managed provider while an
+    /// operator-created provider already points at the same issuer -- that
+    /// row would be a second, unguarded relying-party registration for the
+    /// same IdP, so the admin-only gate could be sidestepped simply by
+    /// signing in through it.
+    #[error(
+        "OIDC provider {provider_id} ('{name}') already uses issuer '{issuer_url}'; remove or repoint it before Temps Cloud can provision console access on that issuer, because a second provider on the same issuer would not enforce the admin-only role gate"
+    )]
+    ManagedIssuerAlreadyUsed {
+        provider_id: i32,
+        name: String,
+        issuer_url: String,
+    },
+
+    /// SECURITY: the provider was revoked or disabled while this login was in
+    /// flight, so the session it had just created was deleted again before
+    /// the cookie was issued -- see
+    /// `OidcService::assert_provider_live_for_session`.
+    #[error(
+        "OIDC provider {provider_id} was revoked or disabled while this login was in progress; the session it created was discarded"
+    )]
+    ProviderRevokedDuringLogin { provider_id: i32 },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -130,6 +194,25 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "Role '{role}' is invalid for Temps SSO mapping (use 'admin' or 'user')"
                 )),
+            OidcError::ManagedByCloudEdit { .. }
+            | OidcError::ManagedByCloudDelete { .. }
+            | OidcError::ManagedByCloudRoleMapping { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Managed By Temps Cloud")
+                .with_detail(err.to_string()),
+            OidcError::ManagedIssuerAlreadyUsed { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Issuer Already In Use")
+                .with_detail(err.to_string()),
+            OidcError::ProviderRevokedDuringLogin { .. } => problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Provider Revoked")
+                .with_detail(err.to_string()),
+            OidcError::InsufficientRole { .. } => problem_new(StatusCode::FORBIDDEN)
+                .with_title("Insufficient Role")
+                .with_detail(err.to_string()),
+            OidcError::IssuerMatchesManagedCloudProvider { .. } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("Issuer Matches Managed Provider")
+                    .with_detail(err.to_string())
+            }
             OidcError::Database(err) => {
                 // Don't return the raw Sea-ORM error text to the
                 // caller: it can include table names, column names,

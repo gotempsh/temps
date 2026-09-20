@@ -584,7 +584,15 @@ export function BackupDetail() {
             </Card>
 
             {backup.error_message ? (
-              <Callout tone="error" title="Backup failed">
+              // A message on a still-pending backup is not a failure: the
+              // server records why it could not start it here (e.g. the
+              // engine needs a Docker daemon this process does not have) and
+              // leaves the run outstanding. Calling that "failed" would send
+              // the operator looking for a failure that never happened.
+              <Callout
+                tone={state === 'pending' ? 'warning' : 'error'}
+                title={state === 'pending' ? 'Backup has not started' : 'Backup failed'}
+              >
                 <span className="break-all font-mono text-xs">{backup.error_message}</span>
               </Callout>
             ) : null}

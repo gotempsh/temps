@@ -36,7 +36,7 @@ use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use temps_providers::externalsvc::ExternalService;
 
-const ENGINE_KEY: &str = "postgres_walg";
+pub(crate) const ENGINE_KEY: &str = "postgres_walg";
 
 pub struct PostgresWalgDeps {
     pub db: Arc<DatabaseConnection>,

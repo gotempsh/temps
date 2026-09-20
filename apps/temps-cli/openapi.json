@@ -30534,6 +30534,10 @@
           "jit_provisioning": {
             "type": "boolean"
           },
+          "managed_by_cloud": {
+            "description": "ADR-045 §4: true only for the provider Temps Cloud provisions for\nconsole access. The admin UI should disable edit/delete controls for\nsuch a row — the API itself refuses those requests regardless\n(`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -30564,7 +30568,8 @@
           "group_claim",
           "role_claim",
           "default_role",
-          "trust_idp_email"
+          "trust_idp_email",
+          "managed_by_cloud"
         ],
         "type": "object"
       },
@@ -98086,6 +98091,9 @@
           "404": {
             "description": "Project or environment not found"
           },
+          "409": {
+            "description": "A container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -98148,6 +98156,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98223,6 +98234,9 @@
           },
           "404": {
             "description": "Container or environment variable not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98391,6 +98405,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98603,6 +98620,9 @@
           "404": {
             "description": "Container not found"
           },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -98661,6 +98681,9 @@
           "404": {
             "description": "Container not found"
           },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -98718,6 +98741,9 @@
           },
           "404": {
             "description": "Container not found"
+          },
+          "409": {
+            "description": "The container is placed on this process, which has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -98785,6 +98811,9 @@
           },
           "404": {
             "description": "Project or environment not found"
+          },
+          "409": {
+            "description": "Claiming a local daemon image needs a local Docker daemon, which this process has none of"
           },
           "500": {
             "description": "Internal server error"

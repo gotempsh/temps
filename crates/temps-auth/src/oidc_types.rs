@@ -76,6 +76,11 @@ pub struct OidcProviderResponse {
     /// during SSO login. Only safe for IdPs where an admin controls
     /// user provisioning — see `oidc_providers::Model::trust_idp_email`.
     pub trust_idp_email: bool,
+    /// ADR-045 §4: true only for the provider Temps Cloud provisions for
+    /// console access. The admin UI should disable edit/delete controls for
+    /// such a row — the API itself refuses those requests regardless
+    /// (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).
+    pub managed_by_cloud: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -223,6 +228,7 @@ pub fn provider_to_response(
         role_claim: provider.role_claim.clone(),
         default_role: provider.default_role.clone(),
         trust_idp_email: provider.trust_idp_email,
+        managed_by_cloud: provider.managed_by_cloud,
     }
 }
 
@@ -329,11 +335,14 @@ mod tests {
             role_claim: "roles".into(),
             default_role: "user".into(),
             trust_idp_email: true,
+            managed_by_cloud: false,
+            admin_only_role_required: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
         let resp = provider_to_response(&model);
         assert!(resp.trust_idp_email);
+        assert!(!resp.managed_by_cloud);
         // Sanity: secret is always masked.
         assert_eq!(resp.client_secret, "***");
     }

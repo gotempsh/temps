@@ -75,6 +75,11 @@ pub struct BackupExecutor {
 struct ExecutorInner {
     db: Arc<DatabaseConnection>,
     engines: HashMap<&'static str, Arc<dyn BackupEngine>>,
+    /// Engine keys this build of the process knows about but deliberately
+    /// cannot run — see [`BackupExecutorBuilder::with_unavailable_engines`].
+    /// Distinct from "unknown": a request for one of these is a request this
+    /// process must decline without destroying it.
+    unavailable_engines: HashMap<&'static str, String>,
     semaphore: Arc<Semaphore>,
     in_flight: Mutex<HashMap<i32, JobHandle>>,
     /// Optional failure-notification hook. Fired from `finalize_failed`
@@ -108,6 +113,7 @@ struct JobHandle {
 pub struct BackupExecutorBuilder {
     db: Arc<DatabaseConnection>,
     engines: HashMap<&'static str, Arc<dyn BackupEngine>>,
+    unavailable_engines: HashMap<&'static str, String>,
     max_concurrent: usize,
     notifier: Option<Arc<dyn BackupFailureNotifier>>,
     event_publisher: Option<Arc<dyn JobQueue>>,
@@ -118,6 +124,7 @@ impl BackupExecutorBuilder {
         Self {
             db,
             engines: HashMap::new(),
+            unavailable_engines: HashMap::new(),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             notifier: None,
             event_publisher: None,
@@ -136,6 +143,33 @@ impl BackupExecutorBuilder {
     /// plugin reload during dev is well-defined).
     pub fn register_engine(mut self, engine: Arc<dyn BackupEngine>) -> Self {
         self.engines.insert(engine.engine(), engine);
+        self
+    }
+
+    /// Declare engine keys this process cannot run, and why.
+    ///
+    /// These are engines the product has but this particular process is not
+    /// equipped for — today, the container-backed engines on a `serve
+    /// --profile control-plane` host with no local Docker daemon. Registering
+    /// them would be a lie (every job would fail on first contact with the
+    /// daemon), and leaving them merely unregistered is worse: `spawn` would
+    /// treat a valid request as a typo and destroy the backup by flipping its
+    /// row to `failed`.
+    ///
+    /// Declaring them instead makes `spawn` decline without consuming the
+    /// request: the `backups` row keeps its `pending` state and gets `reason`
+    /// recorded in `error_message`, so the operator sees exactly which
+    /// capability is missing and where it does exist, and a process that *can*
+    /// run the engine can still pick the row up.
+    pub fn with_unavailable_engines(
+        mut self,
+        keys: impl IntoIterator<Item = &'static str>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let reason = reason.into();
+        for key in keys {
+            self.unavailable_engines.insert(key, reason.clone());
+        }
         self
     }
 
@@ -162,6 +196,7 @@ impl BackupExecutorBuilder {
             inner: Arc::new(ExecutorInner {
                 db: self.db,
                 engines: self.engines,
+                unavailable_engines: self.unavailable_engines,
                 semaphore: Arc::new(Semaphore::new(self.max_concurrent)),
                 in_flight: Mutex::new(HashMap::new()),
                 notifier: self.notifier,
@@ -179,6 +214,15 @@ pub enum SpawnError {
 
     #[error("No engine registered for key '{engine}'; registered: [{registered}]")]
     UnknownEngine { engine: String, registered: String },
+
+    #[error(
+        "Backup {backup_id} needs the '{engine}' engine, which this process cannot run: {reason}"
+    )]
+    EngineUnavailableHere {
+        backup_id: i32,
+        engine: String,
+        reason: String,
+    },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
@@ -215,6 +259,30 @@ impl BackupExecutor {
     /// error immediately. The error is also returned so the HTTP handler
     /// can propagate it.
     pub async fn spawn(&self, params: SpawnParams) -> Result<(), SpawnError> {
+        // A known-but-unavailable engine is a capability gap in this process,
+        // not a bad request, so the backup must survive it: record the reason
+        // on the row and leave it `pending`. Checked before the registry
+        // lookup below so it can never be mistaken for a typo and failed.
+        if let Some(reason) = self.inner.unavailable_engines.get(params.engine.as_str()) {
+            let err = SpawnError::EngineUnavailableHere {
+                backup_id: params.backup_id,
+                engine: params.engine.clone(),
+                reason: reason.clone(),
+            };
+            if let Err(e) = self
+                .mark_backup_deferred(params.backup_id, &err.to_string())
+                .await
+            {
+                error!(
+                    backup_id = params.backup_id,
+                    error = %e,
+                    "BackupExecutor: could not record why this backup is waiting; the row \
+                     stays pending with no reason attached",
+                );
+            }
+            return Err(err);
+        }
+
         // Engine lookup happens first — no point acquiring a permit only
         // to fail on a typo.
         let engine = match self.inner.engines.get(params.engine.as_str()) {
@@ -467,6 +535,42 @@ UPDATE external_service_backups
                 DatabaseBackend::Postgres,
                 sql,
                 vec![SValue::from(backup_id)],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Attach a reason to a backup that this process declined to run, without
+    /// moving it out of `pending`.
+    ///
+    /// Deliberately not a terminal transition: the work is still outstanding
+    /// and a process with the missing capability can still perform it. The
+    /// `state IN ('pending')` guard means a row that has since started or
+    /// finished elsewhere is never stamped with a stale reason.
+    async fn mark_backup_deferred(
+        &self,
+        backup_id: i32,
+        reason: &str,
+    ) -> Result<(), sea_orm::DbErr> {
+        let sql = r#"
+WITH updated_backup AS (
+    UPDATE backups
+       SET error_message = $1
+     WHERE id            = $2
+       AND state         = 'pending'
+     RETURNING id
+)
+UPDATE external_service_backups
+   SET error_message = $1
+ WHERE backup_id IN (SELECT id FROM updated_backup)
+   AND state         = 'pending'
+        "#;
+        self.inner
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
             ))
             .await?;
         Ok(())
@@ -858,6 +962,89 @@ mod tests {
         assert!(sql.contains("UPDATE backups"));
         assert!(sql.contains("UPDATE external_service_backups"));
         assert!(sql.contains("state         = 'failed'"));
+    }
+
+    /// An engine this process cannot run must not be mistaken for a typo.
+    /// `spawn` has to decline it, record why, and leave the row `pending` —
+    /// destroying a perfectly valid backup request because *this* host lacks a
+    /// capability would be a data-loss-adjacent bug for the operator.
+    #[tokio::test]
+    async fn an_unavailable_engine_is_declined_and_the_backup_stays_pending() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 2,
+                }])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_unavailable_engines(
+                ["postgres_pgdump"],
+                "this process has no local Docker daemon",
+            )
+            .build();
+
+        let error = executor
+            .spawn(SpawnParams {
+                backup_id: 42,
+                engine: "postgres_pgdump".to_string(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })
+            .await
+            .expect_err("an unavailable engine must be declined");
+
+        match &error {
+            SpawnError::EngineUnavailableHere {
+                backup_id, engine, ..
+            } => {
+                assert_eq!(*backup_id, 42);
+                assert_eq!(engine, "postgres_pgdump");
+            }
+            other => panic!("expected EngineUnavailableHere, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("no local Docker daemon"),
+            "the decline must carry the reason: {error}",
+        );
+
+        // Nothing was started, so nothing can be cancelled or double-spawned.
+        assert!(executor.inner.in_flight.lock().await.is_empty());
+
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("UPDATE backups"));
+        assert!(sql.contains("UPDATE external_service_backups"));
+        assert!(
+            sql.contains("SET error_message"),
+            "the reason must land on the row: {sql}",
+        );
+        assert!(
+            !sql.contains("'failed'"),
+            "a declined backup must not be failed by this process: {sql}",
+        );
+    }
+
+    /// The counterpart: a key nothing in the product answers to really is a
+    /// bad request, and must still fail fast rather than wait forever.
+    #[tokio::test]
+    async fn an_unknown_engine_still_fails_the_backup() {
+        let (executor, db) = executor_with_one_exec();
+
+        let error = executor
+            .spawn(SpawnParams {
+                backup_id: 7,
+                engine: "not_an_engine".to_string(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })
+            .await
+            .expect_err("an unknown engine must be rejected");
+
+        assert!(matches!(error, SpawnError::UnknownEngine { .. }));
+
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("state         = 'failed'"), "{sql}");
     }
 
     #[tokio::test]

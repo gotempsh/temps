@@ -13785,6 +13785,13 @@ export type OidcProviderResponse = {
     id: number;
     issuer_url: string;
     jit_provisioning: boolean;
+    /**
+     * ADR-045 §4: true only for the provider Temps Cloud provisions for
+     * console access. The admin UI should disable edit/delete controls for
+     * such a row — the API itself refuses those requests regardless
+     * (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).
+     */
+    managed_by_cloud: boolean;
     name: string;
     role_claim: string;
     scopes: string;
@@ -51216,6 +51223,10 @@ export type ListContainersErrors = {
      */
     404: unknown;
     /**
+     * A container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51255,6 +51266,10 @@ export type GetContainerDetailErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51303,6 +51318,10 @@ export type GetContainerEnvironmentVariableErrors = {
      * Container or environment variable not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51399,6 +51418,10 @@ export type GetContainerMetricsErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51541,6 +51564,10 @@ export type RestartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51581,6 +51608,10 @@ export type StartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51620,6 +51651,10 @@ export type StopContainerErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51662,6 +51697,10 @@ export type DeployFromImageErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Claiming a local daemon image needs a local Docker daemon, which this process has none of
+     */
+    409: unknown;
     /**
      * Internal server error
      */

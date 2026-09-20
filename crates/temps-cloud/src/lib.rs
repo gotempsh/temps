@@ -13,12 +13,13 @@ mod plugin;
 mod service;
 
 pub use handler::{
-    cloud_routes, record_backup_outcome_audit, record_enrollment_audit,
-    record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
+    cloud_routes, record_backend_url_bootstrapped_audit, record_backup_outcome_audit,
+    record_enrollment_audit, record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
     UNATTENDED_ENROLLMENT_USER_AGENT,
 };
 pub use plugin::CloudPlugin;
 pub use service::{
-    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
-    ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction, ManagedBackupSetupStatus,
+    BootstrapBackendUrlOutcome, CloudAiCapability, CloudCapability, CloudService,
+    CloudServiceError, CloudStatus, ManagedBackupOutcome, ManagedBackupSetup,
+    ManagedBackupSetupAction, ManagedBackupSetupStatus,
 };

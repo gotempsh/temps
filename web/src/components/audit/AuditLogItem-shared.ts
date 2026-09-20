@@ -74,6 +74,7 @@ export function categorize(op: string): Category {
   if (
     op.startsWith('LOGIN_') ||
     op.startsWith('AUTH_') ||
+    op.startsWith('OIDC_') ||
     op === 'USER_LOGOUT' ||
     op === 'PASSWORD_RESET' ||
     op === 'EMAIL_VERIFIED' ||

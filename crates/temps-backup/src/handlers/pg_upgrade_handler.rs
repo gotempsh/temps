@@ -907,7 +907,7 @@ mod tests {
         ));
         let pg_upgrade_service = Arc::new(PostgresUpgradeService::new(
             db.clone(),
-            docker,
+            Arc::new(temps_core::DockerHandle::available(docker)),
             Arc::new(StubBackupProvider),
             Arc::new(StubLifecycle),
             Arc::new(LogService::new(

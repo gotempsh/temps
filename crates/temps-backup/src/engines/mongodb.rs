@@ -44,7 +44,7 @@ use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "mongodb";
+pub(crate) const ENGINE_KEY: &str = "mongodb";
 const DUMP_FILE_SUFFIX: &str = "dump.archive";
 const MONGO_SIDECAR_IMAGE: &str =
     "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6";

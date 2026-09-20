@@ -41,7 +41,7 @@ use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "control_plane";
+pub(crate) const ENGINE_KEY: &str = "control_plane";
 const DUMP_FILE_SUFFIX: &str = "backup.sql.gz";
 
 /// High-volume observability/analytics tables backed up schema-only.

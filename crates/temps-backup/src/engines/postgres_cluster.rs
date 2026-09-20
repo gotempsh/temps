@@ -23,7 +23,7 @@ use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "postgres_cluster";
+pub(crate) const ENGINE_KEY: &str = "postgres_cluster";
 
 pub struct PostgresClusterDeps {
     pub db: Arc<DatabaseConnection>,

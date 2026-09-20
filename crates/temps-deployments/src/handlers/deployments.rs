@@ -481,6 +481,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
+            DeploymentError::DockerUnavailable(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Docker Unavailable")
+                .with_detail(err.to_string()),
         }
     }
 }
@@ -1110,6 +1113,7 @@ pub async fn teardown_environment(
         (status = 200, description = "List of containers", body = ContainerListResponse),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "A container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1874,6 +1878,7 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
     responses(
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2005,6 +2010,7 @@ pub async fn get_container_detail(
         (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Container or environment variable not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2115,6 +2121,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2171,6 +2178,7 @@ pub async fn stop_container(
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2227,6 +2235,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2283,6 +2292,7 @@ pub async fn restart_container(
     responses(
         (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -4389,9 +4399,8 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
         );
-        let docker_log_service = Arc::new(DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let docker_log_service = Arc::new(DockerLogService::new(docker_handle.clone()));
 
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
@@ -4428,7 +4437,7 @@ mod tests {
             config_service.clone(),
             queue_service.clone(),
             docker_log_service,
-            docker.clone(),
+            docker_handle,
             deployer,
             encryption_service.clone(),
         ));
@@ -4478,7 +4487,7 @@ mod tests {
                 .expect("enc"),
             ),
         ));
-        let blob_service = Arc::new(temps_blob::BlobService::new(rustfs_service));
+        let blob_service = Some(Arc::new(temps_blob::BlobService::new(rustfs_service)));
 
         // Use noop screenshot provider via env var
         // SAFETY: This is test-only code; tests are run single-threaded or this env var
@@ -4522,7 +4531,9 @@ mod tests {
                 db.clone(),
             )),
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker")),
+            Arc::new(temps_core::DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults().expect("docker"),
+            ))),
         ));
 
         let failure_report_service = Arc::new(

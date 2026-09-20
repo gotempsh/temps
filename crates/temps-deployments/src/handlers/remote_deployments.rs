@@ -995,6 +995,7 @@ pub struct PaginatedStaticBundlesResponse {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "Claiming a local daemon image needs a local Docker daemon, which this process has none of"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))

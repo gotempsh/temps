@@ -13,6 +13,13 @@ describe('permission-denial audit presentation', () => {
     expect(categorize('PERMISSION_DENIED')).toBe('auth')
   })
 
+  test('categorizes SSO events as authentication, not "other"', () => {
+    // A denied SSO login is a security event operators go looking for; if it
+    // falls into "Other" it is effectively invisible in the audit console.
+    expect(categorize('OIDC_LOGIN_DENIED')).toBe('auth')
+    expect(categorize('OIDC_PROVIDER_CREATED')).toBe('auth')
+  })
+
   test('renders only normalized, redacted denial metadata', () => {
     expect(
       describePermissionDenial({

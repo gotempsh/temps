@@ -47,6 +47,14 @@ type OidcProviderFormProps = {
   submitting?: boolean
   submitLabel?: string
   footer?: React.ReactNode
+  /**
+   * ADR-045 §4: true for the provider Temps Cloud provisions for console
+   * access. Every field becomes read-only and the submit button is
+   * removed — the API itself refuses `PATCH`/`DELETE` on this row
+   * regardless (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`),
+   * so this is defense in depth plus a clearer signal than a 4xx toast.
+   */
+  disabled?: boolean
 }
 
 function formatTemplateLabel(id: string): string {
@@ -65,6 +73,7 @@ export function OidcProviderForm({
   submitting = false,
   submitLabel,
   footer,
+  disabled = false,
 }: OidcProviderFormProps) {
   const [copiedRedirect, setCopiedRedirect] = useState(false)
 
@@ -118,6 +127,7 @@ export function OidcProviderForm({
               value={value.name}
               onChange={(event) => update('name', event.target.value)}
               placeholder={placeholders.name}
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2">
@@ -137,6 +147,7 @@ export function OidcProviderForm({
               onValueChange={(template) =>
                 handleTemplateChange(template as OidcTemplateId)
               }
+              disabled={disabled}
             >
               <SelectTrigger id="oidc-template">
                 <SelectValue />
@@ -165,6 +176,7 @@ export function OidcProviderForm({
               id="oidc-enabled"
               checked={value.enabled}
               onCheckedChange={(checked) => update('enabled', checked)}
+              disabled={disabled}
             />
           </div>
         </div>
@@ -191,6 +203,7 @@ export function OidcProviderForm({
               value={value.issuer_url}
               onChange={(event) => update('issuer_url', event.target.value)}
               placeholder={placeholders.issuer_url}
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2">
@@ -199,6 +212,7 @@ export function OidcProviderForm({
               id="oidc-client-id"
               value={value.client_id}
               onChange={(event) => update('client_id', event.target.value)}
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2">
@@ -214,6 +228,7 @@ export function OidcProviderForm({
                   : undefined
               }
               autoComplete="new-password"
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2 sm:col-span-2">
@@ -250,6 +265,7 @@ export function OidcProviderForm({
               value={value.scopes}
               onChange={(event) => update('scopes', event.target.value)}
               placeholder={placeholders.scopes}
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2">
@@ -257,6 +273,7 @@ export function OidcProviderForm({
             <Select
               value={value.default_role}
               onValueChange={(role) => update('default_role', role)}
+              disabled={disabled}
             >
               <SelectTrigger id="oidc-default-role">
                 <SelectValue />
@@ -274,6 +291,7 @@ export function OidcProviderForm({
               value={value.role_claim}
               onChange={(event) => update('role_claim', event.target.value)}
               placeholder={placeholders.role_claim || 'roles'}
+              disabled={disabled}
             />
           </div>
           <div className="space-y-2">
@@ -283,6 +301,7 @@ export function OidcProviderForm({
               value={value.group_claim}
               onChange={(event) => update('group_claim', event.target.value)}
               placeholder={placeholders.group_claim || 'groups'}
+              disabled={disabled}
             />
           </div>
         </div>
@@ -305,6 +324,7 @@ export function OidcProviderForm({
             id="oidc-jit"
             checked={value.jit_provisioning}
             onCheckedChange={(checked) => update('jit_provisioning', checked)}
+            disabled={disabled}
           />
         </div>
         <div className="flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50/40 p-4 dark:border-amber-900/60 dark:bg-amber-950/20">
@@ -335,20 +355,28 @@ export function OidcProviderForm({
             id="oidc-trust-idp-email"
             checked={value.trust_idp_email}
             onCheckedChange={(checked) => update('trust_idp_email', checked)}
+            disabled={disabled}
           />
         </div>
       </section>
 
       {footer}
 
-      <div className="flex justify-end gap-3 border-t pt-6">
-        <Button type="button" variant="outline" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button type="submit" disabled={submitting}>
-          {submitting ? 'Saving...' : (submitLabel ?? 'Save')}
-        </Button>
-      </div>
+      {disabled ? (
+        <p className="border-t pt-6 text-sm text-muted-foreground">
+          This provider is managed by Temps Cloud. Its connection settings can
+          only be changed from Temps Cloud.
+        </p>
+      ) : (
+        <div className="flex justify-end gap-3 border-t pt-6">
+          <Button type="button" variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={submitting}>
+            {submitting ? 'Saving...' : (submitLabel ?? 'Save')}
+          </Button>
+        </div>
+      )}
     </form>
   )
 }
