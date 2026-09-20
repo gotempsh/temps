@@ -63985,6 +63985,40 @@
         ]
       }
     },
+    "/auth/oidc/cloud/login": {
+      "get": {
+        "description": "The slug embeds the provider's row id, which Cloud does not know and the\ninstance may regenerate, so Cloud's \"Open console\" button needs a fixed\naddress it can link to: this one. A browser that already holds a Cloud\nsession completes the round trip without seeing a login page, which is\nwhat makes the hosted console feel signed-in from Cloud. Anything else\n(the interactive login, the callback, `return_to` sanitising) is exactly\nthe slug route; only the lookup differs. 404 when no managed provider is\ninstalled, so a self-hosted instance that never enrolled has nothing to\nprobe here.",
+        "operationId": "start_managed_cloud_login",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "return_to",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the Temps Cloud authorize URL"
+          },
+          "404": {
+            "description": "This instance has no Cloud-managed console-access provider"
+          },
+          "503": {
+            "description": "OIDC provider unreachable"
+          }
+        },
+        "summary": "Start a login against the Cloud-managed console-access provider without\nknowing its slug.",
+        "tags": [
+          "Authentication"
+        ]
+      }
+    },
     "/auth/oidc/login/{slug}": {
       "get": {
         "operationId": "start_oidc_login_by_slug",
