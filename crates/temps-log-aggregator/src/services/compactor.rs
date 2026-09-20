@@ -32,7 +32,7 @@ use crate::chunk::format::{
 };
 use crate::chunk::{DecodedLine, MAX_COMPACTED_BYTES};
 use crate::error::LogAggregatorError;
-use crate::index::{LineIndexSink, NoLineIndex};
+use crate::index::{IndexOutcome, LineIndexSink, NoLineIndex};
 use crate::storage::{traits::build_storage_key_v2, LogStorage};
 use crate::store::manifest::{Manifest, ManifestRepo};
 use crate::types::{ChunkMeta, LogLevel, LogLine, LogStream};
@@ -310,14 +310,14 @@ impl CompactorService {
         // repairs boundary overlap from out-of-order event times.
         lines.sort_by_key(|l| l.ts);
 
-        let mut encoder = ChunkEncoder::new(identity.clone());
-        for l in &lines {
-            encoder.push(&LogLine {
+        let log_lines: Vec<LogLine> = lines
+            .into_iter()
+            .map(|l| LogLine {
                 ts: l.ts,
                 stream: l.stream,
                 level: l.level,
-                msg: l.message.clone(),
-                fields: l.fields.clone(),
+                msg: l.message,
+                fields: l.fields,
                 container_id: identity.container_id.clone(),
                 service: identity.service.clone(),
                 env: identity.env.clone(),
@@ -326,7 +326,11 @@ impl CompactorService {
                 deploy_id: identity.deploy_id,
                 node_id: identity.node_id,
                 node_name: identity.node_name.clone(),
-            })?;
+            })
+            .collect();
+        let mut encoder = ChunkEncoder::new(identity.clone());
+        for l in &log_lines {
+            encoder.push(l)?;
         }
         let encoded = encoder.finish(true)?;
         let labels = &encoded.footer.labels;
@@ -373,7 +377,34 @@ impl CompactorService {
             footer_len: Some(trailer.footer_len() as u32),
             bloom_len: trailer.bloom_len,
         };
-        self.manifests.insert(&meta).await?;
+        let seq = self.manifests.insert(&meta).await?;
+
+        // The index must cover the replacement before the sources leave it,
+        // or every line of this window vanishes from facets, histograms and
+        // attribute search until the reindexer catches up. If the index
+        // rejects the rows, abandon this run atomically and leave the
+        // sources — and their index rows — exactly as they were for the
+        // next pass. The replacement is removed outright (row, then
+        // object), not tombstoned: its storage key is deterministic, and a
+        // tombstoned row under that key would absorb the retry's insert
+        // via `ON CONFLICT DO NOTHING` and hide the merged chunk forever.
+        let segments = [Arc::new(log_lines)];
+        match self.line_index.index_chunk(seq, labels, &segments).await {
+            Ok(IndexOutcome::Indexed) => self.manifests.mark_indexed(seq).await?,
+            Ok(IndexOutcome::Skipped) => {}
+            Err(e) => {
+                warn!(seq, storage_key, error = %e, "line index rejected compacted chunk; keeping sources");
+                self.manifests.mark_deleted(&[meta.id]).await?;
+                self.manifests.hard_delete(&[meta.id]).await?;
+                if let Err(del) = self.storage.delete_chunk(&storage_key).await {
+                    // Reconcile treats a manifest-less object as an orphan
+                    // and removes it later.
+                    warn!(storage_key, error = %del, "could not remove abandoned compacted object");
+                }
+                return Err(e);
+            }
+        }
+        drop(segments);
 
         if let Some(cache) = &self.cache {
             let off = trailer.footer_offset();
@@ -622,3 +653,221 @@ impl CompactorService {
 // it through from decoded lines unchanged.
 #[allow(dead_code)]
 const _: Option<LogStream> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::cache::ChunkCache;
+    use crate::chunk::ChunkLabels;
+    use crate::index::IndexOutcome;
+    use crate::types::LogLevel;
+    use std::sync::Mutex;
+
+    /// Records what the compactor tells the index, in order, and can be
+    /// told to reject the next `index_chunk`.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<String>>,
+        reject: Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl LineIndexSink for RecordingSink {
+        async fn index_chunk(
+            &self,
+            seq: i64,
+            _labels: &ChunkLabels,
+            segments: &[Arc<Vec<LogLine>>],
+        ) -> Result<IndexOutcome, LogAggregatorError> {
+            if *self.reject.lock().unwrap() {
+                return Err(LogAggregatorError::LineIndex {
+                    reason: "test rejection".into(),
+                });
+            }
+            let lines: usize = segments.iter().map(|s| s.len()).sum();
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("index {seq} ({lines} lines)"));
+            Ok(IndexOutcome::Indexed)
+        }
+
+        async fn forget_chunks(&self, seqs: &[i64]) -> Result<(), LogAggregatorError> {
+            let mut sorted = seqs.to_vec();
+            sorted.sort_unstable();
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("forget {sorted:?}"));
+            Ok(())
+        }
+    }
+
+    fn line(container: &str, ts: DateTime<Utc>, i: usize) -> LogLine {
+        LogLine {
+            ts,
+            stream: LogStream::Stdout,
+            level: if i.is_multiple_of(10) {
+                LogLevel::Error
+            } else {
+                LogLevel::Info
+            },
+            msg: format!("line {i}"),
+            fields: Some(serde_json::json!({"n": i})),
+            container_id: container.to_string(),
+            service: "svc".into(),
+            env: "prod".into(),
+            project_id: 7,
+            external_service_id: None,
+            deploy_id: Some(1),
+            node_id: None,
+            node_name: None,
+        }
+    }
+
+    /// Compaction must hand the merged chunk to the index — and have it
+    /// accepted — before the sources are forgotten, so analytics never lose
+    /// the window; and when the index rejects the merged chunk, nothing
+    /// changes for the sources.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn compaction_indexes_replacement_before_forgetting_sources() {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(crate::storage::FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let manifests = Arc::new(ManifestRepo::new(db.connection_arc()));
+        let cache = ChunkCache::open(Some(tmp.path().join("cache")), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let writer = crate::services::ChunkWriterService::open_with_index(
+            storage.clone(),
+            manifests.clone(),
+            Some(tmp.path().join("wal")),
+            Some(cache.clone()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Six small sealed chunks of one container inside yesterday's window.
+        let container = "compact-me-000000000001";
+        let (start, end) = CompactorService::previous_day(Utc::now());
+        let mut ts = start + chrono::Duration::hours(1);
+        let mut n = 0usize;
+        for _ in 0..6 {
+            for _ in 0..50 {
+                ts += chrono::Duration::milliseconds(3);
+                n += 1;
+                writer.write_line(line(container, ts, n)).await.unwrap();
+            }
+            writer.flush_all().await;
+        }
+        let sources = manifests
+            .for_container_window(container, start, end)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 6);
+        let source_seqs: Vec<i64> = sources.iter().map(|m| m.seq).collect();
+        let (live, indexed) = manifests.index_coverage().await.unwrap();
+        assert_eq!((live, indexed), (6, 6), "writer indexed every seal");
+        sink.events.lock().unwrap().clear();
+
+        let compactor =
+            CompactorService::new(manifests.clone(), storage.clone(), Some(cache.clone()))
+                .with_line_index(sink.clone());
+
+        // 1. Rejection: atomic no-op for the sources.
+        *sink.reject.lock().unwrap() = true;
+        let report = compactor.compact_window(start, end).await;
+        assert_eq!(report.failed, 1, "{report:?}");
+        assert_eq!(report.chunks_out, 0);
+        let after = manifests
+            .for_container_window(container, start, end)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            source_seqs,
+            "sources stay live when the index rejects the merged chunk"
+        );
+        assert!(
+            sink.events.lock().unwrap().is_empty(),
+            "nothing forgotten on rejection: {:?}",
+            sink.events.lock().unwrap()
+        );
+        let (live, indexed) = manifests.index_coverage().await.unwrap();
+        assert_eq!((live, indexed), (6, 6), "the abandoned replacement is gone");
+
+        // A search result's key from a source chunk, taken before compaction.
+        let store = crate::store::chunk_store::ChunkStore::new(
+            ManifestRepo::new(db.connection_arc()),
+            storage.clone(),
+            cache.clone(),
+            writer.clone(),
+        );
+        let scope = crate::store::LogAccessScope::All;
+        let mut q = crate::store::LogQuery::for_scope(scope.clone());
+        q.start_time = start;
+        q.end_time = end;
+        q.limit = 10;
+        q.text = Some("line 123".into());
+        let page = crate::store::LogLineStore::search(&store, &q)
+            .await
+            .unwrap();
+        let stale_key = page.lines[0].key();
+        assert_eq!(page.lines[0].message, "line 123");
+        assert!(stale_key.chunk_position().is_some());
+
+        // 2. Success: index the replacement, then forget the sources.
+        *sink.reject.lock().unwrap() = false;
+        let report = compactor.compact_window(start, end).await;
+        assert_eq!(
+            (report.chunks_in, report.chunks_out, report.failed),
+            (6, 1, 0)
+        );
+        let merged = manifests
+            .for_container_window(container, start, end)
+            .await
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].line_count, 300);
+        let events = sink.events.lock().unwrap().clone();
+        let mut sorted_sources = source_seqs.clone();
+        sorted_sources.sort_unstable();
+        assert_eq!(
+            events,
+            vec![
+                format!("index {} (300 lines)", merged[0].seq),
+                format!("forget {sorted_sources:?}"),
+            ],
+            "replacement indexed strictly before sources are forgotten"
+        );
+        let (live, indexed) = manifests.index_coverage().await.unwrap();
+        assert_eq!((live, indexed), (1, 1), "merged chunk is marked indexed");
+
+        // 3. The pre-compaction key still resolves: its chunk is gone, so
+        //    context relocates the line by (container, timestamp).
+        let ctx = crate::store::LogLineStore::context(&store, &scope, &stale_key, 2, 2)
+            .await
+            .unwrap();
+        let messages: Vec<&str> = ctx.iter().map(|l| l.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["line 121", "line 122", "line 123", "line 124", "line 125"],
+            "context around a compacted-away line id"
+        );
+        assert_eq!(ctx[2].timestamp, stale_key.timestamp);
+        assert!(
+            ctx[2].key().chunk_position().map(|(s, _)| s) == Some(merged[0].seq),
+            "relocated into the merged chunk"
+        );
+    }
+}

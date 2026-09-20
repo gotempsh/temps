@@ -278,6 +278,15 @@ backstop, not the mechanism. Verified at 50 M lines: purging a project's
 221 chunks / 12.8 M lines took 600 ms, its index rows were gone
 immediately, and the compactor GC removed the 221 objects on its next tick.
 
+Compaction (ADR-046 §8a.1) re-encodes a run of chunks into one and so
+changes every pointer. It therefore indexes the replacement chunk
+*synchronously* and only forgets the source sequences once the index has
+accepted it; if the index rejects the rows the run is abandoned atomically —
+replacement row and object removed outright (a tombstone would absorb the
+retry's idempotent insert under the same deterministic key), sources and
+their index rows untouched — and retried on the next pass. Analytics never
+see a window with neither the sources nor the replacement.
+
 One thing that purge exposed: the collector resumed each container from
 the newest *chunk row*, and once retention/purge plus GC had removed every
 row of a container, a restart replayed the container's whole Docker log —

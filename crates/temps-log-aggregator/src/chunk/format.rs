@@ -617,37 +617,25 @@ pub fn decode_block(
     }
 
     let level_start = cursor;
-    let level_end = level_start + line_count;
-    require_len(&body, level_end)?;
+    let level_end = span_end(&body, level_start, line_count)?;
     cursor = level_end;
 
     let stream_start = cursor;
-    let stream_end = stream_start + line_count;
-    require_len(&body, stream_end)?;
+    let stream_end = span_end(&body, stream_start, line_count)?;
     cursor = stream_end;
 
     // Prefix sums of the varint lengths give the same `offsets[i..=i+1]`
-    // slicing the old fixed-width layout had.
-    let mut msg_offsets = Vec::with_capacity(line_count + 1);
-    msg_offsets.push(0usize);
-    for _ in 0..line_count {
-        let len = get_varint(&body, &mut cursor)? as usize;
-        msg_offsets.push(msg_offsets.last().copied().unwrap_or(0) + len);
-    }
+    // slicing the old fixed-width layout had. Every partial sum is bounded
+    // by the body length as it is built, so a corrupt length can neither
+    // overflow the offset table nor alias another column.
+    let msg_offsets = length_prefix_sums(&body, &mut cursor, line_count)?;
     let msg_bytes_start = cursor;
-    let msg_bytes_end = msg_bytes_start + msg_offsets.last().copied().unwrap_or(0);
-    require_len(&body, msg_bytes_end)?;
+    let msg_bytes_end = span_end(&body, msg_bytes_start, msg_offsets[line_count])?;
     cursor = msg_bytes_end;
 
-    let mut fields_offsets = Vec::with_capacity(line_count + 1);
-    fields_offsets.push(0usize);
-    for _ in 0..line_count {
-        let len = get_varint(&body, &mut cursor)? as usize;
-        fields_offsets.push(fields_offsets.last().copied().unwrap_or(0) + len);
-    }
+    let fields_offsets = length_prefix_sums(&body, &mut cursor, line_count)?;
     let fields_bytes_start = cursor;
-    let fields_bytes_end = fields_bytes_start + fields_offsets.last().copied().unwrap_or(0);
-    require_len(&body, fields_bytes_end)?;
+    span_end(&body, fields_bytes_start, fields_offsets[line_count])?;
 
     let mut out = Vec::new();
     for i in 0..line_count {
@@ -683,6 +671,46 @@ pub fn decode_block(
     }
 
     Ok(out)
+}
+
+/// `start + len`, rejected (never wrapped) when it would run past `buf`.
+fn span_end(buf: &[u8], start: usize, len: usize) -> Result<usize, LogAggregatorError> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| LogAggregatorError::ChunkFormat {
+            reason: format!("block body span overflows: start {start} + len {len}"),
+        })?;
+    require_len(buf, end)?;
+    Ok(end)
+}
+
+/// Reads `n` varint lengths and returns their `n + 1` prefix sums. Each
+/// running total must stay within `buf.len()`: a length that cannot fit in
+/// the remaining body is a format error, not a wrapped offset.
+fn length_prefix_sums(
+    buf: &[u8],
+    cursor: &mut usize,
+    n: usize,
+) -> Result<Vec<usize>, LogAggregatorError> {
+    let mut sums = Vec::with_capacity(n + 1);
+    sums.push(0usize);
+    let mut total = 0usize;
+    for _ in 0..n {
+        let len = get_varint(buf, cursor)?;
+        let len = usize::try_from(len)
+            .ok()
+            .and_then(|len| total.checked_add(len))
+            .filter(|&t| t <= buf.len())
+            .ok_or_else(|| LogAggregatorError::ChunkFormat {
+                reason: format!(
+                    "block column length {len} exceeds body of {} bytes",
+                    buf.len()
+                ),
+            })?;
+        total = len;
+        sums.push(total);
+    }
+    Ok(sums)
 }
 
 fn require_len(buf: &[u8], needed: usize) -> Result<(), LogAggregatorError> {
@@ -1019,6 +1047,67 @@ mod tests {
         // Flip a byte inside the labels section.
         footer_bytes[0] ^= 0xFF;
         assert!(decode_footer(&footer_bytes, &trailer).is_err());
+    }
+
+    /// Hand-built block bodies with hostile column lengths: a message
+    /// length near `u64::MAX` and a sum of lengths that overflows `usize`
+    /// must both be reported as format errors, never wrapped into offsets
+    /// that alias another column or panic on slicing.
+    #[test]
+    fn malformed_column_lengths_are_rejected_without_overflow() {
+        let meta = |uncompressed_len: u32| BlockMeta {
+            offset: 0,
+            len: 0,
+            uncompressed_len,
+            first_ts: Utc::now(),
+            last_ts: Utc::now(),
+            line_count: 2,
+            first_line_index: 0,
+            level_mask: u16::MAX,
+            level_counts: [0; crate::chunk::LEVEL_COUNT],
+        };
+        let filter = BlockFilter::default();
+
+        // line_count = 2, two zero ts deltas, two levels, two streams, then
+        // message lengths.
+        let mut body = 2u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0, 0]); // ts deltas
+        body.extend_from_slice(&[2, 2]); // levels
+        body.extend_from_slice(&[0, 0]); // streams
+        let prefix = body.clone();
+
+        // One absurd length.
+        put_varint(&mut body, u64::MAX);
+        put_varint(&mut body, 0);
+        let compressed = zstd::encode_all(body.as_slice(), 1).unwrap();
+        let err = decode_block(&compressed, &meta(body.len() as u32), &filter).unwrap_err();
+        assert!(
+            matches!(err, LogAggregatorError::ChunkFormat { .. }),
+            "{err}"
+        );
+
+        // Two lengths whose sum wraps usize but each of which is "large".
+        let mut body = prefix.clone();
+        put_varint(&mut body, (usize::MAX / 2 + 1) as u64);
+        put_varint(&mut body, (usize::MAX / 2 + 1) as u64);
+        let compressed = zstd::encode_all(body.as_slice(), 1).unwrap();
+        let err = decode_block(&compressed, &meta(body.len() as u32), &filter).unwrap_err();
+        assert!(
+            matches!(err, LogAggregatorError::ChunkFormat { .. }),
+            "{err}"
+        );
+
+        // A well-formed body of the same shape still decodes.
+        let mut body = prefix;
+        put_varint(&mut body, 1);
+        put_varint(&mut body, 1);
+        body.extend_from_slice(b"ab");
+        put_varint(&mut body, 0);
+        put_varint(&mut body, 0);
+        let compressed = zstd::encode_all(body.as_slice(), 1).unwrap();
+        let lines = decode_block(&compressed, &meta(body.len() as u32), &filter).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].message, "b");
     }
 
     #[test]

@@ -211,7 +211,12 @@ added the endpoint for.
 
 `context(key, before, after)` decodes `chunk_id` from `line_id` (see §5),
 reads that block and its neighbours, and crosses into the previous/next
-manifest of the same container at chunk edges.
+manifest of the same container at chunk edges. When the id's home no longer
+exists — the head buffer sealed, or the chunk was compacted into a new one —
+the line is relocated by the stable half of the key, `(container_id,
+timestamp)`, in whichever live chunk now spans that instant, so a result a
+user is still looking at keeps answering "show context" for as long as the
+line is within retention.
 
 `sources(query)` is `SELECT DISTINCT (container_id, service, node_id)` from
 manifests.
@@ -233,7 +238,10 @@ under 2²⁰). Head-buffer lines carry a sentinel chunk id; when the head is
 sealed their `line_id` changes. Cursor resume therefore treats
 `(timestamp, container_id)` as the primary position — Docker timestamps are
 nanosecond precision and monotonic per container — and `line_id` as a hint.
-`CURSOR_VERSION` bumps to 3.
+The same holds after compaction, which re-encodes lines into a new chunk
+(new `chunk_id`, new `line_index`): `line_id` is a locator, never an
+identity, and every reader that receives one it cannot find falls back to
+`(timestamp, container_id)`. `CURSOR_VERSION` bumps to 3.
 
 ### 6. Cache
 

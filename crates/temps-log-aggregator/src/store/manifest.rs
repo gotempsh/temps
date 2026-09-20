@@ -397,6 +397,39 @@ impl ManifestRepo {
         Ok((before, after))
     }
 
+    /// The live chunk of `container_id` whose time span covers `at`, within
+    /// scope — how a line is found again once the chunk its `line_id`
+    /// named has been compacted away (the newest such chunk wins when
+    /// spans overlap at a seal boundary).
+    pub async fn containing(
+        &self,
+        scope: &LogAccessScope,
+        container_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Manifest>, LogAggregatorError> {
+        let mut binder = Binder::new();
+        let mut conditions = vec!["deleted_at IS NULL".to_string()];
+        if let Some(scope) = scope_condition(scope, &mut binder) {
+            conditions.push(scope);
+        }
+        let container_param = binder.bind(container_id.to_string());
+        conditions.push(format!("container_id = {container_param}"));
+        let at_param = binder.bind(at);
+        conditions.push(format!(
+            "started_at <= {at_param} AND ended_at >= {at_param}"
+        ));
+        let sql = format!(
+            "SELECT {MANIFEST_COLUMNS} FROM log_chunks WHERE {} \
+             ORDER BY seq DESC LIMIT 1",
+            conditions.join(" AND ")
+        );
+        Ok(self
+            .query_manifests(sql, binder.into_values())
+            .await?
+            .into_iter()
+            .next())
+    }
+
     /// A single live manifest by its stable sequence number, within scope.
     pub async fn by_seq(
         &self,

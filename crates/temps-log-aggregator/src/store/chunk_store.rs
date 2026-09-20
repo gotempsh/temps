@@ -986,49 +986,37 @@ impl LogLineStore for ChunkStore {
         let before = before.min(500) as usize;
         let after = after.min(500) as usize;
 
-        // Head line: slice the container's snapshot.
-        let Some((seq, line_index)) = key.chunk_position() else {
-            let Some(snap) = self.heads.snapshot(&key.container_id).await else {
-                return Ok(Vec::new());
-            };
-            let Some(labels) = head_snapshot_labels(&snap) else {
-                return Ok(Vec::new());
-            };
-            let mut probe = LogQuery::for_scope(scope.clone());
-            probe.container_ids = vec![key.container_id.clone()];
-            if !labels_match(&labels, &probe) {
-                return Ok(Vec::new());
-            }
-            // Position by timestamp (the stable part of a head key).
-            let len = snap.len();
-            let idx = snap
-                .iter()
-                .find(|(_, l)| l.ts >= key.timestamp)
-                .map(|(i, _)| i)
-                .unwrap_or(len.saturating_sub(1));
-            let lo = idx.saturating_sub(before);
-            let hi = (idx + after + 1).min(len);
-            let mut out = Vec::with_capacity(hi.saturating_sub(lo));
-            for i in lo..hi {
-                if let Some(l) = snap.get(i) {
-                    out.push(Self::record(
-                        &labels,
-                        Self::head_line(l, i),
-                        HEAD_LINE_ID_BASE | i as i64,
-                    ));
+        // A `line_id` names a position that can move: a head line's id
+        // changes when its buffer seals, and a sealed line's chunk can be
+        // compacted into a new one. `(container_id, timestamp)` is the
+        // stable part of the key, so when the id's home no longer exists
+        // the line is found again by that.
+        let (m, all, idx) = match key.chunk_position() {
+            None => match self.head_context(scope, key, before, after).await? {
+                Some(out) => return Ok(out),
+                None => match self.relocate(scope, key).await? {
+                    Some(found) => found,
+                    None => return Ok(Vec::new()),
+                },
+            },
+            Some((seq, line_index)) => match self.manifests.by_seq(scope, seq).await? {
+                Some(m) => {
+                    let all = self.decode_all(&m).await?;
+                    let idx = all
+                        .iter()
+                        .position(|l| l.line_index >= line_index)
+                        .unwrap_or(all.len().saturating_sub(1));
+                    (m, all, idx)
                 }
-            }
-            return Ok(out);
+                None => match self.relocate(scope, key).await? {
+                    Some(found) => found,
+                    None => return Ok(Vec::new()),
+                },
+            },
         };
-
-        let Some(m) = self.manifests.by_seq(scope, seq).await? else {
+        if all.is_empty() {
             return Ok(Vec::new());
-        };
-        let all = self.decode_all(&m).await?;
-        let idx = all
-            .iter()
-            .position(|l| l.line_index >= line_index)
-            .unwrap_or(all.len().saturating_sub(1));
+        }
         let lo = idx.saturating_sub(before);
         let hi = (idx + after + 1).min(all.len());
         let mut out: Vec<LogLineRecord> = all[lo..hi]
@@ -1256,6 +1244,75 @@ impl LogLineStore for ChunkStore {
 }
 
 impl ChunkStore {
+    /// Context for a line still in its container's head buffer, or `None`
+    /// when the buffer is gone (sealed since the key was issued) or does
+    /// not hold that instant.
+    async fn head_context(
+        &self,
+        scope: &LogAccessScope,
+        key: &LogLineKey,
+        before: usize,
+        after: usize,
+    ) -> Result<Option<Vec<LogLineRecord>>, LogAggregatorError> {
+        let Some(snap) = self.heads.snapshot(&key.container_id).await else {
+            return Ok(None);
+        };
+        let Some(labels) = head_snapshot_labels(&snap) else {
+            return Ok(None);
+        };
+        let mut probe = LogQuery::for_scope(scope.clone());
+        probe.container_ids = vec![key.container_id.clone()];
+        if !labels_match(&labels, &probe) {
+            return Ok(Some(Vec::new()));
+        }
+        if labels.started_at > key.timestamp {
+            // Sealed out from under the key: the line is in a chunk now.
+            return Ok(None);
+        }
+        // Position by timestamp (the stable part of a head key).
+        let len = snap.len();
+        let idx = snap
+            .iter()
+            .find(|(_, l)| l.ts >= key.timestamp)
+            .map(|(i, _)| i)
+            .unwrap_or(len.saturating_sub(1));
+        let lo = idx.saturating_sub(before);
+        let hi = (idx + after + 1).min(len);
+        let mut out = Vec::with_capacity(hi.saturating_sub(lo));
+        for i in lo..hi {
+            if let Some(l) = snap.get(i) {
+                out.push(Self::record(
+                    &labels,
+                    Self::head_line(l, i),
+                    HEAD_LINE_ID_BASE | i as i64,
+                ));
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Find the chunk that now holds `key`'s instant for its container and
+    /// the position of the first line at or after that timestamp.
+    async fn relocate(
+        &self,
+        scope: &LogAccessScope,
+        key: &LogLineKey,
+    ) -> Result<Option<(Manifest, Vec<DecodedLine>, usize)>, LogAggregatorError> {
+        let Some(m) = self
+            .manifests
+            .containing(scope, &key.container_id, key.timestamp)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let all = self.decode_all(&m).await?;
+        let idx = all
+            .iter()
+            .position(|l| l.ts >= key.timestamp)
+            .unwrap_or(all.len().saturating_sub(1));
+        Ok(Some((m, all, idx)))
+    }
+
     /// Every line of a chunk, oldest first, unfiltered. Used by `context`.
     async fn decode_all(&self, m: &Manifest) -> Result<Vec<DecodedLine>, LogAggregatorError> {
         if m.format_version < 2 {
