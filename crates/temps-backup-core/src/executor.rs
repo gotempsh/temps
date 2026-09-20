@@ -257,10 +257,13 @@ impl BackupExecutor {
                 engine: params.engine.clone(),
                 reason: reason.clone(),
             };
-            self.mark_backup_failed(params.backup_id, &err.to_string())
-                .await?;
-            self.finish_failure(params.backup_id, &params.engine, &err.to_string())
-                .await;
+            if self
+                .mark_backup_failed(params.backup_id, &err.to_string())
+                .await?
+            {
+                self.finish_failure(params.backup_id, &params.engine, &err.to_string())
+                    .await;
+            }
             return Err(err);
         }
 
@@ -521,7 +524,13 @@ UPDATE external_service_backups
         Ok(())
     }
 
-    async fn mark_backup_failed(&self, backup_id: i32, reason: &str) -> Result<(), sea_orm::DbErr> {
+    /// Atomically fail parent and child, reporting the parent transition even
+    /// for backup types that have no external-service child row.
+    async fn mark_backup_failed(
+        &self,
+        backup_id: i32,
+        reason: &str,
+    ) -> Result<bool, sea_orm::DbErr> {
         let sql = r#"
 WITH updated_backup AS (
     UPDATE backups
@@ -531,34 +540,36 @@ WITH updated_backup AS (
      WHERE id            = $2
        AND state IN ('pending', 'running')
      RETURNING id
+), updated_children AS (
+    UPDATE external_service_backups
+       SET state         = 'failed',
+           error_message = $1,
+           finished_at   = COALESCE(finished_at, NOW())
+     WHERE backup_id IN (SELECT id FROM updated_backup)
+       AND state IN ('pending', 'running')
 )
-UPDATE external_service_backups
-   SET state         = 'failed',
-       error_message = $1,
-       finished_at   = COALESCE(finished_at, NOW())
- WHERE backup_id IN (SELECT id FROM updated_backup)
-   AND state IN ('pending', 'running')
+SELECT id FROM updated_backup
         "#;
-        self.inner
+        let transitioned = self
+            .inner
             .db
-            .execute(Statement::from_sql_and_values(
+            .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 sql,
                 vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
             ))
             .await?;
-        Ok(())
+        Ok(transitioned.is_some())
     }
 
     async fn finalize_failed(&self, backup_id: i32, engine_key: &str, reason: &str) {
-        if let Err(e) = self.mark_backup_failed(backup_id, reason).await {
-            error!(
-                backup_id,
-                error = %e,
-                "BackupExecutor: finalize_failed UPDATE failed",
-            );
+        match self.mark_backup_failed(backup_id, reason).await {
+            Ok(true) => self.finish_failure(backup_id, engine_key, reason).await,
+            Ok(false) => {} // Already terminal (or removed): do not emit a false failure.
+            Err(error) => {
+                error!(backup_id, %error, "BackupExecutor: finalize_failed UPDATE failed")
+            }
         }
-        self.finish_failure(backup_id, engine_key, reason).await;
     }
 
     async fn finish_failure(&self, backup_id: i32, engine_key: &str, reason: &str) {
@@ -769,9 +780,21 @@ mod tests {
 
     use super::*;
 
+    struct CapturingNotifier(tokio::sync::mpsc::UnboundedSender<BackupFailureContext>);
+    #[async_trait]
+    impl BackupFailureNotifier for CapturingNotifier {
+        async fn notify_failed(&self, context: BackupFailureContext) {
+            self.0.send(context).expect("notification receiver open");
+        }
+    }
+
     fn executor_with_one_exec() -> (BackupExecutor, Arc<DatabaseConnection>) {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
                 .append_exec_results([MockExecResult {
                     last_insert_id: 0,
                     rows_affected: 2,
@@ -922,6 +945,10 @@ mod tests {
     async fn an_unavailable_engine_fails_the_backup_and_finishes_its_schedule() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
                 .append_exec_results([
                     MockExecResult {
                         last_insert_id: 0,
@@ -985,7 +1012,7 @@ mod tests {
     async fn unavailable_engine_surfaces_database_failure() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_errors([sea_orm::DbErr::Custom("write unavailable".into())])
+                .append_query_errors([sea_orm::DbErr::Custom("write unavailable".into())])
                 .into_connection(),
         );
         let executor = BackupExecutorBuilder::new(db)
@@ -1005,15 +1032,12 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_engine_notifies_failure() {
-        struct CapturingNotifier(tokio::sync::mpsc::UnboundedSender<BackupFailureContext>);
-        #[async_trait]
-        impl BackupFailureNotifier for CapturingNotifier {
-            async fn notify_failed(&self, context: BackupFailureContext) {
-                self.0.send(context).expect("notification receiver open");
-            }
-        }
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
                 .append_exec_results([
                     MockExecResult {
                         last_insert_id: 0,
@@ -1047,6 +1071,37 @@ mod tests {
         assert_eq!(notification.backup_id, 42);
         assert_eq!(notification.engine, "postgres_pgdump");
         assert_eq!(notification.error_message, error.to_string());
+    }
+
+    #[tokio::test]
+    async fn terminal_backup_requests_do_not_notify_or_finish_schedule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<std::collections::BTreeMap<&str, SValue>>::new()])
+                .into_connection(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_unavailable_engines(["postgres_pgdump"], "no local Docker daemon")
+            .with_notifier(Arc::new(CapturingNotifier(sender)))
+            .build();
+        let error = executor
+            .spawn(SpawnParams {
+                backup_id: 42,
+                engine: "postgres_pgdump".into(),
+                params: serde_json::json!({}),
+                max_runtime_secs: 3600,
+            })
+            .await
+            .expect_err("unavailable engine reported");
+        assert!(matches!(error, SpawnError::EngineUnavailableHere { .. }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("SELECT id FROM updated_backup"));
     }
 
     #[tokio::test]
@@ -1096,6 +1151,29 @@ mod tests {
         assert!(parent.finished_at.is_some());
         assert!(child.finished_at.is_some());
         assert!(executor.inner.in_flight.lock().await.is_empty());
+        assert!(!executor
+            .mark_backup_failed(backup.id, "duplicate")
+            .await
+            .expect("idempotent transition"));
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("read unchanged parent")
+            .expect("parent exists");
+        assert_eq!(parent.error_message, Some(error.to_string()));
+
+        // Parent-only backup engines must still report an actual transition.
+        external_service_backups::Entity::delete_by_id(child.id)
+            .exec(db.as_ref())
+            .await
+            .expect("remove child");
+        let mut active: backups::ActiveModel = parent.into();
+        active.state = Set("pending".into());
+        active.update(db.as_ref()).await.expect("reset fixture");
+        assert!(executor
+            .mark_backup_failed(backup.id, "parent only")
+            .await
+            .expect("parent-only transition"));
     }
 
     /// The counterpart: a key nothing in the product answers to really is a
