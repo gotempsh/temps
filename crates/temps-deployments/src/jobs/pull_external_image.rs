@@ -189,6 +189,41 @@ impl PullExternalImageJob {
         (registry, image_name.to_string(), tag.to_string())
     }
 
+    /// Record that the registry pull is the worker node's job, and succeed.
+    ///
+    /// Publishes the same context outputs the local pull would, minus the
+    /// daemon-derived ones (there is no local image to inspect): `image_id` is
+    /// empty and `size_bytes` is zero. `DeployImageJob` never reads them for a
+    /// registry-sourced deploy — it synthesises its `BuildImageOutput` from the
+    /// image tag it was configured with — so the downstream contract holds.
+    async fn defer_pull_to_worker(
+        &self,
+        mut context: WorkflowContext,
+        tag: &str,
+        unavailable: temps_core::DockerUnavailable,
+    ) -> Result<JobResult, WorkflowError> {
+        let message = format!(
+            "Skipping the control-plane pull of '{}': {}. The worker node this deployment is \
+             scheduled onto pulls the image directly from its registry.",
+            self.image_ref, unavailable
+        );
+        info!("{}", message);
+        self.log(LogLevel::Info, &format!("📦 {}", message)).await;
+
+        context.set_output(&self.job_id, "image_ref", &self.image_ref)?;
+        context.set_output(&self.job_id, "image_id", "")?;
+        context.set_output(&self.job_id, "size_bytes", 0u64)?;
+        context.set_output(&self.job_id, "tag", tag)?;
+        context.set_output(&self.job_id, "digest", &None::<String>)?;
+        // Also store as image_tag for compatibility with DeployImageJob
+        context.set_output(&self.job_id, "image_tag", &self.image_ref)?;
+        // Lets downstream jobs and anyone reading the workflow context tell
+        // "pulled here" from "the worker will pull it".
+        context.set_output(&self.job_id, "deferred_to_worker", true)?;
+
+        Ok(JobResult::success_with_message(context, message))
+    }
+
     async fn log(&self, level: LogLevel, message: &str) {
         if let (Some(log_service), Some(log_id)) = (&self.log_service, &self.log_id) {
             if let Err(e) = log_service
@@ -216,11 +251,23 @@ impl WorkflowTask for PullExternalImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        let docker = self
-            .docker_handle
-            .require()
-            .map_err(|e| WorkflowError::LocalWorkloadsDisabled(e.to_string()))?;
         let (registry, _image_name, tag) = self.parse_image_ref();
+
+        // No local daemon: caching the image here would be pointless even if
+        // it were possible. A process with no Docker daemon cannot host the
+        // container either, so the deployment is necessarily scheduled onto a
+        // worker node, and `DeployImageJob` asks that node to pull the image
+        // straight from its registry (`POST /agent/images/pull`) rather than
+        // streaming a `docker save` tarball through the control plane. Failing
+        // here would block registry deployments that are perfectly valid — and
+        // if no worker is eligible, `DeployImageJob`'s scheduler is the thing
+        // that says so, naming the real remedy.
+        let docker = match self.docker_handle.require() {
+            Ok(docker) => docker,
+            Err(unavailable) => {
+                return self.defer_pull_to_worker(context, &tag, unavailable).await;
+            }
+        };
 
         info!(
             "Pulling external image: {} (registry: {:?}, tag: {})",
@@ -374,6 +421,66 @@ impl WorkflowTask for PullExternalImageJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn disabled_handle() -> Arc<DockerHandle> {
+        Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ))
+    }
+
+    /// A registry deploy on a process with no daemon is valid: the worker node
+    /// that will host the container pulls the image itself. Failing here would
+    /// block the deployment before it ever reached the node that can run it.
+    #[tokio::test]
+    async fn a_dockerless_process_defers_the_pull_to_the_worker_node() {
+        let job = PullExternalImageJob::new(
+            "pull_external_image".to_string(),
+            "ghcr.io/org/app:v1.0".to_string(),
+            None,
+            disabled_handle(),
+        );
+
+        let context = crate::test_utils::create_test_context("run-dockerless".into(), 1, 1, 1);
+        let result = job
+            .execute(context)
+            .await
+            .expect("a deferred pull is not a job error");
+
+        assert_eq!(
+            result.status,
+            temps_core::JobStatus::Success,
+            "the worker pulls the image, so this job has nothing left to fail at: {:?}",
+            result.message,
+        );
+        let message = result.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("worker node"),
+            "the log must say who pulls the image instead: {message}",
+        );
+
+        // DeployImageJob synthesises its own output for a registry deploy, but
+        // the context contract still has to hold for anything else reading it.
+        let context = result.context;
+        assert_eq!(
+            context
+                .get_output::<String>("pull_external_image", "image_tag")
+                .expect("image_tag output"),
+            Some("ghcr.io/org/app:v1.0".to_string()),
+        );
+        assert_eq!(
+            context
+                .get_output::<String>("pull_external_image", "tag")
+                .expect("tag output"),
+            Some("v1.0".to_string()),
+        );
+        assert_eq!(
+            context
+                .get_output::<bool>("pull_external_image", "deferred_to_worker")
+                .expect("deferred marker"),
+            Some(true),
+        );
+    }
 
     #[test]
     fn test_parse_image_ref_with_registry_and_tag() {
