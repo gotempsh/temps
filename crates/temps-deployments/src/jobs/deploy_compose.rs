@@ -716,6 +716,24 @@ impl DeployComposeJob {
             }
         };
 
+        let (compose_content, compose_override) = self
+            .compose_executor
+            .resolve_security_configuration(
+                &project_name,
+                repo_path.as_deref(),
+                compose_file_name,
+                &compose_content,
+                self.compose_override.as_deref(),
+                &self.environment_vars,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to resolve Compose policy for project {}: {error}",
+                    self.project_id
+                ))
+            })?;
+
         // Full service list from the raw compose file, *before* exclusion
         // stripping — so excluded services still show up as re-includable
         // options in the settings-page checklist. Best-effort: a parse
@@ -725,7 +743,7 @@ impl DeployComposeJob {
         let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
             temps_presets::list_compose_services_with_override(
                 &compose_content,
-                self.compose_override.as_deref(),
+                compose_override.as_deref(),
             )
             .map(|services| {
                 services
@@ -883,7 +901,7 @@ impl DeployComposeJob {
             if !self.secrets.is_empty() {
                 let documents = [
                     compose_content.as_str(),
-                    self.compose_override.as_deref().unwrap_or_default(),
+                    compose_override.as_deref().unwrap_or_default(),
                 ];
                 let services = self.compose_executor.all_service_names(&documents);
                 let skipped = ComposeExecutor::services_managing_own_secrets(&documents);
@@ -960,7 +978,7 @@ impl DeployComposeJob {
         // deployment for what is purely a configuration problem.
         if let Err(error) = self
             .compose_executor
-            .preflight_validate(&compose_content, self.compose_override.as_deref())
+            .preflight_validate(&compose_content, compose_override.as_deref())
         {
             let error_msg = format!("Compose security policy rejected deployment: {error}");
             tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
@@ -974,7 +992,7 @@ impl DeployComposeJob {
                 selected_repo_dir,
                 compose_file_name,
                 &compose_content,
-                self.compose_override.as_deref(),
+                compose_override.as_deref(),
             ) {
                 let error_msg =
                     format!("Compose filesystem security policy rejected deployment: {e}");
@@ -1001,7 +1019,7 @@ impl DeployComposeJob {
             build_args: self.build_args.clone(),
             labels,
             repo_dir: repo_path.clone(),
-            compose_override: self.compose_override.clone(),
+            compose_override: compose_override.clone(),
             relaxed_capability_services: self.relaxed_capability_services.clone(),
             unsandboxed_services: self.unsandboxed_services.clone(),
         };

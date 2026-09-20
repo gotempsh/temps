@@ -50,6 +50,11 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     let custom_domain_routes = super::custom_domains::configure_routes();
 
     Router::new()
+        .route(
+            "/projects/{id}/compose-security",
+            get(super::compose_security::get_compose_security)
+                .put(super::compose_security::update_compose_security),
+        )
         // Project CRUD routes
         .route("/projects/{id}", get(get_project))
         .route("/projects/by-slug/{slug}", get(get_project_by_slug))
@@ -466,6 +471,8 @@ async fn authorize_storage_service_scopes(
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        super::compose_security::get_compose_security,
+        super::compose_security::update_compose_security,
         create_project,
         inspect_drop_archive,
         get_project,
@@ -928,6 +935,7 @@ pub async fn create_project(
     Extension(metadata): Extension<RequestMetadata>,
     Json(project): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    super::compose_security::reject_legacy_sandbox_grants(project.preset_config.as_ref())?;
     permission_guard!(auth, ProjectsCreate);
     let storage_service_claim_ids = if !project.storage_service_ids.is_empty() {
         permission_guard!(auth, ExternalServicesWrite);
@@ -1226,6 +1234,7 @@ pub async fn update_project(
     Extension(metadata): Extension<RequestMetadata>,
     Json(project): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    super::compose_security::reject_legacy_sandbox_grants(project.preset_config.as_ref())?;
     project_permission_guard!(auth, ProjectsWrite, id, state.project_access_checker);
     project_scope_guard!(auth, id);
 
@@ -1544,6 +1553,7 @@ pub async fn update_project_settings(
     Extension(metadata): Extension<RequestMetadata>,
     Json(settings): Json<UpdateProjectSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    super::compose_security::reject_legacy_sandbox_grants(settings.preset_config.as_ref())?;
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -1708,6 +1718,7 @@ pub async fn update_git_settings(
     Extension(metadata): Extension<RequestMetadata>,
     Json(settings): Json<UpdateGitSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    super::compose_security::reject_legacy_sandbox_grants(settings.preset_config.as_ref())?;
     permission_guard!(auth, ProjectsWrite);
     require_git_settings_permissions(&auth)?;
     project_scope_guard!(auth, project_id);
@@ -3453,6 +3464,7 @@ pub async fn create_project_from_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
+    super::compose_security::reject_legacy_sandbox_grants(template.preset_config.as_ref())?;
     let service_template_instance = if template.kind == temps_core::templates::TemplateKind::Service
     {
         Some(

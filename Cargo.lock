@@ -12526,6 +12526,7 @@ dependencies = [
  "temps-entities",
  "temps-environments",
  "temps-git",
+ "temps-migrations",
  "temps-presets",
  "temps-providers",
  "temps-queue",

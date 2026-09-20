@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dev-dependencies]
+temps-migrations = { path = "../temps-migrations" }
 bollard = { workspace = true }
 
 [dependencies]

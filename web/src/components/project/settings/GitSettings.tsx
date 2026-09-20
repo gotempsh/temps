@@ -22,19 +22,10 @@ import {
   updateGitSettingsMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -95,7 +86,6 @@ import {
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
-import { withComposeSandboxDisabled } from '@/lib/compose-security-settings'
 import {
   normalizePresetPath,
   presetConfigForSelection,
@@ -119,7 +109,6 @@ import {
   ChevronDown,
   ChevronsUpDown,
   Database,
-  AlertTriangle,
   EyeOff,
   FileIcon,
   FolderIcon,
@@ -130,7 +119,6 @@ import {
   RefreshCw,
   Route,
   ShieldCheck,
-  ShieldOff,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -370,10 +358,16 @@ function GitSettingsInline({
   ) => {
     const presetCfg: any = (project?.preset_config as any) || {}
     const selectedPreset = overrides.preset ?? project.preset
-    const selectedPresetConfig =
+    let selectedPresetConfig =
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
+    if (selectedPreset === 'docker-compose' && selectedPresetConfig) {
+      selectedPresetConfig = {
+        ...selectedPresetConfig,
+        unsandboxedServices: [],
+      }
+    }
     if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
         body: {
@@ -1243,6 +1237,16 @@ function GitSettingsInline({
               isUploadedSource={isUploadedSource}
             />
 
+            <ComposeSecuritySettings
+              projectId={project.id}
+              hasLegacyExceptions={Boolean(
+                (
+                  composeConfig.unsandboxedServices ??
+                  composeConfig.unsandboxed_services
+                )?.length
+              )}
+            />
+
             {!isUploadedSource && (
               <Collapsible
                 open={advancedComposeOpen}
@@ -2067,14 +2071,7 @@ function ExcludedServicesInline({
     composePath
   )
   const excluded: string[] = cfg.excludedServices || cfg.excluded_services || []
-  const relaxedCapabilities: string[] =
-    cfg.relaxedCapabilityServices || cfg.relaxed_capability_services || []
-  const unsandboxedServices: string[] =
-    cfg.unsandboxedServices || cfg.unsandboxed_services || []
   const [saving, setSaving] = useState(false)
-  const [pendingUnsandboxService, setPendingUnsandboxService] = useState<
-    string | null
-  >(null)
   const publicProvider = publicRepositoryProvider(project.git_url)
   const publicRepository = parsePublicRepositoryUrl(project.git_url)
 
@@ -2155,12 +2152,6 @@ function ExcludedServicesInline({
     }))
     const refreshedNames = new Set(refreshed.map((s) => s.name))
     const filteredExcluded = excluded.filter((name) => refreshedNames.has(name))
-    const filteredRelaxed = relaxedCapabilities.filter((name) =>
-      refreshedNames.has(name)
-    )
-    const filteredUnsandboxed = unsandboxedServices.filter((name) =>
-      refreshedNames.has(name)
-    )
     setSaving(true)
     try {
       await saveGitField({
@@ -2169,8 +2160,8 @@ function ExcludedServicesInline({
           preset: 'docker-compose',
           composeServices: refreshed,
           excludedServices: filteredExcluded,
-          relaxedCapabilityServices: filteredRelaxed,
-          unsandboxedServices: filteredUnsandboxed,
+          relaxedCapabilityServices: [],
+          unsandboxedServices: [],
         },
       })
       toast.success(`Synced ${refreshed.length} service(s) from ${composePath}`)
@@ -2188,7 +2179,10 @@ function ExcludedServicesInline({
     setSaving(true)
     try {
       await saveGitField({
-        preset_config: composeSettingPatch(cfg, 'excludedServices', next),
+        preset_config: {
+          ...composeSettingPatch(cfg, 'excludedServices', next),
+          unsandboxedServices: [],
+        },
       })
       toast.success(
         included
@@ -2197,34 +2191,6 @@ function ExcludedServicesInline({
       )
     } finally {
       setSaving(false)
-    }
-  }
-
-  const toggleSandbox = async (serviceName: string, disabled: boolean) => {
-    const next = withComposeSandboxDisabled(
-      relaxedCapabilities,
-      unsandboxedServices,
-      serviceName,
-      disabled
-    )
-    setSaving(true)
-    try {
-      await saveGitField({
-        preset_config: {
-          ...cfg,
-          preset: 'docker-compose',
-          unsandboxedServices: next.unsandboxedServices,
-          relaxedCapabilityServices: next.relaxedCapabilityServices,
-        },
-      })
-      toast.success(
-        disabled
-          ? `${serviceName} will deploy without the Temps sandbox`
-          : `${serviceName} will use the Temps sandbox`
-      )
-    } finally {
-      setSaving(false)
-      setPendingUnsandboxService(null)
     }
   }
 
@@ -2245,8 +2211,7 @@ function ExcludedServicesInline({
             official images need to fix ownership on their data volume at
             startup — that&apos;s granted automatically, nothing to configure.
             If a service still fails with “Operation not permitted” errors, it
-            needs a capability outside that set; “Disable sandbox” restores
-            Docker’s normal runtime permissions for only that service.
+            may need an exception in Advanced security settings below.
           </p>
         </div>
         <Button
@@ -2279,7 +2244,6 @@ function ExcludedServicesInline({
           <div className="space-y-1.5">
             {services.map((service) => {
               const included = !excluded.includes(service.name)
-              const isUnsandboxed = unsandboxedServices.includes(service.name)
               return (
                 <div
                   key={service.name}
@@ -2319,84 +2283,12 @@ function ExcludedServicesInline({
                       </TooltipContent>
                     </Tooltip>
                   )}
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="flex items-center gap-1.5 pl-2 border-l">
-                        <Checkbox
-                          checked={isUnsandboxed}
-                          disabled={saving || !included}
-                          onCheckedChange={(checked) => {
-                            if (checked === true) {
-                              setPendingUnsandboxService(service.name)
-                            } else {
-                              void toggleSandbox(service.name, false)
-                            }
-                          }}
-                          id={`unsandboxed-service-${service.name}`}
-                        />
-                        <label
-                          htmlFor={`unsandboxed-service-${service.name}`}
-                          className={cn(
-                            'text-xs cursor-pointer whitespace-nowrap flex items-center gap-1',
-                            isUnsandboxed
-                              ? 'text-destructive'
-                              : included
-                                ? 'text-muted-foreground'
-                                : 'text-muted-foreground/50'
-                          )}
-                        >
-                          <ShieldOff className="h-3 w-3" />
-                          Disable sandbox
-                        </label>
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-xs">
-                      Removes Temps’ capability drop, privilege-escalation
-                      guard, PID limit, and Docker init wrapper for this
-                      service. Use only for a trusted image that cannot run with
-                      elevated permissions.
-                    </TooltipContent>
-                  </Tooltip>
                 </div>
               )
             })}
           </div>
         </TooltipProvider>
       )}
-
-      <AlertDialog
-        open={pendingUnsandboxService !== null}
-        onOpenChange={(open) => !open && setPendingUnsandboxService(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-destructive" />
-              Disable the Temps sandbox?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {pendingUnsandboxService} will run with Docker’s normal runtime
-              permissions. Temps will no longer drop Linux capabilities, prevent
-              privilege escalation, enforce its PID limit, or place Docker init
-              ahead of the image entrypoint for this service. Only continue if
-              you trust the image and elevated permissions were not enough.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Keep sandbox enabled</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => {
-                if (pendingUnsandboxService) {
-                  void toggleSandbox(pendingUnsandboxService, true)
-                }
-              }}
-            >
-              Disable sandbox
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   )
 }

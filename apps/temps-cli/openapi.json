@@ -8294,6 +8294,149 @@
         ],
         "type": "object"
       },
+      "ComposeSecurityCheck": {
+        "enum": [
+          "extends",
+          "include",
+          "interpolation",
+          "inline_services",
+          "inline_sections",
+          "inline_fields",
+          "privileged",
+          "docker_socket",
+          "capabilities",
+          "drop_capabilities",
+          "security_options",
+          "no_new_privileges",
+          "devices",
+          "device_rules",
+          "gpu",
+          "sysctls",
+          "groups",
+          "cgroup_parent",
+          "runtime",
+          "lifecycle_hooks",
+          "provider",
+          "container_name",
+          "init",
+          "host_network",
+          "host_pid",
+          "host_ipc",
+          "host_uts",
+          "host_cgroup",
+          "host_user",
+          "container_namespace",
+          "network_mode",
+          "external_networks",
+          "network_names",
+          "network_drivers",
+          "network_options",
+          "network_ipam",
+          "external_links",
+          "published_ports",
+          "bind_mounts",
+          "volume_drivers",
+          "volume_network_filesystems",
+          "volume_host_paths",
+          "volume_options",
+          "external_volumes",
+          "volume_names",
+          "volumes_from",
+          "config_paths",
+          "secret_paths",
+          "external_configs",
+          "external_secrets",
+          "env_files",
+          "label_files",
+          "storage_options",
+          "oom_killer",
+          "service_shm",
+          "aggregate_shm",
+          "tmpfs",
+          "ulimits",
+          "pids",
+          "memory",
+          "logging",
+          "blkio",
+          "swap",
+          "replicas",
+          "remote_build",
+          "build_context",
+          "dockerfile",
+          "build_privileged",
+          "build_entitlements",
+          "build_network",
+          "build_ssh",
+          "build_shm",
+          "build_ulimits",
+          "build_additional_contexts",
+          "build_cache_from",
+          "build_cache_to",
+          "build_tags",
+          "image_references",
+          "build_image",
+          "pull_policy"
+        ],
+        "type": "string"
+      },
+      "ComposeSecurityCheckDefinition": {
+        "properties": {
+          "consequence": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/ComposeSecurityCheck"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group",
+          "label",
+          "consequence"
+        ],
+        "type": "object"
+      },
+      "ComposeSecurityPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "disabled_checks": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeSecurityCheck"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "type": "object"
+      },
+      "ComposeSecurityResponse": {
+        "properties": {
+          "can_edit": {
+            "type": "boolean"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeSecurityCheckDefinition"
+            },
+            "type": "array"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "checks",
+          "can_edit"
+        ],
+        "type": "object"
+      },
       "ComposeServiceFamily": {
         "description": "The specific well-known service family a compose service's image matches,\nwhen it matches one Temps can deploy as a managed `external_services` row\ninstead. Drives the \"deploy this as a Temps-managed service\" recommendation\nin `GitSettings.tsx` and the deploy-log message — kept separate from\n`ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)\nbecause that field only gates the unrelated \"may need elevated Linux\ncapabilities\" warning, and S3/MinIO images need this classification\nwithout tripping that warning.",
         "enum": [
@@ -25750,6 +25893,12 @@
               "null"
             ]
           },
+          "progressId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ref_name": {
             "type": [
               "string",
@@ -34715,6 +34864,67 @@
         ],
         "type": "object"
       },
+      "ProgressSnapshot": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/ProgressStage"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "elapsed_ms",
+          "stages"
+        ],
+        "type": "object"
+      },
+      "ProgressStage": {
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProgressStatus"
+          }
+        },
+        "required": [
+          "stage",
+          "message",
+          "status",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "ProgressStatus": {
+        "enum": [
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ProjectAccessResponse": {
         "properties": {
           "created_at": {
@@ -38667,6 +38877,26 @@
         ],
         "type": "object"
       },
+      "RepositoryCatalogPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/PluginHostPermission"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "permission",
+          "required",
+          "reason"
+        ],
+        "type": "object"
+      },
       "RepositoryCatalogPlugin": {
         "properties": {
           "author": {
@@ -38704,6 +38934,13 @@
               "string",
               "null"
             ]
+          },
+          "permissions": {
+            "description": "Author-declared capabilities for display only; never used to grant access.\nNone means the legacy catalog did not declare permissions.",
+            "items": {
+              "$ref": "#/components/schemas/RepositoryCatalogPermission"
+            },
+            "type": "array"
           },
           "platforms": {
             "items": {
@@ -50279,6 +50516,21 @@
         },
         "required": [
           "config"
+        ],
+        "type": "object"
+      },
+      "UpdateComposeSecurityRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledge_risks": {
+            "type": "boolean"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy"
+          }
+        },
+        "required": [
+          "policy"
         ],
         "type": "object"
       },
@@ -90667,6 +90919,93 @@
         ]
       }
     },
+    "/projects/{id}/compose-security": {
+      "get": {
+        "operationId": "get_compose_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSecurityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "tags": [
+          "Projects"
+        ]
+      },
+      "put": {
+        "operationId": "update_compose_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateComposeSecurityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSecurityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid settings or missing acknowledgement"
+          },
+          "403": {
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
     "/projects/{id}/deployments": {
       "get": {
         "operationId": "get_project_deployments",
@@ -97209,7 +97548,7 @@
     },
     "/projects/{project_id}/env-vars/resolved": {
       "get": {
-        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for plaintext (audit-logged).",
+        "description": "Returns the effective set of environment variables a deployment would see,\ncombining manually-defined vars with those contributed by linked external\nservices (Postgres, Redis, S3, etc.). Each entry is tagged with its source\nso the UI can render an integration icon, and manual entries that shadow an\nintegration key carry a reference to the integration they override.\n\nValues are always returned as a masked preview. Use the per-key reveal\nendpoint for regular plaintext values (audit-logged). Marked secrets\ncannot be revealed.",
         "operationId": "get_resolved_environment_variables",
         "parameters": [
           {
@@ -117079,6 +117418,52 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryCatalogResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install/progress/{id}": {
+      "get": {
+        "operationId": "getRepositoryInstallProgress",
+        "parameters": [
+          {
+            "description": "Client-generated installation UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProgressSnapshot"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

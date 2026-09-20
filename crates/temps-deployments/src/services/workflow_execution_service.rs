@@ -2633,10 +2633,25 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or_default();
 
-                let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
-                    self.docker.clone(),
-                    self.config_service.data_dir(),
-                ));
+                let compose_policy =
+                    temps_entities::compose_security_policies::Entity::find_by_id(project.id)
+                        .one(self.db.as_ref())
+                        .await
+                        .map_err(|error| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Failed to load Compose security policy for project {}: {error}",
+                                project.id
+                            ))
+                        })?
+                        .map(|row| row.policy)
+                        .unwrap_or_default();
+                let compose_executor = Arc::new(
+                    temps_deployer::compose::ComposeExecutor::new(
+                        self.docker.clone(),
+                        self.config_service.data_dir(),
+                    )
+                    .with_security_policy(compose_policy),
+                );
 
                 let job = crate::jobs::DeployComposeJobBuilder::new()
                     .job_id(db_job.job_id.clone())

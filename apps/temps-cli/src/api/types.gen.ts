@@ -3864,6 +3864,25 @@ export type ComposePublicPort = {
     service: string;
 };
 
+export type ComposeSecurityCheck = 'extends' | 'include' | 'interpolation' | 'inline_services' | 'inline_sections' | 'inline_fields' | 'privileged' | 'docker_socket' | 'capabilities' | 'drop_capabilities' | 'security_options' | 'no_new_privileges' | 'devices' | 'device_rules' | 'gpu' | 'sysctls' | 'groups' | 'cgroup_parent' | 'runtime' | 'lifecycle_hooks' | 'provider' | 'container_name' | 'init' | 'host_network' | 'host_pid' | 'host_ipc' | 'host_uts' | 'host_cgroup' | 'host_user' | 'container_namespace' | 'network_mode' | 'external_networks' | 'network_names' | 'network_drivers' | 'network_options' | 'network_ipam' | 'external_links' | 'published_ports' | 'bind_mounts' | 'volume_drivers' | 'volume_network_filesystems' | 'volume_host_paths' | 'volume_options' | 'external_volumes' | 'volume_names' | 'volumes_from' | 'config_paths' | 'secret_paths' | 'external_configs' | 'external_secrets' | 'env_files' | 'label_files' | 'storage_options' | 'oom_killer' | 'service_shm' | 'aggregate_shm' | 'tmpfs' | 'ulimits' | 'pids' | 'memory' | 'logging' | 'blkio' | 'swap' | 'replicas' | 'remote_build' | 'build_context' | 'dockerfile' | 'build_privileged' | 'build_entitlements' | 'build_network' | 'build_ssh' | 'build_shm' | 'build_ulimits' | 'build_additional_contexts' | 'build_cache_from' | 'build_cache_to' | 'build_tags' | 'image_references' | 'build_image' | 'pull_policy';
+
+export type ComposeSecurityCheckDefinition = {
+    consequence: string;
+    group: string;
+    id: ComposeSecurityCheck;
+    label: string;
+};
+
+export type ComposeSecurityPolicy = {
+    disabled_checks?: Array<ComposeSecurityCheck>;
+};
+
+export type ComposeSecurityResponse = {
+    can_edit: boolean;
+    checks: Array<ComposeSecurityCheckDefinition>;
+    policy: ComposeSecurityPolicy;
+};
+
 /**
  * The specific well-known service family a compose service's image matches,
  * when it matches one Temps can deploy as a managed `external_services` row
@@ -11795,6 +11814,7 @@ export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
     path?: string | null;
+    progressId?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -15839,6 +15859,22 @@ export type ProblemDetails = {
     type?: string | null;
 };
 
+export type ProgressSnapshot = {
+    elapsed_ms: number;
+    id: string;
+    stages: Array<ProgressStage>;
+    status: ProgressStatus;
+};
+
+export type ProgressStage = {
+    elapsed_ms: number;
+    message: string;
+    stage: string;
+    status: ProgressStatus;
+};
+
+export type ProgressStatus = 'running' | 'completed' | 'failed';
+
 export type ProjectAccessResponse = {
     created_at: string;
     granted_by: number;
@@ -17712,6 +17748,12 @@ export type RepointContinuousArchiveSourceRequest = {
     new_s3_source_id: number;
 };
 
+export type RepositoryCatalogPermission = {
+    permission: PluginHostPermission;
+    reason: string;
+    required: boolean;
+};
+
 export type RepositoryCatalogPlugin = {
     author: string;
     category: string;
@@ -17722,6 +17764,11 @@ export type RepositoryCatalogPlugin = {
     logoUrl?: string | null;
     name: string;
     path?: string | null;
+    /**
+     * Author-declared capabilities for display only; never used to grant access.
+     * None means the legacy catalog did not declare permissions.
+     */
+    permissions?: Array<RepositoryCatalogPermission>;
     platforms: Array<string>;
     readmeUrl?: string | null;
     ref?: string | null;
@@ -22996,6 +23043,11 @@ export type UpdateCloudflareProviderRequest = {
     config: CloudflareConfig;
     enabled?: boolean | null;
     name?: string | null;
+};
+
+export type UpdateComposeSecurityRequest = {
+    acknowledge_risks?: boolean;
+    policy: ComposeSecurityPolicy;
 };
 
 export type UpdateConfigBody = {
@@ -46277,6 +46329,68 @@ export type SetAlternateSourcesResponses = {
 
 export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
+export type GetComposeSecurityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/compose-security';
+};
+
+export type GetComposeSecurityErrors = {
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetComposeSecurityResponses = {
+    200: ComposeSecurityResponse;
+};
+
+export type GetComposeSecurityResponse = GetComposeSecurityResponses[keyof GetComposeSecurityResponses];
+
+export type UpdateComposeSecurityData = {
+    body: UpdateComposeSecurityRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/compose-security';
+};
+
+export type UpdateComposeSecurityErrors = {
+    /**
+     * Invalid settings or missing acknowledgement
+     */
+    400: unknown;
+    /**
+     * Instance administrator required
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type UpdateComposeSecurityResponses = {
+    200: ComposeSecurityResponse;
+};
+
+export type UpdateComposeSecurityResponse = UpdateComposeSecurityResponses[keyof UpdateComposeSecurityResponses];
+
 export type GetProjectDeploymentsData = {
     body?: never;
     path: {
@@ -62814,6 +62928,30 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
+
+export type GetRepositoryInstallProgressData = {
+    body?: never;
+    path: {
+        /**
+         * Client-generated installation UUID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/x/plugins/install/progress/{id}';
+};
+
+export type GetRepositoryInstallProgressErrors = {
+    404: ProblemDetails;
+};
+
+export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
+
+export type GetRepositoryInstallProgressResponses = {
+    200: ProgressSnapshot;
+};
+
+export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
 
 export type InstallRepositoryData = {
     body: InstallRepositoryRequest;
