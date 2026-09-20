@@ -2598,6 +2598,8 @@ import type {
   StartFixResponses,
   StartGitProviderOauthData,
   StartGitProviderOauthErrors,
+  StartManagedCloudLoginData,
+  StartManagedCloudLoginErrors,
   StartOidcLoginBySlugData,
   StartOidcLoginBySlugErrors,
   StartPgUpgradeData,
@@ -6000,6 +6002,29 @@ export const oidcCallback = <ThrowOnError extends boolean = false>(
     url: "/auth/oidc/callback",
     ...options,
   });
+
+/**
+ * Start a login against the Cloud-managed console-access provider without
+ * knowing its slug.
+ *
+ * The slug embeds the provider's row id, which Cloud does not know and the
+ * instance may regenerate, so Cloud's "Open console" button needs a fixed
+ * address it can link to: this one. A browser that already holds a Cloud
+ * session completes the round trip without seeing a login page, which is
+ * what makes the hosted console feel signed-in from Cloud. Anything else
+ * (the interactive login, the callback, `return_to` sanitising) is exactly
+ * the slug route; only the lookup differs. 404 when no managed provider is
+ * installed, so a self-hosted instance that never enrolled has nothing to
+ * probe here.
+ */
+export const startManagedCloudLogin = <ThrowOnError extends boolean = false>(
+  options?: Options<StartManagedCloudLoginData, ThrowOnError>,
+): RequestResult<unknown, StartManagedCloudLoginErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    unknown,
+    StartManagedCloudLoginErrors,
+    ThrowOnError
+  >({ url: "/auth/oidc/cloud/login", ...options });
 
 export const startOidcLoginBySlug = <ThrowOnError extends boolean = false>(
   options: Options<StartOidcLoginBySlugData, ThrowOnError>,

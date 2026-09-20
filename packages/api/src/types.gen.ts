@@ -30590,6 +30590,26 @@ export type OidcCallbackData = {
   url: "/auth/oidc/callback";
 };
 
+export type StartManagedCloudLoginData = {
+  body?: never;
+  path?: never;
+  query?: {
+    return_to?: string | null;
+  };
+  url: "/auth/oidc/cloud/login";
+};
+
+export type StartManagedCloudLoginErrors = {
+  /**
+   * This instance has no Cloud-managed console-access provider
+   */
+  404: unknown;
+  /**
+   * OIDC provider unreachable
+   */
+  503: unknown;
+};
+
 export type StartOidcLoginBySlugData = {
   body?: never;
   path: {

@@ -54,6 +54,7 @@ syntax may have changed.
 - [`ip-access`](ip-access.md)
 - [`audit`](audit.md)
 - [`proxy-logs`](proxy-logs.md)
+- [`logs`](logs.md)
 - [`email-domains`](email-domains.md)
 - [`email-providers`](email-providers.md)
 - [`incidents`](incidents.md)
