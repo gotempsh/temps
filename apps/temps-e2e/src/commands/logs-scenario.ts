@@ -24,8 +24,8 @@
  *   5. assert a `levels: ["ERROR"]` filter narrows to just the error line
  *   6. assert an `envs` filter on the production environment's id also
  *      narrows correctly (proves env labels, not just text search, work)
- *   7. fetch grep-style context around the error line via chunk_id +
- *      line_offset and confirm the message is present in the raw window
+ *   7. fetch grep-style context around the error line via its line_id
+ *      locator (ADR-046) and confirm the message is present in the raw window
  *   8. purge everything before "now"; confirm the marker is gone from
  *      search afterward -- the one destructive route this feature has
  *   9. teardown: delete the project (cascades the deployment)
@@ -225,11 +225,16 @@ export async function logsScenarioCommand(opts: LogsScenarioOptions): Promise<vo
       if (res.lines.length < 2) throw new Error(`envs filter unexpectedly dropped lines: ${JSON.stringify(res.lines)}`)
     })
 
-    await step('grep-style context around the error line is retrievable via chunk_id + line_offset', async () => {
+    await step('grep-style context around the error line is retrievable via its line_id', async () => {
       const ctx = unwrap(
         await getLogContext({
           client,
-          query: { chunk_id: errorLine!.chunk_id, line_offset: errorLine!.line_offset, lines: 5 },
+          query: {
+            line_id: errorLine!.line_id,
+            timestamp: errorLine!.timestamp,
+            container_id: errorLine!.container_id!,
+            lines: 5,
+          },
         }),
         'getLogContext',
       )
