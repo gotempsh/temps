@@ -1113,6 +1113,7 @@ pub async fn teardown_environment(
         (status = 200, description = "List of containers", body = ContainerListResponse),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "A container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1877,6 +1878,7 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
     responses(
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2008,6 +2010,7 @@ pub async fn get_container_detail(
         (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Container or environment variable not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2118,6 +2121,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2174,6 +2178,7 @@ pub async fn stop_container(
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2230,6 +2235,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2286,6 +2292,7 @@ pub async fn restart_container(
     responses(
         (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
