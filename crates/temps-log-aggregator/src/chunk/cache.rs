@@ -99,7 +99,8 @@ struct Entry {
 
 struct Inner {
     dir: Option<PathBuf>,
-    max_bytes: u64,
+    /// Capacity; a setting, so it can change while the cache is open.
+    max_bytes: AtomicU64,
     entries: Mutex<HashMap<String, Entry>>,
     access_counter: AtomicU64,
     hits: AtomicU64,
@@ -141,7 +142,7 @@ impl ChunkCache {
         let entries = Mutex::new(HashMap::new());
         let inner = Inner {
             dir: dir.clone(),
-            max_bytes,
+            max_bytes: AtomicU64::new(max_bytes),
             entries,
             access_counter: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -264,7 +265,7 @@ impl ChunkCache {
             return;
         };
         let size = data.len() as u64;
-        if size > self.inner.max_bytes {
+        if size > self.max_bytes() {
             // Oversized single item: never store it.
             return;
         }
@@ -323,6 +324,20 @@ impl ChunkCache {
         );
     }
 
+    /// Current capacity in bytes.
+    pub fn max_bytes(&self) -> u64 {
+        self.inner.max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Change the capacity at runtime (Settings → Monitoring → container
+    /// logs). Shrinking evicts immediately, lowest tier first, until the
+    /// cache fits; growing simply allows more to be kept.
+    pub async fn set_max_bytes(&self, max_bytes: u64) {
+        if self.inner.max_bytes.swap(max_bytes, Ordering::Relaxed) != max_bytes {
+            self.evict_for(0).await;
+        }
+    }
+
     /// Evict entries (Block tier first, then Bloom, then Index) until adding
     /// `incoming` bytes would not exceed `max_bytes`.
     async fn evict_for(&self, incoming: u64) {
@@ -334,7 +349,7 @@ impl ChunkCache {
                 let entries = self.lock_entries();
                 entries.values().map(|e| e.size).sum()
             };
-            if current_total + incoming <= self.inner.max_bytes {
+            if current_total + incoming <= self.max_bytes() {
                 return;
             }
             // Pick the LRU entry within the lowest-priority non-empty tier.

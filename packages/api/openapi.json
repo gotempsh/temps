@@ -3532,6 +3532,8 @@
           },
           "container_logs": {
             "default": {
+              "cache_mb": 2048,
+              "head_buffer_mb": 8,
               "max_file": 3,
               "max_size": "50m",
               "service_max_file": 3,
@@ -9163,6 +9165,24 @@
       "ContainerLogSettings": {
         "description": "Docker container log rotation settings\nControls the `--log-opt max-size` and `--log-opt max-file` for containers",
         "properties": {
+          "cache_mb": {
+            "default": 2048,
+            "description": "Disk budget, in MiB, for the collected-log read cache (`logs/cache`\nunder the data dir): recently read chunk blocks, block indexes and\nbloom filters kept locally so searches over object storage do not\nre-fetch them (ADR-046 §6). Applied within a minute of saving;\nshrinking evicts immediately.",
+            "example": 2048,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 64,
+            "type": "integer"
+          },
+          "head_buffer_mb": {
+            "default": 8,
+            "description": "Per-container cap, in MiB, on unsealed log lines held in memory (and\nthe WAL) before they are sealed into a chunk object. Larger buffers\nmean fewer, bigger chunks; smaller ones bound memory per container.",
+            "example": 8,
+            "format": "int32",
+            "maximum": 256,
+            "minimum": 1,
+            "type": "integer"
+          },
           "max_file": {
             "default": 3,
             "description": "Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)",

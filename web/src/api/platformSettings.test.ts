@@ -54,4 +54,25 @@ describe('buildPlatformSettingsUpdateBody', () => {
 
     expect(body.cloud).toEqual(cloud)
   })
+
+  // Same `#[serde(default)]` trap: `container_logs` carries both the Docker
+  // rotation options and the collected-log cache/head budgets (ADR-046), and
+  // none of them survived an unrelated save before it was round-tripped.
+  test('round-trips container log rotation and budgets', () => {
+    const containerLogs = {
+      max_size: '100m',
+      max_file: 5,
+      service_max_size: '20m',
+      service_max_file: 3,
+      cache_mb: 4096,
+      head_buffer_mb: 16,
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      container_logs: containerLogs,
+      preview_domain: 'apps.example.test',
+    } as PlatformSettings)
+
+    expect(body.container_logs).toEqual(containerLogs)
+  })
 })

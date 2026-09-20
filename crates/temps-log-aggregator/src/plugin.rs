@@ -32,9 +32,10 @@ use crate::store::LogLineStore;
 use crate::types::StorageConfig;
 use temps_clickhouse::ClickHouseConfig;
 
-/// Default budget for the chunk read-through cache
-/// (`TEMPS_LOG_CACHE_BYTES` overrides it), per ADR-046 §6.
-const DEFAULT_LOG_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The read cache and head-buffer budgets live in Settings → Monitoring
+/// (`container_logs.cache_mb` / `head_buffer_mb`, persisted and audited);
+/// this is how often a change is picked up without a restart.
+const BUDGET_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Interval for the periodic flush ticker (10 seconds)
 const FLUSH_TICKER_INTERVAL: Duration = Duration::from_secs(10);
@@ -142,10 +143,10 @@ impl TempsPlugin for LogAggregatorPlugin {
             // WIRE: if TEMPS_DATA_DIR cannot be resolved, fall back to an
             // in-memory-only cache rather than failing plugin registration —
             // a missing cache only costs latency, never correctness.
-            let cache_bytes = std::env::var("TEMPS_LOG_CACHE_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_LOG_CACHE_BYTES);
+            // Opened at the default budget; the persisted setting is applied
+            // as soon as the plugin starts (and re-applied every minute).
+            let cache_bytes =
+                u64::from(temps_core::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
             let cache = ChunkCache::open(cache_dir, cache_bytes)
                 .await
                 .map_err(|e| PluginError::PluginRegistrationFailed {
@@ -387,6 +388,45 @@ impl TempsPlugin for LogAggregatorPlugin {
                     spawn_local_container_discovery(docker, collector.clone(), db.clone())
                 }
                 LocalDiscoveryPlan::Skip { reason } => tracing::info!("{}", reason),
+            }
+
+            // ── Budget sync ─────────────────────────────────────────────
+            // Settings → Monitoring → container logs: read cache size and
+            // per-container head buffer. Applied now and re-read every
+            // minute so a saved setting never needs a restart.
+            if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
+                let cache = context.require_service::<ChunkCache>();
+                let writer = context.require_service::<ChunkWriterService>();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(BUDGET_SYNC_INTERVAL);
+                    loop {
+                        interval.tick().await;
+                        match config_service.get_settings().await {
+                            Ok(settings) => {
+                                let logs = &settings.container_logs;
+                                let cache_bytes = u64::from(logs.cache_mb) * 1024 * 1024;
+                                let head_bytes = logs.head_buffer_mb as usize * 1024 * 1024;
+                                if cache.max_bytes() != cache_bytes {
+                                    tracing::info!(
+                                        cache_mb = logs.cache_mb,
+                                        "log read cache budget applied"
+                                    );
+                                    cache.set_max_bytes(cache_bytes).await;
+                                }
+                                if writer.head_max_bytes() != head_bytes {
+                                    tracing::info!(
+                                        head_buffer_mb = logs.head_buffer_mb,
+                                        "log head buffer cap applied"
+                                    );
+                                    writer.set_head_max_bytes(head_bytes);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not read container log budgets; keeping current")
+                            }
+                        }
+                    }
+                });
             }
 
             // ── Retention scheduler ─────────────────────────────────────

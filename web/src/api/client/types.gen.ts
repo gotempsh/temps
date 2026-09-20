@@ -4302,6 +4302,20 @@ export type ContainerListResponse = {
  */
 export type ContainerLogSettings = {
     /**
+     * Disk budget, in MiB, for the collected-log read cache (`logs/cache`
+     * under the data dir): recently read chunk blocks, block indexes and
+     * bloom filters kept locally so searches over object storage do not
+     * re-fetch them (ADR-046 §6). Applied within a minute of saving;
+     * shrinking evicts immediately.
+     */
+    cache_mb?: number;
+    /**
+     * Per-container cap, in MiB, on unsealed log lines held in memory (and
+     * the WAL) before they are sealed into a chunk object. Larger buffers
+     * mean fewer, bigger chunks; smaller ones bound memory per container.
+     */
+    head_buffer_mb?: number;
+    /**
      * Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)
      */
     max_file?: number;

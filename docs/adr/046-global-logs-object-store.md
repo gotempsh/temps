@@ -246,7 +246,9 @@ identity, and every reader that receives one it cannot find falls back to
 ### 6. Cache
 
 Chunk objects are immutable, so caching is trivial: an LRU on local disk
-(`TEMPS_DATA_DIR/logs/cache`, default 1 GB, `TEMPS_LOG_CACHE_BYTES`) keyed
+(`TEMPS_DATA_DIR/logs/cache`; budget is the persisted, audited setting
+Settings → Monitoring → container logs → `cache_mb`, default 2 GiB, applied
+at runtime within a minute) keyed
 by `(storage_key, byte_range)`. Footers are pinned preferentially; blocks
 evict first. Paging back and forth through an incident, or two engineers
 looking at the same window, hits object storage once. In the filesystem
@@ -319,8 +321,10 @@ for the newest two weeks.
 What the model adds to the design: the minimum-size flush gate (without it
 1 000 idle containers cost 288 k PUTs/day), the 64 MB compaction cap, per-
 chunk bloom sizing, a 2 GB default cache with index → bloom → block tiers,
-and a `TEMPS_LOG_HEAD_BYTES` knob for the head cap. Nothing external is
-required at any of the three sizes.
+and a per-container head cap — both budgets are persisted settings
+(`container_logs.cache_mb` / `head_buffer_mb`), never environment
+variables, so an operator changes them from the console without a
+restart. Nothing external is required at any of the three sizes.
 
 ### 7. Concurrency
 

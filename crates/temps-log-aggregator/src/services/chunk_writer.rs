@@ -53,7 +53,7 @@
 //! // single async task hop.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,9 +99,6 @@ const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
-/// Environment override for [`DEFAULT_HEAD_MAX_BYTES`].
-const HEAD_MAX_BYTES_ENV: &str = "TEMPS_LOG_HEAD_BYTES";
-
 // ── Manifest dependency (testable) ─────────────────────────────────────────
 
 /// The writer's only dependency on the manifest store — narrow enough to fake
@@ -143,20 +140,12 @@ struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            head_max_bytes: head_max_bytes_from_env(),
+            head_max_bytes: DEFAULT_HEAD_MAX_BYTES,
             flush_age_secs: FLUSH_AGE_SECS,
             min_flush_bytes: MIN_FLUSH_BYTES,
             max_flush_age_secs: MAX_FLUSH_AGE_SECS,
         }
     }
-}
-
-fn head_max_bytes_from_env() -> usize {
-    std::env::var(HEAD_MAX_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_HEAD_MAX_BYTES)
 }
 
 /// Running summary of a run of lines, updated in O(1) per line so a
@@ -282,11 +271,11 @@ impl HeadBuffer {
     /// [`crate::chunk::MIN_FLUSH_BYTES`]/[`crate::chunk::FLUSH_AGE_SECS`]/
     /// [`crate::chunk::MAX_FLUSH_AGE_SECS`] flush policy (ADR-046 §1),
     /// against the (possibly test-shrunk) thresholds.
-    fn should_seal(&self, t: &Thresholds) -> bool {
+    fn should_seal(&self, t: &Thresholds, head_max_bytes: usize) -> bool {
         if self.is_empty() {
             return false;
         }
-        if self.bytes >= t.head_max_bytes {
+        if self.bytes >= head_max_bytes {
             return true;
         }
         let age_secs = self.opened_at.elapsed().as_secs() as i64;
@@ -381,6 +370,9 @@ pub struct ChunkWriterService {
     wal_dir: Option<WalDir>,
     buffers: Mutex<HashMap<String, HeadBuffer>>,
     thresholds: Thresholds,
+    /// Per-container unsealed buffer cap (Settings → Monitoring → container
+    /// logs); a setting, so it can change while the writer runs.
+    head_max_bytes: AtomicUsize,
     /// Skip building a bloom for the next seals (ADR-046 §8 shedding). No
     /// policy wires this yet; it exists so a future memory/CPU-pressure
     /// signal has somewhere to land.
@@ -452,6 +444,7 @@ impl ChunkWriterService {
             cache,
             wal_dir,
             buffers: Mutex::new(HashMap::new()),
+            head_max_bytes: AtomicUsize::new(thresholds.head_max_bytes),
             thresholds,
             shed_bloom: AtomicBool::new(false),
             dropped_chunks: AtomicU64::new(0),
@@ -575,7 +568,7 @@ impl ChunkWriterService {
                 wal.stream.append(&line).await?;
             }
             buffer.push_line(line);
-            buffer.bytes >= self.thresholds.head_max_bytes
+            buffer.bytes >= self.head_max_bytes()
         };
 
         if should_seal {
@@ -584,13 +577,27 @@ impl ChunkWriterService {
         Ok(())
     }
 
+    /// Current per-container unsealed buffer cap in bytes.
+    pub fn head_max_bytes(&self) -> usize {
+        self.head_max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Change the per-container buffer cap at runtime. Buffers already over
+    /// a lowered cap seal on the next line or flush tick.
+    pub fn set_head_max_bytes(&self, bytes: usize) {
+        self.head_max_bytes.store(bytes.max(1), Ordering::Relaxed);
+    }
+
     /// Seal every head buffer whose flush policy (ADR-046 §1) says it's due.
     pub async fn flush_expired(&self) {
+        let head_max_bytes = self.head_max_bytes();
         let due: Vec<String> = {
             let buffers = self.buffers.lock().await;
             buffers
                 .iter()
-                .filter(|(_, b)| b.sealing.is_none() && b.should_seal(&self.thresholds))
+                .filter(|(_, b)| {
+                    b.sealing.is_none() && b.should_seal(&self.thresholds, head_max_bytes)
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };

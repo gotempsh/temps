@@ -2507,6 +2507,23 @@ fn validate_observability_retention(
 ///
 /// `None` is valid and means "use the default", which is how the field is
 /// cleared.
+/// Collected-log budgets (ADR-046): the read cache and the per-container
+/// head buffer are applied at runtime, so an absurd value must be rejected
+/// here rather than silently clamped later.
+fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Result<(), Problem> {
+    if !(64..=1_048_576).contains(&logs.cache_mb) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("container_logs.cache_mb must be between 64 and 1048576 (1 TiB)")
+            .build());
+    }
+    if !(1..=256).contains(&logs.head_buffer_mb) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("container_logs.head_buffer_mb must be between 1 and 256")
+            .build());
+    }
+    Ok(())
+}
+
 fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
         if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
@@ -2850,6 +2867,7 @@ async fn update_settings(
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
+    validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
@@ -4325,6 +4343,28 @@ mod tests {
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("observability_retention.otel_logs_days must be between 1 and 3650")
         );
+    }
+
+    #[test]
+    fn container_log_budgets_are_bounded() {
+        use temps_core::ContainerLogSettings;
+        let ok = ContainerLogSettings::default();
+        assert!(validate_container_log_budgets(&ok).is_ok());
+        let tiny_cache = ContainerLogSettings {
+            cache_mb: 16,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&tiny_cache).is_err());
+        let huge_head = ContainerLogSettings {
+            head_buffer_mb: 1024,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&huge_head).is_err());
+        let zero_head = ContainerLogSettings {
+            head_buffer_mb: 0,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&zero_head).is_err());
     }
 
     // The ClickHouse metrics store is built from TEMPS_CLICKHOUSE_* env
