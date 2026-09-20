@@ -3,17 +3,18 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { GlobalLogLine } from '@/api/client/types.gen'
-import { groupLogLines, logVolume } from './log-explorer'
+import { groupLogLines, logLineKey, logVolume } from './log-explorer'
 const line: GlobalLogLine = {
   timestamp: '2026-09-09T12:00:00Z',
   level: 'ERROR',
+  stream: 'stdout',
   message: 'Request failed',
   owner: 'Storefront',
   env: 'production',
   service: 'web',
   project_id: 1,
-  chunk_id: 'one',
-  line_offset: 0,
+  container_id: 'container-one',
+  line_id: '1757419200000000001',
 }
 describe('loaded log aggregates', () => {
   test('counts severity buckets across minute boundaries and ignores invalid timestamps', () => {
@@ -42,5 +43,18 @@ describe('loaded log aggregates', () => {
       groupLogLines([line, { ...line, project_id: 2 }], 'service')
     ).toHaveLength(2)
     expect(groupLogLines([], 'service')).toEqual([])
+  })
+  test('identifies a line by its keyset triple without ever parsing line_id', () => {
+    // 1757419200000000001 and ...002 both round to the same double, so any
+    // numeric handling of line_id would collapse two distinct lines into one.
+    const sibling = { ...line, line_id: '1757419200000000002' }
+    expect(logLineKey(line)).not.toBe(logLineKey(sibling))
+    expect(logLineKey(line)).toContain('1757419200000000001')
+    expect(logLineKey({ ...line, container_id: 'container-two' })).not.toBe(
+      logLineKey(line)
+    )
+    expect(logLineKey({ ...line, timestamp: '2026-09-09T12:00:01Z' })).not.toBe(
+      logLineKey(line)
+    )
   })
 })

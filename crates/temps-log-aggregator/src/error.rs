@@ -78,6 +78,20 @@ pub enum LogAggregatorError {
     #[error("Invalid search cursor: {cursor}")]
     InvalidCursor { cursor: String },
 
+    #[error(
+        "Log line {line_id} on container '{container_id}' was not found; it may have aged out \
+         of the log retention window"
+    )]
+    LineNotFound { container_id: String, line_id: i64 },
+
+    // ── Authorization errors ────────────────────────────────────────────
+    /// Log access could not be resolved to an allow-list.
+    ///
+    /// Always a refusal, never a fallback to an unfiltered query — see
+    /// [`crate::store::access`].
+    #[error("Could not resolve log access: {reason}")]
+    AccessResolutionFailed { reason: String },
+
     // ── Validation errors ───────────────────────────────────────────────
     #[error("Validation error: {message}")]
     Validation { message: String },
@@ -101,6 +115,30 @@ pub enum LogAggregatorError {
         key: String,
         reason: String,
     },
+
+    // ── Chunk format errors (ADR-046) ──────────────────────────────────
+    #[error("Chunk format error: {reason}")]
+    ChunkFormat { reason: String },
+
+    // ── Line index errors (ADR-047) ─────────────────────────────────────
+    /// The ClickHouse line index rejected or could not take a write. Never
+    /// fatal for sealing: the chunk stays unindexed until the reindexer
+    /// retries it.
+    #[error("Line index error: {reason}")]
+    LineIndex { reason: String },
+
+    // ── Manifest errors (ADR-046) ───────────────────────────────────────
+    /// The `ON CONFLICT (storage_key) DO NOTHING` insert found no row to
+    /// insert (a concurrent write already claimed the key) but the
+    /// follow-up lookup by that same key also found nothing. This should be
+    /// unreachable — the conflicting row must exist for the conflict to have
+    /// fired — so it is surfaced as a distinct, loud error rather than
+    /// silently treated as "no chunk".
+    #[error(
+        "Manifest insert for storage_key '{storage_key}' hit a conflict but the existing row \
+         could not be found"
+    )]
+    ManifestConflictUnresolved { storage_key: String },
 }
 
 impl From<bollard::errors::Error> for LogAggregatorError {

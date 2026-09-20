@@ -1570,6 +1570,12 @@ pub struct ObservabilityRetentionSettings {
     /// Retain OpenTelemetry metric points for this many days.
     #[schema(minimum = 1, maximum = 3650, example = 90)]
     pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
 }
 
 impl Default for ObservabilityRetentionSettings {
@@ -1579,6 +1585,7 @@ impl Default for ObservabilityRetentionSettings {
             otel_spans_days: 90,
             otel_logs_days: 90,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         }
     }
 }

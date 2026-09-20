@@ -2487,6 +2487,7 @@ fn validate_observability_retention(
         ("otel_spans_days", retention.otel_spans_days),
         ("otel_logs_days", retention.otel_logs_days),
         ("otel_metrics_days", retention.otel_metrics_days),
+        ("container_logs_days", retention.container_logs_days),
     ];
     for (field, days) in values {
         if !(1..=3650).contains(&days) {
@@ -4304,6 +4305,7 @@ mod tests {
                 otel_spans_days: 3650,
                 otel_logs_days: 90,
                 otel_metrics_days: 90,
+                container_logs_days: 30,
             })
             .is_ok()
         );
@@ -4316,6 +4318,7 @@ mod tests {
             otel_spans_days: 90,
             otel_logs_days: 0,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         })
         .expect_err("zero-day retention must be rejected");
         assert_eq!(

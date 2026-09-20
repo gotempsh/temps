@@ -13,7 +13,10 @@ test('an ID-backed environment filter displays its slug in the chip and clear ac
       <LogQueryInput
         params={params}
         text=""
-        lines={[]}
+        filters={{
+          start_time: '2026-09-18T00:00:00Z',
+          end_time: '2026-09-18T12:00:00Z',
+        }}
         environmentLabels={{ '2': 'production' }}
         onChange={() => {}}
       />

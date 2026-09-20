@@ -10,6 +10,21 @@ export const LOG_LEVELS: LogLevel[] = [
   'DEBUG',
   'TRACE',
 ]
+
+/**
+ * Stable identity of a log line.
+ *
+ * The indexed store orders — and paginates — by `(timestamp, container_id,
+ * line_id)`, so that triple is the only thing that identifies a line. `line_id`
+ * is a decimal *string* (a 64-bit value seeded from Unix nanoseconds, well past
+ * `Number.MAX_SAFE_INTEGER`): never parse it, only compare it.
+ */
+export const logLineKey = (line: {
+  timestamp: string
+  container_id?: string
+  line_id: string
+}) => `${line.timestamp}|${line.container_id ?? ''}|${line.line_id}`
+
 export function logVolume(lines: GlobalLogLine[]) {
   const timestamps = lines
     .map((line) => Date.parse(line.timestamp))

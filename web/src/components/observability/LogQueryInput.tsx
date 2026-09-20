@@ -4,7 +4,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { GlobalLogLine } from '@/api/client/types.gen'
+import type { FacetField } from '@/api/client/types.gen'
 import { logEnvironmentLabel } from '@/lib/log-environment'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -15,18 +15,39 @@ import {
   parseLogQuery,
   quoteLogValue,
 } from '@/lib/log-query'
+import {
+  facetValues,
+  useGlobalLogFacets,
+  type GlobalLogFilters,
+} from '@/hooks/useGlobalLogs'
+
+/**
+ * Filter keys whose values come from the store's facet endpoint, mapped to the
+ * facet field to request and the key that field lands under in the response.
+ */
+const FACET_SOURCED = {
+  env: { field: 'env' as FacetField, responseKey: 'env' },
+  node: { field: 'node' as FacetField, responseKey: 'node_id' },
+  deployment: { field: 'deploy' as FacetField, responseKey: 'deploy_id' },
+} as const
+
+type FacetSourcedKey = keyof typeof FACET_SOURCED
+
+const facetKeyFor = (key: string): FacetSourcedKey | undefined =>
+  key in FACET_SOURCED ? (key as FacetSourcedKey) : undefined
 
 export function LogQueryInput({
   params,
   text,
-  lines,
   environmentLabels = {},
+  filters,
   onChange,
 }: {
   params: URLSearchParams
   text: string
   environmentLabels?: Record<string, string>
-  lines: GlobalLogLine[]
+  /** Current search scope; facet suggestions are drawn from it. */
+  filters: GlobalLogFilters
   onChange: (patch: Record<string, string | undefined>) => void
 }) {
   const input = useRef<HTMLInputElement>(null)
@@ -78,6 +99,33 @@ export function LogQueryInput({
     })
   )
   const choices = projects.data?.projects ?? []
+
+  // Suggestions for env/node/deployment come from the store, scoped to the
+  // search the user is building *minus* the field being edited — so switching
+  // env:staging → env:production stays discoverable, and a value that never
+  // appeared on a loaded page is still offered.
+  // Identity of these objects doesn't matter: react-query hashes the query key
+  // structurally, so rebuilding them each render costs one comparison.
+  const facetKey = facetKeyFor(key)
+  const facetScope: GlobalLogFilters =
+    facetKey === 'env'
+      ? { ...filters, envs: [] }
+      : facetKey === 'node'
+        ? { ...filters, node_ids: [] }
+        : facetKey === 'deployment'
+          ? { ...filters, deploy_id: null }
+          : filters
+  const facets = useGlobalLogFacets(
+    facetScope,
+    facetKey ? [FACET_SOURCED[facetKey].field] : [],
+    open && facetKey !== undefined
+  )
+  const suggestions = facetKey
+    ? facetValues(facets.data, FACET_SOURCED[facetKey].responseKey).map(
+        (item) => ({ value: item.value, label: `${item.count} lines` })
+      )
+    : []
+
   const values: Record<string, { value: string; label: string }[]> = {
     project: choices.map((p) => ({ value: String(p.id), label: p.name })),
     source: [
@@ -89,26 +137,15 @@ export function LogQueryInput({
       value,
       label: value,
     })),
-    env: [...new Set(lines.map((l) => l.env).filter(Boolean))].map((value) => ({
-      value,
-      label: logEnvironmentLabel(value, environmentLabels),
+    // node/deployment values come straight from the store's facet counts —
+    // the label is a count ("N lines"), shown only as a hint, never inserted
+    // (the literal filter text always uses the raw id, see `options` below).
+    env: suggestions.map((item) => ({
+      value: item.value,
+      label: logEnvironmentLabel(item.value, environmentLabels),
     })),
-    node: [
-      ...new Map(
-        lines
-          .filter((l) => l.node_id != null)
-          .map((l) => [
-            l.node_id,
-            {
-              value: String(l.node_id),
-              label: l.node_name || String(l.node_id),
-            },
-          ])
-      ).values(),
-    ],
-    deployment: [
-      ...new Set(lines.map((l) => l.deploy_id).filter((v) => v != null)),
-    ].map((value) => ({ value: String(value), label: String(value) })),
+    node: suggestions,
+    deployment: suggestions,
   }
   const options =
     colon < 0
@@ -323,9 +360,11 @@ export function LogQueryInput({
               <p className="px-2 py-3 text-xs text-muted-foreground">
                 {key === 'project' && projects.isFetching
                   ? 'Loading projects…'
-                  : colon >= 0
-                    ? 'No matching suggestions. Enter a value and press Enter.'
-                    : 'Press Enter to search messages.'}
+                  : facetKey && facets.isFetching
+                    ? 'Loading suggestions…'
+                    : colon >= 0
+                      ? 'No matching suggestions. Enter a value and press Enter.'
+                      : 'Press Enter to search messages.'}
               </p>
             )}
           </div>
@@ -338,15 +377,29 @@ export function LogQueryInput({
               Retry project suggestions
             </Button>
           )}
+          {facetKey && facets.isError && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void facets.refetch()}
+            >
+              Retry {facetKey} suggestions
+            </Button>
+          )}
           {key === 'project' && (projects.data?.total ?? 0) > 100 && (
             <p className="px-3 pb-2 text-xs text-muted-foreground">
               Type a project name to narrow suggestions.
             </p>
           )}
-          {['env', 'node', 'deployment'].includes(key) && (
+          {facetKey && (
             <p className="border-t px-3 py-2 text-[11px] text-muted-foreground">
-              Suggestions from loaded logs. You can also enter{' '}
-              {key === 'env' ? 'an environment' : 'an ID'}.
+              {facets.isError
+                ? 'Suggestions unavailable — enter a value and press Enter.'
+                : facets.data?.partial
+                  ? 'Most frequent values in this range; the list is capped. You can also type a value.'
+                  : `Values seen in this time range. You can also enter ${
+                      facetKey === 'env' ? 'an environment' : 'an ID'
+                    }.`}
             </p>
           )}
         </div>

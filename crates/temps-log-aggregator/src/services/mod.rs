@@ -5,16 +5,20 @@
 
 mod chunk_writer;
 mod collector;
+mod compactor;
 pub(crate) mod global_search;
 mod metadata;
+mod reindexer;
 mod remote_collector;
 mod retention;
-mod search;
+pub(crate) mod search;
 mod tail;
 
-pub use chunk_writer::{ChunkWriterService, FlushResult};
+pub use chunk_writer::{ChunkWriterService, ManifestSink};
 pub use collector::CollectorService;
+pub use compactor::{CompactorService, GC_GRACE};
 pub use metadata::{LogEventsQuery, LogMetadataService};
+pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};
 pub use remote_collector::{
     RemoteContainerInfo, RemoteContainerLogSource, RemoteLogCollectorService, RemoteLogSourceError,
     RemoteLogStream,

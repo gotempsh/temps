@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 
@@ -31,12 +32,20 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 axum = { workspace = true }
+axum-extra = { workspace = true }
 utoipa = { workspace = true }
 bollard = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 zstd = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
+memchr = "2.7"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1.4"
+arc-swap = "1.7"
+clickhouse = { workspace = true }
+temps-clickhouse = { path = "../temps-clickhouse" }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
@@ -49,3 +58,5 @@ reqwest = { workspace = true }
 temps-database = { path = "../temps-database" }
 temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
+regex = { workspace = true }
+testcontainers = { workspace = true, features = ["http_wait_plain"] }

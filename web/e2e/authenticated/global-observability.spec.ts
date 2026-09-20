@@ -64,28 +64,67 @@ const fixtures = {
       {
         timestamp: stamp,
         level: 'ERROR',
+        stream: 'stdout',
         message: 'Checkout request failed',
         owner: 'Storefront',
         env: 'production',
         service: 'web',
         project_id: 1,
-        chunk_id: 'chunk-1',
-        line_offset: 1,
+        container_id: 'container-1',
+        // Decimal string, past Number.MAX_SAFE_INTEGER on purpose: anything
+        // that parses this instead of comparing it collapses distinct lines.
+        line_id: '1757419200000000001',
       },
     ],
     next_cursor: 'next-token',
-    scan_limit_reached: false,
-    scanned_bytes: 100,
-    scanned_chunks: 1,
   },
+}
+/** Store-backed facet counts — no longer derived from the returned page. */
+const logFacets = {
+  facets: {
+    level: [
+      { value: 'INFO', count: 40 },
+      { value: 'ERROR', count: 12 },
+    ],
+    project_id: [{ value: '1', count: 52 }],
+    external_service_id: [],
+    env: [
+      { value: 'production', count: 50 },
+      { value: 'staging', count: 2 },
+    ],
+    node_id: [{ value: '7', count: 30 }],
+    deploy_id: [{ value: '42', count: 25 }],
+  },
+  partial: false,
 }
 const endpoints = {
   analytics: '/api/analytics/global',
   traces: '/api/otel/global/trace-summaries',
   errors: '/api/error-groups',
   logs: '/api/logs/global/search',
+  logFacets: '/api/logs/global/facets',
 }
 type Kind = keyof typeof fixtures
+
+/**
+ * A search page whose cursor terminates: the first page offers `next-token`,
+ * the cursored page ends the walk. Infinite scroll auto-loads whenever the
+ * rope fits the viewport, so a fixture that always hands back the same cursor
+ * would spin forever.
+ */
+function logPage(
+  route: Parameters<Parameters<Page['route']>[1]>[0],
+  lines: unknown[] = fixtures.logs.lines
+) {
+  const cursor = route.request().postDataJSON()?.cursor
+  return route.fulfill({
+    json: {
+      lines: cursor ? [] : lines,
+      next_cursor: cursor ? null : 'next-token',
+    },
+  })
+}
+
 async function mock(page: Page, kind: Kind) {
   await page.route(/\/api\/projects(?:\?|$)/, (route) =>
     route.fulfill({
@@ -94,6 +133,10 @@ async function mock(page: Page, kind: Kind) {
         total: 1,
       },
     })
+  )
+  await page.route(
+    (url) => url.pathname === endpoints.logFacets,
+    (route) => route.fulfill({ json: logFacets })
   )
   await page.route(
     (url) => url.pathname === endpoints[kind],
@@ -109,6 +152,7 @@ async function mock(page: Page, kind: Kind) {
             total_views: 120,
           },
         })
+      if (kind === 'logs') return logPage(route)
       return route.fulfill({ json: fixtures[kind] })
     }
   )
@@ -205,7 +249,9 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       (route) =>
         failed
           ? route.fulfill({ status: 403, json: { title: 'Access denied' } })
-          : route.fulfill({ json: fixtures[kind] })
+          : kind === 'logs'
+            ? logPage(route)
+            : route.fulfill({ json: fixtures[kind] })
     )
     await page.goto(`/${kind}`)
     const retry = page.getByRole('button', {
@@ -225,13 +271,33 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
     ).toBeVisible()
   })
 }
-test('log cursor uses the same time window and is reset by a filter change', async ({
+test('loading older lines walks the keyset cursor in the same window and a filter change restarts it', async ({
   page,
 }) => {
   await mock(page, 'logs')
   await page.goto('/logs')
-  await page.getByRole('button', { name: 'Next page', exact: true }).click()
-  await expect(page).toHaveURL(/cursor=next-token/)
+  const first = await page.waitForRequest(
+    (req) => new URL(req.url()).pathname === endpoints.logs
+  )
+  const window = first.postDataJSON()
+  // Page size is not user-configurable: we always ask for the server default.
+  expect(window.page_size).toBe(200)
+  // Infinite scroll walks the cursor on its own once the rope fits the
+  // viewport; the footer button is the same action for anyone not scrolling.
+  const older = await page.waitForRequest(
+    (req) =>
+      new URL(req.url()).pathname === endpoints.logs &&
+      req.postDataJSON().cursor === 'next-token'
+  )
+  const olderBody = older.postDataJSON()
+  expect(olderBody.start_time).toBe(window.start_time)
+  expect(olderBody.end_time).toBe(window.end_time)
+  expect(olderBody.page_size).toBe(200)
+  // A terminating cursor is a real end-of-results, not an exhausted budget.
+  await expect(page.getByText('End of results for this range')).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Load older lines' })
+  ).toHaveCount(0)
   const request = page.waitForRequest(
     (req) =>
       new URL(req.url()).pathname === endpoints.logs &&
@@ -243,7 +309,7 @@ test('log cursor uses the same time window and is reset by a filter change', asy
   expect((await request).postDataJSON().cursor).toBeUndefined()
   await expect(page).not.toHaveURL(/cursor=/)
 })
-test('scan-budget exhaustion asks for a narrower search instead of claiming no logs', async ({
+test('a refused query is reported as an error, never as "some logs may be missing"', async ({
   page,
 }) => {
   await mock(page, 'logs')
@@ -251,31 +317,30 @@ test('scan-budget exhaustion asks for a narrower search instead of claiming no l
     (url) => url.pathname === endpoints.logs,
     (route) =>
       route.fulfill({
+        status: 503,
         json: {
-          lines: [],
-          scan_limit_reached: true,
-          scanned_bytes: 100,
-          scanned_chunks: 512,
-          next_cursor: 'scan-next-token',
+          title: 'Log store unavailable',
+          detail: 'Log store unavailable',
         },
       })
   )
   await page.goto('/logs')
-  await expect(page.getByText(/No matching lines in this scan/)).toBeVisible()
-  await expect(page.getByText('0 loaded lines · partial results')).toBeVisible()
-  await page.getByRole('button', { name: 'About partial results' }).click()
-  await expect(page.getByText(/narrow your search or time range/)).toBeVisible()
-  await page.keyboard.press('Escape')
-  await expect(page.getByText('No logs in this view')).toHaveCount(0)
+  await expect(page.getByText('Log store unavailable').first()).toBeVisible()
   await expect(
-    page.getByRole('button', { name: 'Next page', exact: true })
-  ).toBeEnabled()
-  await page.getByRole('button', { name: 'Next page', exact: true }).click()
-  await expect(page).toHaveURL(/cursor=scan-next-token/)
+    page.getByRole('button', { name: 'Retry logs', exact: true })
+  ).toBeVisible()
+  // The old scan-limit/partial-results vocabulary described a state the
+  // indexed store cannot be in when the request outright failed.
+  await expect(page.getByText('Partial results')).toHaveCount(0)
+  await expect(page.getByText('Search limit reached')).toHaveCount(0)
+  await expect(page.getByText('Search paused')).toHaveCount(0)
+  await expect(
+    page.getByText(/some matching logs may be missing/i)
+  ).toHaveCount(0)
 })
 
 for (const width of [1440, 390]) {
-  test(`scan-budget exhaustion keeps partial logs visible at ${width}px`, async ({
+  test(`log presentation modes keep working at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 1000 })
@@ -286,38 +351,36 @@ for (const width of [1440, 390]) {
         route.fulfill({
           json: {
             ...fixtures.logs,
-            scan_limit_reached: true,
-            scanned_chunks: 512,
+            partial: true,
+            scanned_back_to: stamp,
             next_cursor: 'partial-next-token',
           },
         })
     )
     await page.goto('/logs')
-    await expect(
-      page.getByText('1 loaded line · partial results', { exact: true })
-    ).toBeVisible()
-    await page.getByRole('button', { name: 'About partial results' }).click()
-    const explanation = page.getByText(/This scan reached its limit/)
-    await expect(explanation).toBeVisible()
-    await expect(explanation).toContainText('Use Next page to continue')
-    await expect(explanation).toContainText('narrow your search or time range')
-    const box = await explanation.boundingBox()
-    expect(box!.x).toBeGreaterThanOrEqual(0)
-    expect(box!.x + box!.width).toBeLessThanOrEqual(width)
-    await page.keyboard.press('Escape')
-    await expect(explanation).toBeHidden()
+    const warning = page
+      .getByRole('status')
+      .filter({ hasText: 'Search paused' })
+    await expect(warning).toBeVisible()
+    await expect(warning).toContainText('Searched back to')
+    const keepSearching = warning.getByRole('button', {
+      name: 'Keep searching',
+    })
+    await expect(keepSearching).toBeEnabled()
     await expect(
       page.getByRole('cell', { name: 'Checkout request failed', exact: false })
     ).toBeVisible()
     await expect(
-      page.getByText('1 loaded line · partial results', { exact: true })
+      page.getByText('1 loaded line · newest first', { exact: false })
     ).toBeVisible()
+    // A partial page must not disable the normal "keep paging" affordance —
+    // pressing Next/Load older is exactly how the user resumes the search.
     await expect(
-      page.getByRole('button', { name: 'Next page', exact: true })
+      page.getByRole('button', { name: 'Load older lines', exact: true })
     ).toBeEnabled()
     await expect(page.getByText('No logs in this view')).toHaveCount(0)
     await page.screenshot({
-      path: `/tmp/temps-log-partial-results-${width}.png`,
+      path: `/tmp/temps-log-explorer-${width}.png`,
       fullPage: true,
     })
     await page.getByRole('button', { name: 'Patterns', exact: true }).click()
@@ -340,8 +403,6 @@ for (const width of [1440, 390]) {
       await page.addInitScript(() => localStorage.setItem('theme', 'dark'))
     await mock(page, 'logs')
     await page.goto('/logs')
-    await page.getByRole('button', { name: 'Next page', exact: true }).click()
-    await expect(page).toHaveURL(/cursor=next-token/)
     const before = page.url()
     await page
       .getByRole('button', { name: 'Custom time range', exact: true })
@@ -362,7 +423,6 @@ for (const width of [1440, 390]) {
       .fill('2026-09-09T17:45')
     await page.getByRole('button', { name: 'Apply range' }).click()
     await expect(page).toHaveURL(/range=custom/)
-    await expect(page).not.toHaveURL(/cursor=/)
     const custom = new URL(page.url()).searchParams
     const expected = await page.evaluate(() => ({
       from: new Date(2026, 8, 8, 9, 30).toISOString(),
@@ -457,24 +517,23 @@ test('global log explorer inspects records, exports, and applies API facets', as
   await page.route(
     (url) => url.pathname === endpoints.logs,
     (route) =>
-      route.fulfill({
-        json: {
-          ...fixtures.logs,
-          lines: [
-            {
-              ...fixtures.logs.lines[0],
-              node_id: 7,
-              node_name: 'worker-7',
-              fields: { request_id: 'request-test', duration_ms: 250 },
-            },
-          ],
+      logPage(route, [
+        {
+          ...fixtures.logs.lines[0],
+          node_id: 7,
+          node_name: 'worker-7',
+          fields: { request_id: 'request-test', duration_ms: 250 },
         },
-      })
+      ])
   )
   await page.goto('/logs')
   await expect(
     page.getByRole('complementary', { name: 'Log facets' })
-  ).toContainText('Counts from this page only')
+  ).toContainText('Counts across the whole time range')
+  // 30 is the store's count for node 7, not the 1 line on screen.
+  await expect(
+    page.getByRole('region', { name: 'Node facets', exact: true })
+  ).toContainText('30')
   const row = page.getByRole('button', {
     name: 'Inspect log: Checkout request failed',
   })
@@ -536,7 +595,7 @@ test('logs workspace supports grouping, columns and facets without a page-only v
           ...fixtures.logs,
           lines: Array.from({ length: 60 }, (_, i) => ({
             ...fixtures.logs.lines[0],
-            line_offset: i,
+            line_id: String(1757419200000000001n + BigInt(i)),
             timestamp: new Date(Date.parse(stamp) - i * 30000).toISOString(),
             level: i % 7 === 0 ? 'ERROR' : i % 3 === 0 ? 'WARN' : 'INFO',
             message:
@@ -563,15 +622,12 @@ test('logs workspace supports grouping, columns and facets without a page-only v
     path: '/tmp/temps-logs-reference-desktop.png',
     fullPage: true,
   })
-  await page.getByRole('button', { name: 'Next page', exact: true }).click()
-  await expect(page).toHaveURL(/cursor=next-token/)
   await page.getByRole('button', { name: 'Patterns', exact: true }).click()
   await expect(
     page.getByText('Exact repeated messages on this loaded page.', {
       exact: false,
     })
   ).toBeVisible()
-  await expect(page).toHaveURL(/cursor=next-token/)
   await page.getByRole('button', { name: 'By service', exact: true }).click()
   await expect(
     page.getByRole('button', { name: 'Storefront / web', exact: true })
@@ -611,7 +667,6 @@ test('log key:value autocomplete applies, edits and validates filters', async ({
   await expect(
     page.getByRole('button', { name: 'Edit level filter' })
   ).toHaveText('level:error')
-  await page.getByRole('button', { name: 'Next page', exact: true }).click()
   const request = page.waitForRequest(
     (req) =>
       new URL(req.url()).pathname === endpoints.logs &&
@@ -662,9 +717,7 @@ test('log autocomplete remains usable on a narrow screen', async ({ page }) => {
   await page.goto('/logs')
   const input = page.getByRole('combobox', { name: 'Search log messages' })
   await input.fill('env:')
-  await page
-    .getByRole('option', { name: 'env:production', exact: true })
-    .click()
+  await page.getByRole('option', { name: /^env:production/ }).click()
   await expect(
     page.getByRole('button', { name: 'Edit env filter' })
   ).toHaveText('env:production')
@@ -695,7 +748,7 @@ for (const theme of ['light', 'dark']) {
           lines: [0, 1, 2].map((i) => ({
             ...fixtures.logs.lines[0],
             timestamp: new Date(Date.parse(stamp) + i * 60000).toISOString(),
-            line_offset: i,
+            line_id: String(1757419200000000001n + BigInt(i)),
             message:
               '\u001b[31mError <script>unsafe</script>\u001b[0m plain text',
           })),
@@ -715,3 +768,33 @@ for (const theme of ['light', 'dark']) {
     await page.screenshot({ path: `/tmp/temps-logs-ansi-${theme}.png` })
   })
 }
+
+test('facet suggestions come from the store, including values absent from the loaded page', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await mock(page, 'logs')
+  await page.route(
+    (url) => url.pathname === endpoints.logFacets,
+    (route) => route.fulfill({ json: { ...logFacets, partial: true } })
+  )
+  await page.goto('/logs')
+  // `staging` never appears in any returned line — the old page-derived
+  // autocomplete could not have offered it.
+  const input = page.getByRole('combobox', { name: 'Search log messages' })
+  await input.fill('env:')
+  await expect(page.getByRole('option', { name: /^env:staging/ })).toBeVisible()
+  const request = page.waitForRequest(
+    (req) =>
+      new URL(req.url()).pathname === endpoints.logs &&
+      req.postDataJSON().envs?.[0] === 'staging'
+  )
+  await page.getByRole('option', { name: /^env:staging/ }).click()
+  await request
+  await expect(page).toHaveURL(/env=staging/)
+  // A capped value list is said out loud rather than passed off as complete.
+  await page.keyboard.press('Escape')
+  await expect(
+    page.getByRole('complementary', { name: 'Log facets' })
+  ).toContainText('capped')
+})

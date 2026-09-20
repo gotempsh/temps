@@ -144,6 +144,8 @@ export interface ObservabilityRetentionSettings {
   otel_logs_days: number
   /** OpenTelemetry metric-point retention in days. */
   otel_metrics_days: number
+  /** Collected container log retention in days (chunks, manifest, line index). */
+  container_logs_days: number
 }
 
 /**

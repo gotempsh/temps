@@ -74,6 +74,7 @@ members = [
     "crates/temps-flags",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
+    "crates/temps-clickhouse",
     "crates/temps-otel",
     "crates/temps-telemetry",
     "crates/temps-environments",
@@ -183,6 +184,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 # HTTP Framework & Web Server
 # ============================================================================
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
+axum-extra = { version = "0.10", features = ["query"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "catch-panic", "trace"] }
@@ -262,6 +264,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "logging",
 ] }
 webpki-roots = "1.0"
+
+# ============================================================================
+# ClickHouse
+# ============================================================================
+# Canonical version/feature pin for the whole workspace. Four crates
+# (temps-otel, temps-analytics-backend, temps-proxy, temps-metrics) currently
+# vendor their own ClickHouse config/client/migration-runner code against this
+# same version; temps-clickhouse is the shared crate those are meant to
+# migrate onto. Keep this pin in lockstep with `crates/temps-clickhouse`.
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # ============================================================================
 # Reverse Proxy (Pingora)

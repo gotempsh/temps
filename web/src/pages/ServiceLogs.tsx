@@ -487,7 +487,7 @@ export function ServiceLogs() {
               <pre className="min-w-full px-3 pb-3 font-mono text-xs leading-relaxed">
                 {lines.map((line, i) => (
                   <div
-                    key={`${line.chunk_id}-${line.line_offset}-${i}`}
+                    key={`${line.container_id ?? ''}-${line.line_id}-${i}`}
                     className="flex gap-3 border-b border-border/40 py-0.5 last:border-0"
                   >
                     <span className="shrink-0 text-muted-foreground/70">

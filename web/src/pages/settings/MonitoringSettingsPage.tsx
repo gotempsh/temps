@@ -80,6 +80,7 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
   otel_spans_days: 90,
   otel_logs_days: 90,
   otel_metrics_days: 90,
+  container_logs_days: 30,
 }
 
 // `null` means "use the server default" for both knobs, which is also what
@@ -883,6 +884,44 @@ export function MonitoringSettingsPage() {
                 {errors.observability_retention?.otel_logs_days && (
                   <p className="text-xs text-destructive">
                     {errors.observability_retention.otel_logs_days.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-container-logs">
+                    Container logs
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    log_chunks
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Stdout/stderr collected from deployment and database
+                  containers: the chunk files on disk or S3, their catalog
+                  rows, and the ClickHouse line index when configured.
+                </p>
+                <DurationInput
+                  id="retention-container-logs"
+                  unit="days"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.container_logs_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Chunks older than this are tombstoned hourly and their files
+                  removed after a one-hour grace period. Range 1–3650 days;
+                  default 30.
+                </p>
+                {errors.observability_retention?.container_logs_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.container_logs_days.message}
                   </p>
                 )}
               </div>

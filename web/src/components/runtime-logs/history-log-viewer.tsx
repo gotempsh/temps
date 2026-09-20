@@ -205,38 +205,37 @@ function formatTs(timestamp: string, showDate = false): string {
 }
 
 // Flatten the match rope into render rows, interleaving each match's grep -C
-// context. Contiguous lines (same chunk, adjacent offsets) render as one block;
-// a gap inserts a separator. Dedup on (chunk_id, line_offset) guards against
-// any residual window overlap the backend didn't merge.
+// context.
+//
+// Identity is `(container_id, line_id)`. `line_id` is ordered but *not* dense,
+// so "are these two lines adjacent" is not answerable on the client the way an
+// offset once made it. What is answerable is whether two context windows
+// overlap: if a window's first line was already emitted, the backend's windows
+// touch and the rows belong to one block. Otherwise a `--`-style divider goes
+// between them. With context disabled there are no windows at all, so the list
+// renders as a plain rope with no dividers.
 function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
   const rows: RenderRow[] = []
   const seen = new Set<string>()
-  // Track the last emitted (chunk_id, offset) to decide separators within a
-  // contiguous run. Reset across matches that don't carry context.
-  let lastChunk: string | null = null
-  let lastOffset: number | null = null
+  const keyOf = (containerId: string | undefined, lineId: string) =>
+    `${containerId ?? ''}:${lineId}`
+  // Whether the previous match rendered a context window, so a following plain
+  // match still gets separated from it.
+  let lastWindowed = false
 
-  // Context lines come from the same chunk as their match, and a chunk is a
-  // single container/service — so a neighbor's service is always the match's
+  // Context lines come from the same container as their match, and a container
+  // is a single service — so a neighbor's service is always the match's
   // service. The backend's ContextLine doesn't carry it, so we inherit it here
   // to keep the deployment column populated for context rows too.
   const pushContext = (
-    chunkId: string,
-    service: string,
     containerId: string | undefined,
+    service: string,
     nodeName: string | null | undefined,
     c: ContextLine
   ) => {
-    const key = `${chunkId}:${c.line_offset}`
+    const key = keyOf(containerId, c.line_id)
     if (seen.has(key)) return
     seen.add(key)
-    if (
-      lastChunk === chunkId &&
-      lastOffset !== null &&
-      c.line_offset > lastOffset + 1
-    ) {
-      rows.push({ kind: 'separator', key: `sep-${key}` })
-    }
     rows.push({
       kind: 'context',
       key,
@@ -247,68 +246,33 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
       containerId,
       nodeName,
     })
-    lastChunk = chunkId
-    lastOffset = c.line_offset
   }
 
   for (const line of lines) {
     const ctx = line.context
-    if (ctx?.before?.length) {
-      // A new block start that isn't contiguous with the previous row → divider.
-      if (
-        rows.length > 0 &&
-        !(
-          lastChunk === line.chunk_id &&
-          lastOffset !== null &&
-          ctx.before[0].line_offset <= lastOffset + 1
-        )
-      ) {
-        rows.push({
-          kind: 'separator',
-          key: `sep-pre-${line.chunk_id}:${line.line_offset}`,
-        })
-        lastChunk = null
-        lastOffset = null
-      }
-      for (const c of ctx.before)
-        pushContext(
-          line.chunk_id,
-          line.service,
-          line.container_id,
-          line.node_name,
-          c
-        )
+    const windowed = !!(ctx?.before?.length || ctx?.after?.length)
+    const firstKey = keyOf(
+      line.container_id,
+      ctx?.before?.[0]?.line_id ?? line.line_id
+    )
+    if (rows.length > 0 && (windowed || lastWindowed) && !seen.has(firstKey)) {
+      rows.push({ kind: 'separator', key: `sep-${firstKey}` })
     }
+    lastWindowed = windowed
 
-    const matchKey = `${line.chunk_id}:${line.line_offset}`
+    if (ctx?.before?.length)
+      for (const c of ctx.before)
+        pushContext(line.container_id, line.service, line.node_name, c)
+
+    const matchKey = keyOf(line.container_id, line.line_id)
     if (!seen.has(matchKey)) {
       seen.add(matchKey)
-      // Separator if the match isn't contiguous with the previous row.
-      if (
-        rows.length > 0 &&
-        !(
-          lastChunk === line.chunk_id &&
-          lastOffset !== null &&
-          line.line_offset <= lastOffset + 1
-        )
-      ) {
-        rows.push({ kind: 'separator', key: `sep-m-${matchKey}` })
-      }
       rows.push({ kind: 'match', key: matchKey, line })
-      lastChunk = line.chunk_id
-      lastOffset = line.line_offset
     }
 
-    if (ctx?.after?.length) {
+    if (ctx?.after?.length)
       for (const c of ctx.after)
-        pushContext(
-          line.chunk_id,
-          line.service,
-          line.container_id,
-          line.node_name,
-          c
-        )
-    }
+        pushContext(line.container_id, line.service, line.node_name, c)
   }
 
   return rows
@@ -849,7 +813,6 @@ export default function HistoryLogViewer({
     contextLines,
   ])
 
-  const totalMatched = data?.total_scanned ?? 0
   const showingCount = lines.length
   const canLoadOlder = !!effectiveNextCursor && !olderExhausted
 
@@ -1246,11 +1209,14 @@ export default function HistoryLogViewer({
           <div className="flex items-center gap-2">
             {isFetching && <Loader2 className="h-3 w-3 animate-spin" />}
             <span>
-              Showing {showingCount.toLocaleString()}
-              {totalMatched > showingCount
-                ? ` of ${totalMatched.toLocaleString()}+`
-                : ''}{' '}
+              Showing {showingCount.toLocaleString()}{' '}
               {showingCount === 1 ? 'match' : 'matches'}
+              {canLoadOlder && (
+                <span className="text-muted-foreground/70">
+                  {' '}
+                  · more available
+                </span>
+              )}
               {contextLines > 0 && (
                 <span className="text-muted-foreground/70">
                   {' '}

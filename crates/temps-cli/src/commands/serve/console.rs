@@ -4596,10 +4596,26 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let shutdown_signal = {
         let svc = external_plugins_service.clone();
         let cloud = cloud_service.clone();
+        // Seal every unsealed log head so a restart never loses the last
+        // minutes of container logs (ADR-046 §1). The WAL covers crashes;
+        // this covers the ordinary upgrade restart.
+        let log_writer = plugin_manager
+            .service_context()
+            .get_service::<temps_log_aggregator::ChunkWriterService>();
         async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Console API received shutdown signal, stopping background services...");
             join_cloud_enrollment_bootstrap(enrollment_bootstrap).await;
+            if let Some(writer) = log_writer {
+                match tokio::time::timeout(std::time::Duration::from_secs(20), writer.flush_all())
+                    .await
+                {
+                    Ok(()) => info!("Log heads sealed"),
+                    Err(_) => {
+                        warn!("Sealing log heads exceeded 20s; unsealed lines stay in the WAL")
+                    }
+                }
+            }
             if let Some(service) = cloud {
                 service.shutdown().await;
                 info!("Managed telemetry mirror shut down");

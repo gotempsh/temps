@@ -277,6 +277,9 @@ pub mod m20260917_000001_add_next_check_at_to_status_monitors;
 pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 pub mod m20260919_000001_add_failover_at_to_nodes;
+pub mod m20260919_000001_log_chunks_v2;
+pub mod m20260920_000001_log_chunks_indexed_at;
+pub mod m20260920_000002_log_collector_positions;
 
 mod m20260920_000001_compose_security_policies;
 
@@ -614,6 +617,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260919_000001_log_chunks_v2::Migration),
+            Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
+            Box::new(m20260920_000002_log_collector_positions::Migration),
         ]
     }
 }
