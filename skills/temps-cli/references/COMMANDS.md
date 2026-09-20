@@ -71,6 +71,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`webhooks`](#webhooks) - Manage webhooks for project events
 - [`containers`](#containers) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
+- [`nodes`](#nodes) - Worker nodes and workload placement
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
@@ -2525,6 +2526,7 @@ Manage platform settings
 
 - `show` (`get`) - Show current platform settings
 - `update` (`set`) - Update platform settings
+- `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -2564,6 +2566,16 @@ Update platform settings
 | `--allow-unlimited-timeouts <enabled>` | Whether projects may set a timeout of 0, i.e. no timeout (true/false) | - | No |
 | `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `settings geo-status`
+
+Show the freshness of the geolocation (GeoLite2) database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `settings set-external-url`
 
@@ -3296,6 +3308,24 @@ Cluster DNS resolver (ADR-024) operations
 #### `cluster dns status`
 
 Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `nodes`
+
+Worker nodes and workload placement
+
+**Subcommands:**
+
+- `capability` - Show whether this install can run workloads at all — local workloads plus joined worker nodes — so a deploy that could never be scheduled is visible before it is queued
+
+### `nodes capability`
+
+Show whether this install can run workloads at all — local workloads plus joined worker nodes — so a deploy that could never be scheduled is visible before it is queued
 
 **Options:**
 
@@ -5817,6 +5847,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -5826,6 +5857,16 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform features`
+
+Show which capabilities the server process actually provides
 
 **Options:**
 
@@ -7782,6 +7823,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | No |
 | `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
 | `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
 | `-y, --yes` | Trust the repository and allow installation without prompting | - | No |

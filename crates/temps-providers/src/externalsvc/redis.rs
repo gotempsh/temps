@@ -2029,6 +2029,44 @@ impl RedisService {
 /// Internal port used by Redis inside the container
 const REDIS_INTERNAL_PORT: &str = "6379";
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl RedisService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        // Generate JSON Schema from RedisInputConfig
+        let schema = schemars::schema_for!(RedisInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable (based on RedisParameterStrategy::updateable_keys)
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable - must match RedisParameterStrategy::updateable_keys()
+                let editable = match key.as_str() {
+                    "host" => false,        // Read-only
+                    "port" => true,         // Updateable
+                    "password" => false,    // Read-only
+                    "docker_image" => true, // Updateable
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
+    }
+}
+
 #[async_trait]
 impl ExternalService for RedisService {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
@@ -2249,32 +2287,7 @@ impl ExternalService for RedisService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        // Generate JSON Schema from RedisInputConfig
-        let schema = schemars::schema_for!(RedisInputConfig);
-        let mut schema_json = serde_json::to_value(schema).ok()?;
-
-        // Add metadata about which fields are editable (based on RedisParameterStrategy::updateable_keys)
-        if let Some(properties) = schema_json
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
-            for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable - must match RedisParameterStrategy::updateable_keys()
-                let editable = match key.as_str() {
-                    "host" => false,        // Read-only
-                    "port" => true,         // Updateable
-                    "password" => false,    // Read-only
-                    "docker_image" => true, // Updateable
-                    _ => false,
-                };
-
-                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
-                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
-                }
-            }
-        }
-
-        Some(schema_json)
+        Self::parameter_schema()
     }
 
     fn get_runtime_env_definitions(&self) -> Vec<super::RuntimeEnvVar> {

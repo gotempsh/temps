@@ -463,6 +463,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
                 .with_detail(format!(
                     "Container {operation} failed for {container_id} on {location}: {reason}"
                 )),
+            // Never a 500: this host structurally cannot run containers, and
+            // the single shared mapping in `temps_core` carries the remedy.
+            DeploymentError::DockerUnavailable(ref error) => Problem::from(error),
             DeploymentError::ContainerExecTimeout {
                 container_id,
                 timeout_seconds,
@@ -4562,6 +4565,9 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
+            node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
+                crate::services::NodeService::new(db.clone()),
+            ))),
             encryption_service: Arc::new(
                 temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
             ),

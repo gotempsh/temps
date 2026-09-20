@@ -19,6 +19,7 @@ import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ImportServiceButton } from '@/components/storage/ImportServiceButton'
 import { PlatformServices } from '@/components/storage/PlatformServices'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
+import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { ServiceLogo } from '@/components/ui/service-logo'
@@ -213,6 +214,9 @@ export function Storage() {
                 ) : undefined
               }
             />
+            {/* Managed services are containers: without something to run
+                them, creating one cannot succeed. */}
+            <WorkerNodeRequiredBanner />
             {activeTab === 'platform' ? (
               <PlatformServices />
             ) : (

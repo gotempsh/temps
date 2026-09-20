@@ -10,6 +10,12 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
+import { useNodeCapability } from '@/hooks/useNodeCapability'
+import {
+  shouldPromptForFirstWorkerNode,
+  WORKER_NODES_URL,
+} from '@/lib/worker-nodes'
 import {
   Table,
   TableBody,
@@ -848,8 +854,7 @@ export function NodeDetailPage() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Worker Nodes', href: '/settings/nodes' },
+      { label: 'Worker Nodes', href: WORKER_NODES_URL },
       { label: nodeData?.name ?? `Node ${nodeId}` },
     ])
   }, [setBreadcrumbs, nodeData?.name, nodeId])
@@ -1544,13 +1549,19 @@ export function NodesPage() {
     ...adminListNodesOptions(),
     refetchInterval: 30_000,
   })
+  const { data: capability } = useNodeCapability()
   const nodes = data?.nodes ?? []
+  // "No nodes" means two very different things. With local workloads the
+  // control plane runs everything itself and worker nodes are optional
+  // scale-out; without them nothing can run at all and this page is the
+  // onboarding step the operator must complete.
+  const needsFirstNode = shouldPromptForFirstWorkerNode(
+    capability,
+    nodes.length
+  )
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Worker Nodes' },
-    ])
+    setBreadcrumbs([{ label: 'Worker Nodes' }])
   }, [setBreadcrumbs])
 
   usePageTitle('Worker Nodes')
@@ -1587,7 +1598,14 @@ export function NodesPage() {
         <CardContent className="space-y-6">
           <JoinTokenSection />
 
-          {nodes.length === 0 ? (
+          {needsFirstNode ? (
+            <div className="border-t pt-6">
+              <WorkerNodeRequiredAlert
+                reason={capability?.reason}
+                showSetupAction={false}
+              />
+            </div>
+          ) : nodes.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
               <Server className="h-12 w-12 text-muted-foreground mb-4" />
               <p className="text-sm font-medium">No worker nodes</p>

@@ -50,6 +50,50 @@ use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 
+/// The shared, uniform mapping for the two `ExternalServiceError` variants
+/// that both mean "this process cannot run containers here".
+///
+/// Both produce the same 409 `WORKER_NODE_REQUIRED` Problem (built in
+/// `temps_core`), so the status code, error code, title, remedy sentence and
+/// `setup_path` are byte-identical on every endpoint in every crate. Before
+/// this existed the same condition surfaced as a 500 on one route, a 409 on
+/// another and a 503 on a third, which is unreadable for a self-hosted
+/// operator who has nobody to ask.
+///
+/// Returns `None` for every other variant, so callers keep their own, more
+/// specific classification.
+pub(crate) fn worker_node_required(
+    error: &crate::services::ExternalServiceError,
+) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        // Capability: this process has no daemon at all.
+        E::DockerUnavailable(inner) => Some(Problem::from(inner)),
+        // Policy: a daemon may exist, but the serve profile forbids local
+        // workloads. Same remedy, so the same response.
+        E::LocalWorkloadsDisabled { .. } => {
+            Some(temps_core::worker_node_required_problem(error.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Classify an `ExternalServiceError` that a handler would otherwise report as
+/// a generic 500.
+///
+/// `detail` is the caller's own context message, used verbatim for genuinely
+/// internal failures. The "no worker node" condition is intercepted first so
+/// it can never reach a catch-all again — that bug class is what made
+/// `GET /external-services/types/{service_type}/parameters` answer a plain
+/// metadata question with "Failed to get parameter schema: This process has no
+/// local Docker daemon".
+pub(crate) fn external_service_problem(
+    error: &crate::services::ExternalServiceError,
+    detail: String,
+) -> Problem {
+    worker_node_required(error).unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
 /// Get available service types
 #[utoipa::path(
     get,
@@ -384,9 +428,10 @@ async fn get_service_type_parameters(
             .await
         {
             Ok(schema) => Ok((StatusCode::OK, Json(schema))),
-            Err(e) => Err(internal_server_error()
-                .detail(format!("Failed to get parameter schema: {}", e))
-                .build()),
+            Err(e) => Err(external_service_problem(
+                &e,
+                format!("Failed to get parameter schema: {}", e),
+            )),
         },
         Err(_) => Err(not_found().detail("Service type not found").build()),
     }
@@ -532,9 +577,10 @@ async fn get_service(
         Ok(service) => Ok((StatusCode::OK, Json(service))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to get service: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get service: {}", e),
+            )),
         },
     }
 }
@@ -717,20 +763,21 @@ async fn create_service(
             Ok((StatusCode::CREATED, Json(service)))
         }
         Err(e) => {
-            use crate::services::ExternalServiceError as E;
             let error_msg = e.to_string();
             info!("Failed to create service: {}", error_msg);
-            match &e {
-                E::LocalWorkloadsDisabled { .. } | E::DockerUnavailable(_) => {
-                    Err(conflict().detail(error_msg).build())
-                }
-                _ if error_msg.contains("validation failed") => {
-                    Err(bad_request().detail(&error_msg).build())
-                }
-                _ => Err(internal_server_error()
-                    .detail(format!("Failed to create service: {}", e))
-                    .build()),
+            // "No worker node can run this" first, via the one shared mapping,
+            // so creating a service reports the condition with the same status,
+            // error code and remedy as every other endpoint.
+            if let Some(problem) = worker_node_required(&e) {
+                return Err(problem);
             }
+            if error_msg.contains("validation failed") {
+                return Err(bad_request().detail(&error_msg).build());
+            }
+            Err(external_service_problem(
+                &e,
+                format!("Failed to create service: {}", e),
+            ))
         }
     }
 }
@@ -744,9 +791,7 @@ fn service_link_problem(error: crate::services::ExternalServiceError) -> Problem
         crate::services::ExternalServiceError::DuplicateServiceType { .. } => {
             conflict().detail(error.to_string()).build()
         }
-        _ => internal_server_error()
-            .detail(format!("Failed to link service: {error}"))
-            .build(),
+        _ => external_service_problem(&error, format!("Failed to link service: {error}")),
     }
 }
 
@@ -842,9 +887,10 @@ async fn update_service(
             if e.to_string().contains("validation failed") {
                 Err(bad_request().detail(e.to_string()).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to update service: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to update service: {}", e),
+                ))
             }
         }
     }
@@ -1071,8 +1117,10 @@ fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Pr
         E::UpgradeRejected { .. } => Some(bad_request().detail(e.to_string()).build()),
         E::ServiceNotFound { .. } => Some(not_found().detail(e.to_string()).build()),
         E::UpgradeInProgress { .. } => Some(conflict().detail(e.to_string()).build()),
-        E::LocalWorkloadsDisabled { .. } => Some(conflict().detail(e.to_string()).build()),
-        E::DockerUnavailable(_) => Some(conflict().detail(e.to_string()).build()),
+        // Both "no daemon" variants go through the single shared mapping, so
+        // the wording, the `error_code` and the `setup_path` are identical to
+        // what create/start/stop/delete return for the same condition.
+        E::LocalWorkloadsDisabled { .. } | E::DockerUnavailable(_) => worker_node_required(e),
         _ => None,
     }
 }
@@ -1139,9 +1187,10 @@ async fn upgrade_service(
             if e.to_string().contains("Upgrade not implemented") {
                 Err(bad_request().detail(e.to_string()).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to upgrade service: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to upgrade service: {}", e),
+                ))
             }
         }
     }
@@ -1205,16 +1254,18 @@ async fn delete_service(
                         // Return 400 Bad Request with detailed message about linked projects
                         Err(bad_request().detail(error_str).build())
                     } else {
-                        Err(internal_server_error()
-                            .detail(format!("Failed to delete service: {}", e))
-                            .build())
+                        Err(external_service_problem(
+                            &e,
+                            format!("Failed to delete service: {}", e),
+                        ))
                     }
                 }
             }
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to get service details: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to get service details: {}", e),
+        )),
     }
 }
 
@@ -1299,9 +1350,10 @@ async fn get_cluster_health(
                     .build())
             }
             _ => {
-                return Err(internal_server_error()
-                    .detail(format!("Failed to load service {}: {}", id, e))
-                    .build())
+                return Err(external_service_problem(
+                    &e,
+                    format!("Failed to load service {}: {}", id, e),
+                ))
             }
         },
     };
@@ -1366,9 +1418,10 @@ async fn get_service_health_status(
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load service health: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load service health: {}", e),
+        )),
     }
 }
 
@@ -1446,9 +1499,10 @@ async fn trigger_service_health_check(
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load service health: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load service health: {}", e),
+        )),
     }
 }
 
@@ -1498,9 +1552,10 @@ async fn get_postgres_wal_health(
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load WAL health: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load WAL health: {}", e),
+        )),
     }
 }
 
@@ -1571,9 +1626,10 @@ async fn repoint_continuous_archive_source(
             return Err(not_found().detail("Service not found").build());
         }
         Err(e) => {
-            return Err(internal_server_error()
-                .detail(format!("Failed to load service: {}", e))
-                .build())
+            return Err(external_service_problem(
+                &e,
+                format!("Failed to load service: {}", e),
+            ))
         }
     };
 
@@ -1636,12 +1692,10 @@ async fn repoint_continuous_archive_source(
                 .detail(e.to_string())
                 .build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!(
-                "Failed to repoint continuous archive source: {}",
-                e
-            ))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to repoint continuous archive source: {}", e),
+        )),
     }
 }
 
@@ -1685,9 +1739,10 @@ async fn list_service_health_statuses(
         match app_state.external_service_manager.list_services().await {
             Ok(svcs) => svcs.into_iter().map(|s| s.id).collect::<Vec<_>>(),
             Err(e) => {
-                return Err(internal_server_error()
-                    .detail(format!("Failed to list services: {}", e))
-                    .build())
+                return Err(external_service_problem(
+                    &e,
+                    format!("Failed to list services: {}", e),
+                ))
             }
         }
     } else {
@@ -1708,9 +1763,10 @@ async fn list_service_health_statuses(
                     .collect(),
             }),
         )),
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load health statuses: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load health statuses: {}", e),
+        )),
     }
 }
 
@@ -1773,15 +1829,17 @@ async fn start_service(
                     if let Some(problem) = upgrade_error_problem(&e) {
                         return Err(problem);
                     }
-                    Err(internal_server_error()
-                        .detail(format!("Failed to start service: {}", e))
-                        .build())
+                    Err(external_service_problem(
+                        &e,
+                        format!("Failed to start service: {}", e),
+                    ))
                 }
             }
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to get service details: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to get service details: {}", e),
+        )),
     }
 }
 
@@ -1855,9 +1913,10 @@ async fn retry_cluster(
             } else if msg.contains("only valid for") || msg.contains("must be in") {
                 Err(bad_request().detail(msg).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to retry cluster: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to retry cluster: {}", e),
+                ))
             }
         }
     }
@@ -1944,9 +2003,10 @@ async fn add_cluster_member(
             {
                 Err(bad_request().detail(msg).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to add cluster member: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to add cluster member: {}", e),
+                ))
             }
         }
     }
@@ -1996,9 +2056,10 @@ async fn get_cluster_member(
             if msg.contains("not found") {
                 Err(not_found().detail(msg).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to load cluster member: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to load cluster member: {}", e),
+                ))
             }
         }
     }
@@ -2077,9 +2138,10 @@ async fn remove_cluster_member(
             {
                 Err(bad_request().detail(msg).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to remove cluster member: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to remove cluster member: {}", e),
+                ))
             }
         }
     }
@@ -2168,9 +2230,10 @@ async fn promote_cluster_member(
             {
                 Err(bad_request().detail(msg).build())
             } else {
-                Err(internal_server_error()
-                    .detail(format!("Failed to promote cluster member: {}", e))
-                    .build())
+                Err(external_service_problem(
+                    &e,
+                    format!("Failed to promote cluster member: {}", e),
+                ))
             }
         }
     }
@@ -2233,16 +2296,18 @@ async fn stop_service(
                     error!("Failed to stop service: {}", e);
                     match e.to_string().as_str() {
                         "Service not found" => Err(not_found().detail("Service not found").build()),
-                        _ => Err(internal_server_error()
-                            .detail(format!("Failed to stop service: {}", e))
-                            .build()),
+                        _ => Err(external_service_problem(
+                            &e,
+                            format!("Failed to stop service: {}", e),
+                        )),
                     }
                 }
             }
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to get service details: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to get service details: {}", e),
+        )),
     }
 }
 
@@ -2367,9 +2432,10 @@ async fn link_service_to_project(
             crate::services::ExternalServiceError::InvalidDatabaseProvisioning { .. } => {
                 Err(bad_request().detail(e.to_string()).build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to link service: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to link service: {}", e),
+            )),
         },
     }
 }
@@ -2449,9 +2515,10 @@ async fn unlink_service_from_project(
             | crate::services::ExternalServiceError::ServiceNotLinkedToProject { .. } => {
                 Err(not_found().detail(e.to_string()).build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to unlink service: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to unlink service: {}", e),
+            )),
         },
     }
 }
@@ -2523,9 +2590,10 @@ async fn list_service_projects(
             crate::services::ExternalServiceError::ServiceNotFound { .. } => {
                 Err(not_found().detail("Service not found").build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to list projects: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to list projects: {}", e),
+            )),
         },
     }
 }
@@ -2565,9 +2633,10 @@ async fn list_project_services(
         Ok(services) => Ok((StatusCode::OK, Json(services))),
         Err(e) => match e.to_string().as_str() {
             "Project not found" => Err(not_found().detail("Project not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to list services: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to list services: {}", e),
+            )),
         },
     }
 }
@@ -2643,9 +2712,10 @@ async fn get_service_environment_variable(
             "Access denied for encrypted variable" => {
                 Err(forbidden().detail(e.to_string()).build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to get environment variable: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get environment variable: {}", e),
+            )),
         },
     }
 }
@@ -2758,9 +2828,7 @@ fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Prob
         }
         E::ServiceNotLinkedToProject { .. } => conflict().detail(e.to_string()).build(),
         E::InvalidServiceType { .. } => bad_request().detail(e.to_string()).build(),
-        _ => internal_server_error()
-            .detail(format!("Failed to issue connection credentials: {e}"))
-            .build(),
+        _ => external_service_problem(&e, format!("Failed to issue connection credentials: {e}")),
     }
 }
 
@@ -2808,9 +2876,10 @@ async fn get_service_environment_variables(
             "Service not found" | "Project not found" => {
                 Err(not_found().detail(e.to_string()).build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to get environment variables: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get environment variables: {}", e),
+            )),
         },
     }
 }
@@ -2853,9 +2922,10 @@ async fn get_project_service_environment_variables(
         }
         Err(e) => match e.to_string().as_str() {
             "Project not found" => Err(not_found().detail(e.to_string()).build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to get environment variables: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get environment variables: {}", e),
+            )),
         },
     }
 }
@@ -2904,9 +2974,10 @@ async fn get_service_by_slug(
         Ok(service) => Ok((StatusCode::OK, Json(service))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to get service: {}", e))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get service: {}", e),
+            )),
         },
     }
 }
@@ -2952,12 +3023,10 @@ async fn get_service_preview_environment_variable_names(
         }
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!(
-                    "Failed to get preview environment variable names: {}",
-                    e
-                ))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get preview environment variable names: {}", e),
+            )),
         },
     }
 }
@@ -2998,12 +3067,10 @@ async fn get_service_preview_environment_variables_masked(
         Ok(response) => Ok((StatusCode::OK, Json(response.variables))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!(
-                    "Failed to get preview environment variables: {}",
-                    e
-                ))
-                .build()),
+            _ => Err(external_service_problem(
+                &e,
+                format!("Failed to get preview environment variables: {}", e),
+            )),
         },
     }
 }
@@ -3054,9 +3121,10 @@ async fn reveal_service_environment_variables(
         Err(e) => {
             return match e.to_string().as_str() {
                 "Service not found" => Err(not_found().detail("Service not found").build()),
-                _ => Err(internal_server_error()
-                    .detail(format!("Failed to get environment variables: {}", e))
-                    .build()),
+                _ => Err(external_service_problem(
+                    &e,
+                    format!("Failed to get environment variables: {}", e),
+                )),
             }
         }
     };
@@ -3128,9 +3196,10 @@ async fn get_service_runtime(
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load service runtime: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load service runtime: {}", e),
+        )),
     }
 }
 
@@ -3167,9 +3236,10 @@ async fn get_service_stats(
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to load service stats: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to load service stats: {}", e),
+        )),
     }
 }
 
@@ -3251,9 +3321,10 @@ async fn update_service_resources(
         Err(crate::services::ExternalServiceError::ParameterValidationFailed {
             reason, ..
         }) => Err(bad_request().detail(reason).build()),
-        Err(e) => Err(internal_server_error()
-            .detail(format!("Failed to update resource limits: {}", e))
-            .build()),
+        Err(e) => Err(external_service_problem(
+            &e,
+            format!("Failed to update resource limits: {}", e),
+        )),
     }
 }
 
@@ -3879,6 +3950,65 @@ mod tests {
             name: "n".to_string()
         })
         .is_none());
+    }
+
+    /// Both "this host cannot run containers" variants must produce the one
+    /// shared 409, with the machine-readable code and the setup path — never
+    /// a 500 from a handler's catch-all, and never a differently-worded 409.
+    #[test]
+    fn docker_unavailable_variants_share_one_actionable_problem() {
+        use crate::services::ExternalServiceError as E;
+
+        let unavailable = E::DockerUnavailable(temps_core::DockerUnavailable {
+            profile: temps_core::PROFILE_CONTROL_PLANE,
+            reason: temps_core::CONTROL_PLANE_DOCKER_REASON.to_string(),
+        });
+        let disabled = E::LocalWorkloadsDisabled {
+            name: "pg-a1b2".to_string(),
+        };
+
+        for error in [&unavailable, &disabled] {
+            // Reached through a handler's generic 500 path, it must still be
+            // classified: that catch-all is what produced the original bug.
+            let problem = external_service_problem(error, "Failed to do a thing".to_string());
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{error}");
+            assert_eq!(
+                problem.body.get("error_code").and_then(|v| v.as_str()),
+                Some(temps_core::WORKER_NODE_REQUIRED_ERROR_CODE),
+                "{error}"
+            );
+            assert_eq!(
+                problem.body.get("setup_path").and_then(|v| v.as_str()),
+                Some(temps_core::WORKER_NODE_SETUP_PATH),
+                "{error}"
+            );
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .expect("detail is always set");
+            assert!(
+                detail.ends_with(temps_core::WORKER_NODE_REQUIRED_REMEDY),
+                "the remedy must travel with the error: {detail}"
+            );
+            // The shared upgrade/start/stop mapping must agree with it.
+            let shared = upgrade_error_problem(error).expect("shared mapping classifies it");
+            assert_eq!(shared.body.get("detail"), problem.body.get("detail"));
+        }
+    }
+
+    /// Everything else keeps the caller's context and its 500.
+    #[test]
+    fn unrelated_errors_keep_their_context_and_status() {
+        let error = crate::services::ExternalServiceError::ServiceNotFoundByName {
+            name: "missing".to_string(),
+        };
+        let problem = external_service_problem(&error, "Failed to load service".to_string());
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            problem.body.get("detail").and_then(|v| v.as_str()),
+            Some("Failed to load service")
+        );
     }
 
     #[test]

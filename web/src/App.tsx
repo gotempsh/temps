@@ -27,6 +27,13 @@ import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
+import { problemSetupPath } from '@/lib/api-problem'
+import {
+  WORKER_NODE_REQUIRED_ERROR_CODE,
+  WORKER_NODE_REQUIRED_MESSAGE,
+  WORKER_NODE_REQUIRED_TITLE,
+  sameOriginSetupPath,
+} from '@/lib/worker-nodes'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { Header } from './components/dashboard/Header'
@@ -1140,6 +1147,26 @@ const queryClient = new QueryClient({
           (problemDetails as ProblemDetails & { error_code?: string })
             .error_code ?? problemDetails.extensions?.error_code
         if (errorCode === 'STEP_UP_REQUIRED') return
+
+        // Nothing can run the work: this installation has no local Docker and
+        // no worker node has joined. The raw detail is accurate but leaves the
+        // operator to work out what to do, so surface the fix as an action.
+        // `window.location` rather than the router: this handler is defined
+        // outside the Router, and a worker-node refusal means the current page
+        // cannot do anything useful anyway.
+        if (errorCode === WORKER_NODE_REQUIRED_ERROR_CODE) {
+          const setupPath = sameOriginSetupPath(
+            problemSetupPath(problemDetails)
+          )
+          toast.error(WORKER_NODE_REQUIRED_TITLE, {
+            description: problemDetails.detail || WORKER_NODE_REQUIRED_MESSAGE,
+            action: {
+              label: 'Add worker node',
+              onClick: () => window.location.assign(setupPath),
+            },
+          })
+          return
+        }
 
         // Get custom error title
         const customTitle = getErrorTitle(context, problemDetails.title)

@@ -1029,6 +1029,20 @@ impl RustfsService {
     }
 }
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl RustfsService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        let schema = schemars::schema_for!(RustfsInputConfig);
+        serde_json::to_value(schema).ok()
+    }
+}
+
 #[async_trait]
 impl ExternalService for RustfsService {
     /// Restart the RustFS container so that the `metrics_ingest_key` stored in
@@ -1285,8 +1299,7 @@ impl ExternalService for RustfsService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        let schema = schemars::schema_for!(RustfsInputConfig);
-        serde_json::to_value(schema).ok()
+        Self::parameter_schema()
     }
 
     async fn start(&self) -> Result<()> {

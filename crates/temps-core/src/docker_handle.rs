@@ -26,7 +26,11 @@
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use bollard::Docker;
+
+use crate::error_builder::ErrorBuilder;
+use crate::problemdetails::Problem;
 
 /// A path that needs the local Docker daemon ran in a process that has none.
 ///
@@ -133,6 +137,65 @@ pub const CONTROL_PLANE_DOCKER_REASON: &str =
     "it was started with `--profile control-plane`, which runs no local workloads and \
      never connects to a Docker daemon";
 
+/// Machine-readable code every "this needs a Docker daemon" response carries,
+/// so a client can branch on the condition without parsing prose.
+pub const WORKER_NODE_REQUIRED_ERROR_CODE: &str = "WORKER_NODE_REQUIRED";
+
+/// Console path that fixes the condition: where an operator joins a worker
+/// node. Returned as a `setup_path` extension on the Problem so the UI can
+/// deep-link straight to the remedy instead of hard-coding a route.
+pub const WORKER_NODE_SETUP_PATH: &str = "/settings/nodes";
+
+/// Title shared by every such response.
+pub const WORKER_NODE_REQUIRED_TITLE: &str = "This control plane runs no local workloads";
+
+/// The one sentence that turns the diagnosis into an action. A self-hosted
+/// operator has nobody to ask, so the remedy travels with the error.
+pub const WORKER_NODE_REQUIRED_REMEDY: &str =
+    "Add a worker node to run containers, builds and services, then retry.";
+
+/// RFC 7807 `type` URI for the condition.
+pub const WORKER_NODE_REQUIRED_TYPE: &str = "https://temps.sh/probs/worker-node-required";
+
+/// Build the canonical Problem for "this operation needs a Docker daemon and
+/// this process has none".
+///
+/// Every handler that can surface a [`DockerUnavailable`] must route through
+/// this (directly, or via the `From` impls below) so the status code, the
+/// `error_code`, the title and the remedy sentence are identical everywhere.
+/// The alternative — each crate inventing its own mapping — is what produced
+/// a 500 on one endpoint, a 409 on another and a 503 on a third for the exact
+/// same condition.
+///
+/// `message` is the diagnosis (what was attempted and why it cannot work
+/// here); the remedy sentence is appended by this function.
+pub fn worker_node_required_problem(message: impl AsRef<str>) -> Problem {
+    ErrorBuilder::new(StatusCode::CONFLICT)
+        .type_(WORKER_NODE_REQUIRED_TYPE)
+        .title(WORKER_NODE_REQUIRED_TITLE)
+        .detail(format!(
+            "{}. {}",
+            message.as_ref().trim_end_matches('.'),
+            WORKER_NODE_REQUIRED_REMEDY
+        ))
+        .instance("/error/worker-node-required")
+        .value("error_code", WORKER_NODE_REQUIRED_ERROR_CODE)
+        .value("setup_path", WORKER_NODE_SETUP_PATH)
+        .build()
+}
+
+impl From<DockerUnavailable> for Problem {
+    fn from(error: DockerUnavailable) -> Self {
+        worker_node_required_problem(error.to_string())
+    }
+}
+
+impl From<&DockerUnavailable> for Problem {
+    fn from(error: &DockerUnavailable) -> Self {
+        worker_node_required_problem(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +224,57 @@ mod tests {
         let from_require = handle.require().expect_err("disabled").to_string();
         let standalone = handle.unavailable_error().expect("disabled").to_string();
         assert_eq!(from_require, standalone);
+    }
+
+    #[test]
+    fn docker_unavailable_maps_to_a_worker_node_required_conflict() {
+        let error =
+            DockerHandle::disabled(crate::PROFILE_CONTROL_PLANE, CONTROL_PLANE_DOCKER_REASON)
+                .require()
+                .expect_err("disabled");
+
+        let problem = Problem::from(&error);
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("error_code").and_then(|v| v.as_str()),
+            Some(WORKER_NODE_REQUIRED_ERROR_CODE)
+        );
+        assert_eq!(
+            problem.body.get("setup_path").and_then(|v| v.as_str()),
+            Some(WORKER_NODE_SETUP_PATH)
+        );
+        assert_eq!(
+            problem.body.get("title").and_then(|v| v.as_str()),
+            Some(WORKER_NODE_REQUIRED_TITLE)
+        );
+
+        // The detail must carry both halves: what happened, and what to do.
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("detail is always set");
+        assert!(detail.contains("control-plane"), "{detail}");
+        assert!(detail.ends_with(WORKER_NODE_REQUIRED_REMEDY), "{detail}");
+
+        // Owned and borrowed conversions must not drift apart.
+        let owned = Problem::from(error);
+        assert_eq!(owned.body.get("detail"), problem.body.get("detail"));
+    }
+
+    #[test]
+    fn worker_node_required_problem_does_not_double_the_full_stop() {
+        let problem = worker_node_required_problem("Docker is required for this operation.");
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("detail is always set");
+        assert_eq!(
+            detail,
+            format!("Docker is required for this operation. {WORKER_NODE_REQUIRED_REMEDY}")
+        );
     }
 
     #[test]

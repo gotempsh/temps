@@ -3705,6 +3705,67 @@ impl MariaDbService {
     }
 }
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl MariaDbService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        let schema = schemars::schema_for!(MariaDbInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                let editable = match key.as_str() {
+                    "port" => true,
+                    "docker_image" => true,
+                    // PITR granularity can be tuned at runtime: the archiver
+                    // picks up a new cadence live; the derived
+                    // binlog_expire_logs_seconds takes effect on next recreate.
+                    "binlog_archive_interval" => true,
+                    "size_profile" => false,
+                    "host" | "database" | "username" | "password" | "root_password" => false,
+                    _ => false,
+                };
+
+                if let Some(prop) = properties.get_mut(&key).and_then(|p| p.as_object_mut()) {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+
+            properties.insert(
+                    "size_profile".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "MariaDB resource/tuning profile. Small is the default for shared 4 GiB and 8 GiB Temps hosts; linked projects get separate databases inside this service.",
+                        "default": "small",
+                        "enum": ["small", "standard", "dedicated"],
+                        "x-editable": false
+                    }),
+                );
+
+            properties.insert(
+                    "binlog_archive_interval".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "Point-in-time-recovery granularity: how often binary logs are shipped to S3. Smaller intervals lose less data on restore (lower RPO) but upload more often. The worst-case data loss on restore is one interval.",
+                        "default": "5m",
+                        "enum": ["1m", "5m", "15m", "60m"],
+                        "x-editable": true
+                    }),
+                );
+        }
+
+        Some(schema_json)
+    }
+}
+
 #[async_trait]
 impl ExternalService for MariaDbService {
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
@@ -3830,55 +3891,7 @@ impl ExternalService for MariaDbService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        let schema = schemars::schema_for!(MariaDbInputConfig);
-        let mut schema_json = serde_json::to_value(schema).ok()?;
-
-        if let Some(properties) = schema_json
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
-            for key in properties.keys().cloned().collect::<Vec<_>>() {
-                let editable = match key.as_str() {
-                    "port" => true,
-                    "docker_image" => true,
-                    // PITR granularity can be tuned at runtime: the archiver
-                    // picks up a new cadence live; the derived
-                    // binlog_expire_logs_seconds takes effect on next recreate.
-                    "binlog_archive_interval" => true,
-                    "size_profile" => false,
-                    "host" | "database" | "username" | "password" | "root_password" => false,
-                    _ => false,
-                };
-
-                if let Some(prop) = properties.get_mut(&key).and_then(|p| p.as_object_mut()) {
-                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
-                }
-            }
-
-            properties.insert(
-                "size_profile".to_string(),
-                serde_json::json!({
-                    "type": "string",
-                    "description": "MariaDB resource/tuning profile. Small is the default for shared 4 GiB and 8 GiB Temps hosts; linked projects get separate databases inside this service.",
-                    "default": "small",
-                    "enum": ["small", "standard", "dedicated"],
-                    "x-editable": false
-                }),
-            );
-
-            properties.insert(
-                "binlog_archive_interval".to_string(),
-                serde_json::json!({
-                    "type": "string",
-                    "description": "Point-in-time-recovery granularity: how often binary logs are shipped to S3. Smaller intervals lose less data on restore (lower RPO) but upload more often. The worst-case data loss on restore is one interval.",
-                    "default": "5m",
-                    "enum": ["1m", "5m", "15m", "60m"],
-                    "x-editable": true
-                }),
-            );
-        }
-
-        Some(schema_json)
+        Self::parameter_schema()
     }
 
     async fn start(&self) -> Result<()> {

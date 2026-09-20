@@ -27,11 +27,11 @@ impl From<PlatformInfoError> for Problem {
             // no daemon.  This is a client-visible conflict — the client
             // should consult the /platform/features endpoint instead of
             // retrying, and join a worker node if they need container
-            // platform info.
+            // platform info.  Routed through the shared mapping in
+            // `temps_core` so the status, `error_code`, title, remedy and
+            // `setup_path` match every other endpoint that can hit it.
             PlatformInfoError::DockerUnavailable { .. } => {
-                problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("Docker Unavailable")
-                    .with_detail(err.to_string())
+                temps_core::worker_node_required_problem(err.to_string())
             }
 
             // Docker daemon connectivity / protocol errors.

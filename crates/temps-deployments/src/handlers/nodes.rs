@@ -445,6 +445,7 @@ pub struct ClusterDnsStatusResponse {
         admin_drain_status,
         cluster_dns_status,
         node_docker_disk_usage,
+        node_capability,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -468,6 +469,7 @@ pub struct ClusterDnsStatusResponse {
         ClusterDnsStatusResponse,
         DockerDiskUsage,
         DockerDiskUsageCategory,
+        NodeCapabilityResponse,
     )),
     info(
         title = "Node Registration API",
@@ -532,6 +534,9 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // Literal segment, so it can never be shadowed by the `{node_id}`
+        // routes below it.
+        .route("/nodes/capability", get(node_capability))
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -2130,6 +2135,69 @@ async fn node_docker_disk_usage(
         .map_err(Problem::from)?;
 
     Ok(Json(usage))
+}
+
+/// Whether this installation can run a workload anywhere, and if not, why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeCapabilityResponse {
+    /// Whether the control plane itself may run containers, builds and
+    /// managed services (false in the `control-plane` serve profile).
+    pub local_workloads: bool,
+    /// Worker nodes that are active and heartbeating. Excludes the control
+    /// plane, which `local_workloads` already reports.
+    pub active_worker_nodes: u32,
+    /// Whether a workload can be placed at all.
+    pub schedulable: bool,
+    /// Why nothing can be placed, when `schedulable` is false. Rendered
+    /// verbatim by the client.
+    pub reason: Option<String>,
+    /// Console path that fixes it: where an operator joins a worker node.
+    pub setup_path: String,
+}
+
+/// Report whether this install can schedule workloads.
+///
+/// A control plane with no local workloads and no joined worker node accepts
+/// deploys it can never run. Rather than letting every surface learn that by
+/// failing, this endpoint states it up front so the console can render an
+/// onboarding state with a link to join a node — and so a client can tell
+/// "not set up" apart from "not built", which a 404 or a 500 cannot.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/capability",
+    operation_id = "NodeCapabilityGet",
+    responses(
+        (status = 200, description = "Scheduling capability of this install", body = NodeCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_capability(
+    RequireAuth(_auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Deliberately no permission beyond a session: this answers "can this
+    // installation run anything at all", which every user who can open the
+    // Projects page needs before they try to deploy. It discloses one
+    // boolean, a count and a fixed remedy -- not the node inventory, which
+    // stays behind SettingsRead on the list endpoint.
+
+    let capability = app_state
+        .node_scheduler
+        .scheduling_capability()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(NodeCapabilityResponse {
+        local_workloads: capability.local_workloads,
+        active_worker_nodes: capability.active_worker_nodes,
+        schedulable: capability.schedulable,
+        reason: capability.reason,
+        setup_path: crate::services::NODE_SETUP_PATH.to_string(),
+    }))
 }
 
 impl From<DockerDiskUsageError> for Problem {
