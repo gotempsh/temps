@@ -2199,6 +2199,49 @@ impl MongodbService {
     }
 }
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl MongodbService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        // Generate JSON Schema from MongodbInputConfig
+        let schema = schemars::schema_for!(MongodbInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,        // Don't change host after creation
+                    "port" => true,         // Port can be changed
+                    "database" => false,    // Don't change database name after creation
+                    "username" => false,    // Don't change username after creation
+                    "password" => false,    // Password is auto-generated and cannot be changed
+                    "docker_image" => true, // Docker image can be upgraded
+                    // One-way: standalone -> replica set is supported in-place.
+                    // The merge_updates strategy rejects unsetting or renaming.
+                    "replica_set" => true,
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
+    }
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
@@ -2393,37 +2436,7 @@ impl ExternalService for MongodbService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        // Generate JSON Schema from MongodbInputConfig
-        let schema = schemars::schema_for!(MongodbInputConfig);
-        let mut schema_json = serde_json::to_value(schema).ok()?;
-
-        // Add metadata about which fields are editable
-        if let Some(properties) = schema_json
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
-            for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable
-                let editable = match key.as_str() {
-                    "host" => false,        // Don't change host after creation
-                    "port" => true,         // Port can be changed
-                    "database" => false,    // Don't change database name after creation
-                    "username" => false,    // Don't change username after creation
-                    "password" => false,    // Password is auto-generated and cannot be changed
-                    "docker_image" => true, // Docker image can be upgraded
-                    // One-way: standalone -> replica set is supported in-place.
-                    // The merge_updates strategy rejects unsetting or renaming.
-                    "replica_set" => true,
-                    _ => false,
-                };
-
-                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
-                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
-                }
-            }
-        }
-
-        Some(schema_json)
+        Self::parameter_schema()
     }
 
     async fn start(&self) -> Result<()> {

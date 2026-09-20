@@ -166,6 +166,52 @@ const MAX_CROSS_BUILD_PLATFORMS: usize = 4;
 /// Docker daemon explicitly.
 pub const CONTROL_PLANE_NODE_ID: i32 = 0;
 
+/// Console path an operator visits to join a worker node.
+///
+/// Shipped in the capability response so the client deep-links to the fix
+/// instead of hard-coding a route that can move.
+pub const NODE_SETUP_PATH: &str = temps_core::WORKER_NODE_SETUP_PATH;
+
+/// Whether this installation can place a workload anywhere at all.
+///
+/// A control plane with `--profile control-plane` and no joined worker node
+/// can accept a deployment request and then never start anything. Rather than
+/// letting each surface discover that by failing, this is published up front
+/// so the console can render an onboarding state ("no worker node has joined
+/// yet", with a link to join one) instead of an empty or broken screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulingCapability {
+    /// Whether the control plane itself may run containers.
+    pub local_workloads: bool,
+    /// Worker nodes that are `active` and have heartbeated recently. Excludes
+    /// the control plane, which is never a row in `nodes`.
+    pub active_worker_nodes: u32,
+    /// Whether any workload can be placed: local workloads, or ≥1 worker.
+    pub schedulable: bool,
+    /// Why nothing can be scheduled, when `schedulable` is false.
+    pub reason: Option<String>,
+}
+
+impl SchedulingCapability {
+    /// The one sentence shown when nothing can be scheduled. Stated as a fact
+    /// about this install, not as an error, because it is the expected state
+    /// of a freshly-installed control plane.
+    pub const NO_TARGET_REASON: &'static str =
+        "This control plane runs no local workloads and no worker node has joined yet.";
+
+    /// Derive the capability from its two inputs. Pure, so the rule lives in
+    /// one place and is testable without a database.
+    pub fn evaluate(local_workloads: bool, active_worker_nodes: u32) -> Self {
+        let schedulable = local_workloads || active_worker_nodes > 0;
+        Self {
+            local_workloads,
+            active_worker_nodes,
+            schedulable,
+            reason: (!schedulable).then(|| Self::NO_TARGET_REASON.to_string()),
+        }
+    }
+}
+
 /// Schedules replicas across available nodes using resource-aware placement.
 ///
 /// Default strategy is `LeastLoaded`: each replica is assigned to the node
@@ -240,6 +286,30 @@ impl NodeScheduler {
     /// Whether this scheduler may place replicas on the control plane itself.
     pub fn local_workloads_enabled(&self) -> bool {
         self.local_workloads_enabled
+    }
+
+    /// Whether anything can be scheduled right now, and why not if it can't.
+    ///
+    /// Counts the same active worker nodes the placement path considers (same
+    /// heartbeat threshold), so the answer the console shows cannot disagree
+    /// with what a deploy would actually do. The control plane is excluded
+    /// from the count: it is not a `nodes` row, and `local_workloads` already
+    /// reports it.
+    pub async fn scheduling_capability(&self) -> Result<SchedulingCapability, NodeError> {
+        let nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+
+        let active_worker_nodes = nodes
+            .iter()
+            .filter(|node| node.id != CONTROL_PLANE_NODE_ID && node.role != "control-plane")
+            .count() as u32;
+
+        Ok(SchedulingCapability::evaluate(
+            self.local_workloads_enabled,
+            active_worker_nodes,
+        ))
     }
 
     /// Resolve the control plane's platform from the live image builder, so a
@@ -1163,6 +1233,75 @@ mod tests {
         MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![nodes_list])
             .into_connection()
+    }
+
+    // ── Scheduling capability (onboarding surface) ───────────────────────
+
+    #[test]
+    fn capability_is_schedulable_when_local_workloads_are_allowed() {
+        let capability = SchedulingCapability::evaluate(true, 0);
+        assert!(capability.schedulable);
+        assert_eq!(capability.active_worker_nodes, 0);
+        assert!(capability.reason.is_none());
+    }
+
+    #[test]
+    fn capability_is_schedulable_when_a_worker_has_joined() {
+        let capability = SchedulingCapability::evaluate(false, 1);
+        assert!(capability.schedulable);
+        assert!(capability.reason.is_none());
+    }
+
+    #[test]
+    fn capability_explains_itself_when_nothing_can_run() {
+        let capability = SchedulingCapability::evaluate(false, 0);
+        assert!(!capability.schedulable);
+        // The client renders this verbatim; an empty reason would leave a
+        // self-hosted operator with a dead console and no explanation.
+        assert_eq!(
+            capability.reason.as_deref(),
+            Some(SchedulingCapability::NO_TARGET_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_counts_active_workers_and_ignores_the_control_plane() {
+        let mut control_plane = make_node(CONTROL_PLANE_NODE_ID, "control-plane");
+        control_plane.role = "control-plane".to_string();
+
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![control_plane, make_node(1, "worker-1")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let capability = scheduler
+            .scheduling_capability()
+            .await
+            .expect("mock query succeeds");
+
+        assert_eq!(capability.active_worker_nodes, 1);
+        assert!(capability.schedulable);
+        assert!(!capability.local_workloads);
+    }
+
+    #[tokio::test]
+    async fn capability_reports_a_control_plane_with_no_workers_as_unschedulable() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let capability = scheduler
+            .scheduling_capability()
+            .await
+            .expect("mock query succeeds");
+
+        assert_eq!(capability.active_worker_nodes, 0);
+        assert!(!capability.schedulable);
+        assert_eq!(
+            capability.reason.as_deref(),
+            Some(SchedulingCapability::NO_TARGET_REASON)
+        );
     }
 
     // ── Architecture-aware scheduling ────────────────────────────────────

@@ -146,6 +146,17 @@ pub enum DeploymentError {
         reason: String,
     },
 
+    /// A container operation was asked of a process that has no local Docker
+    /// daemon (e.g. a control plane started with `--profile control-plane`).
+    ///
+    /// Kept distinct from [`Self::ContainerOperation`] on purpose: that
+    /// variant stringifies its cause into a generic 500, which turned "this
+    /// host runs no containers, join a worker node" into an opaque server
+    /// error. This one is mapped to the shared 409 `WORKER_NODE_REQUIRED`
+    /// problem, so the response tells the operator what to do.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
     #[error("Container exec for {container_id} timed out after {timeout_seconds} seconds")]
     ContainerExecTimeout {
         container_id: String,
@@ -172,9 +183,6 @@ pub enum DeploymentError {
 
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
-
-    #[error(transparent)]
-    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 
     #[error("Other error: {0}")]
     Other(String),

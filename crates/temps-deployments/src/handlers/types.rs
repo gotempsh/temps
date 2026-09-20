@@ -37,6 +37,10 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// Placement policy for this process, used by the node capability
+    /// endpoint to answer "can anything run here?" with the same rules the
+    /// deploy path applies.
+    pub node_scheduler: Arc<crate::services::NodeScheduler>,
     /// Encryption service for decrypting node tokens (used by drain to stop remote containers)
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Config service — gives drain/exit-facing handlers access to the cluster

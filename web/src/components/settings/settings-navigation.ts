@@ -15,7 +15,6 @@ import {
   Key,
   KeyRound,
   Monitor,
-  Network,
   Puzzle,
   Server,
   Settings2,
@@ -96,12 +95,10 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         url: '/settings/request-timeouts',
         icon: Clock,
       },
-      {
-        title: 'Worker Nodes',
-        url: '/settings/nodes',
-        icon: Network,
-        featureKey: 'multi-node-worker-join',
-      },
+      // Worker Nodes deliberately is NOT here: it is a main-navigation page
+      // under "Build & deliver" (see components/dashboard/Sidebar.tsx). It
+      // keeps the /settings/nodes URL, and the sidebar excludes that route
+      // from the settings swap so the page renders with the normal shell.
       {
         title: 'Traefik Discovery',
         url: '/settings/traefik-discovery',

@@ -119,11 +119,11 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::S3 { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("S3 Error")
                 .with_detail(error.to_string()),
-            LogAggregatorError::DockerUnavailable(_) => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Docker Unavailable")
-                    .with_detail(error.to_string())
-            }
+            // Not a 503: retrying never helps, because this process will never
+            // grow a Docker daemon. It is a 409 with the same error code and
+            // remedy every other endpoint returns for the condition — the
+            // single mapping lives in `temps_core`.
+            LogAggregatorError::DockerUnavailable(ref e) => Problem::from(e),
         }
     }
 }

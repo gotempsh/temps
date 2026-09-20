@@ -2900,6 +2900,57 @@ fn postgres_recovery_target_setting(recovery_target: Option<&super::RecoveryTarg
 /// Internal port used by PostgreSQL inside the container
 const POSTGRES_INTERNAL_PORT: &str = "5432";
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl PostgresService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        // Generate JSON Schema from PostgresInputConfig
+        let schema = schemars::schema_for!(PostgresInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // `PostgresInputConfig` can deserialize absent values with defaults, but
+        // service creation deliberately requires callers to choose the database
+        // and username explicitly (see `PostgresParameterStrategy`). Schemars
+        // interprets serde defaults as "optional", so without this correction
+        // the public service-type schema contradicts the creation validator.
+        // The dashboard and AI both consume this schema; publishing the wrong
+        // required set makes them learn by failing POST /external-services.
+        schema_json["required"] = serde_json::json!(["database", "username"]);
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,           // Don't change host after creation
+                    "port" => true,            // Port can be changed
+                    "database" => false,       // Don't change database name after creation
+                    "username" => false,       // Don't change username after creation
+                    "password" => true,        // Password can be changed by user
+                    "max_connections" => true, // Max connections can be adjusted
+                    "ssl_mode" => true,        // SSL mode can be changed
+                    "docker_image" => true,    // Docker image can be upgraded
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
+    }
+}
+
 #[async_trait]
 impl ExternalService for PostgresService {
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
@@ -3249,45 +3300,7 @@ impl ExternalService for PostgresService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        // Generate JSON Schema from PostgresInputConfig
-        let schema = schemars::schema_for!(PostgresInputConfig);
-        let mut schema_json = serde_json::to_value(schema).ok()?;
-
-        // `PostgresInputConfig` can deserialize absent values with defaults, but
-        // service creation deliberately requires callers to choose the database
-        // and username explicitly (see `PostgresParameterStrategy`). Schemars
-        // interprets serde defaults as "optional", so without this correction
-        // the public service-type schema contradicts the creation validator.
-        // The dashboard and AI both consume this schema; publishing the wrong
-        // required set makes them learn by failing POST /external-services.
-        schema_json["required"] = serde_json::json!(["database", "username"]);
-
-        // Add metadata about which fields are editable
-        if let Some(properties) = schema_json
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
-            for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable
-                let editable = match key.as_str() {
-                    "host" => false,           // Don't change host after creation
-                    "port" => true,            // Port can be changed
-                    "database" => false,       // Don't change database name after creation
-                    "username" => false,       // Don't change username after creation
-                    "password" => true,        // Password can be changed by user
-                    "max_connections" => true, // Max connections can be adjusted
-                    "ssl_mode" => true,        // SSL mode can be changed
-                    "docker_image" => true,    // Docker image can be upgraded
-                    _ => false,
-                };
-
-                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
-                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
-                }
-            }
-        }
-
-        Some(schema_json)
+        Self::parameter_schema()
     }
 
     async fn start(&self) -> Result<()> {

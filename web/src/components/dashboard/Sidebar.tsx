@@ -39,6 +39,7 @@ import {
   LogOut,
   Monitor,
   Moon,
+  Network,
   Search,
   ScrollText,
   MessageSquare,
@@ -59,6 +60,7 @@ import { usePluginsContext } from '@/contexts/PluginsContext'
 import { isPlatformToolsRoute } from '@/lib/platform-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
@@ -109,6 +111,17 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
       { title: 'Projects', url: '/projects', icon: Folder },
       { title: 'Git providers', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
+      // Lives under the /settings/nodes URL for historical reasons, but it is
+      // a build-and-deliver capability: without a worker node a control plane
+      // that runs no local workloads cannot build or deploy anything. See
+      // WORKER_NODES_URL below for why the sidebar does not treat it as a
+      // settings route.
+      {
+        title: 'Worker Nodes',
+        url: WORKER_NODES_URL,
+        icon: Network,
+        featureKey: 'multi-node-worker-join',
+      },
     ],
   },
   {
@@ -342,7 +355,13 @@ export default function AppSidebar() {
   //   /projects/:slug/* → project nav  (back → default)
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
-  const settingsMode = location.pathname.startsWith('/settings')
+  // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
+  // page ("Build & deliver"). Swapping to the settings sidebar there would
+  // hide the entry that is currently active and highlight nothing, so the
+  // route is explicitly excluded from the settings swap.
+  const settingsMode =
+    location.pathname.startsWith('/settings') &&
+    !location.pathname.startsWith(WORKER_NODES_URL)
   const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
   const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =

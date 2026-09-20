@@ -12,6 +12,7 @@ import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboa
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
+import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -191,6 +192,9 @@ export function Projects() {
           </>
         }
       />
+
+      {/* Nothing here can be built or deployed until something can run it. */}
+      <WorkerNodeRequiredBanner />
 
       {(projectsData?.total ?? 0) > 0 && <OnboardingNextStepCard />}
 

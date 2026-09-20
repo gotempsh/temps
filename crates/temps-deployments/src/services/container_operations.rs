@@ -111,7 +111,15 @@ impl ContainerOperations for LocalContainerOperations {
                 },
             )
             .await
-            .map_err(|error| Self::operation_error(container_id, "log stream", error))?;
+            .map_err(|error| match error {
+                // Preserve the typed "no local daemon" signal instead of
+                // stringifying it into a generic container-operation failure:
+                // the handler maps it to the shared 409 that names the remedy.
+                temps_logs::DockerLogError::DockerUnavailable(unavailable) => {
+                    DeploymentError::DockerUnavailable(unavailable)
+                }
+                error => Self::operation_error(container_id, "log stream", error),
+            })?;
 
         let mapped =
             stream.map(|item| item.map_err(|error| std::io::Error::other(error.to_string())));

@@ -6,9 +6,22 @@ import {
   mergeSettingsNavigationGroups,
   settingsNavigationGroups,
 } from './settings-navigation'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 
 const labels = (groups: ReturnType<typeof mergeSettingsNavigationGroups>) =>
   groups.map((g) => g.label)
+
+describe('settingsNavigationGroups', () => {
+  it('does not list Worker Nodes — it belongs to the main navigation', () => {
+    // The page keeps its /settings/nodes URL but is reachable from
+    // "Build & deliver". Re-adding it here would list it twice in Cmd+K and
+    // swap the sidebar into settings mode on a main-nav page.
+    const urls = settingsNavigationGroups.flatMap((g) =>
+      g.items.map((i) => i.url)
+    )
+    expect(urls).not.toContain(WORKER_NODES_URL)
+  })
+})
 
 describe('mergeSettingsNavigationGroups', () => {
   it('returns the built-in groups untouched when there are no extensions', () => {

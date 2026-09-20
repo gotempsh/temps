@@ -445,6 +445,7 @@ pub struct ClusterDnsStatusResponse {
         admin_drain_status,
         cluster_dns_status,
         node_docker_disk_usage,
+        node_capability,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -468,6 +469,7 @@ pub struct ClusterDnsStatusResponse {
         ClusterDnsStatusResponse,
         DockerDiskUsage,
         DockerDiskUsageCategory,
+        NodeCapabilityResponse,
     )),
     info(
         title = "Node Registration API",
@@ -532,6 +534,9 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // Literal segment, so it can never be shadowed by the `{node_id}`
+        // routes below it.
+        .route("/nodes/capability", get(node_capability))
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -2132,6 +2137,95 @@ async fn node_docker_disk_usage(
     Ok(Json(usage))
 }
 
+/// Whether this installation can run a workload anywhere, and if not, why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeCapabilityResponse {
+    /// Whether the control plane itself may run containers, builds and
+    /// managed services (false in the `control-plane` serve profile).
+    pub local_workloads: bool,
+    /// Worker nodes that are active and heartbeating. Excludes the control
+    /// plane, which `local_workloads` already reports.
+    pub active_worker_nodes: u32,
+    /// Whether a workload can be placed at all.
+    pub schedulable: bool,
+    /// Why nothing can be placed, when `schedulable` is false. Rendered
+    /// verbatim by the client.
+    pub reason: Option<String>,
+    /// Console path that fixes it: where an operator joins a worker node.
+    pub setup_path: String,
+    /// Whether *this caller* can act on `setup_path`.
+    ///
+    /// The capability itself is readable by every authenticated session, but
+    /// the remedy is not: the Worker Nodes page needs `SettingsRead` to list
+    /// the node inventory and `SettingsWrite` to mint an enrollment token.
+    /// Sending a caller without both to that page produces "Failed to load
+    /// worker nodes" — an advertised fix that denies the user who followed it.
+    /// Clients render a non-admin variant ("ask an administrator") when this
+    /// is false rather than a dead link.
+    pub can_manage_nodes: bool,
+}
+
+/// Whether `auth` can actually add a worker node, not merely learn that one is
+/// needed.
+///
+/// Mirrors the guards the Worker Nodes surfaces already apply —
+/// `permission_guard!(auth, SettingsRead)` on the node list in this module and
+/// `permission_guard!(auth, SettingsWrite)` on enrollment-token creation — so
+/// the console never advertises an action the API would refuse.
+fn can_manage_worker_nodes(auth: &temps_auth::AuthContext) -> bool {
+    auth.has_permission(&temps_auth::Permission::SettingsRead)
+        && auth.has_permission(&temps_auth::Permission::SettingsWrite)
+}
+
+/// Report whether this install can schedule workloads.
+///
+/// A control plane with no local workloads and no joined worker node accepts
+/// deploys it can never run. Rather than letting every surface learn that by
+/// failing, this endpoint states it up front so the console can render an
+/// onboarding state with a link to join a node — and so a client can tell
+/// "not set up" apart from "not built", which a 404 or a 500 cannot.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/capability",
+    operation_id = "NodeCapabilityGet",
+    responses(
+        (status = 200, description = "Scheduling capability of this install", body = NodeCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Deliberately no permission beyond a session: this answers "can this
+    // installation run anything at all", which every user who can open the
+    // Projects page needs before they try to deploy. It discloses one
+    // boolean, a count and a fixed remedy -- not the node inventory, which
+    // stays behind SettingsRead on the list endpoint.
+    //
+    // Whether the caller can *act* on the remedy is a different question, and
+    // one the client cannot answer on its own, so it is reported here.
+
+    let capability = app_state
+        .node_scheduler
+        .scheduling_capability()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(NodeCapabilityResponse {
+        local_workloads: capability.local_workloads,
+        active_worker_nodes: capability.active_worker_nodes,
+        schedulable: capability.schedulable,
+        reason: capability.reason,
+        setup_path: crate::services::NODE_SETUP_PATH.to_string(),
+        can_manage_nodes: can_manage_worker_nodes(&auth),
+    }))
+}
+
 impl From<DockerDiskUsageError> for Problem {
     fn from(error: DockerDiskUsageError) -> Self {
         match error {
@@ -3002,6 +3096,82 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Capability: who can act on the advertised remedy ────────────────
+
+    fn sample_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An admin follows "Add worker node" to a page that works.
+    #[test]
+    fn capability_lets_an_admin_add_a_worker_node() {
+        let auth = temps_auth::AuthContext::new_session(sample_user(), temps_auth::Role::Admin);
+        assert!(can_manage_worker_nodes(&auth));
+    }
+
+    /// A regular project user can see *that* a worker node is needed — that is
+    /// why the endpoint needs no permission — but must not be handed an action
+    /// that lands on "Failed to load worker nodes".
+    #[test]
+    fn capability_does_not_offer_a_regular_user_an_action_they_cannot_take() {
+        for role in [
+            temps_auth::Role::User,
+            temps_auth::Role::Reader,
+            temps_auth::Role::ApiReader,
+        ] {
+            let auth = temps_auth::AuthContext::new_session(sample_user(), role.clone());
+            assert!(
+                !can_manage_worker_nodes(&auth),
+                "role {role} must not be offered the add-worker-node action"
+            );
+        }
+    }
+
+    /// Read-only settings access is not enough: minting an enrollment token is
+    /// a `SettingsWrite` operation, so the page would half-work.
+    #[test]
+    fn capability_requires_settings_write_not_just_read() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![temps_auth::Permission::SettingsRead]),
+            "read-only".to_string(),
+            7,
+        );
+        assert!(!can_manage_worker_nodes(&auth));
+
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsRead,
+                temps_auth::Permission::SettingsWrite,
+            ]),
+            "node-admin".to_string(),
+            8,
+        );
+        assert!(can_manage_worker_nodes(&auth));
+    }
 
     fn sample_node() -> nodes::Model {
         nodes::Model {

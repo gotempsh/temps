@@ -10,6 +10,16 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
+import {
+  useInvalidateNodeCapability,
+  useNodeCapability,
+} from '@/hooks/useNodeCapability'
+import {
+  canAddWorkerNode,
+  shouldPromptForFirstWorkerNode,
+  WORKER_NODES_URL,
+} from '@/lib/worker-nodes'
 import {
   Table,
   TableBody,
@@ -848,8 +858,7 @@ export function NodeDetailPage() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Worker Nodes', href: '/settings/nodes' },
+      { label: 'Worker Nodes', href: WORKER_NODES_URL },
       { label: nodeData?.name ?? `Node ${nodeId}` },
     ])
   }, [setBreadcrumbs, nodeData?.name, nodeId])
@@ -881,6 +890,10 @@ function NodeDetail({
   onBack: () => void
 }) {
   const queryClient = useQueryClient()
+  // Draining, removing or reactivating a node changes what this installation
+  // can schedule, so the capability every page's banner reads is stale the
+  // moment one of those succeeds.
+  const invalidateCapability = useInvalidateNodeCapability()
   const [showDrainDialog, setShowDrainDialog] = useState(false)
   const [showRemoveDialog, setShowRemoveDialog] = useState(false)
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
@@ -944,6 +957,7 @@ function NodeDetail({
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
+      invalidateCapability()
     } catch {
       toast.error('Failed to drain node')
     } finally {
@@ -967,6 +981,7 @@ function NodeDetail({
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
+      invalidateCapability()
       onBack()
     } catch {
       toast.error('Failed to remove node')
@@ -994,6 +1009,7 @@ function NodeDetail({
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
+      invalidateCapability()
     } catch {
       toast.error('Failed to undrain node')
     } finally {
@@ -1544,13 +1560,26 @@ export function NodesPage() {
     ...adminListNodesOptions(),
     refetchInterval: 30_000,
   })
+  const { data: capability } = useNodeCapability()
+  const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
+  const nodeCount = nodes.length
+  // "No nodes" means two very different things. With local workloads the
+  // control plane runs everything itself and worker nodes are optional
+  // scale-out; without them nothing can run at all and this page is the
+  // onboarding step the operator must complete.
+  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, nodeCount)
+
+  // This list polls, so it is the first thing in the console to learn that a
+  // worker finished `temps join` (or dropped out). Re-read the capability
+  // whenever the roster changes so this page — and the banner every other
+  // page renders from the same cache entry — stops contradicting it.
+  useEffect(() => {
+    invalidateCapability()
+  }, [nodeCount, invalidateCapability])
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Worker Nodes' },
-    ])
+    setBreadcrumbs([{ label: 'Worker Nodes' }])
   }, [setBreadcrumbs])
 
   usePageTitle('Worker Nodes')
@@ -1587,7 +1616,15 @@ export function NodesPage() {
         <CardContent className="space-y-6">
           <JoinTokenSection />
 
-          {nodes.length === 0 ? (
+          {needsFirstNode ? (
+            <div className="border-t pt-6">
+              <WorkerNodeRequiredAlert
+                reason={capability?.reason}
+                showSetupAction={false}
+                canManageNodes={canAddWorkerNode(capability)}
+              />
+            </div>
+          ) : nodes.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
               <Server className="h-12 w-12 text-muted-foreground mb-4" />
               <p className="text-sm font-medium">No worker nodes</p>

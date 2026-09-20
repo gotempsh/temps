@@ -637,6 +637,18 @@ impl TempsPlugin for DeploymentsPlugin {
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
 
+        // Same placement policy the deploy path uses, so the node capability
+        // endpoint cannot report "schedulable" for a process that would then
+        // refuse every replica.
+        let node_scheduler = Arc::new(
+            crate::services::NodeScheduler::new(node_service.clone()).with_local_workloads_enabled(
+                temps_core::policy_or_default(
+                    context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                )
+                .local_workloads_enabled(),
+            ),
+        );
+
         // Re-fetch encryption service for AppState (the first ref was moved into WorkflowPlanner)
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
@@ -686,6 +698,7 @@ impl TempsPlugin for DeploymentsPlugin {
             image_builder,
             audit_service,
             node_service,
+            node_scheduler,
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,

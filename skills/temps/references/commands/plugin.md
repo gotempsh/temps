@@ -26,6 +26,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | No |
 | `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
 | `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
 | `-y, --yes` | Trust the repository and allow installation without prompting | - | No |

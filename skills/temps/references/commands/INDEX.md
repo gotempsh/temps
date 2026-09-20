@@ -34,6 +34,7 @@ syntax may have changed.
 - [`webhooks`](webhooks.md)
 - [`containers`](containers.md)
 - [`cluster`](cluster.md)
+- [`nodes`](nodes.md)
 - [`tokens`](tokens.md)
 - [`errors`](errors.md)
 - [`metrics`](metrics.md)

@@ -11,6 +11,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -20,6 +21,16 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform features`
+
+Show which capabilities the server process actually provides
 
 **Options:**
 
