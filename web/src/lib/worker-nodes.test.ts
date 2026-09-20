@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import type { NodeCapability } from '@/api/nodeCapability'
+import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/types.gen'
 import {
+  canAddWorkerNode,
   isWorkerNodeRequiredProblem,
+  NODE_CAPABILITY_POLL_MS,
+  nodeCapabilityRefetchInterval,
   problemErrorCode,
   sameOriginSetupPath,
   shouldPromptForFirstWorkerNode,
@@ -19,6 +22,7 @@ function capability(overrides: Partial<NodeCapability> = {}): NodeCapability {
     schedulable: true,
     reason: null,
     setup_path: WORKER_NODES_URL,
+    can_manage_nodes: true,
     ...overrides,
   }
 }
@@ -66,6 +70,50 @@ describe('first-worker-node prompt on the Nodes page', () => {
     expect(shouldPromptForFirstWorkerNode(noLocal, 1)).toBe(false)
     expect(shouldPromptForFirstWorkerNode(capability(), 0)).toBe(false)
     expect(shouldPromptForFirstWorkerNode(undefined, 0)).toBe(false)
+  })
+})
+
+describe('who is offered the add-a-node action', () => {
+  test('offers it to a user the server says can manage nodes', () => {
+    expect(canAddWorkerNode(capability({ can_manage_nodes: true }))).toBe(true)
+  })
+
+  test('withholds it from a user who would hit a permission wall', () => {
+    // The Worker Nodes page needs SettingsRead/SettingsWrite; linking a
+    // project user there is a dead end, so they get "ask an administrator".
+    expect(canAddWorkerNode(capability({ can_manage_nodes: false }))).toBe(
+      false
+    )
+  })
+
+  test('withholds it when the capability is unknown or predates the field', () => {
+    expect(canAddWorkerNode(undefined)).toBe(false)
+    expect(canAddWorkerNode(null)).toBe(false)
+    expect(
+      canAddWorkerNode({
+        ...capability(),
+        can_manage_nodes: undefined as unknown as boolean,
+      })
+    ).toBe(false)
+  })
+})
+
+describe('capability polling', () => {
+  test('polls while nothing can run, so a join clears the banner', () => {
+    expect(
+      nodeCapabilityRefetchInterval(
+        capability({ local_workloads: false, schedulable: false })
+      )
+    ).toBe(NODE_CAPABILITY_POLL_MS)
+  })
+
+  test('stops polling once something can run the work', () => {
+    expect(nodeCapabilityRefetchInterval(capability())).toBe(false)
+  })
+
+  test('does not poll before the first answer arrives', () => {
+    expect(nodeCapabilityRefetchInterval(undefined)).toBe(false)
+    expect(nodeCapabilityRefetchInterval(null)).toBe(false)
   })
 })
 

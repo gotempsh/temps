@@ -29,6 +29,12 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { problemSetupPath } from '@/lib/api-problem'
 import {
+  nodeCapabilityQueryKey,
+  type NodeCapability,
+} from '@/hooks/useNodeCapability'
+import {
+  canAddWorkerNode,
+  WORKER_NODE_ASK_ADMIN_MESSAGE,
   WORKER_NODE_REQUIRED_ERROR_CODE,
   WORKER_NODE_REQUIRED_MESSAGE,
   WORKER_NODE_REQUIRED_TITLE,
@@ -1158,12 +1164,25 @@ const queryClient = new QueryClient({
           const setupPath = sameOriginSetupPath(
             problemSetupPath(problemDetails)
           )
+          // Only offer the action to someone who can complete it. The Worker
+          // Nodes page needs Settings permissions, so for everyone else the
+          // button would land on "Failed to load worker nodes" — say who to
+          // ask instead. The capability read is already cached app-wide by
+          // the banner; absent (never fetched) means "assume not".
+          const canManage = canAddWorkerNode(
+            queryClient.getQueryData<NodeCapability>(nodeCapabilityQueryKey)
+          )
+          const detail = problemDetails.detail || WORKER_NODE_REQUIRED_MESSAGE
           toast.error(WORKER_NODE_REQUIRED_TITLE, {
-            description: problemDetails.detail || WORKER_NODE_REQUIRED_MESSAGE,
-            action: {
-              label: 'Add worker node',
-              onClick: () => window.location.assign(setupPath),
-            },
+            description: canManage
+              ? detail
+              : `${detail} ${WORKER_NODE_ASK_ADMIN_MESSAGE}`,
+            action: canManage
+              ? {
+                  label: 'Add worker node',
+                  onClick: () => window.location.assign(setupPath),
+                }
+              : undefined,
           })
           return
         }

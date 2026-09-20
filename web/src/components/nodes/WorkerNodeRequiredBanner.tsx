@@ -5,9 +5,11 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { useNodeCapability } from '@/hooks/useNodeCapability'
 import {
+  canAddWorkerNode,
   shouldShowWorkerNodeBanner,
   WORKER_NODES_DOCS_URL,
   WORKER_NODES_URL,
+  WORKER_NODE_ASK_ADMIN_MESSAGE,
   WORKER_NODE_REQUIRED_MESSAGE,
   WORKER_NODE_REQUIRED_TITLE,
 } from '@/lib/worker-nodes'
@@ -24,6 +26,7 @@ export function WorkerNodeRequiredAlert({
   reason,
   setupPath = WORKER_NODES_URL,
   showSetupAction = true,
+  canManageNodes = true,
 }: {
   reason?: string | null
   setupPath?: string
@@ -32,6 +35,12 @@ export function WorkerNodeRequiredAlert({
    * would link to the page the user is already reading.
    */
   showSetupAction?: boolean
+  /**
+   * Whether this user may actually add a node. When false the button is
+   * replaced by "Ask an administrator to add a worker node": the page behind
+   * it needs Settings permissions, so linking there would be a dead end.
+   */
+  canManageNodes?: boolean
 }) {
   return (
     <Alert variant="warning">
@@ -39,8 +48,11 @@ export function WorkerNodeRequiredAlert({
       <AlertTitle>{WORKER_NODE_REQUIRED_TITLE}</AlertTitle>
       <AlertDescription>
         <p>{reason || WORKER_NODE_REQUIRED_MESSAGE}</p>
+        {!canManageNodes && (
+          <p className="mt-2 font-medium">{WORKER_NODE_ASK_ADMIN_MESSAGE}</p>
+        )}
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-          {showSetupAction && (
+          {showSetupAction && canManageNodes && (
             <Button asChild size="sm" className="min-h-11 sm:min-h-9">
               <Link to={setupPath}>Add worker node</Link>
             </Button>
@@ -80,6 +92,7 @@ export function WorkerNodeRequiredBanner() {
     <WorkerNodeRequiredAlert
       reason={capability?.reason}
       setupPath={capability?.setup_path || WORKER_NODES_URL}
+      canManageNodes={canAddWorkerNode(capability)}
     />
   )
 }

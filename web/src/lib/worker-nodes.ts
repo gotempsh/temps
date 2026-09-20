@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { NodeCapability } from '@/api/nodeCapability'
+// The generated type, imported directly rather than through the hook: the
+// hook imports the poll policy from this module, and routing the type back
+// through it would make that a cycle.
+import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/types.gen'
 
 /**
  * Console route for the Worker Nodes page.
@@ -23,6 +26,51 @@ export const WORKER_NODE_REQUIRED_TITLE =
 
 export const WORKER_NODE_REQUIRED_MESSAGE =
   'This control plane runs no local workloads. Add a worker node to run builds, deployments and managed services.'
+
+/**
+ * What a user who cannot add a node is told instead of being handed a button.
+ *
+ * The Worker Nodes page needs `SettingsRead` to list the inventory and
+ * `SettingsWrite` to mint an enrollment token, so sending a project user there
+ * produces "Failed to load worker nodes" — an advertised remedy that denies
+ * the person who followed it. They still need to know *why* nothing deploys,
+ * so the explanation stays and only the action changes.
+ */
+export const WORKER_NODE_ASK_ADMIN_MESSAGE =
+  'Ask an administrator to add a worker node.'
+
+/**
+ * Whether this user can act on the remedy the banner advertises.
+ *
+ * Server-computed (`can_manage_nodes`) rather than inferred client-side: the
+ * console cannot know what a custom role grants. Absent — an older server, or
+ * a capability that has not loaded — is treated as "cannot", so a dead link is
+ * never the default.
+ */
+export function canAddWorkerNode(
+  capability: NodeCapability | undefined | null
+): boolean {
+  return capability?.can_manage_nodes === true
+}
+
+/** How often to re-read the capability, in ms, or `false` for not at all. */
+export const NODE_CAPABILITY_POLL_MS = 30_000
+
+/**
+ * Poll the capability only while nothing can run.
+ *
+ * Unschedulable is the one state that resolves from *outside* the console — a
+ * `temps join` on another machine — so without polling the banner outlives the
+ * problem until the page is remounted (focus refetching is disabled globally).
+ * Once something can run, the state only changes through actions the console
+ * already invalidates on, so the poll stops rather than burning a request
+ * every 30 s on every mounted page forever.
+ */
+export function nodeCapabilityRefetchInterval(
+  capability: NodeCapability | undefined | null
+): number | false {
+  return capability?.schedulable === false ? NODE_CAPABILITY_POLL_MS : false
+}
 
 /**
  * Whether the "add a worker node" banner should be rendered.
