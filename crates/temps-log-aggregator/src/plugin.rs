@@ -266,14 +266,11 @@ impl TempsPlugin for LogAggregatorPlugin {
             // from containers on THIS host's daemon. On a `control-plane`
             // profile there is no daemon and no local workload to tail; the
             // remote collector above already covers worker-node containers.
-            match docker_handle.cloned() {
-                Some(docker) => {
+            match local_discovery_plan(&docker_handle) {
+                LocalDiscoveryPlan::Start(docker) => {
                     spawn_local_container_discovery(docker, collector.clone(), db.clone())
                 }
-                None => tracing::info!(
-                    "Local container log discovery disabled: no Docker daemon in this profile \
-                     (worker-node logs are still collected by the remote collector)"
-                ),
+                LocalDiscoveryPlan::Skip { reason } => tracing::info!("{}", reason),
             }
 
             // ── Retention scheduler ─────────────────────────────────────
@@ -344,6 +341,44 @@ impl TempsPlugin for LogAggregatorPlugin {
 /// a one-shot startup scan of already-running containers plus a
 /// self-restarting Docker events listener. Only ever spawned when the
 /// process actually has a daemon (see `initialize_plugin_services`).
+/// What `initialize_plugin_services` should do about local container-log
+/// discovery in this process.
+///
+/// A decision value rather than an inline branch so the "no daemon here" case
+/// is testable, and so the explanation an operator reads in the logs is one
+/// string produced in one place instead of prose stranded inside a `match`.
+#[derive(Debug)]
+enum LocalDiscoveryPlan {
+    /// A daemon exists: tail this host's containers.
+    Start(Arc<bollard::Docker>),
+    /// No daemon exists, and this is what that means for log collection.
+    Skip { reason: String },
+}
+
+/// Decide whether to run the startup scan + Docker events listener.
+///
+/// Both stream logs from containers on *this* host's daemon. On a profile with
+/// no daemon there is neither a daemon to ask nor a local workload to tail —
+/// but worker-node containers are still collected, by the remote collector
+/// started above, so the skip must say so rather than read like logs are off.
+fn local_discovery_plan(handle: &temps_core::DockerHandle) -> LocalDiscoveryPlan {
+    match handle.cloned() {
+        Some(docker) => LocalDiscoveryPlan::Start(docker),
+        None => {
+            let cause = handle
+                .unavailable_error()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "this process has no local Docker daemon".to_string());
+            LocalDiscoveryPlan::Skip {
+                reason: format!(
+                    "Local container log discovery disabled: {cause}. Logs from containers on \
+                     worker nodes are still collected, by the remote log collector"
+                ),
+            }
+        }
+    }
+}
+
 fn spawn_local_container_discovery(
     docker: Arc<bollard::Docker>,
     collector: Arc<CollectorService>,
@@ -598,5 +633,49 @@ mod tests {
             base_path: PathBuf::from("/tmp/test-logs"),
         });
         assert_eq!(plugin.name(), "log-aggregator");
+    }
+
+    /// A process with no local daemon must skip local discovery instead of
+    /// trying to reach one — and must say why, plus that remote logs are
+    /// unaffected, because "my logs are empty" is otherwise indistinguishable
+    /// from a broken install.
+    #[test]
+    fn local_discovery_is_skipped_with_an_explanation_when_there_is_no_daemon() {
+        let handle = temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        );
+
+        match local_discovery_plan(&handle) {
+            LocalDiscoveryPlan::Skip { reason } => {
+                assert!(reason.contains("control-plane"), "{reason}");
+                assert!(
+                    reason.contains("remote log collector"),
+                    "the operator must learn worker logs still arrive: {reason}",
+                );
+            }
+            LocalDiscoveryPlan::Start(_) => {
+                panic!("a disabled handle must never start local discovery")
+            }
+        }
+    }
+
+    /// The other half of the branch: a handle with a client still tails this
+    /// host, exactly as before the profile split.
+    #[test]
+    fn local_discovery_starts_when_a_client_exists() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            // No socket path configured on this machine. A bollard client is a
+            // lazy descriptor, so this only happens when there is nothing to
+            // describe; the disabled arm above is the one under test anyway.
+            println!("No Docker socket path available, skipping");
+            return;
+        };
+        let handle = temps_core::DockerHandle::available(Arc::new(docker));
+
+        assert!(matches!(
+            local_discovery_plan(&handle),
+            LocalDiscoveryPlan::Start(_)
+        ));
     }
 }
