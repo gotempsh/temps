@@ -126,17 +126,14 @@ impl BackupJobProcessor {
                         engine,
                         reason,
                     }) => {
-                        // Not a failure of this backup — a capability this
-                        // process does not have. The executor left the row
-                        // `pending` with the reason attached; another process
-                        // (or this one, once it has a local Docker daemon) can
-                        // still run it.
+                        // There is no remote backup dispatcher. The executor
+                        // records a terminal failure with the missing capability.
                         warn!(
                             backup_id,
                             engine = %engine,
                             reason = %reason,
-                            "BackupJobProcessor: declined BackupRequested; the backup stays \
-                             pending with the reason recorded on the row",
+                            "BackupJobProcessor: failed BackupRequested because the engine is \
+                             unavailable on this process",
                         );
                     }
                     Err(SpawnError::Database(e)) => {

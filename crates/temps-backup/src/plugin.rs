@@ -56,7 +56,7 @@ const DOCKER_BACKED_ENGINES: [&str; 8] = [
 ];
 
 /// Why [`DOCKER_BACKED_ENGINES`] cannot run in this process, phrased for the
-/// operator who finds it on a waiting backup in the console.
+/// operator who finds it on a failed backup in the console.
 ///
 /// The `DockerHandle`'s own message already names the profile and the reason;
 /// this adds what it means for backups specifically and where the capability
@@ -197,8 +197,8 @@ impl TempsPlugin for BackupPlugin {
             // job with an opaque error the first time one is dispatched.
             //
             // They are still *declared* to the executor as unavailable (see
-            // the `else` arm), so a request for one is declined and left
-            // pending rather than mistaken for a typo and failed.
+            // the `else` arm), so failures explain the missing capability
+            // rather than claiming the engine key is unknown.
             if let Some(docker) = docker_handle.cloned() {
                 executor_builder = executor_builder
                     .register_engine(Arc::new(RedisEngine::new(RedisDeps {
@@ -255,8 +255,8 @@ impl TempsPlugin for BackupPlugin {
                 warn!(
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
                     "BackupExecutor: registered only the control_plane engine — {}. Backups \
-                     requesting one of these engines are left pending with that reason on the \
-                     row rather than failed here",
+                     requesting one of these engines fail immediately with that reason; \
+                     remote backup dispatch is not supported",
                     reason,
                 );
             }
@@ -662,7 +662,7 @@ mod tests {
         );
     }
 
-    /// The reason attached to a waiting backup is the only explanation a
+    /// The reason attached to a failed backup is the only explanation a
     /// self-hosted operator gets, so it has to name the cause *and* the fix.
     #[test]
     fn unavailable_reason_names_the_cause_and_the_remedy() {
