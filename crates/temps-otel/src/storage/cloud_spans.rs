@@ -96,18 +96,14 @@ fn genai_filters(query: &TraceQuery) -> String {
     if query.service_name.is_some() {
         clauses.push("spans.service_name = ?".into());
     }
-    clauses.join(" AND ")
-}
-
-fn genai_having(query: &TraceQuery) -> String {
-    let mut clauses = vec!["countIf(mapContains(attributes, 'gen_ai.provider.name') OR mapContains(attributes, 'gen_ai.system')) > 0".to_string()];
+    clauses.push("(mapContains(attributes, 'gen_ai.provider.name') OR mapContains(attributes, 'gen_ai.system'))".into());
     if query
         .attributes
         .as_ref()
         .and_then(|a| a.get("gen_ai.system"))
         .is_some()
     {
-        clauses.push("countIf(coalesce(nullIf(attributes['gen_ai.provider.name'], ''), attributes['gen_ai.system']) = ?) > 0".into());
+        clauses.push("coalesce(nullIf(attributes['gen_ai.provider.name'], ''), attributes['gen_ai.system']) = ?".into());
     }
     if query
         .attributes
@@ -115,7 +111,7 @@ fn genai_having(query: &TraceQuery) -> String {
         .and_then(|a| a.get("gen_ai.request.model"))
         .is_some()
     {
-        clauses.push("countIf(attributes['gen_ai.request.model'] = ?) > 0".into());
+        clauses.push("attributes['gen_ai.request.model'] = ?".into());
     }
     clauses.join(" AND ")
 }
@@ -175,9 +171,8 @@ fn genai_summary_sql(query: &TraceQuery, count: bool) -> String {
         )
     };
     format!(
-        "{select} FROM {CLOUD_SPANS_TABLE} AS spans WHERE {} GROUP BY trace_id HAVING {}{tail}",
-        genai_filters(query),
-        genai_having(query)
+        "{select} FROM {CLOUD_SPANS_TABLE} AS spans WHERE {} GROUP BY trace_id{tail}",
+        genai_filters(query)
     )
 }
 
@@ -723,9 +718,11 @@ mod tests {
             ..Default::default()
         };
         let sql = genai_summary_sql(&query, false);
-        assert!(sql.contains("GROUP BY trace_id HAVING"));
-        assert!(sql.contains("countIf(coalesce(nullIf(attributes['gen_ai.provider.name']"));
-        assert!(sql.contains("countIf(attributes['gen_ai.request.model'] = ?)"));
+        assert!(sql.contains("WHERE project_ref = ?"));
+        assert!(sql.contains("coalesce(nullIf(attributes['gen_ai.provider.name']"));
+        assert!(sql.contains("attributes['gen_ai.request.model'] = ?"));
+        assert!(sql.contains("GROUP BY trace_id ORDER BY"));
+        assert!(!sql.contains(" HAVING "));
         assert!(sql.ends_with("LIMIT 20 OFFSET 40"));
         assert!(genai_summary_sql(&query, true).starts_with("SELECT count() FROM (SELECT trace_id"));
     }
@@ -767,6 +764,8 @@ mod tests {
             ('synthetic-ref','trace-a','span-a','chat',fromUnixTimestamp64Milli(1700000000000),12,'api','client','ok','','dev',map('gen_ai.provider.name','synthetic-provider','gen_ai.request.model','synthetic-model','gen_ai.usage.input_tokens','11')), \
             ('synthetic-ref','trace-a','span-b','tool',fromUnixTimestamp64Milli(1700000001000),3,'api','internal','ok','span-a','dev',map('gen_ai.usage.output_tokens','7')), \
             ('synthetic-ref','trace-b','span-c','chat',fromUnixTimestamp64Milli(1700000002000),8,'api','client','error','','dev',map('gen_ai.system','synthetic-provider','gen_ai.request.model','synthetic-model','gen_ai.usage.prompt_tokens','5')), \
+            ('synthetic-ref','trace-mixed','span-e','chat-alpha',fromUnixTimestamp64Milli(1700000004000),4,'api','client','ok','','dev',map('gen_ai.provider.name','provider-alpha','gen_ai.request.model','model-alpha','gen_ai.usage.input_tokens','10')), \
+            ('synthetic-ref','trace-mixed','span-f','chat-beta',fromUnixTimestamp64Milli(1700000005000),5,'api','client','ok','span-e','dev',map('gen_ai.provider.name','provider-beta','gen_ai.request.model','model-beta','gen_ai.usage.input_tokens','20')), \
             ('other-ref','trace-c','span-d','chat',fromUnixTimestamp64Milli(1700000003000),9,'api','client','ok','','dev',map('gen_ai.provider.name','synthetic-provider'))";
         client
             .query(insert)
@@ -817,9 +816,9 @@ mod tests {
         .await
         .expect("second trace page");
         assert_eq!(page[0].trace_id, "trace-a");
-        assert_eq!(page[0].span_count, 2);
+        assert_eq!(page[0].span_count, 1);
         assert_eq!(page[0].total_input_tokens, 11);
-        assert_eq!(page[0].total_output_tokens, 7);
+        assert_eq!(page[0].total_output_tokens, 0);
 
         let detail = TraceQuery {
             trace_id: Some("trace-a".into()),
@@ -838,5 +837,68 @@ mod tests {
                 .map(String::as_str),
             Some("synthetic-provider")
         );
+
+        let matching = TraceQuery {
+            attributes: Some(BTreeMap::from([
+                ("gen_ai.system".into(), "provider-alpha".into()),
+                ("gen_ai.request.model".into(), "model-alpha".into()),
+            ])),
+            limit: Some(10),
+            offset: Some(0),
+            ..detail.clone()
+        };
+        let matching = TraceQuery {
+            trace_id: None,
+            ..matching
+        };
+        let matched = bind_genai(
+            client.query(&genai_summary_sql(&matching, false)),
+            "synthetic-ref",
+            &matching,
+        )
+        .expect("matching row query")
+        .fetch_all::<CloudGenAiSummaryRow>()
+        .await
+        .expect("same-span provider/model match");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].trace_id, "trace-mixed");
+        assert_eq!(matched[0].gen_ai_system, "provider-alpha");
+        assert_eq!(matched[0].gen_ai_model, "model-alpha");
+        assert_eq!(matched[0].span_count, 1, "only matching spans contribute");
+        assert_eq!(
+            matched[0].total_input_tokens, 10,
+            "other provider's tokens excluded"
+        );
+
+        let cross_span = TraceQuery {
+            attributes: Some(BTreeMap::from([
+                ("gen_ai.system".into(), "provider-alpha".into()),
+                ("gen_ai.request.model".into(), "model-beta".into()),
+            ])),
+            ..matching
+        };
+        let mismatched_count = bind_genai(
+            client.query(&genai_summary_sql(&cross_span, true)),
+            "synthetic-ref",
+            &cross_span,
+        )
+        .expect("cross-span count query")
+        .fetch_one::<u64>()
+        .await
+        .expect("cross-span count executes");
+        assert_eq!(
+            mismatched_count, 0,
+            "provider and model must match one span"
+        );
+        let mismatched_rows = bind_genai(
+            client.query(&genai_summary_sql(&cross_span, false)),
+            "synthetic-ref",
+            &cross_span,
+        )
+        .expect("cross-span list query")
+        .fetch_all::<CloudGenAiSummaryRow>()
+        .await
+        .expect("cross-span list executes");
+        assert!(mismatched_rows.is_empty());
     }
 }

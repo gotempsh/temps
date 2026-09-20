@@ -234,6 +234,96 @@ test('empty Cloud allowlist has an explicit metadata opt-in that preserves other
   ).toHaveCount(0)
 })
 
+test('AI metadata save merges the latest server allowlist', async ({
+  page,
+}) => {
+  let settings = {
+    project_id: 71,
+    write_mode: 'cloud',
+    effective_write_mode: 'cloud',
+    fidelity: 'queryable',
+    attribute_allowlist: ['custom.removed'],
+    analytics_write_mode: 'local',
+    cloud_write_mode_available: true,
+    queued_spans: 0,
+    dead_lettered_spans: 0,
+    gap_windows: [],
+    intervals: [],
+  }
+  let gets = 0
+  let patches = 0
+  await page.route('**/api/otel/cloud-telemetry/projects/71', async (route) => {
+    if (route.request().method() === 'GET') {
+      gets++
+    } else if (route.request().method() === 'PATCH') {
+      patches++
+      const body = route.request().postDataJSON()
+      expect(gets).toBeGreaterThan(1)
+      expect(body.attribute_allowlist).toContain('custom.added')
+      expect(body.attribute_allowlist).not.toContain('custom.removed')
+      expect(body.attribute_allowlist).toContain('gen_ai.provider.name')
+      expect(body.write_mode).toBeUndefined()
+      expect(body.fidelity).toBeUndefined()
+      settings = { ...settings, ...body }
+    }
+    await route.fulfill({ json: settings })
+  })
+  await page.goto('/projects/trace-demo/settings/telemetry')
+  const checkbox = page.getByRole('checkbox', {
+    name: 'Allow AI metadata in Cloud',
+  })
+  await expect(checkbox).toBeVisible()
+  await checkbox.check()
+  settings = { ...settings, attribute_allowlist: ['custom.added'] }
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click()
+  await expect.poll(() => patches).toBe(1)
+})
+
+test('AI metadata save stops when the fresh settings read fails', async ({
+  page,
+}) => {
+  const settings = {
+    project_id: 71,
+    write_mode: 'cloud',
+    effective_write_mode: 'cloud',
+    fidelity: 'queryable',
+    attribute_allowlist: [],
+    analytics_write_mode: 'local',
+    cloud_write_mode_available: true,
+    queued_spans: 0,
+    dead_lettered_spans: 0,
+    gap_windows: [],
+    intervals: [],
+  }
+  let gets = 0
+  let patches = 0
+  await page.route('**/api/otel/cloud-telemetry/projects/71', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      patches++
+      await route.fulfill({ json: settings })
+    } else if (++gets > 1) {
+      await route.fulfill({
+        status: 503,
+        json: { detail: 'Settings unavailable' },
+      })
+    } else {
+      await route.fulfill({ json: settings })
+    }
+  })
+  await page.goto('/projects/trace-demo/settings/telemetry')
+  const checkbox = page.getByRole('checkbox', {
+    name: 'Allow AI metadata in Cloud',
+  })
+  await expect(checkbox).toBeVisible()
+  await checkbox.check()
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click()
+  await expect.poll(() => gets).toBeGreaterThan(1)
+  await expect(
+    page.getByRole('button', { name: 'Save changes', exact: true })
+  ).toBeEnabled()
+  expect(patches).toBe(0)
+})
+
 test('automatic cross-project detail carries the same historical window', async ({
   page,
 }) => {

@@ -11791,32 +11791,6 @@ export type InstallPluginResponse = {
     version: string;
 };
 
-export type InstallRepositoryRequest = {
-    grants?: null | PluginGrantConfig;
-    name?: string | null;
-    path?: string | null;
-    progressId?: string | null;
-    ref_name?: string | null;
-    repository_url: string;
-};
-
-export type InstallRepositoryResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    source_commit: string;
-    version: string;
-};
-
-export type InstallationReportingSettings = {
-    /**
-     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
-     * with the official Temps registry after a verified install succeeds.
-     */
-    enabled: boolean;
-};
-
 export type IntegrationResponse = {
     config?: null | ProviderConfig;
     created_at: string;
@@ -13466,37 +13440,6 @@ export type MxResult = {
 };
 
 /**
- * A navigation entry that the plugin contributes to the Temps UI.
- */
-export type NavEntry = {
-    /**
-     * Lucide icon name (e.g., "puzzle", "database", "activity")
-     */
-    icon: string;
-    /**
-     * Display label in the sidebar
-     */
-    label: string;
-    /**
-     * Sort order within the section (lower = higher in list)
-     */
-    order: number;
-    /**
-     * Client-side route path (e.g., "/my-plugin")
-     */
-    path: string;
-    /**
-     * Which sidebar section this entry belongs to
-     */
-    section: NavSection;
-};
-
-/**
- * Where the plugin's nav entry appears in the Temps UI sidebar.
- */
-export type NavSection = 'platform' | 'settings' | 'project';
-
-/**
  * Network configuration
  */
 export type NetworkConfiguration = {
@@ -13744,13 +13687,6 @@ export type NotificationRoutePage = {
     page: number;
     page_size: number;
     total: number;
-};
-
-export type NpmRelease = {
-    binary_path: string;
-    integrity: string;
-    name: string;
-    version: string;
 };
 
 /**
@@ -15358,184 +15294,16 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
-export type PlatformRelease = {
-    npm?: null | NpmRelease;
-    sha256: string;
-    url: string;
-};
-
-export type PluginActorInfo = {
-    active: boolean;
-    id: string;
-    name: string;
-};
-
-export type PluginAiCapability = {
-    configured: boolean;
-    daily_call_limit: number;
-    max_output_tokens: number;
-    max_prompt_bytes: number;
-    reason?: string | null;
-    setup_path: string;
-};
-
-/**
- * What a plugin is allowed to do with the platform API over the channel.
- *
- * Coarse on purpose. Fine-grained authorization already exists in the
- * permission system and is enforced per request against the acting user;
- * this exists so an operator installing a binary can see at a glance
- * whether it intends to *write* at all, without reading its source.
- */
-export type PluginCapability = 'api_read' | 'api_write';
-
-export type PluginCatalogResponse = {
-    available: boolean;
-    plugins: Array<RegistryPlugin>;
-    reason?: string | null;
-    source: string;
-};
-
 export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
     permissions: Array<PluginHostPermission>;
 };
 
-export type PluginGrantsResponse = {
-    actor: PluginActorInfo;
-    ai: PluginAiCapability;
-    permissions: Array<PluginHostPermission>;
-    requested_permissions: Array<PluginHostPermission>;
-};
-
 /**
  * Host-owned permissions granted to one durable external-plugin actor.
  */
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
-
-/**
- * The complete plugin manifest — the handshake contract.
- */
-export type PluginManifest = {
-    /**
-     * What this plugin may do with the platform's own API over the channel.
-     *
-     * Empty by default, and empty means read-only channel queries and
-     * nothing else: a plugin that never asks cannot deploy, cannot create
-     * projects, and cannot provision databases. Declaring a capability is
-     * not by itself permission to act — every call still runs the real
-     * handler's `permission_guard!` as the user the plugin is acting for,
-     * so a capability can only ever narrow what that user could already do
-     * through the console.
-     */
-    capabilities?: Array<PluginCapability>;
-    /**
-     * Short description of what the plugin does
-     */
-    description?: string | null;
-    /**
-     * Human-readable display name
-     */
-    display_name?: string | null;
-    /**
-     * Platform event types the plugin subscribes to.
-     *
-     * When specified, Temps will POST matching events to the plugin's
-     * `/_events` endpoint. Uses dot-notation event names matching the
-     * webhook event types (e.g., "deployment.succeeded", "project.created").
-     *
-     * Available events:
-     * - `deployment.created`, `deployment.succeeded`, `deployment.failed`,
-     * `deployment.cancelled`, `deployment.ready`
-     * - `project.created`, `project.deleted`
-     * - `domain.created`, `domain.provisioned`
-     */
-    events?: Array<string>;
-    /**
-     * Health check endpoint path (relative to plugin root)
-     */
-    health_path?: string;
-    /**
-     * Suppress the console's own header strip above this plugin's UI.
-     *
-     * The console normally renders the plugin's icon, display name and
-     * version above the iframe. For a plugin whose UI is a full working
-     * surface with its own header, that is a second title bar competing
-     * for the same vertical space — and vertical space is exactly what a
-     * dense full-page layout has none of. Opt out and the frame gets the
-     * full height.
-     *
-     * The nav entry still names the plugin, so nothing becomes
-     * unidentifiable by setting this.
-     */
-    hide_header?: boolean;
-    /**
-     * Host-brokered operations requested by this plugin. These are requests,
-     * not authority: an administrator must grant each one separately.
-     */
-    host_permissions?: Array<PluginHostPermission>;
-    /**
-     * Unique plugin identifier (kebab-case, e.g., "backup-manager")
-     */
-    name: string;
-    /**
-     * Navigation entries for the UI sidebar
-     */
-    nav?: Array<NavEntry>;
-    /**
-     * Routes this plugin authenticates itself, which the platform's proxy
-     * therefore does not gate.
-     *
-     * Every other proxied route requires an authenticated caller before it
-     * reaches the plugin. That is right for anything a signed-in user
-     * drives, and wrong for the endpoints a plugin exposes to clients that
-     * hold no platform session — an agent in a sandbox presenting a
-     * capability token, a share link opened by someone with no account.
-     * This is the external-plugin counterpart of the in-process
-     * `configure_public_routes`.
-     *
-     * Paths are relative to the plugin's mount point and match by prefix,
-     * so `/webhooks/incoming` covers everything beneath it. A listed route is
-     * reachable by anyone who can reach the instance: it **must** check its
-     * own credential. Listing a route that does not is an open door.
-     */
-    public_paths?: Array<string>;
-    /**
-     * Whether the plugin needs database access
-     */
-    requires_db?: boolean;
-    /**
-     * Whether the plugin may read the platform's host data root.
-     *
-     * This is a highly privileged capability: the directory can contain
-     * encryption keys and instance-owned state. It is independent of direct
-     * database access and defaults to `false`.
-     */
-    requires_host_data_access?: boolean;
-    ui?: null | UiManifest;
-    /**
-     * SemVer version string
-     */
-    version: string;
-};
-
-export type PluginSourceResponse = {
-    builder_image: string;
-    commit: string;
-    kind: string;
-    path?: string | null;
-    ref_name: string;
-    repository_url: string;
-    version: string;
-};
-
-export type PluginStatusResponse = {
-    configured: boolean;
-    reason?: string | null;
-    setup_path: string;
-    source?: null | PluginSourceResponse;
-};
 
 /**
  * Port mapping
@@ -15839,22 +15607,6 @@ export type ProblemDetails = {
      */
     type?: string | null;
 };
-
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -17577,23 +17329,6 @@ export type RegistryEnvelope = {
     signature: string;
 };
 
-export type RegistryPlugin = {
-    author: string;
-    category: string;
-    description: string;
-    docs_url?: string | null;
-    keywords?: Array<string>;
-    logo_url?: string | null;
-    name: string;
-    platforms: {
-        [key: string]: PlatformRelease;
-    };
-    repository?: string | null;
-    summary: string;
-    title: string;
-    version: string;
-};
-
 /**
  * Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`
  */
@@ -17638,33 +17373,6 @@ export type ReleaseCheckResult = {
 
 export type ReleaseListResponse = {
     releases: Array<string>;
-};
-
-export type ReloadFailureResponse = {
-    plugin?: string | null;
-    reason: string;
-};
-
-/**
- * Response from the reload endpoint.
- */
-export type ReloadResponse = {
-    /**
-     * Activated installs that could not be verified or started.
-     */
-    failures: Array<ReloadFailureResponse>;
-    /**
-     * Number of plugins successfully loaded after reload
-     */
-    loaded: number;
-    /**
-     * Human-readable status message
-     */
-    message: string;
-    /**
-     * Names of loaded plugins
-     */
-    plugins: Array<string>;
 };
 
 export type RemoteDeploymentResponse = {
@@ -17727,45 +17435,6 @@ export type RepointContinuousArchiveSourceRequest = {
      * The S3 source continuous archiving should point at from now on.
      */
     new_s3_source_id: number;
-};
-
-export type RepositoryCatalogPermission = {
-    permission: PluginHostPermission;
-    reason: string;
-    required: boolean;
-};
-
-export type RepositoryCatalogPlugin = {
-    author: string;
-    category: string;
-    commit: string;
-    description: string;
-    docsUrl?: string | null;
-    latestVersion: string;
-    logoUrl?: string | null;
-    name: string;
-    path?: string | null;
-    /**
-     * Author-declared capabilities for display only; never used to grant access.
-     * None means the legacy catalog did not declare permissions.
-     */
-    permissions?: Array<RepositoryCatalogPermission>;
-    platforms: Array<string>;
-    readmeUrl?: string | null;
-    ref?: string | null;
-    repository: string;
-    screenshots: Array<RepositoryScreenshot>;
-    summary: string;
-    title: string;
-    validation: RepositoryValidation;
-};
-
-export type RepositoryCatalogResponse = {
-    available: boolean;
-    platform: string;
-    plugins: Array<RepositoryCatalogPlugin>;
-    reason?: string | null;
-    source: string;
 };
 
 export type RepositoryComposeServicesResponse = {
@@ -17835,12 +17504,6 @@ export type RepositoryResponse = {
     updated_at: string;
 };
 
-export type RepositoryScreenshot = {
-    alt: string;
-    caption?: string | null;
-    url: string;
-};
-
 /**
  * Returned by `POST /git-connections/{id}/sync` to acknowledge that a
  * sync has been kicked off in the background. Clients should poll the
@@ -17851,11 +17514,6 @@ export type RepositorySyncStartedResponse = {
     connection_id: number;
     started_at: string;
     syncing: boolean;
-};
-
-export type RepositoryValidation = {
-    build: string;
-    metadata: string;
 };
 
 /**
@@ -22593,38 +22251,6 @@ export type TxtRecord = {
 };
 
 /**
- * Describes the plugin's embedded UI bundle.
- */
-export type UiManifest = {
-    /**
-     * CSS files to load
-     */
-    css?: Array<string>;
-    /**
-     * JavaScript entry point filename relative to the bundle root
-     */
-    entry_js: string;
-    /**
-     * Client-side routes the plugin handles
-     */
-    routes?: Array<UiRoute>;
-};
-
-/**
- * A client-side route provided by the plugin UI.
- */
-export type UiRoute = {
-    /**
-     * Route path pattern (e.g., "/my-plugin", "/my-plugin/:id")
-     */
-    path: string;
-    /**
-     * Page title for breadcrumbs
-     */
-    title: string;
-};
-
-/**
  * Response after undraining (reactivating) a node.
  */
 export type UndrainNodeResponse = {
@@ -22672,12 +22298,6 @@ export type UnifiedTrace = {
      * project_ids excluded due to truncation (most-recent first_seen dropped first).
      */
     truncated_projects: Array<number>;
-};
-
-export type UninstallPluginResponse = {
-    data_preserved: boolean;
-    message: string;
-    name: string;
 };
 
 /**
@@ -23725,10 +23345,6 @@ export type UpdateProviderRequest = {
     config?: unknown;
     enabled?: boolean | null;
     name?: string | null;
-};
-
-export type UpdateRepositoryRequest = {
-    ref_name?: string | null;
 };
 
 export type UpdateRouteRequest = {
@@ -62804,370 +62420,6 @@ export type TriggerWeeklyDigestResponses = {
 };
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
-
-export type ListExternalPluginsData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins';
-};
-
-export type ListExternalPluginsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-};
-
-export type ListExternalPluginsResponses = {
-    /**
-     * List of all running external plugins
-     */
-    200: Array<PluginManifest>;
-};
-
-export type ListExternalPluginsResponse = ListExternalPluginsResponses[keyof ListExternalPluginsResponses];
-
-export type ListPluginCatalogData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/catalog';
-};
-
-export type ListPluginCatalogErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-};
-
-export type ListPluginCatalogError = ListPluginCatalogErrors[keyof ListPluginCatalogErrors];
-
-export type ListPluginCatalogResponses = {
-    /**
-     * Signed plugin catalogue, or an unavailable state when registry trust is not configured
-     */
-    200: PluginCatalogResponse;
-};
-
-export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
-
-export type ListRepositoryPluginCatalogData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/catalog/repositories';
-};
-
-export type ListRepositoryPluginCatalogResponses = {
-    200: RepositoryCatalogResponse;
-};
-
-export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
-
-export type GetRepositoryInstallProgressData = {
-    body?: never;
-    path: {
-        /**
-         * Client-generated installation UUID
-         */
-        id: string;
-    };
-    query?: never;
-    url: '/x/plugins/install/progress/{id}';
-};
-
-export type GetRepositoryInstallProgressErrors = {
-    404: ProblemDetails;
-};
-
-export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
-
-export type GetRepositoryInstallProgressResponses = {
-    200: ProgressSnapshot;
-};
-
-export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
-
-export type InstallRepositoryData = {
-    body: InstallRepositoryRequest;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/install/repository';
-};
-
-export type InstallRepositoryErrors = {
-    /**
-     * Invalid repository source
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Plugin source conflict
-     */
-    409: ProblemDetails;
-    /**
-     * Request body exceeds configured limit
-     */
-    413: ProblemDetails;
-    /**
-     * Request content type is not application/json
-     */
-    415: ProblemDetails;
-    /**
-     * Request JSON does not match install schema
-     */
-    422: ProblemDetails;
-    /**
-     * Recent sensitive-action verification required
-     */
-    428: ProblemDetails;
-    /**
-     * Local plugin installation failed
-     */
-    500: ProblemDetails;
-    /**
-     * Repository, build, or startup failed
-     */
-    502: ProblemDetails;
-    /**
-     * Plugin service or security audit unavailable
-     */
-    503: ProblemDetails;
-};
-
-export type InstallRepositoryError = InstallRepositoryErrors[keyof InstallRepositoryErrors];
-
-export type InstallRepositoryResponses = {
-    /**
-     * Repository commit built, verified, and activated
-     */
-    200: InstallRepositoryResponse;
-};
-
-export type InstallRepositoryResponse2 = InstallRepositoryResponses[keyof InstallRepositoryResponses];
-
-export type GetPluginInstallationReportingData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type GetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type GetPluginInstallationReportingResponse = GetPluginInstallationReportingResponses[keyof GetPluginInstallationReportingResponses];
-
-export type SetPluginInstallationReportingData = {
-    body: InstallationReportingSettings;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type SetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type SetPluginInstallationReportingResponse = SetPluginInstallationReportingResponses[keyof SetPluginInstallationReportingResponses];
-
-export type ReloadPluginsData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/reload';
-};
-
-export type ReloadPluginsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * No activated plugin could be reloaded
-     */
-    502: ReloadResponse;
-};
-
-export type ReloadPluginsError = ReloadPluginsErrors[keyof ReloadPluginsErrors];
-
-export type ReloadPluginsResponses = {
-    /**
-     * All plugins reloaded successfully
-     */
-    200: ReloadResponse;
-    /**
-     * Some plugins reloaded and some failed
-     */
-    207: ReloadResponse;
-};
-
-export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
-
-export type GetPluginGrantsData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/grants';
-};
-
-export type GetPluginGrantsResponses = {
-    200: PluginGrantsResponse;
-};
-
-export type GetPluginGrantsResponse = GetPluginGrantsResponses[keyof GetPluginGrantsResponses];
-
-export type PutPluginGrantsData = {
-    body: PluginGrantConfig;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/grants';
-};
-
-export type PutPluginGrantsResponses = {
-    200: PluginGrantsResponse;
-};
-
-export type PutPluginGrantsResponse = PutPluginGrantsResponses[keyof PutPluginGrantsResponses];
-
-export type GetPluginStatusData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/status';
-};
-
-export type GetPluginStatusErrors = {
-    /**
-     * Invalid plugin name
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-};
-
-export type GetPluginStatusError = GetPluginStatusErrors[keyof GetPluginStatusErrors];
-
-export type GetPluginStatusResponses = {
-    /**
-     * Verified active plugin status
-     */
-    200: PluginStatusResponse;
-};
-
-export type GetPluginStatusResponse = GetPluginStatusResponses[keyof GetPluginStatusResponses];
-
-export type UninstallPluginData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/uninstall';
-};
-
-export type UninstallPluginErrors = {
-    /**
-     * Unsafe plugin name
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * No active installation
-     */
-    404: ProblemDetails;
-    /**
-     * Recent sensitive-action verification required
-     */
-    428: ProblemDetails;
-    /**
-     * Local deactivation failed
-     */
-    500: ProblemDetails;
-    /**
-     * Audit or plugin service unavailable
-     */
-    503: ProblemDetails;
-};
-
-export type UninstallPluginError = UninstallPluginErrors[keyof UninstallPluginErrors];
-
-export type UninstallPluginResponses = {
-    /**
-     * Plugin deactivated; data and releases preserved
-     */
-    200: UninstallPluginResponse;
-};
-
-export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
-
-export type UpdateRepositoryData = {
-    body: UpdateRepositoryRequest;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/update';
-};
-
-export type UpdateRepositoryErrors = {
-    /**
-     * No repository-backed active plugin
-     */
-    404: ProblemDetails;
-    /**
-     * Build or startup failed; previous plugin preserved
-     */
-    502: ProblemDetails;
-};
-
-export type UpdateRepositoryError = UpdateRepositoryErrors[keyof UpdateRepositoryErrors];
-
-export type UpdateRepositoryResponses = {
-    /**
-     * Repository plugin explicitly updated to a new pinned commit
-     */
-    200: InstallRepositoryResponse;
-};
-
-export type UpdateRepositoryResponse = UpdateRepositoryResponses[keyof UpdateRepositoryResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

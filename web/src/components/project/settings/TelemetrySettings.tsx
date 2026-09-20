@@ -25,10 +25,13 @@ import {
   type ProjectCloudTelemetryResponse,
 } from '@/api/client'
 import {
+  getProjectCloudTelemetry,
+  updateProjectCloudTelemetry,
+} from '@/api/client/sdk.gen'
+import {
   getCloudTelemetryStatusQueryKey,
   getProjectCloudTelemetryOptions,
   getProjectCloudTelemetryQueryKey,
-  updateProjectCloudTelemetryMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail, problemSetupPath } from '@/lib/api-problem'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -155,7 +158,48 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   }, [settings])
 
   const save = useMutation({
-    ...updateProjectCloudTelemetryMutation(),
+    mutationFn: async ({
+      nextWriteMode,
+      nextFidelity,
+      metadataChange,
+      writeModeChanged,
+      fidelityChanged,
+    }: {
+      nextWriteMode: CloudTelemetryWriteMode
+      nextFidelity: CloudTelemetryFidelity
+      metadataChange: boolean | null
+      writeModeChanged: boolean
+      fidelityChanged: boolean
+    }) => {
+      // The allowlist is a replacement field. Read it from the server at save
+      // time so another operator's additions and removals survive this edit.
+      const latest =
+        metadataChange === null
+          ? null
+          : (
+              await getProjectCloudTelemetry({
+                path: { project_id: project.id },
+                throwOnError: true,
+              })
+            ).data
+      const { data } = await updateProjectCloudTelemetry({
+        path: { project_id: project.id },
+        body: {
+          ...(writeModeChanged ? { write_mode: nextWriteMode } : {}),
+          ...(fidelityChanged ? { fidelity: nextFidelity } : {}),
+          ...(latest && metadataChange !== null
+            ? {
+                attribute_allowlist: withCloudAiMetadata(
+                  latest.attribute_allowlist,
+                  metadataChange
+                ),
+              }
+            : {}),
+        },
+        throwOnError: true,
+      })
+      return data
+    },
     onSuccess: (updated) => {
       queryClient.setQueryData(
         getProjectCloudTelemetryQueryKey({ path: { project_id: project.id } }),
@@ -505,19 +549,12 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
           <Button
             onClick={() =>
               save.mutate({
-                path: { project_id: project.id },
-                body: {
-                  fidelity,
-                  write_mode: writeMode,
-                  ...(aiMetadata !== savedAiMetadata
-                    ? {
-                        attribute_allowlist: withCloudAiMetadata(
-                          settings.attribute_allowlist,
-                          aiMetadata
-                        ),
-                      }
-                    : {}),
-                },
+                nextWriteMode: writeMode,
+                nextFidelity: fidelity,
+                metadataChange:
+                  aiMetadata !== savedAiMetadata ? aiMetadata : null,
+                writeModeChanged: writeMode !== settings.write_mode,
+                fidelityChanged: fidelity !== settings.fidelity,
               })
             }
             disabled={!dirty || downgradeBlocked || save.isPending}
