@@ -398,3 +398,63 @@ test('automatic cross-project detail carries the same historical window', async 
   const sibling = page.getByRole('link', { name: 'Worker demo', exact: true })
   expectBounds(new URL((await sibling.getAttribute('href'))!, page.url()).href)
 })
+
+test('global trace list links preserve bounds for project and cross-project detail', async ({
+  page,
+}) => {
+  await page.route('**/api/otel/global/trace-summaries?*', (route) =>
+    route.fulfill({
+      json: {
+        data: [
+          {
+            ...trace,
+            project_id: 71,
+            project_name: project.name,
+            project_slug: project.slug,
+            status_code: 'OK',
+          },
+        ],
+        projects: [],
+        total: 1,
+        windows: [],
+      },
+    })
+  )
+  await page.route('**/api/otel/global/traces/*', (route) =>
+    route.fulfill({
+      json: {
+        trace_id: trace.trace_id,
+        projects: [],
+        spans: [],
+        start_time: trace.start_time,
+        end_time: '2026-08-04T12:00:12.000Z',
+        total_duration_ms: trace.duration_ms,
+        span_count: 0,
+        error_count: 0,
+        has_redacted_spans: false,
+        truncated: false,
+        truncated_projects: [],
+      },
+    })
+  )
+  await page.goto('/traces')
+  const projectLink = page.getByRole('link', { name: trace.root_span_name })
+  const crossProjectLink = page.getByRole('link', {
+    name: 'Cross-project waterfall',
+  })
+  await expect(projectLink).toBeVisible()
+  expectBounds(
+    new URL((await projectLink.getAttribute('href'))!, page.url()).href
+  )
+  expectBounds(
+    new URL((await crossProjectLink.getAttribute('href'))!, page.url()).href
+  )
+  const request = page.waitForRequest(
+    (req) =>
+      new URL(req.url()).pathname ===
+      `/api/otel/global/traces/${trace.trace_id}`
+  )
+  await crossProjectLink.click()
+  expectBounds((await request).url())
+  expectBounds(page.url())
+})

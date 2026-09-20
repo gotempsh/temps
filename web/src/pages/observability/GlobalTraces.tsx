@@ -167,7 +167,7 @@ export default function GlobalTraces() {
                     </p>
                     <Link
                       className="text-xs text-muted-foreground underline whitespace-nowrap"
-                      to={`/traces/global/${trace.trace_id}`}
+                      to={`/traces/global/${traceDetailPath(trace)}`}
                     >
                       Cross-project waterfall
                     </Link>
