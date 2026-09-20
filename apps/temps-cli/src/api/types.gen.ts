@@ -46,16 +46,6 @@ export type ActiveVisitorCountResponse = {
     window_minutes: number;
 };
 
-/**
- * Query parameters for active visitors endpoint
- */
-export type ActiveVisitorsQuery = {
-    deployment_id?: number | null;
-    environment_id?: number | null;
-    project_id: number;
-    window_minutes?: number | null;
-};
-
 export type ActiveVisitorsResponse = {
     count: number;
     visitors: Array<ActiveVisitor>;
@@ -189,24 +179,6 @@ export type ActivityGoalsRequest = {
     environment_id?: number | null;
     share_with_ai: boolean;
     url: string;
-};
-
-/**
- * Query parameters for activity graph endpoint
- */
-export type ActivityGraphQuery = {
-    /**
-     * Number of days to include (default: 365 for last year)
-     */
-    days?: number;
-    /**
-     * Optional environment ID to filter activity
-     */
-    environment_id?: number | null;
-    /**
-     * Optional project ID to filter activity
-     */
-    project_id?: number | null;
 };
 
 /**
@@ -676,53 +648,12 @@ export type AggregatedBucketItem = {
     timestamp: string;
 };
 
-/**
- * Query parameters for aggregated metrics by time bucket
- */
-export type AggregatedBucketsQuery = {
-    /**
-     * Aggregation level: events, sessions, or visitors
-     */
-    aggregation_level?: AggregationLevel;
-    /**
-     * Time bucket size: "1 hour", "1 day", "1 week", etc. (default: "1 hour")
-     */
-    bucket_size?: string;
-    /**
-     * Optional deployment filter
-     */
-    deployment_id?: number | null;
-    /**
-     * End date for the query range
-     */
-    end_date: string;
-    /**
-     * Optional environment filter
-     */
-    environment_id?: number | null;
-    /**
-     * Start date for the query range
-     */
-    start_date: string;
-};
-
 export type AggregatedBucketsResponse = {
     aggregation_level: string;
     bucket_size: string;
     items: Array<AggregatedBucketItem>;
     total: number;
 };
-
-export type AggregationLevel = 'events' | 'sessions' | 'visitors';
-
-/**
- * The aggregation temporality of a Sum/Histogram/ExponentialHistogram metric.
- *
- * Mirrors OTel's `AggregationTemporality` proto enum: whether reported values
- * are cumulative since the start of the series (Cumulative) or only the delta
- * since the previous report (Delta).
- */
-export type AggregationTemporality = 'unspecified' | 'delta' | 'cumulative';
 
 /**
  * Response wrapping the AI agent breakdown rows.
@@ -2188,17 +2119,6 @@ export type AuthResponse = {
     user_id?: number | null;
 };
 
-export type AuthStatusResponse = {
-    cli_token?: string | null;
-    status: string;
-};
-
-export type AuthTokenResponse = {
-    access_token: string;
-    expires_at: number;
-    refresh_token: string;
-};
-
 export type AuthorizeWorkspacePreviewRequest = {
     path?: string | null;
     port: number;
@@ -2595,20 +2515,6 @@ export type BranchInfo = {
 
 export type BranchListResponse = {
     branches: Array<BranchInfo>;
-};
-
-export type BrowserCount = {
-    browser: string;
-    count: number;
-    percentage: number;
-};
-
-export type BrowsersQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 /**
@@ -3239,11 +3145,6 @@ export type CliDeviceStartResponse = {
      * `verification_uri` with `user_code` pre-filled. Open this directly.
      */
     verification_uri_complete: string;
-};
-
-export type CliLoginRequest = {
-    password: string;
-    username: string;
 };
 
 export type CloudAiCapability = {
@@ -3939,13 +3840,6 @@ export type ConnectionLimitSettings = {
     default_max_concurrent_connections?: number;
 };
 
-export type ConnectionListQuery = {
-    direction?: string | null;
-    page?: number | null;
-    per_page?: number | null;
-    sort?: string | null;
-};
-
 export type ConnectionListResponse = {
     connections: Array<ConnectionResponse>;
     page: number;
@@ -4255,24 +4149,6 @@ export type ContainerLogSettings = {
     service_max_size?: string;
 };
 
-export type ContainerLogsQuery = {
-    /**
-     * Optional container name to get logs from (if deployment has multiple containers)
-     */
-    container_name?: string | null;
-    end_date?: number | null;
-    /**
-     * Follow log output in real-time (default: true for backward compatibility)
-     */
-    follow?: boolean;
-    start_date?: number | null;
-    tail?: string | null;
-    /**
-     * Include timestamps in log output (default: false)
-     */
-    timestamps?: boolean;
-};
-
 /**
  * One bucketed data point of a container resource metric time series.
  */
@@ -4285,21 +4161,6 @@ export type ContainerMetricHistoryPoint = {
      * Averaged metric value for the bucket.
      */
     value: number;
-};
-
-/**
- * Query parameters for the container metrics history endpoint.
- */
-export type ContainerMetricsHistoryQuery = {
-    /**
-     * Dotted metric name, e.g. `container.cpu_percent` or
-     * `container.memory_used_bytes`.
-     */
-    metric: string;
-    /**
-     * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
-     */
-    range?: string;
 };
 
 /**
@@ -4498,15 +4359,6 @@ export type ContextLine = {
     timestamp: string;
 };
 
-export type ContextLogsRequest = {
-    chunk_id: string;
-    line_offset: number;
-    /**
-     * Number of context lines before and after (default: 25)
-     */
-    lines?: number | null;
-};
-
 export type ContextLogsResponse = {
     lines: Array<ContextLine>;
     target_index: number;
@@ -4653,33 +4505,6 @@ export type ConversationSummary = {
     total_input_tokens: number;
     total_output_tokens: number;
     total_tokens: number;
-};
-
-export type ConversationsQueryParams = {
-    /**
-     * ISO 8601 start time (defaults to 24h ago)
-     */
-    from?: string | null;
-    /**
-     * Max results (defaults to 50, max 100)
-     */
-    limit?: number | null;
-    /**
-     * Filter by model name
-     */
-    model?: string | null;
-    /**
-     * Filter by tags (comma-separated, AND logic)
-     */
-    tags?: string | null;
-    /**
-     * ISO 8601 end time (defaults to now)
-     */
-    to?: string | null;
-    /**
-     * Filter by user ID
-     */
-    user_id?: number | null;
 };
 
 /**
@@ -6042,24 +5867,6 @@ export type DashboardLayout = {
 };
 
 /**
- * Query parameters for batch dashboard analytics
- */
-export type DashboardProjectsAnalyticsQuery = {
-    /**
-     * End date for the query range
-     */
-    end_date: string;
-    /**
-     * Comma-separated list of project IDs
-     */
-    project_ids: string;
-    /**
-     * Start date for the query range
-     */
-    start_date: string;
-};
-
-/**
  * Batch response for dashboard project analytics
  */
 export type DashboardProjectsAnalyticsResponse = {
@@ -6286,31 +6093,6 @@ export type DeployFromImageRequest = {
      * Optional deployment metadata
      */
     metadata?: unknown;
-};
-
-/**
- * Query parameters for deploying from an uploaded image tarball
- */
-export type DeployFromImageUploadQuery = {
-    /**
-     * Optional HTTP health-check path override (e.g. "/api/healthz").
-     * Must start with '/'. When omitted, defaults to "/".
-     */
-    health_check_path?: string | null;
-    /**
-     * Deprecated display hint retained for wire compatibility. Temps always
-     * generates the actual project-scoped internal image reference.
-     */
-    tag?: string | null;
-    /**
-     * Client-generated UUID identifying this upload attempt. When a
-     * deployment already exists for this project, environment, and ID, that
-     * deployment is returned as-is instead of importing and deploying the
-     * image again — this makes a client retry after a lost response safe.
-     * Callers that omit it get no such protection (each call always creates
-     * a new deployment), so the CLI always sends one.
-     */
-    upload_request_id?: string | null;
 };
 
 export type DeployFromStaticRequest = {
@@ -6874,12 +6656,6 @@ export type DetectionConfig = (StaticParams & {
     kind: 'auto_watch';
 });
 
-export type DeviceCount = {
-    count: number;
-    device_type: string;
-    percentage: number;
-};
-
 /**
  * Sections that can be included in the weekly digest
  * Note: `#[serde(default)]` allows backward compatibility when deserializing
@@ -7119,11 +6895,6 @@ export type DnsChangesResponse = {
     removed_ids: Array<number>;
 };
 
-export type DnsCompletionResponse = {
-    domain: string;
-    status: string;
-};
-
 /**
  * Error response for DNS lookup failures
  */
@@ -7136,16 +6907,6 @@ export type DnsLookupError = {
      * Error message
      */
     error: string;
-};
-
-/**
- * Request to lookup DNS A records for a domain
- */
-export type DnsLookupRequest = {
-    /**
-     * Domain name to lookup
-     */
-    domain: string;
 };
 
 /**
@@ -7252,46 +7013,6 @@ export type DnsProviderSettingsMasked = {
 export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
 
 /**
- * A DNS record
- */
-export type DnsRecord = {
-    /**
-     * Record content
-     */
-    content: DnsRecordContent;
-    /**
-     * Fully qualified domain name
-     */
-    fqdn: string;
-    /**
-     * Provider-specific record ID (if exists)
-     */
-    id?: string | null;
-    /**
-     * Provider-specific metadata
-     */
-    metadata?: {
-        [key: string]: string;
-    };
-    /**
-     * Record name (without zone, e.g., "www" or "@" for root)
-     */
-    name: string;
-    /**
-     * Whether this record is proxied (Cloudflare-specific)
-     */
-    proxied?: boolean;
-    /**
-     * Time to live in seconds
-     */
-    ttl: number;
-    /**
-     * Zone/domain this record belongs to
-     */
-    zone: string;
-};
-
-/**
  * A single DNS record change the Cloudflare sync would make.
  */
 export type DnsRecordChange = {
@@ -7305,89 +7026,6 @@ export type DnsRecordChange = {
      */
     record_type: string;
     value: string;
-};
-
-/**
- * DNS record content - varies by record type
- */
-export type DnsRecordContent = {
-    type: 'A';
-    /**
-     * A record - IPv4 address (as string, e.g., "192.0.2.1")
-     */
-    value: {
-        address: string;
-    };
-} | {
-    type: 'AAAA';
-    /**
-     * AAAA record - IPv6 address (as string, e.g., "2001:db8::1")
-     */
-    value: {
-        address: string;
-    };
-} | {
-    type: 'CNAME';
-    /**
-     * CNAME record - canonical name
-     */
-    value: {
-        target: string;
-    };
-} | {
-    type: 'TXT';
-    /**
-     * TXT record - text content
-     */
-    value: {
-        content: string;
-    };
-} | {
-    type: 'MX';
-    /**
-     * MX record - mail exchange
-     */
-    value: {
-        priority: number;
-        target: string;
-    };
-} | {
-    type: 'NS';
-    /**
-     * NS record - nameserver
-     */
-    value: {
-        nameserver: string;
-    };
-} | {
-    type: 'SRV';
-    /**
-     * SRV record - service
-     */
-    value: {
-        port: number;
-        priority: number;
-        target: string;
-        weight: number;
-    };
-} | {
-    type: 'CAA';
-    /**
-     * CAA record - certification authority authorization
-     */
-    value: {
-        flags: number;
-        tag: string;
-        value: string;
-    };
-} | {
-    type: 'PTR';
-    /**
-     * PTR record - pointer
-     */
-    value: {
-        target: string;
-    };
 };
 
 export type DnsRecordResponse = {
@@ -8530,13 +8168,6 @@ export type EnvironmentVariableValueResponse = {
     value: string;
 };
 
-export type ErrorDashboardStatsQuery = {
-    compare_to_previous?: boolean | null;
-    end_time: string;
-    environment_id?: number | null;
-    start_time: string;
-};
-
 export type ErrorDashboardStatsResponse = {
     comparison_end_time?: string | null;
     comparison_start_time?: string | null;
@@ -8631,21 +8262,6 @@ export type ErrorTimeSeriesDataResponse = {
     timestamp: string;
 };
 
-export type ErrorTimeSeriesQuery = {
-    /**
-     * Time bucket size (e.g., "1h", "15m", "1d", "1 hour", "30 minutes")
-     */
-    bucket?: string;
-    end_time: string;
-    /**
-     * Filter chart data to a specific environment.
-     * Always AND-combined with project_id — an environment from a different project
-     * returns zero-filled buckets rather than cross-project data.
-     */
-    environment_id?: number | null;
-    start_time: string;
-};
-
 /**
  * What to quote.
  *
@@ -8692,8 +8308,6 @@ export type EventActivityBucket = {
      */
     unique_visitors: number;
 };
-
-export type EventBreakdown = 'country' | 'region' | 'city';
 
 /**
  * Browser stats for an event
@@ -8742,24 +8356,6 @@ export type EventCountryStats = {
 };
 
 /**
- * Query parameters for event detail analytics
- */
-export type EventDetailQuery = {
-    /**
-     * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)
-     */
-    bucket_interval?: string | null;
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * The specific event name to get details for
-     */
-    event_name: string;
-    project_id: number;
-    start_date: string;
-};
-
-/**
  * Summary response for a specific event's analytics
  */
 export type EventDetailResponse = {
@@ -8799,28 +8395,6 @@ export type EventDetailResponse = {
      * Number of unique visitors who triggered this event
      */
     unique_visitors: number;
-};
-
-/**
- * Query parameters for the raw event entries list
- */
-export type EventEntriesQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * The specific event name to list occurrences for
-     */
-    event_name: string;
-    /**
-     * Page number (1-based, default: 1)
-     */
-    page?: number | null;
-    /**
-     * Items per page (default: 20, max: 100)
-     */
-    per_page?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 /**
@@ -8999,21 +8573,6 @@ export type EventTimeline = {
     date: string;
 };
 
-export type EventTimelineQuery = {
-    /**
-     * Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)
-     */
-    aggregation_level?: AggregationLevel;
-    /**
-     * Bucket size: hour, day, or week (auto-detected if not specified)
-     */
-    bucket_size?: string | null;
-    end_date: string;
-    environment_id?: number | null;
-    event_name?: string | null;
-    start_date: string;
-};
-
 export type EventType = {
     count: number;
     name: string;
@@ -9023,16 +8582,6 @@ export type EventTypeBreakdown = {
     count: number;
     event_type: string;
     percentage: number;
-};
-
-export type EventTypeBreakdownQuery = {
-    /**
-     * Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)
-     */
-    aggregation_level?: AggregationLevel;
-    end_date: string;
-    environment_id?: number | null;
-    start_date: string;
 };
 
 export type EventTypeResponse = {
@@ -9099,28 +8648,6 @@ export type EventVisitorInfo = {
 };
 
 /**
- * Query parameters for event visitors list
- */
-export type EventVisitorsQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * The specific event name to list visitors for
-     */
-    event_name: string;
-    /**
-     * Page number (1-based, default: 1)
-     */
-    page?: number | null;
-    /**
-     * Items per page (default: 20, max: 100)
-     */
-    per_page?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
-/**
  * Paginated response for event visitors
  */
 export type EventVisitorsResponse = {
@@ -9144,16 +8671,6 @@ export type EventVisitorsResponse = {
      * Individual visitors who triggered this event
      */
     visitors: Array<EventVisitorInfo>;
-};
-
-export type EventsCountQuery = {
-    breakdown?: null | EventBreakdown;
-    custom_events_only?: boolean | null;
-    end_date: string;
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 export type EventsResponse = {
@@ -9461,33 +8978,6 @@ export type ExternalServiceSummary = {
  * stamping it on each row keeps the status fields unambiguous.
  */
 export type FacetBackendKind = 'clickhouse' | 'timescaledb';
-
-/**
- * Whether a facet registered now would actually cover anything
- * (Feature Discoverability: "not built" and "not set up" need different UI).
- */
-export type FacetCapability = {
-    /**
-     * False when the facet would populate for no project at all.
-     */
-    configured: boolean;
-    /**
-     * Why, when `configured` is false. Always populated in that case.
-     */
-    reason?: string | null;
-    /**
-     * Where the operator goes to change it.
-     */
-    setup_path?: string | null;
-    /**
-     * Projects whose spans this facet will **not** cover, because they are
-     * Cloud-primary and store no spans on this instance. Non-empty alongside
-     * `configured: true` is a real and useful state: the facet works for the
-     * other projects, and the operator must be told which ones it misses
-     * rather than discovering it from an empty filter.
-     */
-    uncovered_project_ids: Array<number>;
-};
 
 /**
  * Public representation of a registered span attribute facet.
@@ -10124,11 +9614,6 @@ export type GenAiTraceSummary = {
     trace_id: string;
 };
 
-export type GeneralStatsQuery = {
-    end_date: string;
-    start_date: string;
-};
-
 export type GeneralStatsResponse = {
     avg_bounce_rate: number;
     avg_engagement_rate: number;
@@ -10449,48 +9934,10 @@ export type GeoSettingsMasked = {
     stale_lookup_days?: number | null;
 };
 
-export type GetDeploymentsParams = {
-    environment_id?: number | null;
-    page?: number | null;
-    per_page?: number | null;
-};
-
-export type GetEnvironmentVariablesQuery = {
-    environment_id?: number | null;
-    /**
-     * Required by integration-value reveals to bind the plaintext response to
-     * the exact service displayed by the client.
-     */
-    service_id?: number | null;
-    /**
-     * Exact manual env-var row to read when it is not marked secret. Required
-     * by the dashboard so duplicate keys cannot select a different row.
-     */
-    var_id?: number | null;
-};
-
-export type GetFunnelMetricsQuery = {
-    country_code?: string | null;
-    end_date?: string | null;
-    environment_id?: number | null;
-    start_date?: string | null;
-};
-
 export type GetOrCreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
     environment_id?: number | null;
-};
-
-export type GetProjectSecretsQuery = {
-    environment_id?: number | null;
-};
-
-export type GetProjectSessionReplaysQuery = {
-    environment_id?: number | null;
-    page?: number | null;
-    per_page?: number | null;
-    project_id: number;
 };
 
 export type GetProjectSessionReplaysResponse = {
@@ -10526,16 +9973,6 @@ export type GetResponse = {
 
 export type GetSessionReplayResponse = {
     session: SessionReplayWithVisitorDto;
-};
-
-export type GetUniqueEventsQuery = {
-    page?: number | null;
-    page_size?: number | null;
-};
-
-export type GetVisitorSessionsQuery = {
-    page?: number | null;
-    per_page?: number | null;
 };
 
 export type GetVisitorSessionsResponse = {
@@ -10714,16 +10151,6 @@ export type GlobalErrorGroupResponse = {
     total_count: number;
 };
 
-export type GlobalErrorGroupsQuery = {
-    end_date?: string | null;
-    page?: number;
-    page_size?: number;
-    project_id?: number | null;
-    search?: string | null;
-    start_date?: string | null;
-    status?: string | null;
-};
-
 export type GlobalErrorGroupsResponse = {
     data: Array<GlobalErrorGroupResponse>;
     pagination: PaginationMeta;
@@ -10882,23 +10309,6 @@ export type GroupedPageMetric = {
     ttfb?: number | null;
 };
 
-export type GroupedPageMetricsQuery = SpeedSegmentFilters & {
-    deployment_id?: number | null;
-    /**
-     * Device type filter: "desktop" or "mobile"
-     */
-    device_type?: string | null;
-    end_date: string;
-    environment_id?: number | null;
-    group_by: string;
-    /**
-     * Include crawler/datacenter (bot) samples. Defaults to false.
-     */
-    include_bots?: boolean | null;
-    project_id: number;
-    start_date: string;
-};
-
 export type GroupedPageMetricsResponse = {
     grouped_by: string;
     groups: Array<GroupedPageMetric>;
@@ -10948,17 +10358,8 @@ export type HasErrorGroupsResponse = {
     has_error_groups: boolean;
 };
 
-export type HasEventsQuery = {
-    environment_id?: number | null;
-    project_id: number;
-};
-
 export type HasEventsResponse = {
     has_events: boolean;
-};
-
-export type HasMetricsQuery = {
-    project_id: number;
 };
 
 export type HasMetricsResponse = {
@@ -11166,16 +10567,6 @@ export type HourlyPageSessions = {
     event_count: number;
     session_count: number;
     timestamp: string;
-};
-
-export type HourlyVisitsQuery = {
-    /**
-     * Aggregation level: events (page views), sessions (unique sessions), or visitors (unique visitors)
-     */
-    aggregation_level?: AggregationLevel;
-    end_date: string;
-    environment_id?: number | null;
-    start_date: string;
 };
 
 export type HttpChallengeDebugResponse = {
@@ -11753,11 +11144,6 @@ export type IngestErrorsResponse = {
     errors: Array<IngestErrorSummary>;
 };
 
-export type InitAuthResponse = {
-    auth_url: string;
-    session_token: string;
-};
-
 /**
  * An anomaly insight.
  */
@@ -11792,23 +11178,6 @@ export type InsightStatus = 'active' | 'resolved';
 export type InsightsResponse = {
     count: number;
     data: Array<Insight>;
-};
-
-export type InstallPluginRequest = {
-    grants?: null | PluginGrantConfig;
-    /**
-     * Validated registry name only. URLs, paths, versions, and hashes are not
-     * accepted from HTTP callers.
-     */
-    name: string;
-};
-
-export type InstallPluginResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    version: string;
 };
 
 export type InstallRepositoryRequest = {
@@ -11855,16 +11224,6 @@ export type IntegrationResponse = {
      * URL is `{api_origin}/webhooks/revenue/{provider}/{webhook_path_token}`.
      */
     webhook_path_token: string;
-};
-
-/**
- * Query parameters for listing IP access control rules
- */
-export type IpAccessControlQuery = {
-    /**
-     * Filter by action ("block" or "allow")
-     */
-    action?: string | null;
 };
 
 /**
@@ -12176,70 +11535,6 @@ export type ListAgentsResponse = {
     total: number;
 };
 
-export type ListApiKeysQuery = {
-    page?: number | null;
-    page_size?: number | null;
-};
-
-/**
- * Query parameters for listing audit logs.
- *
- * Every field is optional — omitting one means "don't filter on it". Deriving
- * `IntoParams` makes utoipa render them as optional query params with the
- * correct types; the previous hand-written `params(("operation_type", Query,
- * …))` tuples defaulted every param to `required: true, type: string`, which
- * misled both API clients and the AI `describe_api`/`call_api` tools into
- * thinking all filters were mandatory.
- */
-export type ListAuditLogsQuery = {
-    /**
-     * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-     */
-    from?: string | null;
-    /**
-     * Maximum number of logs to return
-     */
-    limit?: number | null;
-    /**
-     * Number of logs to skip
-     */
-    offset?: number | null;
-    /**
-     * Filter logs by operation type (omit for all)
-     */
-    operation_type?: string | null;
-    /**
-     * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-     */
-    to?: string | null;
-    /**
-     * Filter logs by user ID (omit for all users)
-     */
-    user_id?: number | null;
-};
-
-/**
- * Query parameters for listing blobs
- */
-export type ListBlobsQuery = {
-    /**
-     * Continuation token for pagination
-     */
-    cursor?: string | null;
-    /**
-     * Maximum number of items to return
-     */
-    limit?: number | null;
-    /**
-     * Prefix to filter by
-     */
-    prefix?: string | null;
-    /**
-     * Project ID (required for API key/session auth, optional for deployment tokens)
-     */
-    project_id?: number | null;
-};
-
 /**
  * Response for listing blobs
  */
@@ -12263,48 +11558,11 @@ export type ListCustomDomainsResponse = {
     total: number;
 };
 
-export type ListDeploymentTokensQuery = {
-    page?: number | null;
-    page_size?: number | null;
-};
-
-export type ListDiscoveredRoutesQuery = {
-    page?: number | null;
-    page_size?: number | null;
-};
-
 export type ListDomainsResponse = {
     domains: Array<DomainResponse>;
     page: number;
     page_size: number;
     total: number;
-};
-
-export type ListEntitiesQuery = {
-    /**
-     * Maximum number of entities to return
-     */
-    limit?: number;
-    /**
-     * Continuation token for pagination (backend-specific)
-     */
-    token?: string | null;
-};
-
-export type ListErrorEventsQuery = {
-    page?: number;
-    page_size?: number;
-};
-
-export type ListErrorGroupsQuery = {
-    end_date?: string | null;
-    environment_id?: number | null;
-    page?: number;
-    page_size?: number;
-    sort_by?: string | null;
-    sort_order?: string;
-    start_date?: string | null;
-    status?: string | null;
 };
 
 export type ListJobsResponse = {
@@ -12380,11 +11638,6 @@ export type ListSandboxesResponse = {
     sandboxes: Array<SandboxInner>;
 };
 
-export type ListScansQuery = {
-    page?: number | null;
-    page_size?: number | null;
-};
-
 export type ListSecretsResponse = {
     items: Array<SecretResponse>;
     total: number;
@@ -12423,21 +11676,6 @@ export type ListTagsResponse = {
 };
 
 /**
- * Query parameters for listing templates
- */
-export type ListTemplatesQuery = {
-    /**
-     * Only return featured templates
-     */
-    featured?: boolean | null;
-    kind?: null | TemplateKind;
-    /**
-     * Filter templates by tag
-     */
-    tag?: string | null;
-};
-
-/**
  * Response for listing templates
  */
 export type ListTemplatesResponse = {
@@ -12449,12 +11687,6 @@ export type ListTemplatesResponse = {
      * Total number of templates
      */
     total: number;
-};
-
-export type ListVulnerabilitiesQuery = {
-    page?: number | null;
-    page_size?: number | null;
-    severity?: string | null;
 };
 
 export type LiveVisitorInfo = {
@@ -12514,14 +11746,6 @@ export type LocalCredentialDto = {
      */
     source: string;
 };
-
-export type LocationCount = {
-    count: number;
-    location: string;
-    percentage: number;
-};
-
-export type LocationGranularity = 'country' | 'region' | 'city';
 
 export type LocationInfo = {
     city?: string | null;
@@ -12599,21 +11823,9 @@ export type LogSource = {
     service: string;
 };
 
-/**
- * Log output stream
- */
-export type LogStream = 'stdout' | 'stderr';
-
 export type LoginRequest = {
     email: string;
     password: string;
-};
-
-export type LogsQuery = {
-    /**
-     * Number of lines to return from the tail. Defaults to 200, capped at 2000.
-     */
-    tail?: number | null;
 };
 
 export type LogsResponse = {
@@ -12836,21 +12048,6 @@ export type MessageResponse = {
 export type MeteredMode = 'derive_from_invoices' | 'use_subscription' | 'ignore';
 
 /**
- * The aggregation applied when reducing raw metric points into a time bucket.
- *
- * Store-neutral: every storage backend (ClickHouse today, TimescaleDB later)
- * must be able to satisfy this contract. `Quantile(q)` carries the requested
- * quantile in `[0.0, 1.0]` (e.g. `0.95` for p95).
- */
-export type MetricAggregation = 'avg' | 'sum' | 'min' | 'max' | 'count' | 'rate_per_sec' | {
-    /**
-     * A quantile of the scalar value in each bucket. The carried `f64` is the
-     * requested quantile in `[0.0, 1.0]`.
-     */
-    quantile: number;
-};
-
-/**
  * A time-bucketed metric aggregate for chart display.
  *
  * Store-neutral response contract. The legacy scalar fields
@@ -12906,11 +12103,6 @@ export type MetricDataPoint = {
     value: number;
 };
 
-/**
- * The type of an OTel metric.
- */
-export type MetricType = 'gauge' | 'sum' | 'histogram' | 'exponential_histogram' | 'summary';
-
 export type MetricsOverTimeResponse = {
     cls: Array<number | null>;
     cls_p75?: number | null;
@@ -12945,42 +12137,6 @@ export type MetricsOverTimeResponse = {
     ttfb_p99?: number | null;
 };
 
-export type MetricsQuery = {
-    deployment_id?: number | null;
-    end_date: string;
-    environment_id?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
-/**
- * Query params for range metric queries.
- */
-export type MetricsRangeQuery = {
-    /**
-     * Explicit window end (ISO 8601). Must be paired with `start_time`.
-     */
-    end_time?: string | null;
-    /**
-     * Metric name, e.g. `"pg.connections_active"`.
-     */
-    metric: string;
-    /**
-     * Optional histogram percentile (0–100).  When provided, the endpoint
-     * fetches histogram buckets and computes the requested quantile.
-     */
-    percentile?: number | null;
-    /**
-     * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
-     * Ignored when `start_time` and `end_time` are both set.
-     */
-    range?: string;
-    /**
-     * Explicit window start (ISO 8601). Must be paired with `end_time`.
-     */
-    start_time?: string | null;
-};
-
 /**
  * Freshness status: when metrics were last received for this service.
  */
@@ -13004,11 +12160,6 @@ export type MetricsSummaryResponse = {
     currency: string;
     current_arr_minor: number;
     current_mrr_minor: number;
-};
-
-export type MfaRequiredResponse = {
-    requires_mfa: boolean;
-    session_token: string;
 };
 
 export type MfaSetupResponse = {
@@ -14054,12 +13205,6 @@ export type OpenAiErrorResponse = {
     error: OpenAiError;
 };
 
-export type OperatingSystemCount = {
-    count: number;
-    operating_system: string;
-    percentage: number;
-};
-
 export type OperationResultResponse = {
     data?: unknown;
     executed_at: string;
@@ -14340,28 +13485,6 @@ export type PageFlowEntry = {
 };
 
 /**
- * Query parameters for page flow analytics
- */
-export type PageFlowQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * Maximum number of entry/exit pages to return (default: 20)
-     */
-    limit?: number | null;
-    /**
-     * Minimum views for drop-off analysis (default: 5)
-     */
-    min_views_for_dropoff?: number | null;
-    project_id: number;
-    start_date: string;
-    /**
-     * Maximum number of transitions to return (default: 50)
-     */
-    transitions_limit?: number | null;
-};
-
-/**
  * Complete page flow analytics response
  */
 export type PageFlowResponse = {
@@ -14391,41 +13514,11 @@ export type PageFlowResponse = {
     transitions: Array<PageTransition>;
 };
 
-/**
- * Query parameters for page hourly sessions endpoint
- */
-export type PageHourlySessionsQuery = {
-    bucket_interval?: string | null;
-    end_time: string;
-    environment_id?: number | null;
-    page_path: string;
-    project_id: number;
-    start_time: string;
-};
-
 export type PageHourlySessionsResponse = {
     hourly_data: Array<HourlyPageSessions>;
     hours: number;
     page_path: string;
     total_sessions: number;
-};
-
-/**
- * Query parameters for page path detail analytics
- */
-export type PagePathDetailQuery = {
-    /**
-     * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)
-     */
-    bucket_interval?: string | null;
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * The specific page path to get details for (URL-encoded)
-     */
-    page_path: string;
-    project_id: number;
-    start_date: string;
 };
 
 /**
@@ -14498,28 +13591,6 @@ export type PagePathSparklinePoint = {
 };
 
 /**
- * Query parameters for page path visitors
- */
-export type PagePathVisitorsQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * Page number (1-based, default: 1)
-     */
-    page?: number | null;
-    /**
-     * The specific page path to get visitors for
-     */
-    page_path: string;
-    /**
-     * Items per page (default: 50, max: 100)
-     */
-    per_page?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
-/**
  * Response for page path visitors endpoint
  */
 export type PagePathVisitorsResponse = {
@@ -14545,31 +13616,9 @@ export type PagePathVisitorsResponse = {
     total_count: number;
 };
 
-export type PagePathsQuery = {
-    end_date?: string | null;
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
-    start_date?: string | null;
-};
-
 export type PagePathsResponse = {
     page_paths: Array<PagePathInfo>;
     total_count: number;
-};
-
-/**
- * Query parameters for batch page paths sparkline endpoint
- */
-export type PagePathsSparklineQuery = {
-    end_time: string;
-    environment_id?: number | null;
-    /**
-     * Comma-separated list of page paths
-     */
-    page_paths: string;
-    project_id: number;
-    start_time: string;
 };
 
 export type PagePathsSparklineResponse = {
@@ -14592,32 +13641,6 @@ export type PageReferrerStats = {
      * Number of visits from this referrer
      */
     visits: number;
-};
-
-export type PageSessionComparison = {
-    avg_duration_seconds: number;
-    date: string;
-    event_count: number;
-    page_path: string;
-    session_count: number;
-};
-
-export type PageSessionStats = {
-    avg_page_views_per_session: number;
-    avg_time_seconds: number;
-    max_time_seconds: number;
-    min_time_seconds: number;
-    page_path: string;
-    total_page_views: number;
-    total_sessions: number;
-};
-
-export type PageSessionStatsQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    page_path: string;
-    project_id: number;
-    start_date: string;
 };
 
 /**
@@ -14717,11 +13740,6 @@ export type PageVisitorSession = {
     visitor_uuid: string;
 };
 
-export type PagesComparisonResponse = {
-    comparisons: Array<PageSessionComparison>;
-    page_paths: Array<string>;
-};
-
 export type PaginatedEmailsResponse = {
     data: Array<EmailResponse>;
     page: number;
@@ -14811,11 +13829,6 @@ export type PaginationMeta = {
     total_pages: number;
 };
 
-export type PaginationParams = {
-    page?: number;
-    per_page?: number;
-};
-
 /**
  * Password protection configuration
  *
@@ -14838,25 +13851,6 @@ export type PatchSettingsRequest = {
     auto_upgrade?: boolean | null;
     host_port?: number | null;
     image?: string | null;
-};
-
-export type PathVisitors = {
-    name: string;
-    percentage: number;
-    visitors: number;
-};
-
-export type PathVisitorsAnalyticsQuery = {
-    deployment_id?: number | null;
-    end_date: string;
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
-export type PathVisitorsResponse = {
-    results: Array<PathVisitors>;
 };
 
 /**
@@ -14930,23 +13924,6 @@ export type PendingActionResponse = {
      */
     step_index: number;
     summary: string;
-};
-
-export type PerformanceMetricsQuery = SpeedSegmentFilters & {
-    deployment_id?: number | null;
-    /**
-     * Device type filter: "desktop" or "mobile"
-     */
-    device_type?: string | null;
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * Include crawler/datacenter (bot) samples. Defaults to false — bots
-     * are excluded from the read view but always stored at ingest.
-     */
-    include_bots?: boolean | null;
-    project_id: number;
-    start_date: string;
 };
 
 export type PerformanceMetricsResponse = {
@@ -15051,34 +14028,6 @@ export type PermissionRequest = {
     kind: PermissionKind;
     /**
      * The tool name from `request.tool_name` (e.g. `"Bash"`, `"AskUserQuestion"`).
-     */
-    tool_name: string;
-};
-
-/**
- * Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
- * The active provider turn is paused waiting for the user to approve or deny
- * a tool/question/plan. Resolve via
- * `POST .../permissions/{id}/resolve`.
- */
-export type PermissionRequestedEvent = {
-    /**
-     * The CLI's `request_id` — also the `{permission_id}` in the resolve URL.
-     */
-    id: string;
-    /**
-     * Raw `input` from the CLI request. Passed through verbatim so each
-     * milestone's card can render tool-specific fields without the service
-     * layer needing to know about their schemas.
-     */
-    input: unknown;
-    /**
-     * What kind of interaction is required: `"tool_approval"`, `"question"`,
-     * or `"plan_approval"`.
-     */
-    kind: PermissionKind;
-    /**
-     * Tool name from the CLI request (e.g. `"Bash"`, `"AskUserQuestion"`).
      */
     tool_name: string;
 };
@@ -16109,11 +15058,6 @@ export type ProjectPresetResponse = {
     projectType: string;
 };
 
-export type ProjectQuery = {
-    environment_id?: number | null;
-    project_id: number;
-};
-
 /**
  * A lightweight project descriptor included in `UnifiedTrace`.
  */
@@ -16472,129 +15416,16 @@ export type PropertyBreakdownItem = {
     value: string;
 };
 
-/**
- * Query parameters for property breakdown (group by column)
- */
-export type PropertyBreakdownQuery = {
-    /**
-     * Aggregation level
-     */
-    aggregation_level?: AggregationLevel;
-    /**
-     * Optional deployment filter
-     */
-    deployment_id?: number | null;
-    /**
-     * End date for the query range
-     */
-    end_date: string;
-    /**
-     * Optional environment filter
-     */
-    environment_id?: number | null;
-    /**
-     * Optional event name filter (e.g., "page_view", "click")
-     */
-    event_name?: string | null;
-    /**
-     * Filter by browser name (for browser version drill-downs)
-     */
-    filter_browser?: string | null;
-    /**
-     * Filter by channel name (for channel -> referrer drill-downs)
-     */
-    filter_channel?: string | null;
-    /**
-     * Filter by country (for region/city drill-downs). Requires geolocation join.
-     */
-    filter_country?: string | null;
-    /**
-     * Filter by operating system name (for OS version drill-downs)
-     */
-    filter_os?: string | null;
-    /**
-     * Filter by referrer hostname (for referrer -> pages drill-downs)
-     */
-    filter_referrer?: string | null;
-    /**
-     * Filter by region (for city drill-downs). Requires geolocation join.
-     */
-    filter_region?: string | null;
-    /**
-     * Property column to group by
-     */
-    group_by: PropertyColumn;
-    /**
-     * Include crawler/bot traffic (default: false). Off by default so the
-     * breakdown percentages share a denominator with the headline counts,
-     * which always exclude crawlers.
-     */
-    include_crawlers?: boolean | null;
-    /**
-     * Maximum number of results to return (default: 20, max: 100)
-     */
-    limit?: number | null;
-    /**
-     * Start date for the query range
-     */
-    start_date: string;
-};
-
 export type PropertyBreakdownResponse = {
     items: Array<PropertyBreakdownItem>;
     property: string;
     total: number;
 };
 
-export type PropertyColumn = 'channel' | 'device_type' | 'browser' | 'browser_version' | 'operating_system' | 'operating_system_version' | 'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_term' | 'utm_content' | 'referrer_hostname' | 'language' | 'event_type' | 'event_name' | 'page_path' | 'pathname' | 'country' | 'region' | 'city';
-
 export type PropertyTimelineItem = {
     count: number;
     timestamp: string;
     value: string;
-};
-
-/**
- * Query parameters for property timeline (group by column over time)
- */
-export type PropertyTimelineQuery = {
-    /**
-     * Aggregation level
-     */
-    aggregation_level?: AggregationLevel;
-    /**
-     * Time bucket size: "hour", "day", "week", "month" (default: auto-detect)
-     */
-    bucket_size?: string | null;
-    /**
-     * Optional deployment filter
-     */
-    deployment_id?: number | null;
-    /**
-     * End date for the query range
-     */
-    end_date: string;
-    /**
-     * Optional environment filter
-     */
-    environment_id?: number | null;
-    /**
-     * Optional event name filter
-     */
-    event_name?: string | null;
-    /**
-     * Property column to group by
-     */
-    group_by: PropertyColumn;
-    /**
-     * Include crawler/bot traffic (default: false). See
-     * [`PropertyBreakdownQuery::include_crawlers`].
-     */
-    include_crawlers?: boolean | null;
-    /**
-     * Start date for the query range
-     */
-    start_date: string;
 };
 
 export type PropertyTimelineResponse = {
@@ -17018,15 +15849,6 @@ export type PublicEnvExampleResponse = {
 };
 
 /**
- * Public hostname generation mode for Temps-managed preview routes.
- *
- * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
- * rather than globally, so a provider such as Cloudflare can offer the flat layout
- * required by its Universal SSL wildcard cert without changing every domain's behaviour.
- */
-export type PublicHostnameStrategy = 'standard' | 'flat';
-
-/**
  * Information about a public IP address lookup
  */
 export type PublicIpInfo = {
@@ -17231,65 +16053,9 @@ export type ReadFileResponse = {
     size: number;
 };
 
-/**
- * Query-string form of [`QueryDataRequest`] for the read-only `GET` rows
- * endpoint.
- *
- * The `POST` variant exists because filters are arbitrary backend-specific
- * JSON. Reading rows is nonetheless a *read*, and the AI agent's tool index
- * is GET-only by construction, so the same capability has to be reachable
- * without a body. `filter` therefore carries the JSON as a string.
- */
-export type ReadRowsQuery = {
-    /**
-     * Backend-specific filter, JSON-encoded. Fetch the expected shape from
-     * the `filter_schema` field of the explorer-support endpoint — e.g.
-     * `{"where":"created_at > now() - interval '7 days'"}` for SQL sources.
-     */
-    filter?: string | null;
-    /**
-     * Maximum number of rows to return
-     */
-    limit?: number;
-    /**
-     * Number of rows to skip
-     */
-    offset?: number;
-    /**
-     * Sort by field name
-     */
-    sort_by?: string | null;
-    /**
-     * Sort order (asc/desc)
-     */
-    sort_order?: string | null;
-};
-
 export type ReassignCustomDomainRequest = {
     target_environment_id: number;
     target_project_id: number;
-};
-
-/**
- * Query parameters for recent activity endpoint
- */
-export type RecentActivityQuery = {
-    /**
-     * Environment ID (optional)
-     */
-    environment_id?: number | null;
-    /**
-     * Max number of events to return (default: 50, max: 100)
-     */
-    limit?: number | null;
-    /**
-     * Project ID
-     */
-    project_id: number;
-    /**
-     * Return events with ID greater than this (for cursor-based polling)
-     */
-    since_id?: number | null;
 };
 
 /**
@@ -17315,73 +16081,6 @@ export type RecentEventResponse = {
     occurred_at: string;
 };
 
-export type RecentQueryParams = {
-    /**
-     * Filter by conversation ID
-     */
-    conversation_id?: string | null;
-    /**
-     * Cost strictly greater-than, in microcents
-     */
-    cost_gt?: number | null;
-    /**
-     * Cost greater-than-or-equal, in microcents
-     */
-    cost_gte?: number | null;
-    /**
-     * Cost strictly less-than, in microcents
-     */
-    cost_lt?: number | null;
-    /**
-     * Cost less-than-or-equal, in microcents
-     */
-    cost_lte?: number | null;
-    /**
-     * Page size (defaults to 20, max 50)
-     */
-    limit?: number | null;
-    /**
-     * Filter by model name
-     */
-    model?: string | null;
-    /**
-     * Number of results to skip for pagination (defaults to 0)
-     */
-    offset?: number | null;
-    /**
-     * Filter by provider name
-     */
-    provider?: string | null;
-    /**
-     * Filter by HTTP status code (exact match)
-     */
-    status?: number | null;
-    /**
-     * Filter by tags (comma-separated, AND logic)
-     */
-    tags?: string | null;
-    /**
-     * Total tokens (input + output) strictly greater-than
-     */
-    tokens_gt?: number | null;
-    /**
-     * Total tokens (input + output) greater-than-or-equal
-     */
-    tokens_gte?: number | null;
-    /**
-     * Total tokens (input + output) strictly less-than
-     */
-    tokens_lt?: number | null;
-    /**
-     * Total tokens (input + output) less-than-or-equal
-     */
-    tokens_lte?: number | null;
-    /**
-     * Filter by user ID
-     */
-    user_id?: number | null;
-};
-
 /**
  * Keys a running app actually evaluated since its last report.
  */
@@ -17404,13 +16103,6 @@ export type RecordExposureResponse = {
 };
 
 /**
- * Record list response
- */
-export type RecordListResponse = {
-    records: Array<DnsRecord>;
-};
-
-/**
  * Engine-specific recovery target for PITR.
  *
  * Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
@@ -17428,19 +16120,6 @@ export type RecoveryTarget = {
 } | {
     kind: 'name';
     name: string;
-};
-
-export type ReferrerCount = {
-    count: number;
-    percentage: number;
-    referrer: string;
-};
-
-export type ReferrersAnalyticsQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 export type RefreshProviderModelsResponse = {
@@ -17555,29 +16234,6 @@ export type RegisterNodeResponse = {
     mtls_required: boolean;
     name: string;
     status: string;
-};
-
-export type RegisterRequest = {
-    email: string;
-    name: string;
-    password: string;
-};
-
-/**
- * The outer envelope signs the decoded bytes in `payload`. Encoding the
- * payload instead of reserializing a JSON object avoids ambiguous map order,
- * whitespace, and number representations.
- */
-export type RegistryEnvelope = {
-    key_id: string;
-    /**
-     * Standard-base64 encoded JSON [`RegistryDocument`].
-     */
-    payload: string;
-    /**
-     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
-     */
-    signature: string;
 };
 
 export type RegistryPlugin = {
@@ -17774,17 +16430,6 @@ export type RepositoryEnvExampleResponse = {
     path?: string | null;
     repositoryId: number;
     variables: Array<EnvExampleVariableResponse>;
-};
-
-export type RepositoryListQuery = {
-    direction?: string | null;
-    language?: string | null;
-    owner?: string | null;
-    page?: number | null;
-    per_page?: number | null;
-    private?: boolean | null;
-    search?: string | null;
-    sort?: string | null;
 };
 
 export type RepositoryListResponse = {
@@ -18377,58 +17022,6 @@ export type RoleInfo = {
     permissions: Array<string>;
 };
 
-/**
- * A cached rootfs image (Firecracker backend). Digest-keyed build artifact
- * shared by all VMs created from the same image.
- */
-export type RootfsCacheEntry = {
-    /**
-     * Actual on-disk size in bytes (sparse-aware).
-     */
-    bytes: number;
-    /**
-     * Image digest this rootfs was built from (the cache key).
-     */
-    digest: string;
-    /**
-     * IDs of live sandboxes whose per-VM disk was cloned from this entry.
-     * Empty means the entry is reclaimable — no sandbox needs it.
-     */
-    referenced_by: Array<string>;
-};
-
-/**
- * Outcome of a rootfs garbage-collection pass.
- */
-export type RootfsGcReport = {
-    freed_bytes: number;
-    /**
-     * Digests of cache entries removed because no sandbox referenced them.
-     */
-    removed_digests: Array<string>;
-};
-
-/**
- * Snapshot of a backend's rootfs storage for the management API. Backends
- * without a rootfs concept (Docker, local) return an empty report.
- */
-export type RootfsReport = {
-    cache: Array<RootfsCacheEntry>;
-    cache_bytes: number;
-    vm_bytes: number;
-    vms: Array<RootfsVmEntry>;
-};
-
-/**
- * A per-sandbox rootfs disk (Firecracker backend). One per non-destroyed
- * sandbox — the authoritative storage, independent of the cache.
- */
-export type RootfsVmEntry = {
-    bytes: number;
-    running: boolean;
-    sandbox_name: string;
-};
-
 export type RotateClusterCaRequest = {
     /**
      * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
@@ -18775,61 +17368,6 @@ export type ScanResponse = {
 };
 
 /**
- * A single run-history entry for the schedule detail page (deliverable 1).
- *
- * Combines one `backups` row with the most-recent `backup_jobs` row for that
- * backup via a lateral JOIN.  Fields from `backup_jobs` are `None` for legacy
- * backup rows that pre-date ADR-014.
- */
-export type ScheduleRunEntry = {
-    /**
-     * Number of claim-and-run attempts so far. `None` for legacy rows.
-     */
-    attempts?: number | null;
-    /**
-     * DB id of the `backups` row.
-     */
-    backup_id: number;
-    /**
-     * UUID string (`backups.backup_id`).
-     */
-    backup_uuid: string;
-    /**
-     * Last completed step reported by the engine (e.g. `"upload"`).
-     * `None` when no step has been persisted yet.
-     */
-    current_step?: string | null;
-    /**
-     * Engine-reported error message when `state = "failed"`.
-     */
-    error_message?: string | null;
-    /**
-     * When the backup finished, if known.
-     */
-    finished_at?: string | null;
-    /**
-     * Most recent `backup_jobs.id` for this backup. `None` for legacy rows.
-     */
-    job_id?: number | null;
-    /**
-     * S3 object key or URL where the backup data lives.
-     */
-    s3_location: string;
-    /**
-     * Final size in bytes once completed. `None` while running.
-     */
-    size_bytes?: number | null;
-    /**
-     * When the backup was started (ISO 8601 / RFC 3339).
-     */
-    started_at: string;
-    /**
-     * Current state: `"pending"`, `"running"`, `"completed"`, `"failed"`.
-     */
-    state: string;
-};
-
-/**
  * A single job entry inside an expanded schedule run, returned by
  * [`BackupService::list_schedule_run_jobs`].
  */
@@ -18879,28 +17417,6 @@ export type ScheduleRunJobEntry = {
      * Current state of this child backup.
      */
     state: string;
-};
-
-/**
- * Paginated run-history response for a backup schedule (deliverable 1).
- */
-export type ScheduleRunListResponse = {
-    /**
-     * Current page (1-based).
-     */
-    page: number;
-    /**
-     * Number of items per page (clamped to 1–100).
-     */
-    page_size: number;
-    /**
-     * Run entries, newest first.
-     */
-    runs: Array<ScheduleRunEntry>;
-    /**
-     * Total number of runs across all pages.
-     */
-    total: number;
 };
 
 /**
@@ -19745,16 +18261,6 @@ export type ServiceMemberInfo = {
     status: string;
 };
 
-export type ServiceParameter = {
-    choices?: Array<string> | null;
-    default_value?: string | null;
-    description: string;
-    encrypted: boolean;
-    name: string;
-    required: boolean;
-    validation_pattern?: string | null;
-};
-
 /**
  * Plan for migrating a single service (database, cache, etc.)
  */
@@ -19936,11 +18442,6 @@ export type ServiceTemplateUpgradeChange = {
     target?: string | null;
 };
 
-export type ServiceTypeInfo = {
-    parameters: Array<ServiceParameter>;
-    service_type: ServiceTypeRoute;
-};
-
 export type ServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio';
 
 /**
@@ -19977,11 +18478,6 @@ export type SessionDetails = {
     visitor_id: string;
 };
 
-export type SessionDetailsQuery = {
-    environment_id?: number | null;
-    project_id: number;
-};
-
 export type SessionEvent = {
     event_data: unknown;
     event_name: string;
@@ -19999,33 +18495,12 @@ export type SessionEventDto = {
     timestamp: number;
 };
 
-export type SessionEventsQuery = {
-    end_date?: string | null;
-    environment_id?: number | null;
-    limit?: number | null;
-    offset?: number | null;
-    project_id: number;
-    sort_order?: string | null;
-    start_date?: string | null;
-};
-
 export type SessionEventsResponse = {
     events: Array<SessionEvent>;
     limit: number;
     offset: number;
     session_id: number;
     total_count: number;
-};
-
-export type SessionLogsQuery = {
-    end_date?: string | null;
-    environment_id?: number | null;
-    limit?: number | null;
-    offset?: number | null;
-    project_id: number;
-    sort_order?: string | null;
-    start_date?: string | null;
-    visitor_id?: number | null;
 };
 
 export type SessionLogsResponse = {
@@ -20044,21 +18519,6 @@ export type SessionReplayEventsRequest = {
     batchId?: string | null;
     events: string;
     sessionId: string;
-};
-
-export type SessionReplayInfoDto = {
-    created_at?: string | null;
-    duration?: number | null;
-    id: string;
-    language?: string | null;
-    screen_height?: number | null;
-    screen_width?: number | null;
-    timezone?: string | null;
-    url?: string | null;
-    user_agent?: string | null;
-    viewport_height?: number | null;
-    viewport_width?: number | null;
-    visitor_id: number;
 };
 
 export type SessionReplayInitRequest = {
@@ -20329,23 +18789,6 @@ export type SetupMfaRequest = {
      * Omit (or leave empty) for SSO-only accounts with no local password.
      */
     current_password?: string | null;
-};
-
-/**
- * A sibling project that shares the same `trace_id` and has opted in to
- * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
- *
- * Returned by `CrossProjectTraceService::find_sibling_projects` and exposed
- * by the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.
- */
-export type SiblingRef = {
-    first_seen: string;
-    project_id: number;
-    project_name: string;
-    /**
-     * URL slug used to link into the sibling project's single-project trace view.
-     */
-    project_slug: string;
 };
 
 /**
@@ -21021,40 +19464,6 @@ export type SpeedMetricsPayload = {
     visitorId?: string | null;
 };
 
-/**
- * Optional segment filters for the performance read endpoints, mirroring
- * analytics' `VisitorSegmentFilters`. Each filter narrows results to samples
- * matching the dimension value, so metrics can be scoped to e.g. one page,
- * one browser, or one country. Geographic filters resolve via
- * `ip_geolocations`; the rest live directly on `performance_metrics`.
- */
-export type SpeedSegmentFilters = {
-    /**
-     * Browser name (matches `performance_metrics.browser`)
-     */
-    filter_browser?: string | null;
-    /**
-     * Geolocation city (matches `ip_geolocations.city`)
-     */
-    filter_city?: string | null;
-    /**
-     * Geolocation country (matches `ip_geolocations.country`)
-     */
-    filter_country?: string | null;
-    /**
-     * Operating system (matches `performance_metrics.operating_system`)
-     */
-    filter_operating_system?: string | null;
-    /**
-     * Page pathname (matches `performance_metrics.pathname`)
-     */
-    filter_path?: string | null;
-    /**
-     * Geolocation region (matches `ip_geolocations.region`)
-     */
-    filter_region?: string | null;
-};
-
 export type StaleSlot = {
     active: boolean;
     retained_bytes: number;
@@ -21215,37 +19624,6 @@ export type StaticPresetConfig = {
     outputDir?: string | null;
 };
 
-/**
- * Filters for statistics queries
- */
-export type StatsFilters = {
-    client_ip?: string | null;
-    deployment_id?: number | null;
-    device_type?: string | null;
-    environment_id?: number | null;
-    /**
-     * Exclude Temps status-monitor traffic, including legacy rows written
-     * before monitor requests received their own `request_source` value.
-     */
-    exclude_synthetic?: boolean;
-    /**
-     * When true, only count requests that matched a project (project_id IS NOT NULL).
-     * Used by the health dashboard so totals match the per-project cards.
-     */
-    has_project?: boolean | null;
-    host?: string | null;
-    is_bot?: boolean | null;
-    method?: string | null;
-    project_id?: number | null;
-    request_source?: string | null;
-    routing_status?: string | null;
-    status_code?: number | null;
-    /**
-     * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
-     */
-    status_code_class?: string | null;
-};
-
 export type StatusBucket = {
     avg_response_time_ms?: number | null;
     bucket_start: string;
@@ -21266,21 +19644,6 @@ export type StatusBucketedResponse = {
     buckets: Array<StatusBucket>;
     interval: string;
     monitor_id: number;
-};
-
-export type StatusCodeCount = {
-    count: number;
-    percentage: number;
-    status_code: number;
-};
-
-export type StatusCodesQuery = {
-    deployment_id?: number | null;
-    end_date: string;
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 export type StatusPageOverview = {
@@ -21456,18 +19819,6 @@ export type StripeConfig = {
  */
 export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
-export type SyncedRepositoryListQuery = {
-    direction?: string | null;
-    git_provider_connection_id?: number | null;
-    language?: string | null;
-    owner?: string | null;
-    page?: number | null;
-    per_page?: number | null;
-    private?: boolean | null;
-    search?: string | null;
-    sort?: string | null;
-};
-
 /**
  * Syntax validation result
  */
@@ -21497,22 +19848,6 @@ export type TagInfo = {
 
 export type TagListResponse = {
     tags: Array<TagInfo>;
-};
-
-export type TailLogsRequest = {
-    env: string;
-    /**
-     * When set, tail an imported/managed external service's logs instead of
-     * a project's (`project_id` is ignored in this mode).
-     */
-    external_service_id?: number | null;
-    levels?: Array<string>;
-    /**
-     * Project ID (integer, as used by the rest of the platform)
-     */
-    project_id: number;
-    service: string;
-    text?: string | null;
 };
 
 /**
@@ -21956,41 +20291,6 @@ export type TimeseriesBucket = {
     request_count: number;
 };
 
-export type TimeseriesQueryParams = {
-    /**
-     * Bucket size: "hour", "day", "week" (defaults to "day")
-     */
-    bucket?: string | null;
-    /**
-     * Filter by conversation ID
-     */
-    conversation_id?: string | null;
-    /**
-     * ISO 8601 start time (defaults to 24h ago)
-     */
-    from?: string | null;
-    /**
-     * Filter by model name
-     */
-    model?: string | null;
-    /**
-     * Filter by provider name
-     */
-    provider?: string | null;
-    /**
-     * Filter by tags (comma-separated, AND logic)
-     */
-    tags?: string | null;
-    /**
-     * ISO 8601 end time (defaults to now)
-     */
-    to?: string | null;
-    /**
-     * Filter by user ID
-     */
-    user_id?: number | null;
-};
-
 export type TlsMode = 'None' | 'Starttls' | 'Tls';
 
 /**
@@ -22042,23 +20342,6 @@ export type ToggleServiceMetricsRequest = {
     enabled: boolean;
 };
 
-export type TokenRenewalRequest = {
-    refresh_token: string;
-};
-
-/**
- * Payload for the `tool_call` SSE event: the model is about to run a tool.
- * Serialized as compact single-line JSON onto one `data:` line.
- */
-export type ToolCallEvent = {
-    /**
-     * The raw JSON-args string the model emitted.
-     */
-    arguments: string;
-    id: string;
-    name: string;
-};
-
 /**
  * One persisted tool invocation + its result, attached to an assistant message.
  */
@@ -22069,63 +20352,10 @@ export type ToolInfo = {
     result?: string | null;
 };
 
-/**
- * Payload for the `tool_result` SSE event: a tool finished running. Serialized
- * as compact single-line JSON; `content` is JSON-string-escaped so it stays on
- * one `data:` line even when long.
- */
-export type ToolResultEvent = {
-    content: string;
-    id: string;
-    name: string;
-};
-
-export type TopModelsQueryParams = {
-    /**
-     * ISO 8601 start time (defaults to 24h ago)
-     */
-    from?: string | null;
-    /**
-     * Max results (defaults to 10)
-     */
-    limit?: number | null;
-    /**
-     * Filter by tags (comma-separated, AND logic)
-     */
-    tags?: string | null;
-    /**
-     * ISO 8601 end time (defaults to now)
-     */
-    to?: string | null;
-    /**
-     * Filter by user ID
-     */
-    user_id?: number | null;
-};
-
 export type TraceProject = {
     id: number;
     name: string;
     slug: string;
-};
-
-/**
- * All projects that contributed spans to a trace, including their sharing flag.
- *
- * Returned by `CrossProjectTraceService::find_trace_projects`.
- */
-export type TraceProjectRef = {
-    first_seen: string;
-    project_id: number;
-    project_name: string;
-    /**
-     * URL slug used to link into the project's single-project trace view.
-     */
-    project_slug: string;
-    /**
-     * Whether this project has `cross_project_trace_sharing = true`.
-     */
-    sharing: boolean;
 };
 
 export type TraceSummariesResponse = {
@@ -22670,34 +20900,6 @@ export type UninstallPluginResponse = {
     data_preserved: boolean;
     message: string;
     name: string;
-};
-
-/**
- * Query parameters for unique counts over time frame
- */
-export type UniqueCountsQuery = {
-    /**
-     * Optional deployment filter
-     */
-    deployment_id?: number | null;
-    /**
-     * End date for the query range
-     */
-    end_date: string;
-    /**
-     * Optional environment filter
-     */
-    environment_id?: number | null;
-    /**
-     * Metric to count: "sessions" (unique sessions), "visitors" (unique visitors),
-     * "returning_visitors" (visitors seen before the range), or "page_views"
-     * (total page views) (default: "sessions")
-     */
-    metric?: string;
-    /**
-     * Start date for the query range
-     */
-    start_date: string;
 };
 
 export type UniqueCountsResponse = {
@@ -24058,61 +22260,6 @@ export type UptimeHistoryResponse = {
     uptime_data: Array<UptimeDataPoint>;
 };
 
-/**
- * Filters for querying AI usage data.
- *
- * Cost bounds are expressed in microcents (the unit stored in
- * `estimated_cost_microcents`). At most one of `gte`/`gt` and one of
- * `lte`/`lt` is meaningful per query; if both are set the stricter wins
- * naturally because they are ANDead together.
- */
-export type UsageFilter = {
-    conversation_id?: string | null;
-    /**
-     * Cost strictly greater-than, in microcents.
-     */
-    cost_gt?: number | null;
-    /**
-     * Cost greater-than-or-equal, in microcents.
-     */
-    cost_gte?: number | null;
-    /**
-     * Cost strictly less-than, in microcents.
-     */
-    cost_lt?: number | null;
-    /**
-     * Cost less-than-or-equal, in microcents.
-     */
-    cost_lte?: number | null;
-    model?: string | null;
-    provider?: string | null;
-    /**
-     * Filter by HTTP status code (exact match).
-     */
-    status?: number | null;
-    /**
-     * Comma-separated tags to filter by (AND logic).
-     */
-    tags?: string | null;
-    /**
-     * Total tokens (input + output) strictly greater-than.
-     */
-    tokens_gt?: number | null;
-    /**
-     * Total tokens (input + output) greater-than-or-equal.
-     */
-    tokens_gte?: number | null;
-    /**
-     * Total tokens (input + output) strictly less-than.
-     */
-    tokens_lt?: number | null;
-    /**
-     * Total tokens (input + output) less-than-or-equal.
-     */
-    tokens_lte?: number | null;
-    user_id?: number | null;
-};
-
 export type UsageInfo = {
     completion_tokens: number;
     prompt_tokens: number;
@@ -24149,37 +22296,6 @@ export type UsageLogPage = {
      * Total number of entries matching the filter (across all pages).
      */
     total: number;
-};
-
-export type UsageQueryParams = {
-    /**
-     * Filter by conversation ID
-     */
-    conversation_id?: string | null;
-    /**
-     * ISO 8601 start time (defaults to 24h ago)
-     */
-    from?: string | null;
-    /**
-     * Filter by model name
-     */
-    model?: string | null;
-    /**
-     * Filter by provider name
-     */
-    provider?: string | null;
-    /**
-     * Filter by tags (comma-separated, AND logic)
-     */
-    tags?: string | null;
-    /**
-     * ISO 8601 end time (defaults to now)
-     */
-    to?: string | null;
-    /**
-     * Filter by user ID
-     */
-    user_id?: number | null;
 };
 
 /**
@@ -24372,28 +22488,6 @@ export type VerifyStepUpRequest = {
     code: string;
 };
 
-export type ViewItem = {
-    label: string;
-    value: number;
-};
-
-export type ViewsOverTime = {
-    comparison_labels?: Array<string> | null;
-    comparison_plot?: Array<number> | null;
-    full_intervals?: Array<string> | null;
-    items: Array<ViewItem>;
-    metric: string;
-    present_index: number;
-};
-
-export type ViewsOverTimeQuery = {
-    deployment_id?: number | null;
-    end_date: string;
-    environment_id?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
 export type VisitorActivityAssessment = {
     categories: Array<string>;
     evidence: Array<ActivityEvidence>;
@@ -24473,25 +22567,6 @@ export type VisitorFacets = {
     region: Array<VisitorFacetValue>;
 };
 
-/**
- * Query parameters for the visitor-facets endpoint. Mirrors the shape of
- * `VisitorsListQuery` so the same segment filters apply — facet counts are
- * always computed against the *currently filtered* visitor pool, minus the
- * dimension being aggregated.
- */
-export type VisitorFacetsQuery = VisitorSegmentFilters & {
-    end_date: string;
-    environment_id?: number | null;
-    has_activity_only?: boolean | null;
-    include_crawlers?: boolean | null;
-    /**
-     * Maximum number of values returned per dimension (default: 50, max: 200).
-     */
-    per_facet_limit?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
 export type VisitorInfo = {
     city?: string | null;
     country?: string | null;
@@ -24531,11 +22606,6 @@ export type VisitorInfo = {
     visitor_id: string;
 };
 
-export type VisitorJourneyQuery = {
-    limit_sessions?: number | null;
-    project_id: number;
-};
-
 /**
  * Complete visitor journey response
  */
@@ -24558,57 +22628,12 @@ export type VisitorJourneyResponse = {
     visitor_id: number;
 };
 
-export type VisitorLocationsQuery = {
-    end_date: string;
-    environment_id?: number | null;
-    granularity?: null | LocationGranularity;
-    limit?: number | null;
-    project_id: number;
-    start_date: string;
-};
-
 export type VisitorRecord = {
     created_at: string;
     custom_data?: unknown;
     id: number;
     project_id: number;
     visitor_id: string;
-};
-
-/**
- * Optional segment filters for [`VisitorsListQuery`]. Each filter narrows the
- * result set to visitors who match the given dimension value within the date
- * range. All filters resolve against `visitor` / `ip_geolocations` — by
- * design we never touch the events hypertable here so filtering stays fast
- * regardless of event volume.
- */
-export type VisitorSegmentFilters = {
-    /**
-     * First-touch marketing channel (matches `visitor.first_channel`)
-     */
-    filter_channel?: string | null;
-    /**
-     * Geolocation city (matches `ip_geolocations.city`)
-     */
-    filter_city?: string | null;
-    /**
-     * Geolocation country (matches `ip_geolocations.country`)
-     */
-    filter_country?: string | null;
-    /**
-     * First-touch referrer hostname (matches `visitor.first_referrer_hostname`)
-     */
-    filter_referrer?: string | null;
-    /**
-     * Geolocation region (matches `ip_geolocations.region`)
-     */
-    filter_region?: string | null;
-};
-
-export type VisitorSessionsQuery = {
-    environment_id?: number | null;
-    limit?: number | null;
-    project_id: number;
 };
 
 export type VisitorSessionsResponse = {
@@ -24665,21 +22690,6 @@ export type VisitorWithGeolocation = {
     timezone?: string | null;
     user_agent?: string | null;
     visitor_id: string;
-};
-
-export type VisitorsListQuery = VisitorSegmentFilters & {
-    end_date: string;
-    environment_id?: number | null;
-    /**
-     * Filter to only include visitors with recorded activity (events/sessions).
-     * When true, excludes "ghost" visitors that have no events.
-     */
-    has_activity_only?: boolean | null;
-    include_crawlers?: boolean | null;
-    limit?: number | null;
-    offset?: number | null;
-    project_id: number;
-    start_date: string;
 };
 
 export type VisitorsResponse = {
@@ -24761,8 +22771,6 @@ export type WalWarning = {
     kind: 'wal_not_recycled';
     oldest_age_secs: number;
 };
-
-export type WalWarningSeverity = 'warning' | 'critical';
 
 /**
  * Configuration for a generic webhook notification provider

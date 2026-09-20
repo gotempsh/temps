@@ -163,40 +163,6 @@
         ],
         "type": "object"
       },
-      "ActiveVisitorsQuery": {
-        "description": "Query parameters for active visitors endpoint",
-        "properties": {
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "window_minutes": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "ActiveVisitorsResponse": {
         "properties": {
           "count": {
@@ -494,33 +460,6 @@
           "url",
           "share_with_ai"
         ],
-        "type": "object"
-      },
-      "ActivityGraphQuery": {
-        "description": "Query parameters for activity graph endpoint",
-        "properties": {
-          "days": {
-            "description": "Number of days to include (default: 365 for last year)",
-            "format": "int32",
-            "type": "integer"
-          },
-          "environment_id": {
-            "description": "Optional environment ID to filter activity",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "description": "Optional project ID to filter activity",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "ActivityGraphResponse": {
@@ -1688,50 +1627,6 @@
         ],
         "type": "object"
       },
-      "AggregatedBucketsQuery": {
-        "description": "Query parameters for aggregated metrics by time bucket",
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level: events, sessions, or visitors"
-          },
-          "bucket_size": {
-            "description": "Time bucket size: \"1 hour\", \"1 day\", \"1 week\", etc. (default: \"1 hour\")",
-            "type": "string"
-          },
-          "deployment_id": {
-            "description": "Optional deployment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "description": "End date for the query range",
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "description": "Optional environment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_date": {
-            "description": "Start date for the query range",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "AggregatedBucketsResponse": {
         "properties": {
           "aggregation_level": {
@@ -1758,23 +1653,6 @@
           "total"
         ],
         "type": "object"
-      },
-      "AggregationLevel": {
-        "enum": [
-          "events",
-          "sessions",
-          "visitors"
-        ],
-        "type": "string"
-      },
-      "AggregationTemporality": {
-        "description": "The aggregation temporality of a Sum/Histogram/ExponentialHistogram metric.\n\nMirrors OTel's `AggregationTemporality` proto enum: whether reported values\nare cumulative since the start of the series (Cumulative) or only the delta\nsince the previous report (Delta).",
-        "enum": [
-          "unspecified",
-          "delta",
-          "cumulative"
-        ],
-        "type": "string"
       },
       "AiAgentBreakdownResponse": {
         "description": "Response wrapping the AI agent breakdown rows.",
@@ -4883,43 +4761,6 @@
         ],
         "type": "object"
       },
-      "AuthStatusResponse": {
-        "properties": {
-          "cli_token": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "status"
-        ],
-        "type": "object"
-      },
-      "AuthTokenResponse": {
-        "properties": {
-          "access_token": {
-            "type": "string"
-          },
-          "expires_at": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "refresh_token": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "access_token",
-          "refresh_token",
-          "expires_at"
-        ],
-        "type": "object"
-      },
       "AuthorizeWorkspacePreviewRequest": {
         "properties": {
           "path": {
@@ -5811,63 +5652,6 @@
         },
         "required": [
           "branches"
-        ],
-        "type": "object"
-      },
-      "BrowserCount": {
-        "properties": {
-          "browser": {
-            "type": "string"
-          },
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          }
-        },
-        "required": [
-          "browser",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
-      "BrowsersQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
         ],
         "type": "object"
       },
@@ -7260,21 +7044,6 @@
         ],
         "type": "object"
       },
-      "CliLoginRequest": {
-        "properties": {
-          "password": {
-            "type": "string"
-          },
-          "username": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "username",
-          "password"
-        ],
-        "type": "object"
-      },
       "CloudAiCapability": {
         "properties": {
           "configured": {
@@ -8522,39 +8291,6 @@
         },
         "type": "object"
       },
-      "ConnectionListQuery": {
-        "properties": {
-          "direction": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "sort": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ConnectionListResponse": {
         "properties": {
           "connections": {
@@ -9210,46 +8946,6 @@
         },
         "type": "object"
       },
-      "ContainerLogsQuery": {
-        "properties": {
-          "container_name": {
-            "description": "Optional container name to get logs from (if deployment has multiple containers)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "follow": {
-            "description": "Follow log output in real-time (default: true for backward compatibility)",
-            "type": "boolean"
-          },
-          "start_date": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tail": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "timestamps": {
-            "description": "Include timestamps in log output (default: false)",
-            "type": "boolean"
-          }
-        },
-        "type": "object"
-      },
       "ContainerMetricHistoryPoint": {
         "description": "One bucketed data point of a container resource metric time series.",
         "properties": {
@@ -9267,23 +8963,6 @@
         "required": [
           "time",
           "value"
-        ],
-        "type": "object"
-      },
-      "ContainerMetricsHistoryQuery": {
-        "description": "Query parameters for the container metrics history endpoint.",
-        "properties": {
-          "metric": {
-            "description": "Dotted metric name, e.g. `container.cpu_percent` or\n`container.memory_used_bytes`.",
-            "type": "string"
-          },
-          "range": {
-            "description": "Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).",
-            "type": "string"
-          }
-        },
-        "required": [
-          "metric"
         ],
         "type": "object"
       },
@@ -9606,31 +9285,6 @@
           "message",
           "line_offset",
           "is_match"
-        ],
-        "type": "object"
-      },
-      "ContextLogsRequest": {
-        "properties": {
-          "chunk_id": {
-            "type": "string"
-          },
-          "line_offset": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "lines": {
-            "description": "Number of context lines before and after (default: 25)",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "chunk_id",
-          "line_offset"
         ],
         "type": "object"
       },
@@ -10199,56 +9853,6 @@
           "first_at",
           "last_at"
         ],
-        "type": "object"
-      },
-      "ConversationsQueryParams": {
-        "properties": {
-          "from": {
-            "description": "ISO 8601 start time (defaults to 24h ago)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Max results (defaults to 50, max 100)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model": {
-            "description": "Filter by model name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Filter by tags (comma-separated, AND logic)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "to": {
-            "description": "ISO 8601 end time (defaults to now)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter by user ID",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "CopyBlobRequest": {
@@ -13194,31 +12798,6 @@
         ],
         "type": "object"
       },
-      "DashboardProjectsAnalyticsQuery": {
-        "description": "Query parameters for batch dashboard analytics",
-        "properties": {
-          "end_date": {
-            "description": "End date for the query range",
-            "format": "date-time",
-            "type": "string"
-          },
-          "project_ids": {
-            "description": "Comma-separated list of project IDs",
-            "type": "string"
-          },
-          "start_date": {
-            "description": "Start date for the query range",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "project_ids",
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "DashboardProjectsAnalyticsResponse": {
         "description": "Batch response for dashboard project analytics",
         "properties": {
@@ -13558,36 +13137,6 @@
           },
           "metadata": {
             "description": "Optional deployment metadata"
-          }
-        },
-        "type": "object"
-      },
-      "DeployFromImageUploadQuery": {
-        "description": "Query parameters for deploying from an uploaded image tarball",
-        "properties": {
-          "health_check_path": {
-            "description": "Optional HTTP health-check path override (e.g. \"/api/healthz\").\nMust start with '/'. When omitted, defaults to \"/\".",
-            "example": "/api/healthz",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tag": {
-            "description": "Deprecated display hint retained for wire compatibility. Temps always\ngenerates the actual project-scoped internal image reference.",
-            "example": "myapp:v1.0",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "upload_request_id": {
-            "description": "Client-generated UUID identifying this upload attempt. When a\ndeployment already exists for this project, environment, and ID, that\ndeployment is returned as-is instead of importing and deploying the\nimage again — this makes a client retry after a lost response safe.\nCallers that omit it get no such protection (each call always creates\na new deployment), so the CLI always sends one.",
-            "example": "9b1f7a4e-6e3e-4d9b-8c34-5b6b6a6d7e21",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "type": "object"
@@ -14786,27 +14335,6 @@
           }
         ]
       },
-      "DeviceCount": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "device_type": {
-            "type": "string"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          }
-        },
-        "required": [
-          "device_type",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
       "DigestSections": {
         "description": "Sections that can be included in the weekly digest\nNote: `#[serde(default)]` allows backward compatibility when deserializing\nold data that may have `security` and `resources` fields instead of `projects`",
         "properties": {
@@ -15190,21 +14718,6 @@
         ],
         "type": "object"
       },
-      "DnsCompletionResponse": {
-        "properties": {
-          "domain": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "domain",
-          "status"
-        ],
-        "type": "object"
-      },
       "DnsLookupError": {
         "description": "Error response for DNS lookup failures",
         "properties": {
@@ -15221,20 +14734,6 @@
         },
         "required": [
           "error",
-          "domain"
-        ],
-        "type": "object"
-      },
-      "DnsLookupRequest": {
-        "description": "Request to lookup DNS A records for a domain",
-        "properties": {
-          "domain": {
-            "description": "Domain name to lookup",
-            "example": "example.com",
-            "type": "string"
-          }
-        },
-        "required": [
           "domain"
         ],
         "type": "object"
@@ -15597,67 +15096,6 @@
         ],
         "type": "string"
       },
-      "DnsRecord": {
-        "description": "A DNS record",
-        "properties": {
-          "content": {
-            "$ref": "#/components/schemas/DnsRecordContent",
-            "description": "Record content"
-          },
-          "fqdn": {
-            "description": "Fully qualified domain name",
-            "example": "www.example.com",
-            "type": "string"
-          },
-          "id": {
-            "description": "Provider-specific record ID (if exists)",
-            "example": "abc123",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "metadata": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Provider-specific metadata",
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
-          },
-          "name": {
-            "description": "Record name (without zone, e.g., \"www\" or \"@\" for root)",
-            "example": "www",
-            "type": "string"
-          },
-          "proxied": {
-            "description": "Whether this record is proxied (Cloudflare-specific)",
-            "type": "boolean"
-          },
-          "ttl": {
-            "description": "Time to live in seconds",
-            "example": 300,
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "zone": {
-            "description": "Zone/domain this record belongs to",
-            "example": "example.com",
-            "type": "string"
-          }
-        },
-        "required": [
-          "zone",
-          "name",
-          "fqdn",
-          "content",
-          "ttl"
-        ],
-        "type": "object"
-      },
       "DnsRecordChange": {
         "description": "A single DNS record change the Cloudflare sync would make.",
         "properties": {
@@ -15683,299 +15121,6 @@
           "value"
         ],
         "type": "object"
-      },
-      "DnsRecordContent": {
-        "description": "DNS record content - varies by record type",
-        "oneOf": [
-          {
-            "description": "A record - IPv4 address (as string, e.g., \"192.0.2.1\")",
-            "properties": {
-              "type": {
-                "enum": [
-                  "A"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "A record - IPv4 address (as string, e.g., \"192.0.2.1\")",
-                "properties": {
-                  "address": {
-                    "example": "192.0.2.1",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "address"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "AAAA record - IPv6 address (as string, e.g., \"2001:db8::1\")",
-            "properties": {
-              "type": {
-                "enum": [
-                  "AAAA"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "AAAA record - IPv6 address (as string, e.g., \"2001:db8::1\")",
-                "properties": {
-                  "address": {
-                    "example": "2001:db8::1",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "address"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "CNAME record - canonical name",
-            "properties": {
-              "type": {
-                "enum": [
-                  "CNAME"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "CNAME record - canonical name",
-                "properties": {
-                  "target": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "target"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "TXT record - text content",
-            "properties": {
-              "type": {
-                "enum": [
-                  "TXT"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "TXT record - text content",
-                "properties": {
-                  "content": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "content"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "MX record - mail exchange",
-            "properties": {
-              "type": {
-                "enum": [
-                  "MX"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "MX record - mail exchange",
-                "properties": {
-                  "priority": {
-                    "format": "int32",
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "target": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "priority",
-                  "target"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "NS record - nameserver",
-            "properties": {
-              "type": {
-                "enum": [
-                  "NS"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "NS record - nameserver",
-                "properties": {
-                  "nameserver": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "nameserver"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "SRV record - service",
-            "properties": {
-              "type": {
-                "enum": [
-                  "SRV"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "SRV record - service",
-                "properties": {
-                  "port": {
-                    "format": "int32",
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "priority": {
-                    "format": "int32",
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "target": {
-                    "type": "string"
-                  },
-                  "weight": {
-                    "format": "int32",
-                    "minimum": 0,
-                    "type": "integer"
-                  }
-                },
-                "required": [
-                  "priority",
-                  "weight",
-                  "port",
-                  "target"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "CAA record - certification authority authorization",
-            "properties": {
-              "type": {
-                "enum": [
-                  "CAA"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "CAA record - certification authority authorization",
-                "properties": {
-                  "flags": {
-                    "format": "int32",
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "tag": {
-                    "type": "string"
-                  },
-                  "value": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "flags",
-                  "tag",
-                  "value"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "PTR record - pointer",
-            "properties": {
-              "type": {
-                "enum": [
-                  "PTR"
-                ],
-                "type": "string"
-              },
-              "value": {
-                "description": "PTR record - pointer",
-                "properties": {
-                  "target": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "target"
-                ],
-                "type": "object"
-              }
-            },
-            "required": [
-              "value",
-              "type"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "DnsRecordResponse": {
         "properties": {
@@ -18414,36 +17559,6 @@
         ],
         "type": "object"
       },
-      "ErrorDashboardStatsQuery": {
-        "properties": {
-          "compare_to_previous": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "end_time": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_time": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_time",
-          "end_time"
-        ],
-        "type": "object"
-      },
       "ErrorDashboardStatsResponse": {
         "properties": {
           "comparison_end_time": {
@@ -18797,36 +17912,6 @@
         ],
         "type": "object"
       },
-      "ErrorTimeSeriesQuery": {
-        "properties": {
-          "bucket": {
-            "description": "Time bucket size (e.g., \"1h\", \"15m\", \"1d\", \"1 hour\", \"30 minutes\")",
-            "example": "1h",
-            "type": "string"
-          },
-          "end_time": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "description": "Filter chart data to a specific environment.\nAlways AND-combined with project_id — an environment from a different project\nreturns zero-filled buckets rather than cross-project data.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_time": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_time",
-          "end_time"
-        ],
-        "type": "object"
-      },
       "EstimateBulkActivationRequest": {
         "description": "What to quote.\n\nExactly one of `all_eligible_projects` and a non-empty `project_ids` must be\ngiven. Defaulting an omitted scope to \"everything\" would make a typo cost\nmoney; defaulting it to \"nothing\" would make the endpoint silently useless.",
         "properties": {
@@ -18888,14 +17973,6 @@
           "unique_visitors"
         ],
         "type": "object"
-      },
-      "EventBreakdown": {
-        "enum": [
-          "country",
-          "region",
-          "city"
-        ],
-        "type": "string"
       },
       "EventBrowserStats": {
         "description": "Browser stats for an event",
@@ -18975,48 +18052,6 @@
         ],
         "type": "object"
       },
-      "EventDetailQuery": {
-        "description": "Query parameters for event detail analytics",
-        "properties": {
-          "bucket_interval": {
-            "description": "Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "description": "The specific event name to get details for",
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "event_name",
-          "project_id",
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "EventDetailResponse": {
         "description": "Summary response for a specific event's analytics",
         "properties": {
@@ -19082,59 +18117,6 @@
           "countries",
           "browsers",
           "bucket_interval"
-        ],
-        "type": "object"
-      },
-      "EventEntriesQuery": {
-        "description": "Query parameters for the raw event entries list",
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "description": "The specific event name to list occurrences for",
-            "type": "string"
-          },
-          "page": {
-            "description": "Page number (1-based, default: 1)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "description": "Items per page (default: 20, max: 100)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "event_name",
-          "project_id",
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -19466,47 +18448,6 @@
         ],
         "type": "object"
       },
-      "EventTimelineQuery": {
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)"
-          },
-          "bucket_size": {
-            "description": "Bucket size: hour, day, or week (auto-detected if not specified)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "EventType": {
         "properties": {
           "count": {
@@ -19541,34 +18482,6 @@
           "event_type",
           "count",
           "percentage"
-        ],
-        "type": "object"
-      },
-      "EventTypeBreakdownQuery": {
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)"
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -19702,59 +18615,6 @@
         ],
         "type": "object"
       },
-      "EventVisitorsQuery": {
-        "description": "Query parameters for event visitors list",
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "description": "The specific event name to list visitors for",
-            "type": "string"
-          },
-          "page": {
-            "description": "Page number (1-based, default: 1)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "description": "Items per page (default: 20, max: 100)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "event_name",
-          "project_id",
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "EventVisitorsResponse": {
         "description": "Paginated response for event visitors",
         "properties": {
@@ -19793,58 +18653,6 @@
           "page",
           "per_page",
           "visitors"
-        ],
-        "type": "object"
-      },
-      "EventsCountQuery": {
-        "properties": {
-          "breakdown": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/EventBreakdown"
-              }
-            ]
-          },
-          "custom_events_only": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
         ],
         "type": "object"
       },
@@ -20502,42 +19310,6 @@
           "timescaledb"
         ],
         "type": "string"
-      },
-      "FacetCapability": {
-        "description": "Whether a facet registered now would actually cover anything\n(Feature Discoverability: \"not built\" and \"not set up\" need different UI).",
-        "properties": {
-          "configured": {
-            "description": "False when the facet would populate for no project at all.",
-            "type": "boolean"
-          },
-          "reason": {
-            "description": "Why, when `configured` is false. Always populated in that case.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "setup_path": {
-            "description": "Where the operator goes to change it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "uncovered_project_ids": {
-            "description": "Projects whose spans this facet will **not** cover, because they are\nCloud-primary and store no spans on this instance. Non-empty alongside\n`configured: true` is a real and useful state: the facet works for the\nother projects, and the operator must be told which ones it misses\nrather than discovering it from an empty filter.",
-            "items": {
-              "format": "int32",
-              "type": "integer"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "configured",
-          "uncovered_project_ids"
-        ],
-        "type": "object"
       },
       "FacetInfo": {
         "description": "Public representation of a registered span attribute facet.",
@@ -21967,23 +20739,6 @@
         ],
         "type": "object"
       },
-      "GeneralStatsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "GeneralStatsResponse": {
         "properties": {
           "avg_bounce_rate": {
@@ -22530,92 +21285,6 @@
         ],
         "type": "object"
       },
-      "GetDeploymentsParams": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "GetEnvironmentVariablesQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "service_id": {
-            "description": "Required by integration-value reveals to bind the plaintext response to\nthe exact service displayed by the client.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "var_id": {
-            "description": "Exact manual env-var row to read when it is not marked secret. Required\nby the dashboard so duplicate keys cannot select a different row.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "GetFunnelMetricsQuery": {
-        "properties": {
-          "country_code": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "GetOrCreateDSNRequest": {
         "properties": {
           "base_url": {
@@ -22639,53 +21308,6 @@
             ]
           }
         },
-        "type": "object"
-      },
-      "GetProjectSecretsQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "GetProjectSessionReplaysQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
-        ],
         "type": "object"
       },
       "GetProjectSessionReplaysResponse": {
@@ -22761,48 +21383,6 @@
         "required": [
           "session"
         ],
-        "type": "object"
-      },
-      "GetUniqueEventsQuery": {
-        "properties": {
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "GetVisitorSessionsQuery": {
-        "properties": {
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "GetVisitorSessionsResponse": {
@@ -23274,54 +21854,6 @@
           "events_in_range",
           "affected_users"
         ],
-        "type": "object"
-      },
-      "GlobalErrorGroupsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "search": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "GlobalErrorGroupsResponse": {
@@ -23884,68 +22416,6 @@
         ],
         "type": "object"
       },
-      "GroupedPageMetricsQuery": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/SpeedSegmentFilters",
-            "description": "Segment filters — same shape as `PerformanceMetricsQuery`."
-          },
-          {
-            "properties": {
-              "deployment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "device_type": {
-                "description": "Device type filter: \"desktop\" or \"mobile\"",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "end_date": {
-                "format": "date-time",
-                "type": "string"
-              },
-              "environment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "group_by": {
-                "type": "string"
-              },
-              "include_bots": {
-                "description": "Include crawler/datacenter (bot) samples. Defaults to false.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "project_id": {
-                "format": "int32",
-                "type": "integer"
-              },
-              "start_date": {
-                "format": "date-time",
-                "type": "string"
-              }
-            },
-            "required": [
-              "start_date",
-              "end_date",
-              "project_id",
-              "group_by"
-            ],
-            "type": "object"
-          }
-        ]
-      },
       "GroupedPageMetricsResponse": {
         "properties": {
           "grouped_by": {
@@ -24103,25 +22573,6 @@
         ],
         "type": "object"
       },
-      "HasEventsQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "HasEventsResponse": {
         "properties": {
           "has_events": {
@@ -24130,18 +22581,6 @@
         },
         "required": [
           "has_events"
-        ],
-        "type": "object"
-      },
-      "HasMetricsQuery": {
-        "properties": {
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
         ],
         "type": "object"
       },
@@ -24574,34 +23013,6 @@
           "session_count",
           "event_count",
           "avg_duration_seconds"
-        ],
-        "type": "object"
-      },
-      "HourlyVisitsQuery": {
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level: events (page views), sessions (unique sessions), or visitors (unique visitors)"
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -25683,21 +24094,6 @@
         ],
         "type": "object"
       },
-      "InitAuthResponse": {
-        "properties": {
-          "auth_url": {
-            "type": "string"
-          },
-          "session_token": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "auth_url",
-          "session_token"
-        ],
-        "type": "object"
-      },
       "Insight": {
         "description": "An anomaly insight.",
         "properties": {
@@ -25819,56 +24215,6 @@
         "required": [
           "data",
           "count"
-        ],
-        "type": "object"
-      },
-      "InstallPluginRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "grants": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/PluginGrantConfig"
-              }
-            ]
-          },
-          "name": {
-            "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name"
-        ],
-        "type": "object"
-      },
-      "InstallPluginResponse": {
-        "properties": {
-          "message": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "platform": {
-            "type": "string"
-          },
-          "sha256": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "version",
-          "platform",
-          "sha256",
-          "message"
         ],
         "type": "object"
       },
@@ -26015,19 +24361,6 @@
           "has_secret",
           "created_at"
         ],
-        "type": "object"
-      },
-      "IpAccessControlQuery": {
-        "description": "Query parameters for listing IP access control rules",
-        "properties": {
-          "action": {
-            "description": "Filter by action (\"block\" or \"allow\")",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "IpAccessControlResponse": {
@@ -26630,119 +24963,6 @@
         ],
         "type": "object"
       },
-      "ListApiKeysQuery": {
-        "properties": {
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ListAuditLogsQuery": {
-        "description": "Query parameters for listing audit logs.\n\nEvery field is optional — omitting one means \"don't filter on it\". Deriving\n`IntoParams` makes utoipa render them as optional query params with the\ncorrect types; the previous hand-written `params((\"operation_type\", Query,\n…))` tuples defaulted every param to `required: true, type: string`, which\nmisled both API clients and the AI `describe_api`/`call_api` tools into\nthinking all filters were mandatory.",
-        "properties": {
-          "from": {
-            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum number of logs to return",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "offset": {
-            "description": "Number of logs to skip",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "operation_type": {
-            "description": "Filter logs by operation type (omit for all)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "to": {
-            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter logs by user ID (omit for all users)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ListBlobsQuery": {
-        "description": "Query parameters for listing blobs",
-        "properties": {
-          "cursor": {
-            "description": "Continuation token for pagination",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum number of items to return",
-            "example": 100,
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "prefix": {
-            "description": "Prefix to filter by",
-            "example": "images/",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "project_id": {
-            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
-            "example": 1,
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ListBlobsResponse": {
         "description": "Response for listing blobs",
         "properties": {
@@ -26791,52 +25011,6 @@
         ],
         "type": "object"
       },
-      "ListDeploymentTokensQuery": {
-        "properties": {
-          "page": {
-            "example": 1,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "example": 20,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ListDiscoveredRoutesQuery": {
-        "properties": {
-          "page": {
-            "example": 1,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "example": 20,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ListDomainsResponse": {
         "properties": {
           "domains": {
@@ -26867,90 +25041,6 @@
           "page",
           "page_size"
         ],
-        "type": "object"
-      },
-      "ListEntitiesQuery": {
-        "properties": {
-          "limit": {
-            "description": "Maximum number of entities to return",
-            "example": 100,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "token": {
-            "description": "Continuation token for pagination (backend-specific)",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ListErrorEventsQuery": {
-        "properties": {
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      },
-      "ListErrorGroupsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "sort_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sort_order": {
-            "type": "string"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "ListJobsResponse": {
@@ -27162,29 +25252,6 @@
         ],
         "type": "object"
       },
-      "ListScansQuery": {
-        "properties": {
-          "page": {
-            "example": 1,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "example": 20,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ListSecretsResponse": {
         "properties": {
           "items": {
@@ -27279,37 +25346,6 @@
         ],
         "type": "object"
       },
-      "ListTemplatesQuery": {
-        "description": "Query parameters for listing templates",
-        "properties": {
-          "featured": {
-            "description": "Only return featured templates",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "kind": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/TemplateKind",
-                "description": "Filter by gallery (`starter` or `service`)."
-              }
-            ]
-          },
-          "tag": {
-            "description": "Filter templates by tag",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ListTemplatesResponse": {
         "description": "Response for listing templates",
         "properties": {
@@ -27330,36 +25366,6 @@
           "templates",
           "total"
         ],
-        "type": "object"
-      },
-      "ListVulnerabilitiesQuery": {
-        "properties": {
-          "page": {
-            "example": 1,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_size": {
-            "example": 20,
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "severity": {
-            "example": "CRITICAL",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "LiveVisitorInfo": {
@@ -27552,35 +25558,6 @@
           "label"
         ],
         "type": "object"
-      },
-      "LocationCount": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "location": {
-            "type": "string"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          }
-        },
-        "required": [
-          "location",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
-      "LocationGranularity": {
-        "enum": [
-          "country",
-          "region",
-          "city"
-        ],
-        "type": "string"
       },
       "LocationInfo": {
         "properties": {
@@ -27796,14 +25773,6 @@
         ],
         "type": "object"
       },
-      "LogStream": {
-        "description": "Log output stream",
-        "enum": [
-          "stdout",
-          "stderr"
-        ],
-        "type": "string"
-      },
       "LoginRequest": {
         "properties": {
           "email": {
@@ -27817,19 +25786,6 @@
           "email",
           "password"
         ],
-        "type": "object"
-      },
-      "LogsQuery": {
-        "properties": {
-          "tail": {
-            "description": "Number of lines to return from the tail. Defaults to 200, capped at 2000.",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "LogsResponse": {
@@ -28317,67 +26273,6 @@
         ],
         "type": "string"
       },
-      "MetricAggregation": {
-        "description": "The aggregation applied when reducing raw metric points into a time bucket.\n\nStore-neutral: every storage backend (ClickHouse today, TimescaleDB later)\nmust be able to satisfy this contract. `Quantile(q)` carries the requested\nquantile in `[0.0, 1.0]` (e.g. `0.95` for p95).",
-        "oneOf": [
-          {
-            "description": "Arithmetic mean of the scalar value in each bucket. The default.",
-            "enum": [
-              "avg"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Sum of the scalar value in each bucket.",
-            "enum": [
-              "sum"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Minimum scalar value in each bucket.",
-            "enum": [
-              "min"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Maximum scalar value in each bucket.",
-            "enum": [
-              "max"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Number of points in each bucket.",
-            "enum": [
-              "count"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Per-second rate of change of a cumulative monotonic counter, computed as\n`(max - min) / window_seconds` within each bucket. Non-monotonic series\nfall back to a simple delta.",
-            "enum": [
-              "rate_per_sec"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "A quantile of the scalar value in each bucket. The carried `f64` is the\nrequested quantile in `[0.0, 1.0]`.",
-            "properties": {
-              "quantile": {
-                "description": "A quantile of the scalar value in each bucket. The carried `f64` is the\nrequested quantile in `[0.0, 1.0]`.",
-                "format": "double",
-                "type": "number"
-              }
-            },
-            "required": [
-              "quantile"
-            ],
-            "type": "object"
-          }
-        ]
-      },
       "MetricBucket": {
         "description": "A time-bucketed metric aggregate for chart display.\n\nStore-neutral response contract. The legacy scalar fields\n(`avg_value`/`min_value`/`max_value`/`count`) are always populated for chart\nback-compat. The richer fields describe the explicitly-requested\n[`MetricAggregation`] (`value`), optional `quantiles`, an optional\n`histogram_summary`, and a `series_key` identifying the label-set when the\nquery used `group_by`.",
         "properties": {
@@ -28482,17 +26377,6 @@
           "value"
         ],
         "type": "object"
-      },
-      "MetricType": {
-        "description": "The type of an OTel metric.",
-        "enum": [
-          "gauge",
-          "sum",
-          "histogram",
-          "exponential_histogram",
-          "summary"
-        ],
-        "type": "string"
       },
       "MetricsOverTimeResponse": {
         "properties": {
@@ -28742,81 +26626,6 @@
         ],
         "type": "object"
       },
-      "MetricsQuery": {
-        "properties": {
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
-        ],
-        "type": "object"
-      },
-      "MetricsRangeQuery": {
-        "description": "Query params for range metric queries.",
-        "properties": {
-          "end_time": {
-            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "metric": {
-            "description": "Metric name, e.g. `\"pg.connections_active\"`.",
-            "type": "string"
-          },
-          "percentile": {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "range": {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
-            "type": "string"
-          },
-          "start_time": {
-            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "metric"
-        ],
-        "type": "object"
-      },
       "MetricsStatusResponse": {
         "description": "Freshness status: when metrics were last received for this service.",
         "properties": {
@@ -28876,21 +26685,6 @@
           "active_customers",
           "churned_last_30d",
           "arpu_minor"
-        ],
-        "type": "object"
-      },
-      "MfaRequiredResponse": {
-        "properties": {
-          "requires_mfa": {
-            "type": "boolean"
-          },
-          "session_token": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "requires_mfa",
-          "session_token"
         ],
         "type": "object"
       },
@@ -31038,27 +28832,6 @@
         ],
         "type": "object"
       },
-      "OperatingSystemCount": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "operating_system": {
-            "type": "string"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          }
-        },
-        "required": [
-          "operating_system",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
       "OperationResultResponse": {
         "properties": {
           "data": {},
@@ -31630,60 +29403,6 @@
         ],
         "type": "object"
       },
-      "PageFlowQuery": {
-        "description": "Query parameters for page flow analytics",
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum number of entry/exit pages to return (default: 20)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "min_views_for_dropoff": {
-            "description": "Minimum views for drop-off analysis (default: 5)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "transitions_limit": {
-            "description": "Maximum number of transitions to return (default: 50)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id",
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "PageFlowResponse": {
         "description": "Complete page flow analytics response",
         "properties": {
@@ -31736,46 +29455,6 @@
         ],
         "type": "object"
       },
-      "PageHourlySessionsQuery": {
-        "description": "Query parameters for page hourly sessions endpoint",
-        "properties": {
-          "bucket_interval": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_time": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_path": {
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_time": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "page_path",
-          "project_id",
-          "start_time",
-          "end_time"
-        ],
-        "type": "object"
-      },
       "PageHourlySessionsResponse": {
         "properties": {
           "hourly_data": {
@@ -31801,48 +29480,6 @@
           "hourly_data",
           "total_sessions",
           "hours"
-        ],
-        "type": "object"
-      },
-      "PagePathDetailQuery": {
-        "description": "Query parameters for page path detail analytics",
-        "properties": {
-          "bucket_interval": {
-            "description": "Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_path": {
-            "description": "The specific page path to get details for (URL-encoded)",
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "page_path",
-          "project_id",
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -31994,59 +29631,6 @@
         ],
         "type": "object"
       },
-      "PagePathVisitorsQuery": {
-        "description": "Query parameters for page path visitors",
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page": {
-            "description": "Page number (1-based, default: 1)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_path": {
-            "description": "The specific page path to get visitors for",
-            "type": "string"
-          },
-          "per_page": {
-            "description": "Items per page (default: 50, max: 100)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "page_path",
-          "project_id",
-          "start_date",
-          "end_date"
-        ],
-        "type": "object"
-      },
       "PagePathVisitorsResponse": {
         "description": "Response for page path visitors endpoint",
         "properties": {
@@ -32088,46 +29672,6 @@
         ],
         "type": "object"
       },
-      "PagePathsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "PagePathsResponse": {
         "properties": {
           "page_paths": {
@@ -32144,41 +29688,6 @@
         "required": [
           "page_paths",
           "total_count"
-        ],
-        "type": "object"
-      },
-      "PagePathsSparklineQuery": {
-        "description": "Query parameters for batch page paths sparkline endpoint",
-        "properties": {
-          "end_time": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_paths": {
-            "description": "Comma-separated list of page paths",
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_time": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "project_id",
-          "start_time",
-          "end_time",
-          "page_paths"
         ],
         "type": "object"
       },
@@ -32218,110 +29727,6 @@
           "referrer",
           "visits",
           "percentage"
-        ],
-        "type": "object"
-      },
-      "PageSessionComparison": {
-        "properties": {
-          "avg_duration_seconds": {
-            "format": "double",
-            "type": "number"
-          },
-          "date": {
-            "type": "string"
-          },
-          "event_count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "page_path": {
-            "type": "string"
-          },
-          "session_count": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "page_path",
-          "date",
-          "session_count",
-          "event_count",
-          "avg_duration_seconds"
-        ],
-        "type": "object"
-      },
-      "PageSessionStats": {
-        "properties": {
-          "avg_page_views_per_session": {
-            "format": "double",
-            "type": "number"
-          },
-          "avg_time_seconds": {
-            "format": "double",
-            "type": "number"
-          },
-          "max_time_seconds": {
-            "format": "double",
-            "type": "number"
-          },
-          "min_time_seconds": {
-            "format": "double",
-            "type": "number"
-          },
-          "page_path": {
-            "type": "string"
-          },
-          "total_page_views": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "total_sessions": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "page_path",
-          "total_sessions",
-          "avg_time_seconds",
-          "min_time_seconds",
-          "max_time_seconds",
-          "total_page_views",
-          "avg_page_views_per_session"
-        ],
-        "type": "object"
-      },
-      "PageSessionStatsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "page_path": {
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "page_path",
-          "project_id",
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -32480,27 +29885,6 @@
           "is_entry",
           "is_exit",
           "is_bounce"
-        ],
-        "type": "object"
-      },
-      "PagesComparisonResponse": {
-        "properties": {
-          "comparisons": {
-            "items": {
-              "$ref": "#/components/schemas/PageSessionComparison"
-            },
-            "type": "array"
-          },
-          "page_paths": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "comparisons",
-          "page_paths"
         ],
         "type": "object"
       },
@@ -32805,19 +30189,6 @@
         ],
         "type": "object"
       },
-      "PaginationParams": {
-        "properties": {
-          "page": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "per_page": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      },
       "PasswordProtectionConfig": {
         "description": "Password protection configuration\n\nWhen enabled, the proxy shows an HTML password form before allowing access.\nAfter the user enters the correct password, an HMAC-signed cookie is set\nso subsequent requests pass through without re-entering the password.",
         "properties": {
@@ -32859,84 +30230,6 @@
             ]
           }
         },
-        "type": "object"
-      },
-      "PathVisitors": {
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          },
-          "visitors": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "name",
-          "visitors",
-          "percentage"
-        ],
-        "type": "object"
-      },
-      "PathVisitorsAnalyticsQuery": {
-        "properties": {
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
-        ],
-        "type": "object"
-      },
-      "PathVisitorsResponse": {
-        "properties": {
-          "results": {
-            "items": {
-              "$ref": "#/components/schemas/PathVisitors"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "results"
-        ],
         "type": "object"
       },
       "PeerEntry": {
@@ -33071,64 +30364,6 @@
           "created_at"
         ],
         "type": "object"
-      },
-      "PerformanceMetricsQuery": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/SpeedSegmentFilters",
-            "description": "Segment filters (filter_path, filter_country, filter_region,\nfilter_city, filter_browser, filter_operating_system) — flattened so\neach remains a top-level query string param."
-          },
-          {
-            "properties": {
-              "deployment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "device_type": {
-                "description": "Device type filter: \"desktop\" or \"mobile\"",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "end_date": {
-                "format": "date-time",
-                "type": "string"
-              },
-              "environment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "include_bots": {
-                "description": "Include crawler/datacenter (bot) samples. Defaults to false — bots\nare excluded from the read view but always stored at ingest.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "project_id": {
-                "format": "int32",
-                "type": "integer"
-              },
-              "start_date": {
-                "format": "date-time",
-                "type": "string"
-              }
-            },
-            "required": [
-              "start_date",
-              "end_date",
-              "project_id"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "PerformanceMetricsResponse": {
         "properties": {
@@ -33487,33 +30722,6 @@
           },
           "tool_name": {
             "description": "The tool name from `request.tool_name` (e.g. `\"Bash\"`, `\"AskUserQuestion\"`).",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "kind",
-          "tool_name",
-          "input"
-        ],
-        "type": "object"
-      },
-      "PermissionRequestedEvent": {
-        "description": "Payload for the `permission_requested` SSE event (ADR-038 Phase 2).\nThe active provider turn is paused waiting for the user to approve or deny\na tool/question/plan. Resolve via\n`POST .../permissions/{id}/resolve`.",
-        "properties": {
-          "id": {
-            "description": "The CLI's `request_id` — also the `{permission_id}` in the resolve URL.",
-            "type": "string"
-          },
-          "input": {
-            "description": "Raw `input` from the CLI request. Passed through verbatim so each\nmilestone's card can render tool-specific fields without the service\nlayer needing to know about their schemas."
-          },
-          "kind": {
-            "$ref": "#/components/schemas/PermissionKind",
-            "description": "What kind of interaction is required: `\"tool_approval\"`, `\"question\"`,\nor `\"plan_approval\"`."
-          },
-          "tool_name": {
-            "description": "Tool name from the CLI request (e.g. `\"Bash\"`, `\"AskUserQuestion\"`).",
             "type": "string"
           }
         },
@@ -35332,25 +32540,6 @@
         ],
         "type": "object"
       },
-      "ProjectQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "ProjectRef": {
         "description": "A lightweight project descriptor included in `UnifiedTrace`.",
         "properties": {
@@ -36024,115 +33213,6 @@
         ],
         "type": "object"
       },
-      "PropertyBreakdownQuery": {
-        "description": "Query parameters for property breakdown (group by column)",
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level"
-          },
-          "deployment_id": {
-            "description": "Optional deployment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "description": "End date for the query range",
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "description": "Optional environment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "description": "Optional event name filter (e.g., \"page_view\", \"click\")",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_browser": {
-            "description": "Filter by browser name (for browser version drill-downs)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_channel": {
-            "description": "Filter by channel name (for channel -> referrer drill-downs)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_country": {
-            "description": "Filter by country (for region/city drill-downs). Requires geolocation join.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_os": {
-            "description": "Filter by operating system name (for OS version drill-downs)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_referrer": {
-            "description": "Filter by referrer hostname (for referrer -> pages drill-downs)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_region": {
-            "description": "Filter by region (for city drill-downs). Requires geolocation join.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "group_by": {
-            "$ref": "#/components/schemas/PropertyColumn",
-            "description": "Property column to group by"
-          },
-          "include_crawlers": {
-            "description": "Include crawler/bot traffic (default: false). Off by default so the\nbreakdown percentages share a denominator with the headline counts,\nwhich always exclude crawlers.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum number of results to return (default: 20, max: 100)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "start_date": {
-            "description": "Start date for the query range",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "group_by"
-        ],
-        "type": "object"
-      },
       "PropertyBreakdownResponse": {
         "properties": {
           "items": {
@@ -36156,31 +33236,6 @@
         ],
         "type": "object"
       },
-      "PropertyColumn": {
-        "enum": [
-          "channel",
-          "device_type",
-          "browser",
-          "browser_version",
-          "operating_system",
-          "operating_system_version",
-          "utm_source",
-          "utm_medium",
-          "utm_campaign",
-          "utm_term",
-          "utm_content",
-          "referrer_hostname",
-          "language",
-          "event_type",
-          "event_name",
-          "page_path",
-          "pathname",
-          "country",
-          "region",
-          "city"
-        ],
-        "type": "string"
-      },
       "PropertyTimelineItem": {
         "properties": {
           "count": {
@@ -36198,72 +33253,6 @@
           "timestamp",
           "value",
           "count"
-        ],
-        "type": "object"
-      },
-      "PropertyTimelineQuery": {
-        "description": "Query parameters for property timeline (group by column over time)",
-        "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level"
-          },
-          "bucket_size": {
-            "description": "Time bucket size: \"hour\", \"day\", \"week\", \"month\" (default: auto-detect)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "deployment_id": {
-            "description": "Optional deployment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "description": "End date for the query range",
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "description": "Optional environment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "event_name": {
-            "description": "Optional event name filter",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "group_by": {
-            "$ref": "#/components/schemas/PropertyColumn",
-            "description": "Property column to group by"
-          },
-          "include_crawlers": {
-            "description": "Include crawler/bot traffic (default: false). See\n[`PropertyBreakdownQuery::include_crawlers`].",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "start_date": {
-            "description": "Start date for the query range",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "group_by"
         ],
         "type": "object"
       },
@@ -37407,14 +34396,6 @@
         ],
         "type": "object"
       },
-      "PublicHostnameStrategy": {
-        "description": "Public hostname generation mode for Temps-managed preview routes.\n\nThe mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)\nrather than globally, so a provider such as Cloudflare can offer the flat layout\nrequired by its Universal SSL wildcard cert without changing every domain's behaviour.",
-        "enum": [
-          "standard",
-          "flat"
-        ],
-        "type": "string"
-      },
       "PublicIpInfo": {
         "description": "Information about a public IP address lookup",
         "properties": {
@@ -37778,45 +34759,6 @@
         ],
         "type": "object"
       },
-      "ReadRowsQuery": {
-        "description": "Query-string form of [`QueryDataRequest`] for the read-only `GET` rows\nendpoint.\n\nThe `POST` variant exists because filters are arbitrary backend-specific\nJSON. Reading rows is nonetheless a *read*, and the AI agent's tool index\nis GET-only by construction, so the same capability has to be reachable\nwithout a body. `filter` therefore carries the JSON as a string.",
-        "properties": {
-          "filter": {
-            "description": "Backend-specific filter, JSON-encoded. Fetch the expected shape from\nthe `filter_schema` field of the explorer-support endpoint — e.g.\n`{\"where\":\"created_at > now() - interval '7 days'\"}` for SQL sources.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum number of rows to return",
-            "example": 100,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "offset": {
-            "description": "Number of rows to skip",
-            "example": 0,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "sort_by": {
-            "description": "Sort by field name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sort_order": {
-            "description": "Sort order (asc/desc)",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ReassignCustomDomainRequest": {
         "properties": {
           "target_environment_id": {
@@ -37831,44 +34773,6 @@
         "required": [
           "target_project_id",
           "target_environment_id"
-        ],
-        "type": "object"
-      },
-      "RecentActivityQuery": {
-        "description": "Query parameters for recent activity endpoint",
-        "properties": {
-          "environment_id": {
-            "description": "Environment ID (optional)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Max number of events to return (default: 50, max: 100)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "description": "Project ID",
-            "format": "int32",
-            "type": "integer"
-          },
-          "since_id": {
-            "description": "Return events with ID greater than this (for cursor-based polling)",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id"
         ],
         "type": "object"
       },
@@ -37936,137 +34840,6 @@
         ],
         "type": "object"
       },
-      "RecentQueryParams": {
-        "properties": {
-          "conversation_id": {
-            "description": "Filter by conversation ID",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "cost_gt": {
-            "description": "Cost strictly greater-than, in microcents",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_gte": {
-            "description": "Cost greater-than-or-equal, in microcents",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_lt": {
-            "description": "Cost strictly less-than, in microcents",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_lte": {
-            "description": "Cost less-than-or-equal, in microcents",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Page size (defaults to 20, max 50)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model": {
-            "description": "Filter by model name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "offset": {
-            "description": "Number of results to skip for pagination (defaults to 0)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "provider": {
-            "description": "Filter by provider name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "description": "Filter by HTTP status code (exact match)",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Filter by tags (comma-separated, AND logic)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tokens_gt": {
-            "description": "Total tokens (input + output) strictly greater-than",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_gte": {
-            "description": "Total tokens (input + output) greater-than-or-equal",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_lt": {
-            "description": "Total tokens (input + output) strictly less-than",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_lte": {
-            "description": "Total tokens (input + output) less-than-or-equal",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter by user ID",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "RecordExposureRequest": {
         "description": "Keys a running app actually evaluated since its last report.",
         "properties": {
@@ -38098,21 +34871,6 @@
         },
         "required": [
           "recorded"
-        ],
-        "type": "object"
-      },
-      "RecordListResponse": {
-        "description": "Record list response",
-        "properties": {
-          "records": {
-            "items": {
-              "$ref": "#/components/schemas/DnsRecord"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "records"
         ],
         "type": "object"
       },
@@ -38197,56 +34955,6 @@
             "type": "object"
           }
         ]
-      },
-      "ReferrerCount": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          },
-          "referrer": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "referrer",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
-      "ReferrersAnalyticsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
-        ],
-        "type": "object"
       },
       "RefreshProviderModelsResponse": {
         "properties": {
@@ -38451,47 +35159,6 @@
           "status",
           "message",
           "mtls_required"
-        ],
-        "type": "object"
-      },
-      "RegisterRequest": {
-        "properties": {
-          "email": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "password": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "email",
-          "password",
-          "name"
-        ],
-        "type": "object"
-      },
-      "RegistryEnvelope": {
-        "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
-        "properties": {
-          "key_id": {
-            "type": "string"
-          },
-          "payload": {
-            "description": "Standard-base64 encoded JSON [`RegistryDocument`].",
-            "type": "string"
-          },
-          "signature": {
-            "description": "Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key_id",
-          "payload",
-          "signature"
         ],
         "type": "object"
       },
@@ -38984,63 +35651,6 @@
           "repositoryId",
           "variables"
         ],
-        "type": "object"
-      },
-      "RepositoryListQuery": {
-        "properties": {
-          "direction": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "owner": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "private": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "search": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sort": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "RepositoryListResponse": {
@@ -40318,112 +36928,6 @@
         ],
         "type": "object"
       },
-      "RootfsCacheEntry": {
-        "description": "A cached rootfs image (Firecracker backend). Digest-keyed build artifact\nshared by all VMs created from the same image.",
-        "properties": {
-          "bytes": {
-            "description": "Actual on-disk size in bytes (sparse-aware).",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "digest": {
-            "description": "Image digest this rootfs was built from (the cache key).",
-            "type": "string"
-          },
-          "referenced_by": {
-            "description": "IDs of live sandboxes whose per-VM disk was cloned from this entry.\nEmpty means the entry is reclaimable — no sandbox needs it.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "digest",
-          "bytes",
-          "referenced_by"
-        ],
-        "type": "object"
-      },
-      "RootfsGcReport": {
-        "description": "Outcome of a rootfs garbage-collection pass.",
-        "properties": {
-          "freed_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "removed_digests": {
-            "description": "Digests of cache entries removed because no sandbox referenced them.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "removed_digests",
-          "freed_bytes"
-        ],
-        "type": "object"
-      },
-      "RootfsReport": {
-        "description": "Snapshot of a backend's rootfs storage for the management API. Backends\nwithout a rootfs concept (Docker, local) return an empty report.",
-        "properties": {
-          "cache": {
-            "items": {
-              "$ref": "#/components/schemas/RootfsCacheEntry"
-            },
-            "type": "array"
-          },
-          "cache_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "vm_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "vms": {
-            "items": {
-              "$ref": "#/components/schemas/RootfsVmEntry"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "cache_bytes",
-          "cache",
-          "vm_bytes",
-          "vms"
-        ],
-        "type": "object"
-      },
-      "RootfsVmEntry": {
-        "description": "A per-sandbox rootfs disk (Firecracker backend). One per non-destroyed\nsandbox — the authoritative storage, independent of the cache.",
-        "properties": {
-          "bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "running": {
-            "type": "boolean"
-          },
-          "sandbox_name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "sandbox_name",
-          "bytes",
-          "running"
-        ],
-        "type": "object"
-      },
       "RotateClusterCaRequest": {
         "properties": {
           "confirmation": {
@@ -41283,85 +37787,6 @@
         ],
         "type": "object"
       },
-      "ScheduleRunEntry": {
-        "description": "A single run-history entry for the schedule detail page (deliverable 1).\n\nCombines one `backups` row with the most-recent `backup_jobs` row for that\nbackup via a lateral JOIN.  Fields from `backup_jobs` are `None` for legacy\nbackup rows that pre-date ADR-014.",
-        "properties": {
-          "attempts": {
-            "description": "Number of claim-and-run attempts so far. `None` for legacy rows.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "backup_id": {
-            "description": "DB id of the `backups` row.",
-            "format": "int32",
-            "type": "integer"
-          },
-          "backup_uuid": {
-            "description": "UUID string (`backups.backup_id`).",
-            "type": "string"
-          },
-          "current_step": {
-            "description": "Last completed step reported by the engine (e.g. `\"upload\"`).\n`None` when no step has been persisted yet.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "error_message": {
-            "description": "Engine-reported error message when `state = \"failed\"`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "finished_at": {
-            "description": "When the backup finished, if known.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "job_id": {
-            "description": "Most recent `backup_jobs.id` for this backup. `None` for legacy rows.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "s3_location": {
-            "description": "S3 object key or URL where the backup data lives.",
-            "type": "string"
-          },
-          "size_bytes": {
-            "description": "Final size in bytes once completed. `None` while running.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "started_at": {
-            "description": "When the backup was started (ISO 8601 / RFC 3339).",
-            "type": "string"
-          },
-          "state": {
-            "description": "Current state: `\"pending\"`, `\"running\"`, `\"completed\"`, `\"failed\"`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "backup_id",
-          "backup_uuid",
-          "state",
-          "started_at",
-          "s3_location"
-        ],
-        "type": "object"
-      },
       "ScheduleRunJobEntry": {
         "description": "A single job entry inside an expanded schedule run, returned by\n[`BackupService::list_schedule_run_jobs`].",
         "properties": {
@@ -41434,40 +37859,6 @@
           "state",
           "started_at",
           "s3_source_id"
-        ],
-        "type": "object"
-      },
-      "ScheduleRunListResponse": {
-        "description": "Paginated run-history response for a backup schedule (deliverable 1).",
-        "properties": {
-          "page": {
-            "description": "Current page (1-based).",
-            "format": "int64",
-            "type": "integer"
-          },
-          "page_size": {
-            "description": "Number of items per page (clamped to 1–100).",
-            "format": "int64",
-            "type": "integer"
-          },
-          "runs": {
-            "description": "Run entries, newest first.",
-            "items": {
-              "$ref": "#/components/schemas/ScheduleRunEntry"
-            },
-            "type": "array"
-          },
-          "total": {
-            "description": "Total number of runs across all pages.",
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "runs",
-          "total",
-          "page",
-          "page_size"
         ],
         "type": "object"
       },
@@ -43116,50 +39507,6 @@
         ],
         "type": "object"
       },
-      "ServiceParameter": {
-        "properties": {
-          "choices": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "default_value": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "description": {
-            "type": "string"
-          },
-          "encrypted": {
-            "type": "boolean"
-          },
-          "name": {
-            "type": "string"
-          },
-          "required": {
-            "type": "boolean"
-          },
-          "validation_pattern": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "name",
-          "required",
-          "encrypted",
-          "description"
-        ],
-        "type": "object"
-      },
       "ServicePlan": {
         "description": "Plan for migrating a single service (database, cache, etc.)",
         "properties": {
@@ -43443,25 +39790,6 @@
         ],
         "type": "object"
       },
-      "ServiceTypeInfo": {
-        "properties": {
-          "parameters": {
-            "example": "[{\"name\": \"host\", \"required\": true, \"encrypted\": false, \"description\": \"Database host\"}]",
-            "items": {
-              "$ref": "#/components/schemas/ServiceParameter"
-            },
-            "type": "array"
-          },
-          "service_type": {
-            "$ref": "#/components/schemas/ServiceTypeRoute"
-          }
-        },
-        "required": [
-          "service_type",
-          "parameters"
-        ],
-        "type": "object"
-      },
       "ServiceTypeRoute": {
         "enum": [
           "mariadb",
@@ -43609,25 +39937,6 @@
         ],
         "type": "object"
       },
-      "SessionDetailsQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "SessionEvent": {
         "properties": {
           "event_data": {},
@@ -43693,59 +40002,6 @@
         ],
         "type": "object"
       },
-      "SessionEventsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "offset": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "sort_order": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "SessionEventsResponse": {
         "properties": {
           "events": {
@@ -43777,66 +40033,6 @@
           "total_count",
           "offset",
           "limit"
-        ],
-        "type": "object"
-      },
-      "SessionLogsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "offset": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "sort_order": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "visitor_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id"
         ],
         "type": "object"
       },
@@ -43893,87 +40089,6 @@
         "required": [
           "sessionId",
           "events"
-        ],
-        "type": "object"
-      },
-      "SessionReplayInfoDto": {
-        "properties": {
-          "created_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "duration": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "id": {
-            "type": "string"
-          },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "screen_height": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "screen_width": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "timezone": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_agent": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "viewport_height": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "viewport_width": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "visitor_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "id",
-          "visitor_id"
         ],
         "type": "object"
       },
@@ -44654,33 +40769,6 @@
             ]
           }
         },
-        "type": "object"
-      },
-      "SiblingRef": {
-        "description": "A sibling project that shares the same `trace_id` and has opted in to\ncross-project trace sharing (`cross_project_trace_sharing = TRUE`).\n\nReturned by `CrossProjectTraceService::find_sibling_projects` and exposed\nby the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.",
-        "properties": {
-          "first_seen": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "project_name": {
-            "type": "string"
-          },
-          "project_slug": {
-            "description": "URL slug used to link into the sibling project's single-project trace view.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "project_id",
-          "project_name",
-          "project_slug",
-          "first_seen"
-        ],
         "type": "object"
       },
       "SilenceAlarmRequest": {
@@ -46137,54 +42225,6 @@
         },
         "type": "object"
       },
-      "SpeedSegmentFilters": {
-        "description": "Optional segment filters for the performance read endpoints, mirroring\nanalytics' `VisitorSegmentFilters`. Each filter narrows results to samples\nmatching the dimension value, so metrics can be scoped to e.g. one page,\none browser, or one country. Geographic filters resolve via\n`ip_geolocations`; the rest live directly on `performance_metrics`.",
-        "properties": {
-          "filter_browser": {
-            "description": "Browser name (matches `performance_metrics.browser`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_city": {
-            "description": "Geolocation city (matches `ip_geolocations.city`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_country": {
-            "description": "Geolocation country (matches `ip_geolocations.country`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_operating_system": {
-            "description": "Operating system (matches `performance_metrics.operating_system`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_path": {
-            "description": "Page pathname (matches `performance_metrics.pathname`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_region": {
-            "description": "Geolocation region (matches `ip_geolocations.region`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "StaleSlot": {
         "properties": {
           "active": {
@@ -46512,100 +42552,6 @@
         },
         "type": "object"
       },
-      "StatsFilters": {
-        "description": "Filters for statistics queries",
-        "properties": {
-          "client_ip": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "device_type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "exclude_synthetic": {
-            "description": "Exclude Temps status-monitor traffic, including legacy rows written\nbefore monitor requests received their own `request_source` value.",
-            "type": "boolean"
-          },
-          "has_project": {
-            "description": "When true, only count requests that matched a project (project_id IS NOT NULL).\nUsed by the health dashboard so totals match the per-project cards.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "host": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "is_bot": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "method": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "request_source": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "routing_status": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status_code": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "status_code_class": {
-            "description": "Filter by status code class (e.g. \"2xx\", \"3xx\", \"4xx\", \"5xx\")",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "StatusBucket": {
         "properties": {
           "avg_response_time_ms": {
@@ -46709,71 +42655,6 @@
           "monitor_id",
           "interval",
           "buckets"
-        ],
-        "type": "object"
-      },
-      "StatusCodeCount": {
-        "properties": {
-          "count": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "percentage": {
-            "format": "double",
-            "type": "number"
-          },
-          "status_code": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "status_code",
-          "count",
-          "percentage"
-        ],
-        "type": "object"
-      },
-      "StatusCodesQuery": {
-        "properties": {
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
         ],
         "type": "object"
       },
@@ -47117,70 +42998,6 @@
         ],
         "type": "string"
       },
-      "SyncedRepositoryListQuery": {
-        "properties": {
-          "direction": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "git_provider_connection_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "owner": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "private": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "search": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sort": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "SyntaxResult": {
         "description": "Syntax validation result",
         "properties": {
@@ -47243,47 +43060,6 @@
         },
         "required": [
           "tags"
-        ],
-        "type": "object"
-      },
-      "TailLogsRequest": {
-        "properties": {
-          "env": {
-            "type": "string"
-          },
-          "external_service_id": {
-            "description": "When set, tail an imported/managed external service's logs instead of\na project's (`project_id` is ignored in this mode).",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "levels": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "project_id": {
-            "description": "Project ID (integer, as used by the rest of the platform)",
-            "format": "int32",
-            "type": "integer"
-          },
-          "service": {
-            "type": "string"
-          },
-          "text": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "project_id",
-          "service",
-          "env"
         ],
         "type": "object"
       },
@@ -48095,68 +43871,6 @@
         ],
         "type": "object"
       },
-      "TimeseriesQueryParams": {
-        "properties": {
-          "bucket": {
-            "description": "Bucket size: \"hour\", \"day\", \"week\" (defaults to \"day\")",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "conversation_id": {
-            "description": "Filter by conversation ID",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "from": {
-            "description": "ISO 8601 start time (defaults to 24h ago)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "model": {
-            "description": "Filter by model name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider": {
-            "description": "Filter by provider name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Filter by tags (comma-separated, AND logic)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "to": {
-            "description": "ISO 8601 end time (defaults to now)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter by user ID",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "TlsMode": {
         "enum": [
           "None",
@@ -48240,38 +43954,6 @@
         ],
         "type": "object"
       },
-      "TokenRenewalRequest": {
-        "properties": {
-          "refresh_token": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "refresh_token"
-        ],
-        "type": "object"
-      },
-      "ToolCallEvent": {
-        "description": "Payload for the `tool_call` SSE event: the model is about to run a tool.\nSerialized as compact single-line JSON onto one `data:` line.",
-        "properties": {
-          "arguments": {
-            "description": "The raw JSON-args string the model emitted.",
-            "type": "string"
-          },
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "arguments"
-        ],
-        "type": "object"
-      },
       "ToolInfo": {
         "description": "One persisted tool invocation + its result, attached to an assistant message.",
         "properties": {
@@ -48298,69 +43980,6 @@
         ],
         "type": "object"
       },
-      "ToolResultEvent": {
-        "description": "Payload for the `tool_result` SSE event: a tool finished running. Serialized\nas compact single-line JSON; `content` is JSON-string-escaped so it stays on\none `data:` line even when long.",
-        "properties": {
-          "content": {
-            "type": "string"
-          },
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "content"
-        ],
-        "type": "object"
-      },
-      "TopModelsQueryParams": {
-        "properties": {
-          "from": {
-            "description": "ISO 8601 start time (defaults to 24h ago)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Max results (defaults to 10)",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Filter by tags (comma-separated, AND logic)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "to": {
-            "description": "ISO 8601 end time (defaults to now)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter by user ID",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "TraceProject": {
         "properties": {
           "id": {
@@ -48378,38 +43997,6 @@
           "id",
           "name",
           "slug"
-        ],
-        "type": "object"
-      },
-      "TraceProjectRef": {
-        "description": "All projects that contributed spans to a trace, including their sharing flag.\n\nReturned by `CrossProjectTraceService::find_trace_projects`.",
-        "properties": {
-          "first_seen": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "project_name": {
-            "type": "string"
-          },
-          "project_slug": {
-            "description": "URL slug used to link into the project's single-project trace view.",
-            "type": "string"
-          },
-          "sharing": {
-            "description": "Whether this project has `cross_project_trace_sharing = true`.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "project_id",
-          "project_name",
-          "project_slug",
-          "first_seen",
-          "sharing"
         ],
         "type": "object"
       },
@@ -49769,46 +45356,6 @@
           "name",
           "message",
           "data_preserved"
-        ],
-        "type": "object"
-      },
-      "UniqueCountsQuery": {
-        "description": "Query parameters for unique counts over time frame",
-        "properties": {
-          "deployment_id": {
-            "description": "Optional deployment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "description": "End date for the query range",
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "description": "Optional environment filter",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "metric": {
-            "description": "Metric to count: \"sessions\" (unique sessions), \"visitors\" (unique visitors),\n\"returning_visitors\" (visitors seen before the range), or \"page_views\"\n(total page views) (default: \"sessions\")",
-            "type": "string"
-          },
-          "start_date": {
-            "description": "Start date for the query range",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date"
         ],
         "type": "object"
       },
@@ -52697,116 +48244,6 @@
         ],
         "type": "object"
       },
-      "UsageFilter": {
-        "description": "Filters for querying AI usage data.\n\nCost bounds are expressed in microcents (the unit stored in\n`estimated_cost_microcents`). At most one of `gte`/`gt` and one of\n`lte`/`lt` is meaningful per query; if both are set the stricter wins\nnaturally because they are ANDead together.",
-        "properties": {
-          "conversation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "cost_gt": {
-            "description": "Cost strictly greater-than, in microcents.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_gte": {
-            "description": "Cost greater-than-or-equal, in microcents.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_lt": {
-            "description": "Cost strictly less-than, in microcents.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "cost_lte": {
-            "description": "Cost less-than-or-equal, in microcents.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "description": "Filter by HTTP status code (exact match).",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Comma-separated tags to filter by (AND logic).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tokens_gt": {
-            "description": "Total tokens (input + output) strictly greater-than.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_gte": {
-            "description": "Total tokens (input + output) greater-than-or-equal.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_lt": {
-            "description": "Total tokens (input + output) strictly less-than.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tokens_lte": {
-            "description": "Total tokens (input + output) less-than-or-equal.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "user_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "UsageInfo": {
         "properties": {
           "completion_tokens": {
@@ -52931,61 +48368,6 @@
           "entries",
           "total"
         ],
-        "type": "object"
-      },
-      "UsageQueryParams": {
-        "properties": {
-          "conversation_id": {
-            "description": "Filter by conversation ID",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "from": {
-            "description": "ISO 8601 start time (defaults to 24h ago)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "model": {
-            "description": "Filter by model name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider": {
-            "description": "Filter by provider name",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tags": {
-            "description": "Filter by tags (comma-separated, AND logic)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "to": {
-            "description": "ISO 8601 end time (defaults to now)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_id": {
-            "description": "Filter by user ID",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "UsageSource": {
@@ -53341,110 +48723,6 @@
         ],
         "type": "object"
       },
-      "ViewItem": {
-        "properties": {
-          "label": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "value": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "label",
-          "value"
-        ],
-        "type": "object"
-      },
-      "ViewsOverTime": {
-        "properties": {
-          "comparison_labels": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "comparison_plot": {
-            "items": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "full_intervals": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/ViewItem"
-            },
-            "type": "array"
-          },
-          "metric": {
-            "type": "string"
-          },
-          "present_index": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "items",
-          "metric",
-          "present_index"
-        ],
-        "type": "object"
-      },
-      "ViewsOverTimeQuery": {
-        "properties": {
-          "deployment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
-        ],
-        "type": "object"
-      },
       "VisitorActivityAssessment": {
         "properties": {
           "categories": {
@@ -53683,63 +48961,6 @@
         ],
         "type": "object"
       },
-      "VisitorFacetsQuery": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/VisitorSegmentFilters"
-          },
-          {
-            "properties": {
-              "end_date": {
-                "format": "date-time",
-                "type": "string"
-              },
-              "environment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "has_activity_only": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "include_crawlers": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "per_facet_limit": {
-                "description": "Maximum number of values returned per dimension (default: 50, max: 200).",
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "project_id": {
-                "format": "int32",
-                "type": "integer"
-              },
-              "start_date": {
-                "format": "date-time",
-                "type": "string"
-              }
-            },
-            "required": [
-              "start_date",
-              "end_date",
-              "project_id"
-            ],
-            "type": "object"
-          }
-        ],
-        "description": "Query parameters for the visitor-facets endpoint. Mirrors the shape of\n`VisitorsListQuery` so the same segment filters apply — facet counts are\nalways computed against the *currently filtered* visitor pool, minus the\ndimension being aggregated."
-      },
       "VisitorInfo": {
         "properties": {
           "city": {
@@ -53886,25 +49107,6 @@
         ],
         "type": "object"
       },
-      "VisitorJourneyQuery": {
-        "properties": {
-          "limit_sessions": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
-        ],
-        "type": "object"
-      },
       "VisitorJourneyResponse": {
         "description": "Complete visitor journey response",
         "properties": {
@@ -53939,52 +49141,6 @@
         ],
         "type": "object"
       },
-      "VisitorLocationsQuery": {
-        "properties": {
-          "end_date": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "granularity": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LocationGranularity"
-              }
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "start_date": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "start_date",
-          "end_date",
-          "project_id"
-        ],
-        "type": "object"
-      },
       "VisitorRecord": {
         "properties": {
           "created_at": {
@@ -54010,73 +49166,6 @@
           "visitor_id",
           "project_id",
           "created_at"
-        ],
-        "type": "object"
-      },
-      "VisitorSegmentFilters": {
-        "description": "Optional segment filters for [`VisitorsListQuery`]. Each filter narrows the\nresult set to visitors who match the given dimension value within the date\nrange. All filters resolve against `visitor` / `ip_geolocations` — by\ndesign we never touch the events hypertable here so filtering stays fast\nregardless of event volume.",
-        "properties": {
-          "filter_channel": {
-            "description": "First-touch marketing channel (matches `visitor.first_channel`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_city": {
-            "description": "Geolocation city (matches `ip_geolocations.city`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_country": {
-            "description": "Geolocation country (matches `ip_geolocations.country`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_referrer": {
-            "description": "First-touch referrer hostname (matches `visitor.first_referrer_hostname`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter_region": {
-            "description": "Geolocation region (matches `ip_geolocations.region`)",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "VisitorSessionsQuery": {
-        "properties": {
-          "environment_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "project_id"
         ],
         "type": "object"
       },
@@ -54316,69 +49405,6 @@
           "is_crawler"
         ],
         "type": "object"
-      },
-      "VisitorsListQuery": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/VisitorSegmentFilters"
-          },
-          {
-            "properties": {
-              "end_date": {
-                "format": "date-time",
-                "type": "string"
-              },
-              "environment_id": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "has_activity_only": {
-                "description": "Filter to only include visitors with recorded activity (events/sessions).\nWhen true, excludes \"ghost\" visitors that have no events.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "include_crawlers": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "limit": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "offset": {
-                "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "project_id": {
-                "format": "int32",
-                "type": "integer"
-              },
-              "start_date": {
-                "format": "date-time",
-                "type": "string"
-              }
-            },
-            "required": [
-              "start_date",
-              "end_date",
-              "project_id"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "VisitorsResponse": {
         "properties": {
@@ -54661,13 +49687,6 @@
             "type": "object"
           }
         ]
-      },
-      "WalWarningSeverity": {
-        "enum": [
-          "warning",
-          "critical"
-        ],
-        "type": "string"
       },
       "WebhookConfig": {
         "description": "Configuration for a generic webhook notification provider",

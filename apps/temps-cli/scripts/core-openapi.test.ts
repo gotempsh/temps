@@ -34,3 +34,32 @@ test('refresh imports core changes but not plugin routes or transitive plugin sc
     Check: { enum: ['extends'] },
   })
 })
+
+test('refresh removes deleted and renamed schemas while retaining transitive dependencies', () => {
+  const before = {
+    paths: { '/project': ref('OldProject'), '/x/old': ref('LegacyPlugin') },
+    components: {
+      schemas: {
+        OldProject: { type: 'string' },
+        Deleted: { type: 'object' },
+        LegacyPlugin: ref('LegacyDependency'),
+        LegacyDependency: { type: 'string' },
+      },
+    },
+  }
+  const fetched = {
+    paths: { '/project': ref('Project') },
+    components: {
+      schemas: {
+        Project: ref('ProjectId'),
+        ProjectId: { type: 'integer' },
+      },
+    },
+  }
+  expect(coreOpenApi(fetched, before).components?.schemas).toEqual({
+    Project: ref('ProjectId'),
+    ProjectId: { type: 'integer' },
+    LegacyPlugin: ref('LegacyDependency'),
+    LegacyDependency: { type: 'string' },
+  })
+})

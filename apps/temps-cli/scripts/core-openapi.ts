@@ -47,7 +47,7 @@ export function coreOpenApi(fetched: Document, committed: Document): Document {
   }
   const coreNames = closure(corePaths, fetchedSchemas)
   const historicalNames = closure(historicalPluginPaths, oldSchemas)
-  const schemas = { ...oldSchemas }
+  const schemas: Record<string, unknown> = {}
   for (const name of coreNames)
     if (name in fetchedSchemas) schemas[name] = fetchedSchemas[name]
   // Historical plugin-only schema shapes stay frozen, just like their paths.
