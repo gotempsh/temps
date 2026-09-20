@@ -136,6 +136,50 @@ pub async fn start_oidc_login_by_slug(
     Ok(Redirect::temporary(&login.authorize_url))
 }
 
+/// Start a login against the Cloud-managed console-access provider without
+/// knowing its slug.
+///
+/// The slug embeds the provider's row id, which Cloud does not know and the
+/// instance may regenerate, so Cloud's "Open console" button needs a fixed
+/// address it can link to: this one. A browser that already holds a Cloud
+/// session completes the round trip without seeing a login page, which is
+/// what makes the hosted console feel signed-in from Cloud. Anything else
+/// (the interactive login, the callback, `return_to` sanitising) is exactly
+/// the slug route; only the lookup differs. 404 when no managed provider is
+/// installed, so a self-hosted instance that never enrolled has nothing to
+/// probe here.
+#[utoipa::path(
+    get,
+    path = "/auth/oidc/cloud/login",
+    params(OidcLoginQuery),
+    responses(
+        (status = 302, description = "Redirect to the Temps Cloud authorize URL"),
+        (status = 404, description = "This instance has no Cloud-managed console-access provider"),
+        (status = 503, description = "OIDC provider unreachable")
+    ),
+    tag = "Authentication"
+)]
+pub async fn start_managed_cloud_login(
+    State(state): State<Arc<AuthState>>,
+    Query(query): Query<OidcLoginQuery>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Redirect, Problem> {
+    let provider = state
+        .oidc_service
+        .managed_cloud_provider()
+        .await?
+        .ok_or(OidcError::ProviderNotFound { provider_id: 0 })?;
+    let redirect_uri = format!(
+        "{}/api/auth/oidc/callback",
+        metadata.base_url.trim_end_matches('/')
+    );
+    let login = state
+        .oidc_service
+        .start_login(provider.id, &redirect_uri, query.return_to)
+        .await?;
+    Ok(Redirect::temporary(&login.authorize_url))
+}
+
 #[utoipa::path(
     get,
     path = "/auth/oidc/callback",
@@ -935,6 +979,7 @@ pub async fn delete_oidc_role_mapping(
     paths(
         list_public_providers,
         start_oidc_login_by_slug,
+        start_managed_cloud_login,
         oidc_callback,
         create_oidc_provider,
         list_oidc_providers,

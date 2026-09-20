@@ -756,6 +756,13 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
         )
+        // Fixed address for the Cloud-managed provider (Cloud's "Open
+        // console" links here); rate-limited with the slug route because it
+        // is the same login start.
+        .route(
+            "/auth/oidc/cloud/login",
+            get(crate::oidc_handler::start_managed_cloud_login),
+        )
         .route(
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),

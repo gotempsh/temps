@@ -137,9 +137,7 @@ for (const [path, parameter, endpoint] of [
   ['traces', 'q', '/api/otel/trace-summaries'],
   ['telemetry-logs', 'trace', '/api/otel/logs'],
 ] as const) {
-  test(`${path} keeps exact trace searches independent of time`, async ({
-    page,
-  }) => {
+  test(`${path} handles exact trace searches`, async ({ page }) => {
     const { projects } = await (await page.request.get('/api/projects')).json()
     test.skip(!projects[0], 'Requires a local test project')
     const traceId = 'a'.repeat(32)
@@ -154,13 +152,18 @@ for (const [path, parameter, endpoint] of [
       `/projects/${projects[0].slug}/${path}?${parameter}=${traceId}&range=1h`
     )
     const query = new URL((await request).url()).searchParams
-    expect(query.has('start_time')).toBe(false)
-    expect(query.has('end_time')).toBe(false)
-    if (path === 'telemetry-logs')
+    if (path === 'traces') {
+      // Exact trace lookups keep timestamp partition pruning (#1058).
+      expect(query.has('start_time')).toBe(true)
+      expect(query.has('end_time')).toBe(true)
+    } else {
+      expect(query.has('start_time')).toBe(false)
+      expect(query.has('end_time')).toBe(false)
       await expect(
         page
           .getByRole('group', { name: 'Date and time range', exact: true })
           .getByRole('button', { name: '6h', exact: true })
       ).toBeDisabled()
+    }
   })
 }

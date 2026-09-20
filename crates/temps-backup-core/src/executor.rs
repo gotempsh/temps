@@ -82,7 +82,7 @@ struct ExecutorInner {
     unavailable_engines: HashMap<&'static str, String>,
     semaphore: Arc<Semaphore>,
     in_flight: Mutex<HashMap<i32, JobHandle>>,
-    /// Optional failure-notification hook. Fired from `finish_failure`
+    /// Optional failure-notification hook. Fired from `announce_failure`
     /// via a detached `tokio::spawn` so slow notifiers can't delay the DB
     /// write.
     notifier: Option<Arc<dyn BackupFailureNotifier>>,
@@ -257,13 +257,8 @@ impl BackupExecutor {
                 engine: params.engine.clone(),
                 reason: reason.clone(),
             };
-            if self
-                .mark_backup_failed(params.backup_id, &err.to_string())
-                .await?
-            {
-                self.finish_failure(params.backup_id, &params.engine, &err.to_string())
-                    .await;
-            }
+            self.try_finalize_failed(params.backup_id, &params.engine, &err.to_string())
+                .await?;
             return Err(err);
         }
 
@@ -562,23 +557,49 @@ SELECT id FROM updated_backup
         Ok(transitioned.is_some())
     }
 
+    /// Terminal failure for a task that has no caller left to report to: the
+    /// state transition is attempted, a DB error is logged, and the
+    /// out-of-band signals still fire on a DB error so the operator hears about
+    /// the failed task. Already-terminal rows never emit another failure.
     async fn finalize_failed(&self, backup_id: i32, engine_key: &str, reason: &str) {
-        match self.mark_backup_failed(backup_id, reason).await {
-            Ok(true) => self.finish_failure(backup_id, engine_key, reason).await,
-            Ok(false) => {} // Already terminal (or removed): do not emit a false failure.
-            Err(error) => {
-                error!(backup_id, %error, "BackupExecutor: finalize_failed UPDATE failed")
-            }
+        if let Err(e) = self
+            .try_finalize_failed(backup_id, engine_key, reason)
+            .await
+        {
+            error!(
+                backup_id,
+                error = %e,
+                "BackupExecutor: finalize_failed UPDATE failed",
+            );
+            self.announce_failure(backup_id, engine_key, reason);
         }
     }
 
-    async fn finish_failure(&self, backup_id: i32, engine_key: &str, reason: &str) {
+    /// Terminal failure where the caller can act on a DB error: the row is
+    /// flipped to `failed` first, and only when that changes the parent row does
+    /// the notifier / event publisher announce it. Announcing a failure whose row
+    /// is still `pending` would tell the operator the backup is over while it
+    /// is still counted as in flight by the schedule fan-out.
+    async fn try_finalize_failed(
+        &self,
+        backup_id: i32,
+        engine_key: &str,
+        reason: &str,
+    ) -> Result<(), sea_orm::DbErr> {
+        if !self.mark_backup_failed(backup_id, reason).await? {
+            return Ok(());
+        }
         if let Err(error) =
             mark_schedule_run_finished_if_done(self.inner.db.as_ref(), backup_id).await
         {
             error!(backup_id, %error, "BackupExecutor: could not finish failed backup schedule run");
         }
+        self.announce_failure(backup_id, engine_key, reason);
+        Ok(())
+    }
 
+    /// Fire-and-forget the failure notification and `BackupFailed` event.
+    fn announce_failure(&self, backup_id: i32, engine_key: &str, reason: &str) {
         // Fire-and-forget the failure notification. The notifier is
         // responsible for its own error handling; we never await the
         // spawned task so a slow SMTP/webhook cannot stall the finalize
@@ -1071,6 +1092,28 @@ mod tests {
         assert_eq!(notification.backup_id, 42);
         assert_eq!(notification.engine, "postgres_pgdump");
         assert_eq!(notification.error_message, error.to_string());
+    }
+
+    #[tokio::test]
+    async fn running_task_still_notifies_when_failure_persistence_fails() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("write unavailable".into())])
+                .into_connection(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let executor = BackupExecutorBuilder::new(db)
+            .with_notifier(Arc::new(CapturingNotifier(sender)))
+            .build();
+        executor
+            .finalize_failed(42, "postgres_pgdump", "engine failed")
+            .await;
+        let notification = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("notification arrives")
+            .expect("notification present");
+        assert_eq!(notification.backup_id, 42);
+        assert_eq!(notification.error_message, "engine failed");
     }
 
     #[tokio::test]
