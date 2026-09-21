@@ -74,6 +74,7 @@ pub async fn get_failure_report_preview(
     responses(
         (status = 204, description = "Report sent"),
         (status = 404, description = "Job not found"),
+        (status = 422, description = "Report text is empty"),
         (status = 502, description = "Failed to reach the central reporting endpoint"),
         (status = 500, description = "Internal server error")
     ),
@@ -150,6 +151,14 @@ impl From<FailureReportError> for Problem {
                      opt-out). No report was sent. You can still open a GitHub issue from the \
                      deployment's failure view — that path never contacts a Temps server.",
                 ),
+            FailureReportError::EmptyReport => problemdetails::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .with_title("Empty Failure Report")
+            .with_detail(
+                "The failure report is empty. Add the text you want to send, or reset it to \
+                     the redacted trace.",
+            ),
             FailureReportError::Deployment(deployment_error) => deployment_error.into(),
         }
     }

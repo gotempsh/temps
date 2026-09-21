@@ -51,6 +51,50 @@ const SENSITIVE_JOB_CONFIG_FIELDS: &[&str] = &[
     "environment_vars",
 ];
 
+/// Largest `report_text` the central endpoint accepts. Mirrors
+/// `MAX_REPORT_TEXT_CHARS` in `telemetry-api/src/routes/failure-reports.ts`,
+/// which rejects anything longer with a 422. That check uses JavaScript's
+/// `String.length`, i.e. UTF-16 code units, so the budget here is counted the
+/// same way (a Rust `char` is never more than 2 units, so counting units is
+/// the safe direction). Keep the two constants in sync.
+pub const MAX_REPORT_TEXT_UTF16_UNITS: usize = 200_000;
+
+const TRUNCATION_MARKER: &str = "[... earlier output truncated to fit the report size limit ...]\n";
+
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Bound `text` to [`MAX_REPORT_TEXT_UTF16_UNITS`], keeping the *end* of it:
+/// the report is the concatenated trace of every job up to the failed one, so
+/// the failure itself is always at the tail and the head is the part that can
+/// be dropped. A truncation marker is prepended so the reader knows.
+fn fit_report_text(text: &str) -> String {
+    if utf16_len(text) <= MAX_REPORT_TEXT_UTF16_UNITS {
+        return text.to_string();
+    }
+
+    let mut budget = MAX_REPORT_TEXT_UTF16_UNITS - utf16_len(TRUNCATION_MARKER);
+    let mut start = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let units = ch.len_utf16();
+        if units > budget {
+            break;
+        }
+        budget -= units;
+        start = idx;
+    }
+
+    // Prefer starting on a line boundary so the first kept line isn't a
+    // fragment, as long as that costs at most one (typical) line.
+    let tail = &text[start..];
+    let tail = match tail.find('\n') {
+        Some(nl) if nl < 1_000 => &tail[nl + 1..],
+        _ => tail,
+    };
+    format!("{TRUNCATION_MARKER}{tail}")
+}
+
 /// Deployment job errors are often nested chains ("Job execution failed:
 /// Failed to build image: Build failed: Build failed: Docker stream error:
 /// ..."), which makes an unbounded GitHub issue title unreadable in a PR
@@ -79,6 +123,9 @@ pub enum FailureReportError {
 
     #[error("Failed to send failure report for deployment {deployment_id}: {reason}")]
     SendFailed { deployment_id: i32, reason: String },
+
+    #[error("The failure report is empty; there is nothing to send")]
+    EmptyReport,
 
     #[error("Deployment lookup failed: {0}")]
     Deployment(#[from] DeploymentError),
@@ -259,7 +306,9 @@ impl FailureReportService {
 
         let secrets = self.known_secret_values(jobs);
         let redacted = redact_known_secrets(&combined, &secrets);
-        Ok(redact_common_secret_patterns(&redacted))
+        // Bound it here so the preview shows exactly what would be sent: the
+        // central endpoint rejects oversized reports outright.
+        Ok(fit_report_text(&redact_common_secret_patterns(&redacted)))
     }
 
     /// Build the redacted, editable preview shown to the user before they
@@ -345,7 +394,12 @@ impl FailureReportService {
         let jobs = self.jobs_up_to(project_id, deployment_id, job_id).await?;
         let failed_job = jobs.last().expect("jobs_up_to always returns >= 1 job");
         let secrets = self.known_secret_values(&jobs);
-        let safe_text = redact_known_secrets(report_text, &secrets);
+        let safe_text = fit_report_text(&redact_known_secrets(report_text, &secrets));
+        // The central endpoint rejects a blank report with a 422; say so
+        // here rather than making the user decode a bare status code.
+        if safe_text.trim().is_empty() {
+            return Err(FailureReportError::EmptyReport);
+        }
 
         let payload = FailureReportPayload {
             report_text: &safe_text,
@@ -356,26 +410,48 @@ impl FailureReportService {
             failed_job_type: &failed_job.job_type,
         };
 
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| FailureReportError::SendFailed {
-                deployment_id,
-                reason: e.to_string(),
-            })?;
-
-        if !response.status().is_success() {
-            return Err(FailureReportError::SendFailed {
-                deployment_id,
-                reason: format!("central endpoint returned {}", response.status()),
-            });
-        }
-
-        Ok(())
+        post_report(&self.client, &self.endpoint, deployment_id, &payload).await
     }
+}
+
+/// POST `payload` to the central endpoint. On a non-2xx answer the reason the
+/// endpoint gave (its JSON `error` field) is carried into the error, because a
+/// bare "422 Unprocessable Entity" is undiagnosable for a self-hoster with no
+/// one to ask.
+async fn post_report(
+    client: &reqwest::Client,
+    endpoint: &str,
+    deployment_id: i32,
+    payload: &FailureReportPayload<'_>,
+) -> Result<(), FailureReportError> {
+    let response = client
+        .post(endpoint)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| FailureReportError::SendFailed {
+            deployment_id,
+            reason: e.to_string(),
+        })?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .filter(|e| !e.is_empty());
+    let reason = match detail {
+        Some(detail) => format!("central endpoint returned {status}: {detail}"),
+        None => format!("central endpoint returned {status}"),
+    };
+    Err(FailureReportError::SendFailed {
+        deployment_id,
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -383,6 +459,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(temps_telemetry_env)]
     fn reporting_enabled_defaults_on_and_honors_opt_out() {
         std::env::remove_var("TEMPS_TELEMETRY");
         assert!(FailureReportService::reporting_enabled_from_env());
@@ -398,6 +475,7 @@ mod tests {
     /// caller with DeploymentsRead could still POST deployment logs to the
     /// central endpoint by calling the send route directly.
     #[test]
+    #[serial_test::serial(temps_telemetry_env)]
     fn send_report_is_refused_when_reporting_is_disabled() {
         // The construction path reads the same env var the preview reports, so
         // an instance built under the opt-out carries reporting_enabled = false.
@@ -437,5 +515,111 @@ mod tests {
     #[test]
     fn truncate_for_title_trims_whitespace() {
         assert_eq!(truncate_for_title("  padded  "), "padded");
+    }
+
+    #[test]
+    fn fit_report_text_leaves_reports_within_the_limit_untouched() {
+        let text = "a".repeat(MAX_REPORT_TEXT_UTF16_UNITS);
+        assert_eq!(fit_report_text(&text), text);
+    }
+
+    /// The failure is at the end of the concatenated trace, so it is the head
+    /// that must be dropped -- and the result has to fit the endpoint's limit.
+    #[test]
+    fn fit_report_text_keeps_the_tail_and_fits_the_limit() {
+        let mut text = String::new();
+        for i in 0..40_000 {
+            text.push_str(&format!("build step {i}\n"));
+        }
+        text.push_str("ERROR: application failed health check");
+        assert!(utf16_len(&text) > MAX_REPORT_TEXT_UTF16_UNITS);
+
+        let fitted = fit_report_text(&text);
+        assert!(utf16_len(&fitted) <= MAX_REPORT_TEXT_UTF16_UNITS);
+        assert!(fitted.starts_with(TRUNCATION_MARKER));
+        assert!(fitted.ends_with("ERROR: application failed health check"));
+        assert!(!fitted.contains("build step 0\n"));
+    }
+
+    /// The endpoint measures UTF-16 code units (JS `String.length`), so a
+    /// report of astral chars (2 units each) must be bounded by units, not by
+    /// `chars().count()`, or it is still rejected.
+    #[test]
+    fn fit_report_text_counts_utf16_units_not_chars() {
+        let text = "🚀".repeat(MAX_REPORT_TEXT_UTF16_UNITS / 2 + 10);
+        assert!(text.chars().count() <= MAX_REPORT_TEXT_UTF16_UNITS);
+        assert!(utf16_len(&text) > MAX_REPORT_TEXT_UTF16_UNITS);
+
+        let fitted = fit_report_text(&text);
+        assert!(utf16_len(&fitted) <= MAX_REPORT_TEXT_UTF16_UNITS);
+    }
+
+    async fn serve_once(status: axum::http::StatusCode, body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/deploy-failure-reports",
+            axum::routing::post(move || async move {
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1/deploy-failure-reports")
+    }
+
+    fn sample_payload() -> FailureReportPayload<'static> {
+        FailureReportPayload {
+            report_text: "boom",
+            temps_version: "0.0.0",
+            project_id: 1,
+            deployment_id: 22,
+            failed_job_id: "deploy_container",
+            failed_job_type: "DeployContainerJob",
+        }
+    }
+
+    /// Before, a 422 surfaced as just "central endpoint returned 422
+    /// Unprocessable Entity" and the endpoint's own explanation was dropped.
+    #[tokio::test]
+    async fn post_report_carries_the_endpoints_rejection_reason() {
+        let endpoint = serve_once(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"error":"report_text exceeds 200000 chars"}"#,
+        )
+        .await;
+
+        let err = post_report(&reqwest::Client::new(), &endpoint, 22, &sample_payload())
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("422"), "{message}");
+        assert!(
+            message.contains("report_text exceeds 200000 chars"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_report_without_a_json_reason_still_reports_the_status() {
+        let endpoint = serve_once(axum::http::StatusCode::BAD_GATEWAY, "<html>oops</html>").await;
+
+        let err = post_report(&reqwest::Client::new(), &endpoint, 22, &sample_payload())
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .ends_with("central endpoint returned 502 Bad Gateway"));
+    }
+
+    #[tokio::test]
+    async fn post_report_succeeds_on_2xx() {
+        let endpoint = serve_once(axum::http::StatusCode::CREATED, r#"{"ok":true}"#).await;
+        post_report(&reqwest::Client::new(), &endpoint, 22, &sample_payload())
+            .await
+            .unwrap();
     }
 }
