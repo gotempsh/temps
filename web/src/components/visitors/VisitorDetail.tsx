@@ -312,7 +312,6 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
 
       enrichMutation.mutate({
         path: { visitor_id: visitorIdToUse },
-        query: { project_id: project.id },
         body: { custom_data: parsedData },
       })
     } catch {

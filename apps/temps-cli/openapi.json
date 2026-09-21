@@ -63022,22 +63022,12 @@
         "operationId": "enrich_visitor",
         "parameters": [
           {
-            "description": "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)",
+            "description": "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project.",
             "in": "path",
             "name": "visitor_id",
             "required": true,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Project ID or slug",
-            "in": "query",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
             }
           }
         ],
@@ -63063,7 +63053,10 @@
             "description": "Successfully enriched visitor data"
           },
           "400": {
-            "description": "Invalid parameters or project not found"
+            "description": "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"
+          },
+          "403": {
+            "description": "Deployment token used with a non-encrypted visitor ID"
           },
           "404": {
             "description": "Visitor not found"

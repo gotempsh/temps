@@ -29024,24 +29024,23 @@ export type EnrichVisitorData = {
     body: EnrichVisitorRequest;
     path: {
         /**
-         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
+         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project.
          */
         visitor_id: string;
     };
-    query: {
-        /**
-         * Project ID or slug
-         */
-        project_id: number;
-    };
+    query?: never;
     url: '/analytics/visitors/{visitor_id}/enrich';
 };
 
 export type EnrichVisitorErrors = {
     /**
-     * Invalid parameters or project not found
+     * Invalid visitor ID, or enrichment data that is not a JSON object within the size limits
      */
     400: unknown;
+    /**
+     * Deployment token used with a non-encrypted visitor ID
+     */
+    403: unknown;
     /**
      * Visitor not found
      */
