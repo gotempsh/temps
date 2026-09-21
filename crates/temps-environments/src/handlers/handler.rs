@@ -104,6 +104,62 @@ fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<
     Ok(())
 }
 
+/// ADR 045: an environment variable is delivered into a granted project's
+/// container verbatim, and a secret is materialised as a file under
+/// `/run/secrets/<KEY>` -- either is enough to get arbitrary code execution
+/// in most runtimes once a shell reads it (`NODE_OPTIONS`, `PYTHONSTARTUP`,
+/// `BASH_ENV`, ...). That makes writing one here the same "plant the input a
+/// later deployment executes as host root" attack the runtime-write and
+/// source-field guards in `temps-projects` close -- through a channel neither
+/// of those covers, since env vars and secrets are never part of the same
+/// request as either. `Role::User` holds `EnvironmentsCreate`/
+/// `EnvironmentsWrite`, and OSS never registers a `ProjectAccessChecker`
+/// (`project_access_guard!` is a no-op), so this is reachable against any
+/// project -- including one an admin just created for host Docker access,
+/// which "carries no restrictive access grants of its own" (ADR 045).
+async fn require_granted_project_write_authority(
+    environment_service: &crate::services::environment_service::EnvironmentService,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    field: &str,
+) -> Result<(), Problem> {
+    require_granted_project_write_authority_against(
+        environment_service,
+        temps_core::docker_socket_grant::process_grant(),
+        auth,
+        project_id,
+        field,
+    )
+    .await
+}
+
+/// [`require_granted_project_write_authority`] with the grant injected,
+/// rather than read from the process-wide `OnceLock`, so it is testable
+/// without mutating global state — same reasoning as
+/// `ProjectService::guard_granted_project_write_against` in `temps-projects`.
+async fn require_granted_project_write_authority_against(
+    environment_service: &crate::services::environment_service::EnvironmentService,
+    grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    field: &str,
+) -> Result<(), Problem> {
+    let project = environment_service.get_project(project_id).await?;
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    if temps_core::docker_socket_grant::deploy_requires_instance_admin(grant, &project.slug, caller)
+    {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Host Docker Access Write Requires An Admin")
+            .detail(
+                temps_core::docker_socket_grant::granted_project_write_reason(&project.slug, field),
+            )
+            .build());
+    }
+    Ok(())
+}
+
 /// A regular variable can be revealed with EnvironmentsRead. Secrets remain
 /// write-only regardless of the caller's permissions.
 fn require_environment_variable_reveal(
@@ -829,6 +885,13 @@ pub async fn create_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     let var = state
         .env_var_service
@@ -933,6 +996,13 @@ pub async fn update_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     let outcome = state
         .env_var_service
@@ -2054,6 +2124,13 @@ pub async fn create_project_secret(
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     let secret = state
         .secret_service
@@ -2118,6 +2195,13 @@ pub async fn update_project_secret(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     let secret = state
         .secret_service
@@ -2484,6 +2568,179 @@ mod tests {
                 .expect_err("a secret must be write-only even for an administrator");
 
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── ADR 045: env vars and secrets are an equivalent-payload channel ──
+    //
+    // Same "plant the input a later deployment executes as host root" attack
+    // the runtime-write and source-field guards in temps-projects close, but
+    // through a channel neither of those covers: neither request carries an
+    // env var or a secret.
+    mod granted_project_write {
+        use super::*;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_config::{ConfigService, ServerConfig};
+        use temps_core::docker_socket_grant::DockerSocketGrant;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, projects};
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!(
+                        "Docker unavailable, skipping granted-project-write integration test: \
+                         {error:#}"
+                    );
+                    None
+                }
+                Err(error) => panic!("granted-project-write test database setup failed: {error:#}"),
+            }
+        }
+
+        fn environment_service(
+            test_db: &TestDatabase,
+        ) -> crate::services::environment_service::EnvironmentService {
+            let server_config = ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://localhost/test".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+            let config_service = Arc::new(ConfigService::new(
+                Arc::new(server_config),
+                test_db.db.clone(),
+            ));
+            crate::services::environment_service::EnvironmentService::new(
+                test_db.db.clone(),
+                config_service,
+            )
+        }
+
+        async fn insert_project(test_db: &TestDatabase, name: &str, slug: &str) -> i32 {
+            let project = projects::ActiveModel {
+                name: Set(name.to_string()),
+                slug: Set(slug.to_string()),
+                repo_name: Set(slug.to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .unwrap();
+            project.id
+        }
+
+        /// `Role::User` holds `EnvironmentsCreate`/`EnvironmentsWrite`, and
+        /// OSS never registers a `ProjectAccessChecker`, so this is the
+        /// non-admin's actual path to planting an env var on a granted
+        /// project.
+        #[tokio::test]
+        async fn a_project_writer_cannot_write_an_env_var_on_a_granted_project() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+
+            let error = require_granted_project_write_authority_against(
+                &environment_service(&test_db),
+                &grant,
+                &test_auth_context(temps_auth::Role::User),
+                project_id,
+                "environment variables",
+            )
+            .await
+            .expect_err("a non-admin must not plant an env var on a granted project");
+
+            assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_project_writer_cannot_write_a_secret_on_a_granted_project() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+
+            let error = require_granted_project_write_authority_against(
+                &environment_service(&test_db),
+                &grant,
+                &test_auth_context(temps_auth::Role::User),
+                project_id,
+                "secrets",
+            )
+            .await
+            .expect_err("a non-admin must not plant a secret on a granted project");
+
+            assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn an_instance_admin_may_write_either() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let service = environment_service(&test_db);
+
+            require_granted_project_write_authority_against(
+                &service,
+                &grant,
+                &test_auth_context(temps_auth::Role::Admin),
+                project_id,
+                "environment variables",
+            )
+            .await
+            .expect("an admin may write an env var on a granted project");
+
+            require_granted_project_write_authority_against(
+                &service,
+                &grant,
+                &test_auth_context(temps_auth::Role::Admin),
+                project_id,
+                "secrets",
+            )
+            .await
+            .expect("an admin may write a secret on a granted project");
+        }
+
+        #[tokio::test]
+        async fn an_undeclared_project_is_writable_by_any_project_writer() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let ordinary_id = insert_project(&test_db, "Ordinary App", "ordinary-app").await;
+            let granted_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let service = environment_service(&test_db);
+
+            require_granted_project_write_authority_against(
+                &service,
+                &DockerSocketGrant::parse(Some("node-daemon")),
+                &test_auth_context(temps_auth::Role::User),
+                ordinary_id,
+                "environment variables",
+            )
+            .await
+            .expect("an undeclared project's env vars are untouched by ADR 045");
+
+            // An install that never set the variable declares nothing.
+            require_granted_project_write_authority_against(
+                &service,
+                &DockerSocketGrant::default(),
+                &test_auth_context(temps_auth::Role::User),
+                granted_id,
+                "secrets",
+            )
+            .await
+            .expect("an install that never set TEMPS_DOCKER_SOCKET_PROJECTS declares nothing");
+        }
     }
 
     #[tokio::test]
