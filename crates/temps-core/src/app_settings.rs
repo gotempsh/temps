@@ -970,6 +970,18 @@ pub struct ContainerLogSettings {
     /// Maximum rotated log files for external service containers
     #[schema(example = 3)]
     pub service_max_file: u32,
+    /// Disk budget, in MiB, for the collected-log read cache (`logs/cache`
+    /// under the data dir): recently read chunk blocks, block indexes and
+    /// bloom filters kept locally so searches over object storage do not
+    /// re-fetch them (ADR-046 §6). Applied within a minute of saving;
+    /// shrinking evicts immediately.
+    #[schema(minimum = 64, maximum = 1048576, example = 2048)]
+    pub cache_mb: u32,
+    /// Per-container cap, in MiB, on unsealed log lines held in memory (and
+    /// the WAL) before they are sealed into a chunk object. Larger buffers
+    /// mean fewer, bigger chunks; smaller ones bound memory per container.
+    #[schema(minimum = 1, maximum = 256, example = 8)]
+    pub head_buffer_mb: u32,
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -1570,6 +1582,12 @@ pub struct ObservabilityRetentionSettings {
     /// Retain OpenTelemetry metric points for this many days.
     #[schema(minimum = 1, maximum = 3650, example = 90)]
     pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
 }
 
 impl Default for ObservabilityRetentionSettings {
@@ -1579,6 +1597,7 @@ impl Default for ObservabilityRetentionSettings {
             otel_spans_days: 90,
             otel_logs_days: 90,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         }
     }
 }
@@ -2020,6 +2039,8 @@ impl Default for ContainerLogSettings {
             max_file: 3,
             service_max_size: "20m".to_string(),
             service_max_file: 3,
+            cache_mb: 2048,
+            head_buffer_mb: 8,
         }
     }
 }

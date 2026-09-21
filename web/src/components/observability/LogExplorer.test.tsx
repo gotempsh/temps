@@ -21,6 +21,10 @@ test('shows loaded logs without a misleading current-page volume chart', () => {
     expect(html).toContain('loaded')
     expect(html).not.toContain('Volume by level')
     expect(html).not.toContain('Show volume table')
+    // Facet counts come from the store now, so the sidebar must not keep
+    // telling the user they only describe the lines currently loaded.
+    expect(html).not.toContain('Counts from this page only')
+    expect(html).toContain('Counts across the whole time range')
   } finally {
     if (previousWindow)
       Object.defineProperty(globalThis, 'window', previousWindow)
@@ -42,8 +46,9 @@ for (const mode of ['list', 'patterns', 'service']) {
             <LogExplorer
               lines={[
                 {
-                  chunk_id: 'sample',
-                  line_offset: 0,
+                  container_id: 'sample',
+                  line_id: '1',
+                  stream: 'stdout',
                   timestamp: '2026-09-18T12:00:00Z',
                   level: 'INFO',
                   owner: 'sample',
@@ -87,7 +92,8 @@ for (const [query, visible] of [
       )
       expect(html.includes('aria-label="Log facets"')).toBe(visible)
       expect(html.includes('aria-expanded="true"')).toBe(visible)
-      if (visible) expect(html).toContain('Counts from this page only.')
+      if (visible)
+        expect(html).toContain('Counts across the whole time range')
     } finally {
       if (previousWindow)
         Object.defineProperty(globalThis, 'window', previousWindow)

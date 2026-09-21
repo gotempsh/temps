@@ -169,12 +169,12 @@ impl RemoteLogCollectorService {
                 if let Some(task) = active.remove(&id) {
                     task.handle.abort();
                 }
-                // Flush whatever the container buffered so its tail isn't lost.
-                if let Some(Ok(flush)) = self.chunk_writer.remove_container(&id).await {
-                    if let Err(e) = self.metadata_service.insert_chunk_meta(&flush.meta).await {
-                        warn!(container_id = %id, error = %e,
-                            "Failed to insert chunk metadata on remote stream stop");
-                    }
+                // Flush (seal + commit the manifest) whatever the container
+                // buffered so its tail isn't lost. The writer owns the whole
+                // seal pipeline now — nothing left to insert here.
+                if let Err(e) = self.chunk_writer.remove_container(&id).await {
+                    warn!(container_id = %id, error = %e,
+                        "Failed to flush remaining lines on remote stream stop");
                 }
             }
         }
@@ -209,20 +209,11 @@ impl RemoteLogCollectorService {
 
         let source = self.source.clone();
         let chunk_writer = self.chunk_writer.clone();
-        let metadata_service = self.metadata_service.clone();
         let tail_tx = self.tail_tx.clone();
         let container_id = info.container_id.clone();
 
         let handle = tokio::spawn(async move {
-            Self::stream_remote_container(
-                source,
-                chunk_writer,
-                metadata_service,
-                tail_tx,
-                info,
-                resume_after,
-            )
-            .await;
+            Self::stream_remote_container(source, chunk_writer, tail_tx, info, resume_after).await;
         });
 
         let mut active = self.active.lock().await;
@@ -248,7 +239,6 @@ impl RemoteLogCollectorService {
     async fn stream_remote_container(
         source: Arc<dyn RemoteContainerLogSource>,
         chunk_writer: Arc<ChunkWriterService>,
-        metadata_service: Arc<LogMetadataService>,
         tail_tx: broadcast::Sender<LogLine>,
         info: RemoteContainerInfo,
         resume_after: i64,
@@ -318,20 +308,11 @@ impl RemoteLogCollectorService {
 
                         let _ = tail_tx.send(line.clone());
 
-                        match chunk_writer.write_line(line).await {
-                            Ok(Some(flush)) => {
-                                if let Err(e) =
-                                    metadata_service.insert_chunk_meta(&flush.meta).await
-                                {
-                                    error!(container_id = %info.container_id, error = %e,
-                                        "Failed to insert chunk metadata for remote container");
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                error!(container_id = %info.container_id, error = %e,
-                                    "Failed to write remote log line to chunk buffer");
-                            }
+                        // The writer owns sealing (object write + manifest
+                        // commit) itself now — nothing left to do here.
+                        if let Err(e) = chunk_writer.write_line(line).await {
+                            error!(container_id = %info.container_id, error = %e,
+                                "Failed to write remote log line to chunk buffer");
                         }
                     }
                     Err(e) => {
@@ -414,12 +395,29 @@ mod tests {
         }
     }
 
-    fn collector(source: Arc<MockSource>) -> RemoteLogCollectorService {
+    /// A no-op [`crate::services::ManifestSink`] — these tests use `pending()`
+    /// streams that never produce a line, so the seal path is never exercised.
+    struct NoopManifestSink;
+
+    #[async_trait]
+    impl crate::services::ManifestSink for NoopManifestSink {
+        async fn insert(
+            &self,
+            _meta: &crate::types::ChunkMeta,
+        ) -> Result<i64, crate::error::LogAggregatorError> {
+            Ok(0)
+        }
+    }
+
+    async fn collector(source: Arc<MockSource>) -> RemoteLogCollectorService {
         use sea_orm::{DatabaseBackend, MockDatabase};
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn LogStorage> =
             Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
-        let chunk_writer = Arc::new(ChunkWriterService::new(storage));
+        let chunk_writer =
+            ChunkWriterService::open(storage, Arc::new(NoopManifestSink), None, None)
+                .await
+                .unwrap();
         // start_stream queries get_latest_chunk_end_for_container once per new
         // container; return empty results (→ resume from 0). A few extra empty
         // result sets cover any incidental queries. The pending streams produce
@@ -437,7 +435,7 @@ mod tests {
         let source = Arc::new(MockSource {
             containers: StdMutex::new(vec![info("cnt-a"), info("cnt-b")]),
         });
-        let collector = collector(source.clone());
+        let collector = collector(source.clone()).await;
 
         // Two remote containers → two active streams.
         collector.reconcile().await.unwrap();

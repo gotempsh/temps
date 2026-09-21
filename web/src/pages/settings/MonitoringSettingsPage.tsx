@@ -17,6 +17,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
 import type {
+  ContainerLogSettings,
   MetricsStoreKind,
   MonitoringSettings,
   ObservabilityCompressionSettings,
@@ -42,8 +43,19 @@ interface MonitoringFormData {
   monitoring: MonitoringSettings
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  container_logs: ContainerLogBudgetFormData
   geo: GeoFormData
 }
+
+/**
+ * The editable subset of `ContainerLogSettings`. The Docker `--log-opt`
+ * rotation fields are not exposed here and are round-tripped from
+ * `settings.container_logs` on save.
+ */
+type ContainerLogBudgetFormData = Pick<
+  ContainerLogSettings,
+  'cache_mb' | 'head_buffer_mb'
+>
 
 /**
  * The editable subset of `GeoSettings`. The read-only refresh metadata and
@@ -80,6 +92,12 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
   otel_spans_days: 90,
   otel_logs_days: 90,
   otel_metrics_days: 90,
+  container_logs_days: 30,
+}
+
+const CONTAINER_LOG_BUDGET_DEFAULTS: ContainerLogBudgetFormData = {
+  cache_mb: 2048,
+  head_buffer_mb: 8,
 }
 
 // `null` means "use the server default" for both knobs, which is also what
@@ -96,7 +114,7 @@ const BYTES_PER_ROW = 100
 // Approximate number of metrics tracked per monitored service
 const METRICS_PER_SERVICE = 15
 
-type DurationUnit = 'hours' | 'days' | 'years'
+type DurationUnit = 'hours' | 'days' | 'years' | 'MiB'
 
 interface DurationInputProps extends ComponentProps<'input'> {
   unit: DurationUnit
@@ -213,6 +231,7 @@ export function MonitoringSettingsPage() {
       monitoring: DEFAULTS,
       observability_compression: COMPRESSION_DEFAULTS,
       observability_retention: RETENTION_DEFAULTS,
+      container_logs: CONTAINER_LOG_BUDGET_DEFAULTS,
       geo: GEO_DEFAULTS,
     },
   })
@@ -247,6 +266,14 @@ export function MonitoringSettingsPage() {
           settings.observability_compression ?? COMPRESSION_DEFAULTS,
         observability_retention:
           settings.observability_retention ?? RETENTION_DEFAULTS,
+        container_logs: {
+          cache_mb:
+            settings.container_logs?.cache_mb ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.cache_mb,
+          head_buffer_mb:
+            settings.container_logs?.head_buffer_mb ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.head_buffer_mb,
+        },
         geo: {
           refresh_interval_hours:
             settings.geo?.refresh_interval_hours ?? null,
@@ -266,6 +293,12 @@ export function MonitoringSettingsPage() {
         monitoring: data.monitoring,
         observability_compression: data.observability_compression,
         observability_retention: data.observability_retention,
+        container_logs: {
+          // Keep the Docker rotation fields this page does not edit.
+          ...(settings?.container_logs ??
+            ({} as PlatformSettings['container_logs'])),
+          ...data.container_logs,
+        },
         geo: {
           // Round-trip the server's read-only view so the metadata and the
           // masked key flag are not dropped from the merged body.
@@ -883,6 +916,118 @@ export function MonitoringSettingsPage() {
                 {errors.observability_retention?.otel_logs_days && (
                   <p className="text-xs text-destructive">
                     {errors.observability_retention.otel_logs_days.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-container-logs">
+                    Container logs
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    log_chunks
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Stdout/stderr collected from deployment and database
+                  containers: the chunk files on disk or S3, their catalog
+                  rows, and the ClickHouse line index when configured.
+                </p>
+                <DurationInput
+                  id="retention-container-logs"
+                  unit="days"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.container_logs_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Chunks older than this are tombstoned hourly and their files
+                  removed after a one-hour grace period. Range 1–3650 days;
+                  default 30.
+                </p>
+                {errors.observability_retention?.container_logs_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.container_logs_days.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="container-log-cache-mb">
+                    Container log read cache
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    logs/cache
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Disk kept under the data directory for recently read chunk
+                  blocks, block indexes and bloom filters, so searches over
+                  object storage do not re-download them.
+                </p>
+                <DurationInput
+                  id="container-log-cache-mb"
+                  unit="MiB"
+                  min={64}
+                  max={1048576}
+                  {...register('container_logs.cache_mb', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 64, message: 'Min 64 MiB' },
+                    max: { value: 1048576, message: 'Max 1 TiB' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Applied within a minute of saving; shrinking evicts
+                  immediately. Range 64 MiB–1 TiB; default 2048.
+                </p>
+                {errors.container_logs?.cache_mb && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.cache_mb.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="container-log-head-mb">
+                    Container log head buffer
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    per container
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Unsealed log lines held in memory (and the write-ahead log)
+                  per container before they are sealed into a chunk. Larger
+                  buffers mean fewer, bigger chunks; smaller ones bound memory.
+                </p>
+                <DurationInput
+                  id="container-log-head-mb"
+                  unit="MiB"
+                  min={1}
+                  max={256}
+                  {...register('container_logs.head_buffer_mb', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 MiB' },
+                    max: { value: 256, message: 'Max 256 MiB' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Applied to newly collected lines within a minute of saving.
+                  Range 1–256 MiB; default 8.
+                </p>
+                {errors.container_logs?.head_buffer_mb && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.head_buffer_mb.message}
                   </p>
                 )}
               </div>

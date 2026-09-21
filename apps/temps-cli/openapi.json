@@ -1672,6 +1672,46 @@
         ],
         "type": "object"
       },
+      "AggregateResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AggregateRow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "type": "object"
+      },
+      "AggregateRow": {
+        "description": "One row of an aggregation: the group values (in `group_by` order) and\nthe metric.",
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "lines": {
+            "description": "Lines that contributed (always populated; equals `value` for\n`Count`).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "keys",
+          "value",
+          "lines"
+        ],
+        "type": "object"
+      },
       "AggregatedBucketItem": {
         "properties": {
           "count": {
@@ -2621,6 +2661,75 @@
         ],
         "type": "object"
       },
+      "AnalyticsCapability": {
+        "properties": {
+          "backend": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LineIndexBackend",
+                "description": "Where the index lives (`clickhouse`, `temps_cloud` or `timescaledb`)\nwhen configured. The TimescaleDB fallback answers the same endpoints\nbut scales with line count on the control-plane database; the\nonboarding copy points at ClickHouse or Temps Cloud for volume."
+              }
+            ]
+          },
+          "configured": {
+            "description": "`true` when the line index is active and receiving sealed chunks.",
+            "type": "boolean"
+          },
+          "example": {
+            "description": "What analytics would do here — shown as the example in the\nonboarding state.",
+            "type": "string"
+          },
+          "forget_backlog": {
+            "description": "Chunks retired (compacted, purged, or expired by retention) whose\nremoval from the line index has not yet been confirmed — durably\nqueued in `log_line_forget_backlog` and drained by `ForgetSweeper`\n(ADR-047 §8a). Non-zero for more than a few sweep intervals (30s,\nsee [`crate::services::FORGET_SWEEP_INTERVAL`]) means the index\nstill holds rows for chunks that no longer exist — over-counted in\nfacets/histograms/aggregates until the sweeper catches up.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "indexed_chunks": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "live_chunks": {
+            "description": "Live chunks in the manifest and how many of them are indexed. Equal\nnumbers mean the index is complete; a gap is the reindexer's queue.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_window_days": {
+            "description": "Widest window one analytics query answers on this store, in days.\nThe TimescaleDB store clamps `start_time` to this many days before\n`end_time` so a query can never scan the whole control-plane\ndatabase; ClickHouse stores are unbounded (`None`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Exactly what is missing, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console route where the operator fixes it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path",
+          "example",
+          "live_chunks",
+          "indexed_chunks",
+          "forget_backlog"
+        ],
+        "type": "object"
+      },
       "AnalyticsFacet": {
         "enum": [
           "summary",
@@ -3450,6 +3559,8 @@
           },
           "container_logs": {
             "default": {
+              "cache_mb": 2048,
+              "head_buffer_mb": 8,
               "max_file": 3,
               "max_size": "50m",
               "service_max_file": 3,
@@ -3631,6 +3742,7 @@
           },
           "observability_retention": {
             "default": {
+              "container_logs_days": 30,
               "otel_logs_days": 90,
               "otel_metrics_days": 90,
               "otel_spans_days": 90,
@@ -4670,6 +4782,54 @@
         "required": [
           "inserted",
           "total_attached"
+        ],
+        "type": "object"
+      },
+      "AttrOp": {
+        "enum": [
+          "eq",
+          "neq",
+          "exists",
+          "prefix",
+          "gt",
+          "lt"
+        ],
+        "type": "string"
+      },
+      "AttrPredicate": {
+        "description": "Predicate on one attribute (canonical or dynamic).",
+        "properties": {
+          "key": {
+            "description": "Attribute key: a canonical key (`status_code`, `http_route`, …) or\nany extracted key (`worker`, `http.status`).",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/AttrOp"
+          },
+          "value": {
+            "description": "Omitted for `exists`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "AttributeKeysResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/FacetValue"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "keys"
         ],
         "type": "object"
       },
@@ -9215,6 +9375,24 @@
       "ContainerLogSettings": {
         "description": "Docker container log rotation settings\nControls the `--log-opt max-size` and `--log-opt max-file` for containers",
         "properties": {
+          "cache_mb": {
+            "default": 2048,
+            "description": "Disk budget, in MiB, for the collected-log read cache (`logs/cache`\nunder the data dir): recently read chunk blocks, block indexes and\nbloom filters kept locally so searches over object storage do not\nre-fetch them (ADR-046 §6). Applied within a minute of saving;\nshrinking evicts immediately.",
+            "example": 2048,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 64,
+            "type": "integer"
+          },
+          "head_buffer_mb": {
+            "default": 8,
+            "description": "Per-container cap, in MiB, on unsealed log lines held in memory (and\nthe WAL) before they are sealed into a chunk object. Larger buffers\nmean fewer, bigger chunks; smaller ones bound memory per container.",
+            "example": 8,
+            "format": "int32",
+            "maximum": 256,
+            "minimum": 1,
+            "type": "integer"
+          },
           "max_file": {
             "default": 3,
             "description": "Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)",
@@ -9625,9 +9803,9 @@
           "level": {
             "$ref": "#/components/schemas/LogLevel"
           },
-          "line_offset": {
-            "format": "int32",
-            "type": "integer"
+          "line_id": {
+            "description": "Decimal string form of this line's `line_id` — see [`LogSearchLine`].",
+            "type": "string"
           },
           "message": {
             "type": "string"
@@ -9640,33 +9818,37 @@
           "timestamp",
           "level",
           "message",
-          "line_offset",
+          "line_id",
           "is_match"
         ],
         "type": "object"
       },
       "ContextLogsRequest": {
         "properties": {
-          "chunk_id": {
+          "container_id": {
             "type": "string"
           },
-          "line_offset": {
-            "format": "int32",
-            "type": "integer"
+          "line_id": {
+            "description": "Decimal string form of the target line's `line_id`.",
+            "type": "string"
           },
           "lines": {
-            "description": "Number of context lines before and after (default: 25)",
+            "description": "Number of context lines before and after (default: 25, max 50)",
             "format": "int32",
             "minimum": 0,
             "type": [
               "integer",
               "null"
             ]
+          },
+          "timestamp": {
+            "type": "string"
           }
         },
         "required": [
-          "chunk_id",
-          "line_offset"
+          "timestamp",
+          "container_id",
+          "line_id"
         ],
         "type": "object"
       },
@@ -20666,6 +20848,21 @@
         ],
         "type": "object"
       },
+      "FacetField": {
+        "description": "A dimension a caller can ask for distinct values of.\n\nRestricted to a closed enum on purpose: the field name reaches SQL as a\ncolumn identifier, so it can never be caller-supplied text.",
+        "enum": [
+          "env",
+          "service",
+          "level",
+          "stream",
+          "project",
+          "external_service",
+          "node",
+          "deploy",
+          "container"
+        ],
+        "type": "string"
+      },
       "FacetInfo": {
         "description": "Public representation of a registered span attribute facet.",
         "properties": {
@@ -20722,6 +20919,34 @@
           "deleting"
         ],
         "type": "string"
+      },
+      "FacetValue": {
+        "description": "One distinct value of a facet field, with its occurrence count inside the\nqueried window.",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "count"
+        ],
+        "type": "object"
+      },
+      "FacetsAttrsResponse": {
+        "properties": {
+          "facets": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "facets"
+        ],
+        "type": "object"
       },
       "FacetsResponse": {
         "description": "Response body for facet list.",
@@ -23546,6 +23771,56 @@
         ],
         "type": "object"
       },
+      "GlobalLogCapabilities": {
+        "description": "What the log explorer can offer on this instance. Attribute facets,\nhistograms and `GROUP BY` analytics need the ClickHouse line index; when\nit is missing the client shows *why* and where to configure it instead\nof hiding the feature (CLAUDE.md: unconfigured features onboard).",
+        "properties": {
+          "analytics": {
+            "$ref": "#/components/schemas/AnalyticsCapability"
+          }
+        },
+        "required": [
+          "analytics"
+        ],
+        "type": "object"
+      },
+      "GlobalLogFacetsRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GlobalLogSearchRequest"
+          },
+          {
+            "properties": {
+              "fields": {
+                "description": "Fields to return distinct values for. Empty returns the default set.",
+                "items": {
+                  "$ref": "#/components/schemas/FacetField"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "Facet request: the same filter body plus the fields to aggregate."
+      },
+      "GlobalLogFacetsResponse": {
+        "description": "Distinct values and counts per requested field, inside the current window.",
+        "properties": {
+          "facets": {
+            "description": "Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values\nare ordered by count, descending.",
+            "type": "object"
+          },
+          "partial": {
+            "description": "`true` when a field's value list was capped or timed out, so it is a\nprefix rather than the complete set. Reported rather than glossed: the\npoint of a facet is that a user can trust it to surface values they\nhave never seen on screen.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "facets",
+          "partial"
+        ],
+        "type": "object"
+      },
       "GlobalLogLine": {
         "allOf": [
           {
@@ -23564,9 +23839,11 @@
                 ]
               },
               "owner": {
+                "description": "Display name of the owning project or external service.",
                 "type": "string"
               },
               "project_id": {
+                "description": "`None` for external-service lines.",
                 "format": "int32",
                 "type": [
                   "integer",
@@ -23580,11 +23857,28 @@
             ],
             "type": "object"
           }
-        ]
+        ],
+        "description": "One line in a global search result."
       },
       "GlobalLogSearchRequest": {
+        "description": "Filter body shared by `/logs/global/search` and `/logs/global/facets`.\n\nBoth endpoints take the identical filter set so a facet count always\ndescribes the search the user is actually looking at.",
         "properties": {
+          "attrs": {
+            "description": "Attribute predicates (ADR-047 §5): `<key><op><value>` with `op` one of\n`=`, `!=`, `^=` (prefix), `>`, `<`, or `<key>?` for \"exists\". Requires\nthe line index; when combined with `text`, the text filter is applied\nin memory over the lines the index already matched (the index holds\nno message bytes, so it cannot answer `text` on its own).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "container_ids": {
+            "description": "Docker container IDs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "cursor": {
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
             "type": [
               "string",
               "null"
@@ -23627,6 +23921,7 @@
             "type": "array"
           },
           "page_size": {
+            "description": "Defaults to 200, server-capped at 1000.",
             "format": "int32",
             "minimum": 0,
             "type": [
@@ -23642,19 +23937,27 @@
             "type": "array"
           },
           "scopes": {
-            "description": "Explicit resource identities, e.g. application:12 or service:34.",
+            "description": "Explicit resource identities, e.g. `application:12` or `service:34`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "services": {
+            "description": "Container service labels (the `service` column), e.g. `web`, `worker`.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "source": {
-            "$ref": "#/components/schemas/GlobalLogSource"
+            "$ref": "#/components/schemas/LogSourceKind"
           },
           "start_time": {
             "type": "string"
           },
           "text": {
+            "description": "Case-insensitive substring match over the message.",
             "type": [
               "string",
               "null"
@@ -23668,48 +23971,39 @@
         "type": "object"
       },
       "GlobalLogSearchResponse": {
+        "description": "A page of global search results.",
         "properties": {
           "lines": {
-            "description": "Newest first, ordered by timestamp, chunk ID and line offset.",
+            "description": "Newest first, ordered by `(timestamp, container_id, line_id)`.",
             "items": {
               "$ref": "#/components/schemas/GlobalLogLine"
             },
             "type": "array"
           },
           "next_cursor": {
+            "description": "Opaque cursor for the next (older) page, or `None` on the last page.\n\nThis is a keyset position over the store's own sort order, so page 40\ncosts what page 1 costs. Stays populated on a partial page too — that\nis the whole point: the user can press Next to keep searching.",
             "type": [
               "string",
               "null"
             ]
           },
-          "scan_limit_reached": {
-            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found in this scan window, but unread chunks may contain newer\nlines. `next_cursor` continues into another bounded scan window.",
+          "partial": {
+            "description": "`true` when the store's time/byte budget ran out before this page\ncould be proven complete (`scanned_back_to` explains how far).",
             "type": "boolean"
           },
-          "scanned_bytes": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "scanned_chunks": {
-            "minimum": 0,
-            "type": "integer"
+          "scanned_back_to": {
+            "description": "Set when `partial` is `true`: every chunk ending after this timestamp\nhas been searched, nothing older has yet.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "lines",
-          "scan_limit_reached",
-          "scanned_chunks",
-          "scanned_bytes"
+          "partial"
         ],
         "type": "object"
-      },
-      "GlobalLogSource": {
-        "enum": [
-          "collected",
-          "application",
-          "service"
-        ],
-        "type": "string"
       },
       "GlobalMrrResponse": {
         "properties": {
@@ -23971,6 +24265,51 @@
           "windows"
         ],
         "type": "object"
+      },
+      "GroupKey": {
+        "description": "What to group or facet by.",
+        "oneOf": [
+          {
+            "description": "A stream label (`service`, `env`, `level`, …).",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "label"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "$ref": "#/components/schemas/FacetField",
+                "description": "A stream label (`service`, `env`, `level`, …)."
+              }
+            },
+            "required": [
+              "name",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An attribute key.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "attr"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "description": "An attribute key.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "GroupedPageMetric": {
         "properties": {
@@ -24597,6 +24936,43 @@
           "container_type",
           "can_list_containers",
           "can_list_entities"
+        ],
+        "type": "object"
+      },
+      "HistogramBucket": {
+        "description": "One time bucket of a histogram, optionally split by a group value.",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts",
+          "count"
+        ],
+        "type": "object"
+      },
+      "HistogramResponse": {
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/HistogramBucket"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "buckets"
         ],
         "type": "object"
       },
@@ -26843,6 +27219,15 @@
         ],
         "type": "object"
       },
+      "LineIndexBackend": {
+        "description": "The stores a line index can live in, in the order the plugin prefers\nthem: the instance's own ClickHouse, then Temps Cloud's, then the\ncontrol-plane TimescaleDB.",
+        "enum": [
+          "clickhouse",
+          "temps_cloud",
+          "timescaledb"
+        ],
+        "type": "string"
+      },
       "LinkApplicationProjectRequest": {
         "properties": {
           "project_id": {
@@ -27952,13 +28337,10 @@
         "type": "object"
       },
       "LogSearchLine": {
-        "description": "A single line in search results",
+        "description": "A single line in search results.\n\nIdentity is `(timestamp, container_id, line_id)` — the store's own sort\norder, which is also the pagination key. `line_id` is serialized as a\n**string**: it is seeded from a 64-bit chunk/line encoding well past the\n2^53 an IEEE-754 double can represent exactly, so a JSON number would\nsilently lose its low digits in every JavaScript client.",
         "properties": {
-          "chunk_id": {
-            "type": "string"
-          },
           "container_id": {
-            "description": "Container this line came from — lets the UI tag/group lines by container\nin a combined (\"show all\") multi-container view.",
+            "description": "Container this line came from — lets the UI tag/group lines by container\nin a combined (\"show all\") multi-container view, and is the second\ncomponent of the line's identity.",
             "type": "string"
           },
           "context": {
@@ -27983,9 +28365,9 @@
           "level": {
             "$ref": "#/components/schemas/LogLevel"
           },
-          "line_offset": {
-            "format": "int32",
-            "type": "integer"
+          "line_id": {
+            "description": "Decimal string form of the line's `line_id`. See the type docs.",
+            "type": "string"
           },
           "message": {
             "type": "string"
@@ -28008,6 +28390,10 @@
           "service": {
             "type": "string"
           },
+          "stream": {
+            "$ref": "#/components/schemas/LogStream",
+            "description": "stdout or stderr."
+          },
           "timestamp": {
             "type": "string"
           }
@@ -28015,10 +28401,10 @@
         "required": [
           "timestamp",
           "level",
+          "stream",
           "service",
           "message",
-          "chunk_id",
-          "line_offset"
+          "line_id"
         ],
         "type": "object"
       },
@@ -28062,6 +28448,15 @@
           "service"
         ],
         "type": "object"
+      },
+      "LogSourceKind": {
+        "description": "Which family of log sources a query covers.",
+        "enum": [
+          "collected",
+          "application",
+          "service"
+        ],
+        "type": "string"
       },
       "LogStream": {
         "description": "Log output stream",
@@ -28583,6 +28978,151 @@
           "ignore"
         ],
         "type": "string"
+      },
+      "Metric": {
+        "description": "Aggregate metric for [`LogAnalytics::aggregate`].",
+        "oneOf": [
+          {
+            "properties": {
+              "fn": {
+                "enum": [
+                  "count"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "count_distinct"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "avg"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "p50"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "p95"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "p99"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "attr": {
+                "type": "string"
+              },
+              "fn": {
+                "enum": [
+                  "sum"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "attr",
+              "fn"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "MetricAggregation": {
         "description": "The aggregation applied when reducing raw metric points into a time bucket.\n\nStore-neutral: every storage backend (ClickHouse today, TimescaleDB later)\nmust be able to satisfy this contract. `Quantile(q)` carries the requested\nquantile in `[0.0, 1.0]` (e.g. `0.95` for p95).",
@@ -30934,6 +31474,15 @@
       "ObservabilityRetentionSettings": {
         "description": "Retention policy configuration for raw observability tables. Values are in\ndays. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy\nlogs and spans retain their storage-level per-row TTL behavior.",
         "properties": {
+          "container_logs_days": {
+            "default": 30,
+            "description": "Retain collected container logs (chunk objects on disk/S3, their\nmanifest rows, and the ClickHouse line index when configured) for\nthis many days.",
+            "example": 30,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": "integer"
+          },
           "otel_logs_days": {
             "default": 90,
             "description": "Retain OpenTelemetry log events for this many days.",
@@ -41632,34 +42181,28 @@
             "type": "array"
           },
           "next_cursor": {
+            "description": "Opaque keyset cursor for the next (older) page. Stays populated on a\npartial page — that's the whole point: the user can press Next to keep\nsearching.",
             "type": [
               "string",
               "null"
             ]
           },
-          "search_mode": {
-            "$ref": "#/components/schemas/SearchMode"
+          "partial": {
+            "description": "`true` when the store's time/byte budget ran out before this page\ncould be proven complete.",
+            "type": "boolean"
           },
-          "total_scanned": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+          "scanned_back_to": {
+            "description": "Set when `partial` is `true`: every chunk ending after this timestamp\nhas been searched, nothing older has yet.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "lines",
-          "search_mode",
-          "total_scanned"
+          "lines"
         ],
         "type": "object"
-      },
-      "SearchMode": {
-        "description": "Search execution mode",
-        "enum": [
-          "index",
-          "archive"
-        ],
-        "type": "string"
       },
       "Seasonality": {
         "description": "Seasonality model for an anomaly baseline.",
@@ -81840,26 +82383,34 @@
         "operationId": "get_log_context",
         "parameters": [
           {
-            "description": "Chunk ID",
+            "description": "Target line timestamp (RFC 3339)",
             "in": "query",
-            "name": "chunk_id",
+            "name": "timestamp",
             "required": true,
             "schema": {
               "type": "string"
             }
           },
           {
-            "description": "Line offset within the chunk",
+            "description": "Target line container ID",
             "in": "query",
-            "name": "line_offset",
+            "name": "container_id",
             "required": true,
             "schema": {
-              "format": "int32",
-              "type": "integer"
+              "type": "string"
             }
           },
           {
-            "description": "Context lines before and after (default: 25)",
+            "description": "Target line_id, as a decimal string",
+            "in": "query",
+            "name": "line_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Context lines before and after (default: 25, max 50)",
             "in": "query",
             "name": "lines",
             "required": false,
@@ -81909,7 +82460,7 @@
                 }
               }
             },
-            "description": "Chunk not found"
+            "description": "Line not found"
           },
           "500": {
             "content": {
@@ -81928,6 +82479,997 @@
           }
         ],
         "summary": "Get context lines surrounding a specific log line",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/aggregate": {
+      "get": {
+        "operationId": "global_log_aggregate",
+        "parameters": [
+          {
+            "description": "Window start (RFC 3339)",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (RFC 3339)",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source kind (default: all)",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogSourceKind"
+            }
+          },
+          {
+            "description": "Project selectors (repeatable)",
+            "in": "query",
+            "name": "projects",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "External service selectors (repeatable)",
+            "in": "query",
+            "name": "external_services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Scope selectors (repeatable)",
+            "in": "query",
+            "name": "scopes",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Levels (repeatable)",
+            "in": "query",
+            "name": "levels",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/LogLevel"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Environments (repeatable)",
+            "in": "query",
+            "name": "envs",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Services (repeatable)",
+            "in": "query",
+            "name": "services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Container ids (repeatable)",
+            "in": "query",
+            "name": "container_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Node ids (repeatable)",
+            "in": "query",
+            "name": "node_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Deployment id",
+            "in": "query",
+            "name": "deploy_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comma-separated label names and/or attr:<name>",
+            "in": "query",
+            "name": "group_by",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "count | count_distinct:<k> | avg:<k> | p50:<k> | p95:<k> | p99:<k> | max:<k> | sum:<k>",
+            "in": "query",
+            "name": "metric",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max rows returned (default 50, cap 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repeatable attribute predicate: <key><op><value> or <key>?",
+            "in": "query",
+            "name": "attr",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregateResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/attributes": {
+      "get": {
+        "operationId": "global_log_attribute_keys",
+        "parameters": [
+          {
+            "description": "Window start (RFC 3339)",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (RFC 3339)",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source kind (default: all)",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogSourceKind"
+            }
+          },
+          {
+            "description": "Project selectors (repeatable)",
+            "in": "query",
+            "name": "projects",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "External service selectors (repeatable)",
+            "in": "query",
+            "name": "external_services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Scope selectors (repeatable)",
+            "in": "query",
+            "name": "scopes",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Levels (repeatable)",
+            "in": "query",
+            "name": "levels",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/LogLevel"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Environments (repeatable)",
+            "in": "query",
+            "name": "envs",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Services (repeatable)",
+            "in": "query",
+            "name": "services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Container ids (repeatable)",
+            "in": "query",
+            "name": "container_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Node ids (repeatable)",
+            "in": "query",
+            "name": "node_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Deployment id",
+            "in": "query",
+            "name": "deploy_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Max keys returned (default/cap 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttributeKeysResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/capabilities": {
+      "get": {
+        "operationId": "global_log_capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalLogCapabilities"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/facets": {
+      "post": {
+        "operationId": "facet_global_logs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GlobalLogFacetsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalLogFacetsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/facets/attrs": {
+      "get": {
+        "operationId": "global_log_facets_attrs",
+        "parameters": [
+          {
+            "description": "Window start (RFC 3339)",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (RFC 3339)",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source kind (default: all)",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogSourceKind"
+            }
+          },
+          {
+            "description": "Project selectors (repeatable)",
+            "in": "query",
+            "name": "projects",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "External service selectors (repeatable)",
+            "in": "query",
+            "name": "external_services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Scope selectors (repeatable)",
+            "in": "query",
+            "name": "scopes",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Levels (repeatable)",
+            "in": "query",
+            "name": "levels",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/LogLevel"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Environments (repeatable)",
+            "in": "query",
+            "name": "envs",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Services (repeatable)",
+            "in": "query",
+            "name": "services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Container ids (repeatable)",
+            "in": "query",
+            "name": "container_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Node ids (repeatable)",
+            "in": "query",
+            "name": "node_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Deployment id",
+            "in": "query",
+            "name": "deploy_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comma-separated label names or attr:<name>",
+            "in": "query",
+            "name": "keys",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeatable attribute predicate: <key><op><value> or <key>?",
+            "in": "query",
+            "name": "attr",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Max values per key (default/cap 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetsAttrsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/global/histogram": {
+      "get": {
+        "operationId": "global_log_histogram",
+        "parameters": [
+          {
+            "description": "Window start (RFC 3339)",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (RFC 3339)",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source kind (default: all)",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogSourceKind"
+            }
+          },
+          {
+            "description": "Project selectors (repeatable)",
+            "in": "query",
+            "name": "projects",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "External service selectors (repeatable)",
+            "in": "query",
+            "name": "external_services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Scope selectors (repeatable)",
+            "in": "query",
+            "name": "scopes",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Levels (repeatable)",
+            "in": "query",
+            "name": "levels",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/LogLevel"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Environments (repeatable)",
+            "in": "query",
+            "name": "envs",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Services (repeatable)",
+            "in": "query",
+            "name": "services",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Container ids (repeatable)",
+            "in": "query",
+            "name": "container_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Node ids (repeatable)",
+            "in": "query",
+            "name": "node_ids",
+            "required": false,
+            "schema": {
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Deployment id",
+            "in": "query",
+            "name": "deploy_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Bucket width in seconds (default 60)",
+            "in": "query",
+            "name": "bucket_secs",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "One label name or attr:<name> to split series by",
+            "in": "query",
+            "name": "group_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max series before folding the rest into \"other\" (default 8)",
+            "in": "query",
+            "name": "max_groups",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repeatable attribute predicate: <key><op><value> or <key>?",
+            "in": "query",
+            "name": "attr",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistogramResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Logs"
         ]
@@ -81977,7 +83519,7 @@
             },
             "description": ""
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {

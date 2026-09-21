@@ -11,14 +11,19 @@ import {
 // ── Types matching the Rust SearchLogsResponse ─────────────────────────
 
 export type LogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
-export type SearchMode = 'index' | 'archive'
+export type LogStream = 'stdout' | 'stderr'
 
 export interface ContextLine {
   timestamp: string
   level: LogLevel
   message: string
   fields: Record<string, unknown> | null
-  line_offset: number
+  /**
+   * Decimal-string `line_id`. It is a 64-bit value seeded from Unix
+   * nanoseconds, far past `Number.MAX_SAFE_INTEGER` — compare it, never parse
+   * it.
+   */
+  line_id: string
   is_match: boolean
 }
 
@@ -30,13 +35,19 @@ export interface LineContext {
 export interface LogSearchLine {
   timestamp: string
   level: LogLevel
+  /** stdout or stderr. */
+  stream: LogStream
   service: string
   message: string
   fields: Record<string, unknown> | null
-  chunk_id: string
-  line_offset: number
+  /** Decimal-string line identity — see {@link ContextLine.line_id}. */
+  line_id: string
   deploy_id: number | null
-  /** Container this line came from — lets the UI tag/group a combined view. */
+  /**
+   * Container this line came from — lets the UI tag/group a combined view, and
+   * the second component of the line's `(timestamp, container_id, line_id)`
+   * identity.
+   */
   container_id?: string
   /** Worker node id (null/absent = control-plane-local). */
   node_id?: number | null
@@ -57,10 +68,14 @@ export interface LogSource {
 }
 
 export interface SearchLogsResponse {
+  /** Oldest first, so a terminal-style viewer appends newer lines at the bottom. */
   lines: LogSearchLine[]
+  /**
+   * Keyset cursor for the next (older) page. `null` genuinely means there is
+   * nothing older — the indexed store has no scan budget to exhaust, so there
+   * is no "partial results" state to report.
+   */
   next_cursor: string | null
-  search_mode: SearchMode
-  total_scanned: number
   /** Full set of sources for the scope (first page only). */
   available_sources?: LogSource[]
 }

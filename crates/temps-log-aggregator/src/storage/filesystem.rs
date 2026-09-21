@@ -178,7 +178,12 @@ impl LogStorage for FilesystemStorage {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.extension().map(|ext| ext == "zst").unwrap_or(false) {
+                } else if path
+                    .extension()
+                    .map(|ext| ext == crate::chunk::V2_EXTENSION)
+                    .unwrap_or(false)
+                {
+                    // v1 (`.ndjson.zst`) and v2 (`.zst`) objects both match.
                     // Strip base_path prefix to get the relative storage key
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
                         keys.push(relative.to_string_lossy().to_string());

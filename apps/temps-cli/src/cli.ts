@@ -55,6 +55,7 @@ import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
+import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
 import { registerEmailDomainsCommands } from './commands/email-domains/index.js'
 import { registerEmailProvidersCommands } from './commands/email-providers/index.js'
 import { registerIncidentsCommands } from './commands/incidents/index.js'
@@ -210,6 +211,7 @@ export function createProgram(): Command {
   registerIpAccessCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)
+  registerGlobalLogsCommands(program)
   registerEmailDomainsCommands(program)
   registerEmailProvidersCommands(program)
   registerIncidentsCommands(program)

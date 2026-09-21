@@ -1521,8 +1521,8 @@ interface SearchLogsLine {
 
 interface SearchLogsResponse {
   lines: SearchLogsLine[]
+  /** `null` means nothing older exists — the indexed store has no scan budget. */
   next_cursor: string | null
-  total_scanned: number
 }
 
 const LEVEL_COLORS: Record<string, (s: string) => string> = {

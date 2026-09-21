@@ -283,6 +283,12 @@ pub mod m20260917_000001_add_next_check_at_to_status_monitors;
 pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 pub mod m20260919_000001_add_failover_at_to_nodes;
+pub mod m20260919_000001_log_chunks_v2;
+pub mod m20260920_000001_log_chunks_indexed_at;
+pub mod m20260920_000002_log_collector_positions;
+pub mod m20260921_000001_log_lines_index;
+pub mod m20260921_000002_log_line_index_state;
+pub mod m20260921_000003_log_line_forget_backlog;
 
 mod m20260920_000001_compose_security_policies;
 mod m20260921_000005_add_docker_socket_mounted_to_deployments;
@@ -620,7 +626,20 @@ impl MigratorTrait for Migrator {
             Box::new(m20260918_000001_visitor_activity_run_history::Migration),
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
+            Box::new(m20260919_000001_log_chunks_v2::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
+            Box::new(m20260920_000002_log_collector_positions::Migration),
+            // This branch and main each shipped migrations stamped
+            // m20260921_0000{1,2,3}, independently and for unrelated
+            // features (line-index stores here vs. monitoring credential
+            // checks on main). This branch's landed first (07:22 UTC vs
+            // main's 17:31 UTC); DeriveMigrationName keys on the full
+            // module name, so the shared stamps are not a collision in
+            // seaql_migrations.
+            Box::new(m20260921_000001_log_lines_index::Migration),
+            Box::new(m20260921_000002_log_line_index_state::Migration),
+            Box::new(m20260921_000003_log_line_forget_backlog::Migration),
             Box::new(m20260921_000001_http_checks::Migration),
             Box::new(m20260921_000002_env_check_history::Migration),
             Box::new(m20260921_000003_detection_retry::Migration),

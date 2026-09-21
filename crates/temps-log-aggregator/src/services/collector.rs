@@ -41,10 +41,6 @@ const LABEL_DEPLOY_ID: &str = "sh.temps.deploy_id";
 /// At 30s max backoff this is roughly 10 minutes of retrying.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
-/// Callback type invoked when a chunk is flushed during streaming.
-type OnChunkFlushedCallback =
-    Arc<dyn Fn(crate::types::ChunkMeta, Vec<LogLine>) + Send + Sync + 'static>;
-
 /// State of a streaming task for a single container
 struct StreamTask {
     handle: JoinHandle<()>,
@@ -67,8 +63,6 @@ pub struct CollectorService {
     tail_tx: broadcast::Sender<LogLine>,
     /// Active streaming tasks per container_id
     active_streams: Mutex<HashMap<String, StreamTask>>,
-    /// Callback for chunk metadata (to write to DB)
-    on_chunk_flushed: Option<OnChunkFlushedCallback>,
 }
 
 impl CollectorService {
@@ -86,7 +80,6 @@ impl CollectorService {
             db: None,
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
-            on_chunk_flushed: None,
         }
     }
 
@@ -96,14 +89,6 @@ impl CollectorService {
     pub fn with_db(mut self, db: Arc<sea_orm::DatabaseConnection>) -> Self {
         self.db = Some(db);
         self
-    }
-
-    /// Set a callback that is invoked whenever a chunk is flushed.
-    ///
-    /// The callback receives the chunk metadata and the lines that were written,
-    /// allowing the caller to insert metadata into the database and create log_events.
-    pub fn set_on_chunk_flushed(&mut self, callback: OnChunkFlushedCallback) {
-        self.on_chunk_flushed = Some(callback);
     }
 
     /// Get a broadcast receiver for live tail subscriptions.
@@ -178,7 +163,6 @@ impl CollectorService {
         let chunk_writer = self.chunk_writer.clone();
         let tail_tx = self.tail_tx.clone();
         let container_id_owned = container_id.to_string();
-        let on_chunk_flushed = self.on_chunk_flushed.clone();
 
         let handle = tokio::spawn(async move {
             Self::stream_container_logs(
@@ -187,7 +171,6 @@ impl CollectorService {
                 tail_tx,
                 container_id_owned.clone(),
                 ctx,
-                on_chunk_flushed,
                 resume_after,
             )
             .await;
@@ -209,28 +192,15 @@ impl CollectorService {
 
         if let Some(task) = task {
             task.handle.abort();
-            // Flush remaining lines
-            if let Some(result) = self.chunk_writer.remove_container(container_id).await {
-                match result {
-                    Ok(flush_result) => {
-                        debug!(
-                            container_id = container_id,
-                            chunk_id = %flush_result.meta.id,
-                            "Flushed remaining lines on stop"
-                        );
-                        // Invoke callback for final chunk
-                        if let Some(ref callback) = self.on_chunk_flushed {
-                            callback(flush_result.meta, flush_result.lines);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            container_id = container_id,
-                            error = %e,
-                            "Failed to flush remaining lines on stop"
-                        );
-                    }
-                }
+            // Flush (seal + commit the manifest) remaining lines; the writer
+            // owns the whole seal pipeline now, so there is nothing left for
+            // the caller to insert.
+            if let Err(e) = self.chunk_writer.remove_container(container_id).await {
+                warn!(
+                    container_id = container_id,
+                    error = %e,
+                    "Failed to flush remaining lines on stop"
+                );
             }
             info!(container_id = container_id, "Stopped log streaming");
         }
@@ -480,7 +450,6 @@ impl CollectorService {
         tail_tx: broadcast::Sender<LogLine>,
         container_id: String,
         ctx: ContainerContext,
-        on_chunk_flushed: Option<OnChunkFlushedCallback>,
         resume_after: i64,
     ) {
         // Track the timestamp of the last successfully received line.
@@ -523,21 +492,14 @@ impl CollectorService {
                     // Send to live tail subscribers (ignore errors if no subscribers)
                     let _ = tail_tx.send(line.clone());
 
-                    // Buffer the line
-                    match chunk_writer.write_line(line).await {
-                        Ok(Some(flush_result)) => {
-                            if let Some(ref callback) = on_chunk_flushed {
-                                callback(flush_result.meta, flush_result.lines);
-                            }
-                        }
-                        Ok(None) => {} // Buffered, not flushed
-                        Err(e) => {
-                            error!(
-                                container_id = container_id,
-                                error = %e,
-                                "Failed to write log line to chunk buffer"
-                            );
-                        }
+                    // Buffer the line. The writer owns sealing (object write +
+                    // manifest commit) itself now — nothing left to do here.
+                    if let Err(e) = chunk_writer.write_line(line).await {
+                        error!(
+                            container_id = container_id,
+                            error = %e,
+                            "Failed to write log line to chunk buffer"
+                        );
                     }
                 }
                 Some(Err(e)) => {
@@ -603,10 +565,23 @@ mod tests {
     use crate::storage::{FilesystemStorage, LogStorage};
     use sea_orm::{DatabaseBackend, MockDatabase};
 
+    /// A [`crate::services::ManifestSink`] that never gets exercised by these
+    /// tests (they only touch `extract_external_service_context`, never the
+    /// chunk-writer seal path); it exists only so `ChunkWriterService::open`
+    /// has something to hold.
+    struct NoopManifestSink;
+
+    #[async_trait::async_trait]
+    impl crate::services::ManifestSink for NoopManifestSink {
+        async fn insert(&self, _meta: &crate::types::ChunkMeta) -> Result<i64, LogAggregatorError> {
+            Ok(0)
+        }
+    }
+
     /// Build a CollectorService backed by a MockDatabase. `extract_external_service_context`
     /// only touches `self.db`, so the Docker handle is never dialed — but `new`
     /// requires one, so we use a disabled handle (no daemon connection needed).
-    fn collector_with_db(db: Arc<sea_orm::DatabaseConnection>) -> CollectorService {
+    async fn collector_with_db(db: Arc<sea_orm::DatabaseConnection>) -> CollectorService {
         let handle = Arc::new(temps_core::DockerHandle::disabled(
             "test",
             "no docker needed for db-only tests".to_string(),
@@ -614,7 +589,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn LogStorage> =
             Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
-        let chunk_writer = Arc::new(ChunkWriterService::new(storage));
+        let chunk_writer =
+            ChunkWriterService::open(storage, Arc::new(NoopManifestSink), None, None)
+                .await
+                .unwrap();
         let metadata = Arc::new(LogMetadataService::new(db.clone()));
         CollectorService::new(handle, chunk_writer, metadata, 16).with_db(db)
     }
@@ -652,7 +630,7 @@ mod tests {
             // Path 3: service_members by container_name → the member.
             .append_query_results(vec![vec![member(7, "postgres-mydb-1")]])
             .into_connection();
-        let collector = collector_with_db(Arc::new(db));
+        let collector = collector_with_db(Arc::new(db)).await;
 
         let labels = HashMap::new(); // no temps.service_name label
         let ctx = collector
@@ -680,7 +658,7 @@ mod tests {
             .append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
             .append_query_results(vec![Vec::<temps_entities::service_members::Model>::new()])
             .into_connection();
-        let collector = collector_with_db(Arc::new(db));
+        let collector = collector_with_db(Arc::new(db)).await;
 
         let labels = HashMap::new();
         let ctx = collector

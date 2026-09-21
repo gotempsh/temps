@@ -135,6 +135,22 @@ export interface ObservabilityCompressionSettings {
   otel_spans_after_hours: number
 }
 
+/**
+ * Collected container-log budgets (ADR-046). Mirrors the Rust
+ * `ContainerLogSettings`; the Docker `--log-opt` rotation fields are
+ * round-tripped untouched from the server response.
+ */
+export interface ContainerLogSettings {
+  max_size: string
+  max_file: number
+  service_max_size: string
+  service_max_file: number
+  /** Disk budget (MiB) for the read cache of chunk blocks/indexes/blooms. */
+  cache_mb: number
+  /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
+  head_buffer_mb: number
+}
+
 export interface ObservabilityRetentionSettings {
   /** Raw proxy request-log retention in days. */
   proxy_logs_days: number
@@ -144,6 +160,8 @@ export interface ObservabilityRetentionSettings {
   otel_logs_days: number
   /** OpenTelemetry metric-point retention in days. */
   otel_metrics_days: number
+  /** Collected container log retention in days (chunks, manifest, line index). */
+  container_logs_days: number
 }
 
 /**
@@ -200,6 +218,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  container_logs: ContainerLogSettings
   /** Geolocation refresh policy, with the MaxMind key masked to a boolean. */
   geo: GeoSettings
   /** Effective backend for proxy logs and OTel spans. */
@@ -316,6 +335,9 @@ export function buildPlatformSettingsUpdateBody(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Same reasoning: omitting this would reset Docker log rotation and the
+    // collected-log cache/head budgets to defaults on every unrelated save.
+    container_logs: updated.container_logs,
     // Same `#[serde(default)]` reasoning as the blocks below: omitting this
     // would reset the geolocation refresh interval and staleness window to
     // their defaults on every unrelated settings save. The server preserves

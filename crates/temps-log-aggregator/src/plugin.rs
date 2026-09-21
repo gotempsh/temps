@@ -16,19 +16,53 @@ use tracing;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
+use crate::chunk::cache::ChunkCache;
 use crate::handlers::{self, create_log_aggregator_app_state, LogAggregatorAppState};
+use crate::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
+use crate::index::timescale::TimescaleLineIndex;
+use crate::index::{LineIndex, NoLineIndex};
 use crate::services::{
-    ChunkWriterService, CollectorService, LogMetadataService, LogSearchService,
+    ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
     RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
 };
+use crate::services::{
+    ForgetSweeper, ReindexService, DEFAULT_FORGET_BATCH, DEFAULT_REINDEX_BATCH,
+    FORGET_SWEEP_BURST_PAUSE, FORGET_SWEEP_INTERVAL,
+};
 use crate::storage::{FilesystemStorage, LogStorage, S3Storage};
+use crate::store::chunk_store::ChunkStore;
+use crate::store::manifest::ManifestRepo;
+use crate::store::LogLineStore;
 use crate::types::StorageConfig;
+use temps_clickhouse::ClickHouseConfig;
+
+/// The read cache and head-buffer budgets live in Settings → Monitoring
+/// (`container_logs.cache_mb` / `head_buffer_mb`, persisted and audited);
+/// this is how often a change is picked up without a restart.
+const BUDGET_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Interval for the periodic flush ticker (10 seconds)
 const FLUSH_TICKER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Interval for retention cleanup (24 hours)
-const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Retention runs hourly: cheap (one indexed query per project) and it keeps
+/// the line index TTL within an hour of a settings change.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Tombstoned chunk objects are removed this often (grace period applies).
+const GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Yesterday's fragmented chunks are merged this often.
+const COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay before the first compaction pass after boot.
+const COMPACTION_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// Delay before the reindexer's first pass after boot (let ingest settle).
+const REINDEX_STARTUP_DELAY: Duration = Duration::from_secs(30);
+/// Idle interval between reindex passes when the queue is empty.
+const REINDEX_INTERVAL: Duration = Duration::from_secs(60);
+/// Pause between passes while a backlog is being drained (rate limit).
+const REINDEX_BURST_PAUSE: Duration = Duration::from_secs(2);
 
 /// How often the remote log collector reconciles its open streams against the
 /// set of running remote containers (start new, drop gone).
@@ -46,11 +80,27 @@ const EVENTS_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Log Aggregator Plugin for structured log collection, storage, search, and streaming
 pub struct LogAggregatorPlugin {
     storage_config: StorageConfig,
+    /// ClickHouse connection for the ADR-047 line index, resolved once by
+    /// the composition root from `ServerConfig` (the single home of the
+    /// instance's ClickHouse connection, shared with analytics, OTel, proxy
+    /// logs and metrics — ADR-012). `None` = no local ClickHouse; the index
+    /// then goes to Temps Cloud's ClickHouse when the instance is linked,
+    /// else to the control-plane TimescaleDB (ADR-047 §8).
+    line_index_config: Option<ClickHouseConfig>,
 }
 
 impl LogAggregatorPlugin {
     pub fn new(storage_config: StorageConfig) -> Self {
-        Self { storage_config }
+        Self {
+            storage_config,
+            line_index_config: None,
+        }
+    }
+
+    /// Enable the ClickHouse line index with the instance's connection.
+    pub fn with_line_index(mut self, config: Option<ClickHouseConfig>) -> Self {
+        self.line_index_config = config;
+        self
     }
 }
 
@@ -88,8 +138,107 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Database connection
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
-            // Chunk writer
-            let chunk_writer = Arc::new(ChunkWriterService::new(storage.clone()));
+            // ── ADR-046 chunk read-through cache ─────────────────────────
+            // Built before the chunk writer so the writer can write-through
+            // into the same cache a sealing node reads from (ADR-046 §6a).
+            let data_dir = std::env::var("TEMPS_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .ok();
+            let cache_dir = data_dir.as_ref().map(|dir| dir.join("logs").join("cache"));
+            // WIRE: if TEMPS_DATA_DIR cannot be resolved, fall back to an
+            // in-memory-only cache rather than failing plugin registration —
+            // a missing cache only costs latency, never correctness.
+            // Opened at the default budget; the persisted setting is applied
+            // as soon as the plugin starts (and re-applied every minute).
+            let cache_bytes =
+                u64::from(temps_core::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
+            let cache = ChunkCache::open(cache_dir, cache_bytes)
+                .await
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: "log-aggregator".to_string(),
+                    error: format!("Failed to open log chunk cache: {e}"),
+                })?;
+            context.register_service(Arc::new(cache.clone()));
+
+            // Chunk writer (ADR-046): owns the whole seal pipeline (encode →
+            // object write → manifest insert → WAL truncate). The WAL gives
+            // crash-safety for the unflushed head window; when
+            // `TEMPS_DATA_DIR` cannot be resolved the writer simply runs
+            // without WAL protection rather than failing to start.
+            let wal_dir = data_dir.map(|dir| dir.join("logs").join("wal"));
+
+            // ADR-047 §8: the per-line index lives in the first store that
+            // is available — the instance's ClickHouse, then Temps Cloud's
+            // ClickHouse (through the telemetry proxies), then the
+            // control-plane TimescaleDB. Any reason a preferred store is
+            // skipped is logged; the chosen store is reported by the
+            // capabilities endpoint so the operator always knows where the
+            // index is (never a silent downgrade).
+            let selected_index = select_line_index(
+                self.line_index_config.as_ref(),
+                context.get_service::<temps_cloud_client::CloudLink>(),
+                db.clone(),
+            )
+            .await;
+
+            // A different store than last start means the existing
+            // `indexed_at` marks describe rows queries will never read
+            // again: clear them so the reindexer rebuilds the index here.
+            // This must succeed *before* the new store is exposed to any
+            // reader or writer — if it silently failed, chunks that really
+            // do need reindexing would keep their old `indexed_at` marks,
+            // the reindexer would skip them (it only looks at
+            // `indexed_at IS NULL`), and facets/histograms/aggregates/
+            // attribute search would read as complete while actually
+            // missing everything not yet in the new store, with nothing
+            // short of a lucky future backend flap ever correcting it.
+            // Retried with the seal path's backoff (a transient control-
+            // plane blip should not be treated the same as "will never
+            // work"); if it still fails, the index stays disabled rather
+            // than exposed in a state nothing can distinguish from correct.
+            let line_index: Arc<dyn LineIndex> = if let Some(backend) = selected_index.backend() {
+                let manifests = ManifestRepo::new(db.clone());
+                match crate::services::retry_with_backoff(|| {
+                    manifests.activate_index_backend(backend.as_str())
+                })
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            backend = backend.as_str(),
+                            "log line index store changed; every live chunk queued for reindex"
+                        );
+                        selected_index
+                    }
+                    Ok(false) => selected_index,
+                    Err(e) => {
+                        let reason = format!(
+                            "log line index disabled: could not durably record the active \
+                             backend ({backend}: {e}) — refusing to serve or write to a store \
+                             whose transition from the previous one is not confirmed; this \
+                             will retry on the next restart",
+                            backend = backend.as_str(),
+                        );
+                        tracing::error!(error = %e, backend = backend.as_str(), "{reason}");
+                        Arc::new(NoLineIndex::new(reason))
+                    }
+                }
+            } else {
+                selected_index
+            };
+
+            let chunk_writer = ChunkWriterService::open_with_index(
+                storage.clone(),
+                Arc::new(ManifestRepo::new(db.clone())),
+                wal_dir,
+                Some(cache.clone()),
+                line_index.clone(),
+            )
+            .await
+            .map_err(|e| PluginError::PluginRegistrationFailed {
+                plugin_name: "log-aggregator".to_string(),
+                error: format!("Failed to open chunk writer: {e}"),
+            })?;
             context.register_service(chunk_writer.clone());
 
             // DockerHandle — always registered; CollectorService holds it and
@@ -100,31 +249,16 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Metadata service (used by collector to resume from last known position on restart)
             let collector_metadata = Arc::new(LogMetadataService::new(db.clone()));
 
-            // Collector service — set the on_chunk_flushed callback before wrapping in Arc
-            let mut collector = CollectorService::new(
+            // Collector service. The chunk writer now owns the whole seal
+            // pipeline (object write + manifest insert) itself, so the
+            // collector no longer needs an on-chunk-flushed callback.
+            let collector = CollectorService::new(
                 docker_handle,
                 chunk_writer.clone(),
-                collector_metadata.clone(),
+                collector_metadata,
                 10_000,
             )
             .with_db(db.clone());
-
-            // Wire callback: when a chunk is flushed during streaming, insert chunk metadata into DB.
-            // This callback runs in the collector's streaming task, so it must be Send + Sync.
-            // Note: we do NOT insert into log_events — all searches read directly from chunk files.
-            let cb_metadata = collector_metadata;
-            collector.set_on_chunk_flushed(Arc::new(move |meta, _lines| {
-                let metadata_svc = cb_metadata.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = metadata_svc.insert_chunk_meta(&meta).await {
-                        tracing::error!(
-                            chunk_id = %meta.id,
-                            error = %e,
-                            "Failed to insert chunk metadata from collector callback"
-                        );
-                    }
-                });
-            }));
 
             let collector = Arc::new(collector);
             let tail_tx_sender = collector.tail_sender();
@@ -134,9 +268,32 @@ impl TempsPlugin for LogAggregatorPlugin {
             let metadata_service = Arc::new(LogMetadataService::new(db.clone()));
             context.register_service(metadata_service.clone());
 
+            // ── ADR-046 chunk-backed log line store ─────────────────────
+            // `log_chunks` manifests (Postgres, one row per chunk — never per
+            // line) plus the read-through cache over the object-storage
+            // bytes built above. `ManifestRepo` is a thin wrapper over the
+            // shared DB connection, so a second instance for
+            // `RetentionService` is cheap — it is not `Clone` because it has
+            // no state worth sharing beyond that.
+            //
+            // `chunk_writer` doubles as the store's `HeadSource`: unsealed
+            // head-buffer lines become visible to search before they are
+            // flushed to object storage (ADR-046 §4).
+            let store: Arc<dyn LogLineStore> = Arc::new(
+                ChunkStore::new(
+                    ManifestRepo::new(db.clone()),
+                    storage.clone(),
+                    cache,
+                    chunk_writer.clone(),
+                )
+                .with_line_index(line_index.clone()),
+            );
+            context.register_service(line_index.clone());
+            context.register_service(store.clone());
+
             // Search service
             let search_service = Arc::new(LogSearchService::new(
-                storage.clone(),
+                store.clone(),
                 metadata_service.clone(),
             ));
             context.register_service(search_service.clone());
@@ -146,10 +303,13 @@ impl TempsPlugin for LogAggregatorPlugin {
             context.register_service(tail_service.clone());
 
             // Retention service
-            let retention_service = Arc::new(RetentionService::new(
-                storage.clone(),
-                metadata_service.clone(),
-            ));
+            let retention_service = Arc::new(
+                RetentionService::new(
+                    Arc::new(ManifestRepo::new(db.clone())),
+                    metadata_service.clone(),
+                )
+                .with_line_index(line_index.clone()),
+            );
             context.register_service(retention_service.clone());
 
             // Audit service
@@ -162,6 +322,9 @@ impl TempsPlugin for LogAggregatorPlugin {
                 tail_service,
                 retention_service,
                 audit_service,
+                store,
+                db.clone(),
+                line_index,
             )
             .await;
             context.register_service(app_state);
@@ -177,48 +340,44 @@ impl TempsPlugin for LogAggregatorPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let chunk_writer = context.require_service::<ChunkWriterService>();
-            let metadata_service = context.require_service::<LogMetadataService>();
             let collector = context.require_service::<CollectorService>();
             let docker_handle = context.require_service::<temps_core::DockerHandle>();
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let retention_service = context.require_service::<RetentionService>();
+            let compactor_storage = context.require_service::<dyn LogStorage>();
+            let compactor_cache = (*context.require_service::<ChunkCache>()).clone();
             let retention_metadata = context.require_service::<LogMetadataService>();
 
             // ── Flush ticker ────────────────────────────────────────────
-            // Periodically flushes expired buffers (those that have exceeded the 30s threshold)
-            // and inserts chunk metadata into the database
+            // Seals every head buffer whose flush policy (ADR-046 §1) says
+            // it's due. The writer owns the whole seal pipeline itself now
+            // (object write + manifest insert + WAL truncate), so there is
+            // nothing left for the ticker to do with a result.
+            let flush_chunk_writer = chunk_writer.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(FLUSH_TICKER_INTERVAL);
                 loop {
                     interval.tick().await;
-                    let results = chunk_writer.flush_expired().await;
-                    for result in results {
-                        match result {
-                            Ok(flush_result) => {
-                                if let Err(e) =
-                                    metadata_service.insert_chunk_meta(&flush_result.meta).await
-                                {
-                                    tracing::error!(
-                                        chunk_id = %flush_result.meta.id,
-                                        error = %e,
-                                        "Failed to insert chunk metadata from flush ticker"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Flush ticker encountered error"
-                                );
-                            }
-                        }
-                    }
+                    flush_chunk_writer.flush_expired().await;
                 }
             });
             tracing::info!(
                 "Log aggregator flush ticker started (interval: {:?})",
                 FLUSH_TICKER_INTERVAL
             );
+
+            // ── WAL sync ticker ─────────────────────────────────────────
+            // Flushes and fsyncs every open per-container WAL file so at
+            // most ~1s of ingest is unsynced at any time (ADR-046 §1).
+            let sync_chunk_writer = chunk_writer.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    sync_chunk_writer.sync_wals().await;
+                }
+            });
+            tracing::info!("Log aggregator WAL sync ticker started (interval: 1s)");
 
             // ── Remote worker-node log collector ────────────────────────
             // If a RemoteContainerLogSource is registered (multi-node setups —
@@ -273,13 +432,74 @@ impl TempsPlugin for LogAggregatorPlugin {
                 LocalDiscoveryPlan::Skip { reason } => tracing::info!("{}", reason),
             }
 
+            // ── Budget sync ─────────────────────────────────────────────
+            // Settings → Monitoring → container logs: read cache size and
+            // per-container head buffer. Applied now and re-read every
+            // minute so a saved setting never needs a restart.
+            if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
+                let cache = context.require_service::<ChunkCache>();
+                let writer = context.require_service::<ChunkWriterService>();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(BUDGET_SYNC_INTERVAL);
+                    loop {
+                        interval.tick().await;
+                        match config_service.get_settings().await {
+                            Ok(settings) => {
+                                let logs = &settings.container_logs;
+                                let cache_bytes = u64::from(logs.cache_mb) * 1024 * 1024;
+                                let head_bytes = logs.head_buffer_mb as usize * 1024 * 1024;
+                                if cache.max_bytes() != cache_bytes {
+                                    tracing::info!(
+                                        cache_mb = logs.cache_mb,
+                                        "log read cache budget applied"
+                                    );
+                                    cache.set_max_bytes(cache_bytes).await;
+                                }
+                                if writer.head_max_bytes() != head_bytes {
+                                    tracing::info!(
+                                        head_buffer_mb = logs.head_buffer_mb,
+                                        "log head buffer cap applied"
+                                    );
+                                    writer.set_head_max_bytes(head_bytes);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not read container log budgets; keeping current")
+                            }
+                        }
+                    }
+                });
+            }
+
             // ── Retention scheduler ─────────────────────────────────────
             // Run retention cleanup once every 24 hours
+            let retention_settings = context.get_service::<temps_config::ConfigService>();
             tokio::spawn(async move {
-                let retention_config = crate::types::RetentionConfig::default();
                 let mut interval = tokio::time::interval(RETENTION_INTERVAL);
                 loop {
                     interval.tick().await;
+
+                    // Settings → Monitoring → retention. Falls back to the
+                    // default window when the config service is absent
+                    // (tests) or unreadable, and says so.
+                    let mut retention_config = crate::types::RetentionConfig::default();
+                    match &retention_settings {
+                        Some(config_service) => match config_service.get_settings().await {
+                            Ok(settings) => {
+                                retention_config.chunk_retention_days =
+                                    settings.observability_retention.container_logs_days;
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                default_days = retention_config.chunk_retention_days,
+                                "could not read container log retention setting; using default"
+                            ),
+                        },
+                        None => tracing::debug!("config service not registered; default retention"),
+                    }
+                    retention_service
+                        .sync_index_retention(&retention_config)
+                        .await;
 
                     // Find all distinct project_ids that have log_chunks
                     match retention_metadata.list_distinct_projects().await {
@@ -312,6 +532,106 @@ impl TempsPlugin for LogAggregatorPlugin {
                 RETENTION_INTERVAL
             );
 
+            // ── Compaction + GC (ADR-046 §8a.1, §8a.3) ─────────────────
+            // GC deletes objects whose manifest tombstone is older than the
+            // grace period; compaction merges yesterday's fragmented chunks.
+            // Both are idempotent, so a restart mid-run is harmless.
+            let line_index = context.require_service::<dyn LineIndex>();
+            let compactor = Arc::new(
+                CompactorService::new(
+                    Arc::new(ManifestRepo::new(db.clone())),
+                    compactor_storage,
+                    Some(compactor_cache),
+                )
+                .with_line_index(line_index.clone()),
+            );
+            let gc = compactor.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(GC_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    gc.gc_once().await;
+                }
+            });
+            tokio::spawn(async move {
+                // First pass shortly after boot so an upgrade picks up the
+                // backlog; then daily.
+                tokio::time::sleep(COMPACTION_STARTUP_DELAY).await;
+                let mut interval = tokio::time::interval(COMPACTION_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    compactor.reconcile_once().await;
+                    compactor.run_once().await;
+                }
+            });
+            tracing::info!(
+                "Log chunk compaction scheduled (interval: {:?}); gc interval {:?}",
+                COMPACTION_INTERVAL,
+                GC_INTERVAL
+            );
+
+            // ── Reindexer (ADR-047 §6) ─────────────────────────────────
+            // Drains `indexed_at IS NULL` chunks into the line index: the
+            // backlog from before ClickHouse was configured, chunks sealed
+            // while it was down, and compactor output. Runs in short bursts
+            // while there is work, then idles on the interval. Scheduled
+            // whenever a store is selected — not on `unavailable_reason()`,
+            // which is dynamic for Temps Cloud (telemetry export is switched
+            // on after startup) and would leave the backlog undrained.
+            if line_index.backend().is_some() {
+                let reindexer = ReindexService::new(
+                    Arc::new(ManifestRepo::new(db.clone())),
+                    context.require_service::<dyn LogStorage>(),
+                    line_index.clone(),
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(REINDEX_STARTUP_DELAY).await;
+                    loop {
+                        let report = reindexer.run_once(DEFAULT_REINDEX_BATCH).await;
+                        let pause = if report.more && report.failed == 0 {
+                            REINDEX_BURST_PAUSE
+                        } else {
+                            REINDEX_INTERVAL
+                        };
+                        tokio::time::sleep(pause).await;
+                    }
+                });
+                tracing::info!(
+                    "Log line reindexer scheduled (interval: {:?})",
+                    REINDEX_INTERVAL
+                );
+            }
+
+            // ── Forget sweeper (ADR-047 §8a) ────────────────────────────
+            // Drains `log_line_forget_backlog`: chunks compaction, purge and
+            // retention retired but could not immediately confirm forgotten
+            // from the line index (a transient ClickHouse error, or a
+            // rejected Cloud insert during an outage). Without this,
+            // that first failure was the end of the story and the rows
+            // stayed queryable — double-counted in facets/histograms/
+            // aggregates, or pointing at chunks the reader can no longer
+            // resolve — for the rest of the index's retention window.
+            // Gated the same way the reindexer is.
+            if line_index.backend().is_some() {
+                let sweeper =
+                    ForgetSweeper::new(Arc::new(ManifestRepo::new(db.clone())), line_index.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let report = sweeper.run_once(DEFAULT_FORGET_BATCH).await;
+                        let pause = if report.more && report.failed == 0 {
+                            FORGET_SWEEP_BURST_PAUSE
+                        } else {
+                            FORGET_SWEEP_INTERVAL
+                        };
+                        tokio::time::sleep(pause).await;
+                    }
+                });
+                tracing::info!(
+                    "Log line forget sweeper scheduled (interval: {:?})",
+                    FORGET_SWEEP_INTERVAL
+                );
+            }
+
             Ok(())
         })
     }
@@ -325,7 +645,11 @@ impl TempsPlugin for LogAggregatorPlugin {
             tail_service: old.tail_service.clone(),
             retention_service: old.retention_service.clone(),
             audit_service: old.audit_service.clone(),
+            store: old.store.clone(),
+            db: old.db.clone(),
             project_access_checker,
+            line_index: old.line_index.clone(),
+            manifests: old.manifests.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 
@@ -620,6 +944,55 @@ fn spawn_local_container_discovery(
         }
     });
     tracing::info!("Container discovery started (events listener + startup scan)");
+}
+
+/// Pick the line index store in preference order (ADR-047 §8).
+///
+/// A *configured* local ClickHouse that cannot be reached is not a reason
+/// to index somewhere else: a restart during a ClickHouse blip would
+/// otherwise move the index (and, with Cloud next in line, export the whole
+/// retention window) on nobody's decision. Configured-but-unavailable fails
+/// closed with the verbatim reason; only an *unconfigured* store is skipped.
+async fn select_line_index(
+    local: Option<&ClickHouseConfig>,
+    cloud: Option<Arc<temps_cloud_client::CloudLink>>,
+    db: Arc<sea_orm::DatabaseConnection>,
+) -> Arc<dyn LineIndex> {
+    if let Some(config) = local {
+        return match ClickHouseLineIndex::connect(LineIndexTarget::Local(config.clone())).await {
+            Ok(index) => index,
+            Err(reason) => {
+                tracing::warn!(
+                    %reason,
+                    "log line index disabled: the configured ClickHouse is unavailable \
+                     (not falling back — fix the connection or unset TEMPS_CLICKHOUSE_*)"
+                );
+                Arc::new(NoLineIndex::new(reason.to_string()))
+            }
+        };
+    }
+    if let Some(link) = cloud.filter(|link| link.is_linked()) {
+        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud {
+            link,
+            db: db.clone(),
+        })
+        .await
+        {
+            Ok(index) => {
+                tracing::info!("log line index ready (Temps Cloud ClickHouse)");
+                return index;
+            }
+            Err(reason) => tracing::warn!(
+                %reason,
+                "Temps Cloud cannot host the log line index; falling back to TimescaleDB"
+            ),
+        }
+    }
+    tracing::info!(
+        "log line index ready (TimescaleDB) — configure ClickHouse or link Temps Cloud for \
+         volume beyond a few million lines a day"
+    );
+    TimescaleLineIndex::new(db)
 }
 
 #[cfg(test)]

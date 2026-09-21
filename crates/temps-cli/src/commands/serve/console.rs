@@ -3324,7 +3324,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Reuses `shared_log_storage_config`, resolved once above alongside
     // LogsPlugin -- see the comment there for why these two plugins share a
     // single config resolution instead of two independent env-var reads.
-    let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(shared_log_storage_config));
+    // The ADR-047 line index uses the instance's ClickHouse connection from
+    // `ServerConfig`, exactly like the other ClickHouse-backed stores above;
+    // the plugin never reads the environment itself.
+    let log_line_index_config = if config.is_clickhouse_enabled() {
+        Some(temps_clickhouse::ClickHouseConfig::new(
+            config.clickhouse_url.clone().unwrap_or_default(),
+            config.clickhouse_database.clone().unwrap_or_default(),
+            config.clickhouse_user.clone().unwrap_or_default(),
+            config.clickhouse_password.clone().unwrap_or_default(),
+        ))
+    } else {
+        None
+    };
+    let log_aggregator_plugin = Box::new(
+        LogAggregatorPlugin::new(shared_log_storage_config).with_line_index(log_line_index_config),
+    );
     plugin_manager.register_plugin(log_aggregator_plugin);
 
     // 9.5. ImportPlugin - provides workload import functionality (depends on
@@ -4598,10 +4613,26 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let shutdown_signal = {
         let svc = external_plugins_service.clone();
         let cloud = cloud_service.clone();
+        // Seal every unsealed log head so a restart never loses the last
+        // minutes of container logs (ADR-046 §1). The WAL covers crashes;
+        // this covers the ordinary upgrade restart.
+        let log_writer = plugin_manager
+            .service_context()
+            .get_service::<temps_log_aggregator::ChunkWriterService>();
         async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Console API received shutdown signal, stopping background services...");
             join_cloud_enrollment_bootstrap(enrollment_bootstrap).await;
+            if let Some(writer) = log_writer {
+                match tokio::time::timeout(std::time::Duration::from_secs(20), writer.flush_all())
+                    .await
+                {
+                    Ok(()) => info!("Log heads sealed"),
+                    Err(_) => {
+                        warn!("Sealing log heads exceeded 20s; unsealed lines stay in the WAL")
+                    }
+                }
+            }
             if let Some(service) = cloud {
                 service.shutdown().await;
                 info!("Managed telemetry mirror shut down");
