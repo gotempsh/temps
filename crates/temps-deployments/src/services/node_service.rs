@@ -5,7 +5,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -741,6 +741,66 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
         Ok(nodes)
+    }
+
+    /// `(id, name)` of every node that advertises `project_slug` under
+    /// `docker_socket_projects` in its heartbeat capacity (ADR 045).
+    ///
+    /// Selects only `id`, `name` and `capacity` — never the full `nodes` row
+    /// (labels, token, address and timestamp columns), which this call
+    /// discards entirely to answer "which of these grant this one slug".
+    /// This runs on every placement of a project this control plane
+    /// declares, so trimming what's fetched matters at fleet size even
+    /// though the exact-match test itself still runs in Rust
+    /// (`capacity_grants`), the same test `docker_socket_gate` used before
+    /// this method existed. A `capacity->'docker_socket_projects' @>
+    /// '["<slug>"]'` predicate evaluated by Postgres (as
+    /// `ProjectService::docker_socket_capability` does for the read-only
+    /// capability response) would remove the Rust-side filter entirely, but
+    /// `Expr::cust_with_values` raw predicates are not mockable with
+    /// `sea_orm::MockDatabase`, which this module's placement tests rely on
+    /// throughout — left as a follow-up that also converts those tests to a
+    /// real database.
+    ///
+    /// Decodes via a named `#[derive(FromQueryResult)]` struct rather than
+    /// `.into_tuple()`. `MockDatabase` builds its rows from the *full*
+    /// `nodes::Model` (all columns, in struct-declaration order) regardless
+    /// of which columns `select_only()` asked for, and `.into_tuple()`
+    /// decodes positionally — so against a mocked row it silently read
+    /// whatever the model's 3rd declared field is (`token_hash`, a String)
+    /// instead of `capacity`, rather than the 3 columns actually selected.
+    /// A named struct resolves each field by column name instead, which
+    /// gives the intended column against both `MockDatabase` and a real
+    /// connection.
+    pub async fn granting_node_ids_and_names(
+        &self,
+        project_slug: &str,
+    ) -> Result<Vec<(i32, String)>, NodeError> {
+        #[derive(sea_orm::FromQueryResult)]
+        struct GrantingNode {
+            id: i32,
+            name: String,
+            capacity: serde_json::Value,
+        }
+
+        let rows: Vec<GrantingNode> = nodes::Entity::find()
+            .select_only()
+            .column(nodes::Column::Id)
+            .column(nodes::Column::Name)
+            .column(nodes::Column::Capacity)
+            .order_by_asc(nodes::Column::Name)
+            .into_model::<GrantingNode>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                temps_core::docker_socket_grant::capacity_grants(&row.capacity)
+                    .iter()
+                    .any(|slug| slug == project_slug)
+            })
+            .map(|row| (row.id, row.name))
+            .collect())
     }
 
     /// Total DNS records currently registered in the cluster zone (ADR-024).

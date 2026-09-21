@@ -349,10 +349,14 @@ impl NodeScheduler {
     /// Costs a second query only when the gate actually applies: an
     /// undeclared project never reads the node table here.
     ///
-    /// When it does apply, it reads **all** nodes rather than only active ones
-    /// on purpose: a project granted solely on a node that is currently
-    /// offline must fail with "that host is not schedulable right now", not
-    /// silently land somewhere that would start it without the socket.
+    /// When it does apply, it matches against **all** nodes rather than only
+    /// active ones on purpose: a project granted solely on a node that is
+    /// currently offline must fail with "that host is not schedulable right
+    /// now", not silently land somewhere that would start it without the
+    /// socket. The match itself is done by Postgres
+    /// (`NodeService::granting_node_ids_and_names`), not by loading every
+    /// node's full row (heartbeat capacity blob and all) to filter in Rust —
+    /// this runs on every placement of a declared project.
     async fn resolve_docker_socket_gate(
         &self,
         project_slug: &str,
@@ -360,12 +364,11 @@ impl NodeScheduler {
         if !self.docker_socket_grant.declares(project_slug) {
             return Ok(None);
         }
-        let nodes = self.node_service.list_all().await?;
-        Ok(docker_socket_gate(
-            &self.docker_socket_grant,
-            project_slug,
-            &nodes,
-        ))
+        let granting_nodes = self
+            .node_service
+            .granting_node_ids_and_names(project_slug)
+            .await?;
+        Ok(docker_socket_gate(project_slug, &granting_nodes))
     }
 
     /// Declare which projects the **control plane** grants host Docker access
@@ -1174,39 +1177,28 @@ impl NodeScheduler {
     }
 }
 
-/// Resolve the ADR-045 placement gate for one project, from the declared set
-/// and the nodes' advertised sets.
+/// Build the ADR-045 placement gate for one project from the nodes already
+/// established to grant it.
 ///
-/// **An advertisement never creates a gate.** The gate exists for a slug iff
-/// `declared` — the control plane's own `TEMPS_DOCKER_SOCKET_PROJECTS` —
-/// names it. Heartbeat capacity is agent-supplied data: if it could create the
-/// gate, a single compromised or misconfigured worker could advertise any slug
-/// and become the only eligible placement for that project (or, once drained,
-/// deny it cluster-wide). Advertisements are therefore only allowed to
-/// *narrow* where an already-declared project may run.
-///
-/// Pure, taking the declared set explicitly, so both halves of that rule are
-/// testable without a database.
+/// **An advertisement never creates a gate on its own** — that rule is
+/// enforced by the caller (`resolve_docker_socket_gate`), which only reaches
+/// this function once the control plane's own
+/// `TEMPS_DOCKER_SOCKET_PROJECTS` already declares `project_slug`; a
+/// misconfigured or compromised worker cannot advertise any slug into
+/// eligibility by itself. `granting_nodes` is expected to already be
+/// filtered to advertisers of this exact slug (`NodeService::granting_node_ids_and_names`),
+/// so this function only assembles the gate's shape — it deliberately does
+/// not re-derive membership, so a caller cannot pass an unrelated node list
+/// and have it silently narrowed here instead of at the query.
 fn docker_socket_gate(
-    declared: &DockerSocketGrant,
     project_slug: &str,
-    nodes: &[temps_entities::nodes::Model],
+    granting_nodes: &[(i32, String)],
 ) -> Option<DockerSocketGate> {
-    if !declared.declares(project_slug) {
-        return None;
-    }
-
-    let mut granting_node_ids = std::collections::HashSet::new();
-    let mut granting_node_names = Vec::new();
-    for node in nodes {
-        if temps_core::docker_socket_grant::capacity_grants(&node.capacity)
-            .iter()
-            .any(|slug| slug == project_slug)
-        {
-            granting_node_ids.insert(node.id);
-            granting_node_names.push(node.name.clone());
-        }
-    }
+    let granting_node_ids = granting_nodes.iter().map(|(id, _)| *id).collect();
+    let granting_node_names = granting_nodes
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect();
 
     Some(DockerSocketGate {
         project_slug: project_slug.to_string(),
@@ -1573,33 +1565,40 @@ mod tests {
 
         // ── The rule itself, pure ────────────────────────────────────────
 
-        #[test]
-        fn an_advertisement_never_creates_a_gate() {
-            // The finding this rule exists for: a worker that advertises a
-            // slug the control plane never declared must not become the only
-            // eligible placement for it — nor, once drained, deny it.
-            let nodes = vec![granting_node(1, "hostile", &["node-daemon"])];
-            assert!(
-                docker_socket_gate(&DockerSocketGrant::default(), "node-daemon", &nodes).is_none()
-            );
+        /// The finding this rule exists for: a worker that advertises a slug
+        /// the control plane never declared must not become the only eligible
+        /// placement for it — nor, once drained, deny it. Checked as an async
+        /// test against `resolve_docker_socket_gate`, since the declared-vs-not
+        /// decision (unlike node-matching, now done in SQL — see
+        /// `NodeService::granting_node_ids_and_names`) still lives in pure
+        /// Rust ahead of any query. Queuing zero query results proves it: if
+        /// the gate resolver queried the database for an undeclared project,
+        /// this test would panic on an empty result queue instead of
+        /// returning `Ok(None)`.
+        #[tokio::test]
+        async fn an_advertisement_never_creates_a_gate() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_docker_socket_grant(DockerSocketGrant::default());
+            let gate = scheduler
+                .resolve_docker_socket_gate("node-daemon")
+                .await
+                .expect("an undeclared project never queries the node table");
+            assert!(gate.is_none());
         }
 
+        /// `docker_socket_gate` only assembles the struct from nodes already
+        /// established to grant the slug — the exact-match filtering itself
+        /// is now a SQL predicate (`NodeService::granting_node_ids_and_names`),
+        /// so this is exercised with an already-filtered `(id, name)` list,
+        /// as if that query had already run.
         #[test]
-        fn a_declared_project_is_narrowed_to_the_nodes_that_advertise_it() {
-            let nodes = vec![
-                granting_node(1, "node-daemon-host", &["node-daemon"]),
-                make_node(2, "worker-2"),
-            ];
-            let gate = docker_socket_gate(
-                &DockerSocketGrant::parse(Some("node-daemon")),
-                "node-daemon",
-                &nodes,
-            )
-            .expect("the control plane declares it");
+        fn assembles_the_gate_from_the_nodes_already_known_to_grant_it() {
+            let gate = docker_socket_gate("node-daemon", &[(1, "node-daemon-host".to_string())])
+                .expect("a declared project always produces a gate");
 
             assert_eq!(gate.project_slug, "node-daemon");
             assert!(gate.granting_node_ids.contains(&1));
-            assert!(!gate.granting_node_ids.contains(&2));
             assert_eq!(gate.granting_node_names, vec!["node-daemon-host"]);
         }
 
@@ -1608,12 +1607,8 @@ mod tests {
             // The gate exists, with an empty node set: placement then falls to
             // the control plane (if it runs workloads) or fails — never to an
             // arbitrary node.
-            let gate = docker_socket_gate(
-                &DockerSocketGrant::parse(Some("node-daemon")),
-                "node-daemon",
-                &[make_node(1, "worker-1")],
-            )
-            .expect("the declaration alone creates the gate");
+            let gate = docker_socket_gate("node-daemon", &[])
+                .expect("the declaration alone creates the gate");
             assert!(gate.granting_node_ids.is_empty());
         }
 
