@@ -27,6 +27,7 @@ import {
   ProjectAvatar,
   ResourceStat,
   RecordLink,
+  CredentialProviderMark,
   Status,
   STATUS_TONES,
   TimeChart,
@@ -73,6 +74,14 @@ export default function Components() {
       </Block>
 
       <Block title="Page tabs">
+        <div className="mb-6 flex flex-wrap gap-6" aria-label="Credential providers">
+          {['github', 'gitlab', 'openai', 'anthropic', 'custom'].map((provider) => (
+            <div key={provider} className="flex items-center gap-2">
+              <CredentialProviderMark provider={provider} />
+              <span>{provider}</span>
+            </div>
+          ))}
+        </div>
         <Tabs defaultValue="checks" className="w-full">
           <TabsList aria-label="Example record views">
             <TabsTrigger value="checks" count={3}>Checks</TabsTrigger>

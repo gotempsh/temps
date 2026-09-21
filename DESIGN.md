@@ -358,3 +358,33 @@ interval or list/grid display), not for navigating content sections.
 The shared primitive applies this decision to its existing consumers. Remove
 legacy style overrides when touching a screen. The design-system Components
 page and environment-variable detail page are reference implementations.
+
+### Credential provider logos
+
+Use `CredentialProviderMark` from `@temps-sdk/ds` for credential identity in
+check rows, per-variable check summaries, and provider template choices. The
+shared registry currently includes GitHub, GitLab, OpenAI, and Anthropic.
+
+- Accept only a canonical provider ID from backend `automatic_provider` or an
+  explicit provider preset. Never infer a brand from variable names, check names,
+  arbitrary URLs, or ambiguous detection suggestions. Custom checks without
+  confirmed identity use the neutral key icon, even when named after a company.
+- Use original official company assets, never generated artwork, traced paths,
+  Lucide approximations, or another product's mark (Claude is not Anthropic).
+  Preserve geometry, aspect ratio, clear space, and original colors. Do not
+  recolor logos to indicate success or failure; retain separate status icons/text.
+- Bundle assets locally. Do not request logos from third-party services at runtime.
+  Use a fixed 24px slot and contain the asset without cropping. The white backing
+  preserves the provided marks in light and dark themes. Keep a text name nearby
+  and expose the provider name as image alt text.
+- Add a provider only with an official source URL, retrieval date, original-byte
+  SHA-256, and light/dark visual verification. Provenance lives beside the shared
+  assets in `web/packages/ds/src/credential-provider-assets.ts`. Logos identify
+  providers; they do not assert credential validity or company endorsement.
+
+Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/logo),
+[GitLab press kit](https://about.gitlab.com/press/press-kit/),
+[OpenAI design guidelines](https://openai.com/brand/) and its
+[developer-site mark](https://developers.openai.com/favicon.png), and
+[Anthropic's company site](https://www.anthropic.com/) (official favicon).
+The company marks remain the property of their respective owners.

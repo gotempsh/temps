@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { CredentialProviderMark } from '@temps-sdk/ds'
 
 import { CheckLoading } from './CheckLoading'
 import { useState } from 'react'
@@ -221,7 +222,10 @@ export function HttpChecksSettings({
               className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between"
             >
               <div className="min-w-0">
-                <p className="font-medium text-sm break-all">{check.name}</p>
+                <p className="flex items-center gap-2 font-medium text-sm break-all">
+                  <CredentialProviderMark provider={check.automatic_provider} />
+                  {check.name}
+                </p>
                 <EnvironmentVariableChecks checks={checkIndicators([check])} />
               </div>
               <div className="flex flex-wrap gap-2">
@@ -339,7 +343,10 @@ export function HttpChecksSettings({
                 <SelectItem value="custom">Custom HTTP / Temps</SelectItem>
                 {presets.data?.map((preset) => (
                   <SelectItem key={preset.id} value={preset.id}>
-                    {preset.name}
+                    <span className="inline-flex items-center gap-2">
+                      <CredentialProviderMark provider={preset.id} />
+                      {preset.name}
+                    </span>
                   </SelectItem>
                 ))}
               </SelectContent>

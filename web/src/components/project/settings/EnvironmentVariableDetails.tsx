@@ -21,7 +21,13 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@temps-sdk/ds'
+import {
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  TabsContent,
+  CredentialProviderMark,
+} from '@temps-sdk/ds'
 import {
   Table,
   TableHeader,
@@ -335,7 +341,12 @@ export function EnvironmentVariableDetails({
                     .map((check) => (
                       <TableRow key={check.id}>
                         <TableCell className="min-w-56 whitespace-normal">
-                          <p className="font-medium">{check.name}</p>
+                          <p className="flex items-center gap-2 font-medium">
+                            <CredentialProviderMark
+                              provider={check.automatic_provider}
+                            />
+                            {check.name}
+                          </p>
                           <p className="mt-1 text-xs text-muted-foreground">
                             {check.automatic_provider
                               ? 'Automatic detection'

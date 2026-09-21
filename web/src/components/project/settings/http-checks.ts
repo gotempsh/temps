@@ -33,6 +33,7 @@ export function useHttpChecks(projectId: number) {
 export function checkIndicators(checks: HttpCheckView[]) {
   return checks.map((check) => ({
     id: String(check.id),
+    provider: check.automatic_provider,
     status: !check.enabled
       ? ('unknown' as const)
       : (check.result?.status ?? ('pending' as const)),

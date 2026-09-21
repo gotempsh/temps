@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { CredentialProviderMark } from '@temps-sdk/ds'
 
 import {
   CircleCheck,
@@ -17,6 +18,7 @@ import { Button } from '@/components/ui/button'
 
 /** Presentation model for HTTP check results; independent of credential providers. */
 export interface EnvironmentVariableCheck {
+  provider?: string | null
   id: string
   status: 'healthy' | 'warning' | 'error' | 'pending' | 'unknown'
   label: string
@@ -77,6 +79,9 @@ export function EnvironmentVariableChecks({
           aria-label={`Checks: ${label}`}
         >
           <Icon className="size-4 shrink-0" aria-hidden="true" />
+          {mostSevere?.provider && (
+            <CredentialProviderMark provider={mostSevere.provider} />
+          )}
           <span>{label}</span>
         </button>
       </PopoverTrigger>
@@ -99,7 +104,10 @@ export function EnvironmentVariableChecks({
                     aria-hidden="true"
                   />
                   <div className="min-w-0">
-                    <p className="text-sm font-medium">{check.label}</p>
+                    <p className="flex items-center gap-2 text-sm font-medium">
+                      <CredentialProviderMark provider={check.provider} />
+                      {check.label}
+                    </p>
                     <p className="mt-1 text-sm text-muted-foreground">
                       {check.detail}
                     </p>
