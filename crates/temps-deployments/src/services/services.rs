@@ -5631,6 +5631,108 @@ mod tests {
         Ok((project, environment, deployment))
     }
 
+    /// ADR 045: proves `DeployImageJob::persist_docker_socket_mounted`'s
+    /// write is visible through the *exact* read path exec authorization
+    /// uses -- `DeploymentService::deployment_docker_socket_mounted` --
+    /// against a real database, and that it does not disturb a sibling
+    /// deployment's row. `guard_exec_against`'s own tests exercise the
+    /// boolean as a hand-supplied literal, which would keep passing even if
+    /// this write silently stopped happening; this is the test that would
+    /// actually fail in that case.
+    #[tokio::test]
+    async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        // A second deployment of the *same* project/environment -- the write
+        // must target only the row it was asked to persist, not every
+        // deployment of that project.
+        let sibling_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("test-deployment-sibling".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert sibling deployment");
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        assert!(
+            !deployment_service
+                .deployment_docker_socket_mounted(deployment.id)
+                .await
+                .expect("read freshly-created deployment"),
+            "a freshly-created deployment must not already read as socket-mounted"
+        );
+
+        let job = crate::jobs::DeployImageJobBuilder::new(
+            project.slug.clone(),
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(crate::jobs::DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name(project.slug.clone())
+        .failed_container_retention(db.clone(), deployment.id)
+        .build(Arc::new(MockContainerDeployer::new()))
+        .expect("valid deploy job");
+        let context = temps_core::WorkflowContext::new(
+            "run-persist".to_string(),
+            deployment.id,
+            project.id,
+            environment.id,
+            Arc::new(NoopLogWriter),
+        );
+
+        job.persist_docker_socket_mounted(&context).await;
+
+        assert!(
+            deployment_service
+                .deployment_docker_socket_mounted(deployment.id)
+                .await
+                .expect("read the deployment after the write"),
+            "the write must be visible through the read path exec authorization uses"
+        );
+        assert!(
+            !deployment_service
+                .deployment_docker_socket_mounted(sibling_deployment.id)
+                .await
+                .expect("read the sibling deployment"),
+            "persisting one deployment's mount must not affect a sibling deployment's row"
+        );
+    }
+
+    struct NoopLogWriter;
+
+    #[async_trait::async_trait]
+    impl temps_core::LogWriter for NoopLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), temps_core::WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
     #[tokio::test]
     async fn legacy_asset_origin_walks_partial_reuse_metadata_to_original_build() {
         let test_db = match TestDatabase::with_migrations().await {

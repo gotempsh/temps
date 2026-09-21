@@ -1254,7 +1254,13 @@ impl DeployImageJob {
     /// failure is logged, not propagated, since refusing to complete an
     /// already-running deployment over a follow-up bookkeeping write would
     /// be worse than the (still-audited, still-logged) gap it would leave.
-    async fn persist_docker_socket_mounted(&self, context: &WorkflowContext) {
+    ///
+    /// `pub(crate)` rather than private so `services.rs`'s test module can
+    /// prove the write is visible through
+    /// `DeploymentService::deployment_docker_socket_mounted` -- the exact
+    /// read path exec authorization uses -- with a real database, not just
+    /// that the two methods independently look correct in isolation.
+    pub(crate) async fn persist_docker_socket_mounted(&self, context: &WorkflowContext) {
         let (Some(db), Some(deployment_id)) =
             (self.failed_container_db.as_ref(), self.deployment_id)
         else {
