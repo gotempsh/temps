@@ -64,15 +64,43 @@ is project X", and the worker answers from its own policy.
 
 ### Placement is gated up front, never discovered mid-deploy
 
-A worker advertises its grant set in its heartbeat. When a granted project is
-scheduled, the node scheduler keeps only nodes (or the control plane itself,
-by its own environment) that advertise the grant for that slug, and records
-the exclusion reason per node the way the architecture filter does. If no
-node qualifies the deployment fails before anything is built, with the same
-actionable worker-node problem the platform already uses, carrying the reason
-"project X is not granted host Docker access on any node". A granted project
-is never silently placed on a host that would quietly deploy it without the
-socket.
+The same variable answers two different questions depending on where it is
+set. On the **control plane** it *declares* which projects require the socket:
+that declaration, and nothing else, creates the placement gate. On **each
+host** it decides whether *that host* provides the socket. A worker advertises
+its own set in its heartbeat, and those advertisements only ever **narrow**
+which hosts a declared project may run on — they never create a gate.
+
+That asymmetry is the security property. Heartbeat capacity is data supplied
+by the node: if an advertisement could create the gate, one compromised or
+merely misconfigured worker could name any slug and make itself the only
+eligible placement for that project — or, once drained, make it unschedulable
+cluster-wide. So the scheduler asks its own process grant first; a slug it
+does not declare is placed exactly as it was before this ADR, whatever any
+node reports. Slugs advertised outside the declared set are ignored for
+scheduling and logged at `warn!` when a node's advertised set changes, naming
+the node, since the common cause is an operator who set the variable on the
+worker and forgot the control plane.
+
+When the gate does apply, the scheduler keeps only nodes that advertise the
+grant for that slug (plus the control plane itself, which by declaring it also
+grants it, when this process runs local workloads), and records the exclusion
+reason per node the way the architecture filter does. If no host qualifies the
+deployment fails before anything is built, with the same actionable
+worker-node problem the platform already uses, telling the operator to declare
+the project on the control plane and grant it on at least one node. A granted
+project is never silently placed on a host that would quietly deploy it
+without the socket.
+
+The gate is also *verified* rather than assumed. The scheduling result carries
+whether the gate applied, and the deploy step compares it against the
+executing host's `DeployResult.docker_socket_mounted`: a replica that was
+placed because the project requires the socket, on a host that then reports it
+mounted none, fails the deployment with a message naming that host and the
+variable to set on it. Without that check the one failure the feature exists
+to prevent — a half-applied configuration change leaving an infrastructure
+service running with no engine access — would be reported as a healthy
+deployment.
 
 The companion control is the address the granted workload is *published* on.
 A service that holds the socket is root-equivalent on its host, so its own
@@ -91,9 +119,43 @@ internet; that combination is the one an operator must not ship.
 The project response carries a capability object -- `granted`, `reason`,
 `setup_path`, plus the nodes that advertise the grant -- so the console can
 show a "Host Docker access" badge on the project header and an onboarding
-state explaining what to set and where when it is not granted. Every
-deployment that mounts the socket records an audit event naming the project
-and the node. The CLI surfaces the same capability.
+state explaining what to set and where when it is not granted. `granted`
+follows the rule above: it is false until the control plane declares the
+project, and a node advertising a slug nobody declared is reported in the
+reason as the misconfiguration it is rather than as a grant. Every deployment
+that mounts the socket records an audit event naming the project and the node.
+The CLI surfaces the same capability.
+
+Claiming a granted slug is itself an admin-only act. `projects.slug` is
+writable by any project writer and is derived from the display name at create
+time, so without that rule a non-admin could rename a project onto a granted
+slug and have its next deployment run as root on every host that grants it.
+Creating a project with -- or renaming one onto -- a slug this host grants is
+therefore refused with a 403 for anyone who is not an instance admin, named in
+the API error and logged with the principal. Renaming a project *away* from a
+granted slug is admin-only for the same reason: it revokes that service's host
+Docker access everywhere and frees the slug for whoever creates a project next,
+so gating only the claim would leave the same outcome open in two requests
+instead of one. Only a slug *change* is gated -- an existing granted project
+keeps working through every update that does not move its slug, whoever sends
+it.
+
+#### What the audit record does and does not prove
+
+The audit event is written on the control plane from the executing host's
+**self-report** (`DeployResult.docker_socket_mounted`). It is therefore not
+tamper-evident against a compromise of that host: a host that mounts the
+socket and reports that it did not would produce no control-plane record. The
+deployer's own `warn!` at the bind site carries a stable
+`event = "docker_socket_mounted"` field with the project slug and container
+name, so host-side log shipping keeps an independent record of the same fact,
+and the two can be reconciled.
+
+Similarly, anyone holding a worker's agent token can ask that worker to deploy
+a container for any slug that worker grants. The agent token *is* the trust
+boundary here: it already authorises arbitrary container creation on that
+host, and the grant adds one more thing an attacker who holds it can reach.
+Protecting it is unchanged and unchangeable by this ADR.
 
 Compose deployments are unchanged: the deny-list stays as it is. The grant
 applies only to the image deployment path.
@@ -112,6 +174,9 @@ applies only to the image deployment path.
 - Operators get zero-downtime rollouts for the one kind of service that used
   to require a hand-maintained unit file, without a general "privileged
   deploy" switch existing anywhere in the product.
-- Multi-node works by construction: the grant travels with each host's
-  environment, and scheduling reads it from heartbeats rather than trusting
-  the control plane's view.
+- Multi-node works by construction, with the two halves kept apart: the
+  control plane's variable *declares* which projects require the socket, each
+  host's variable decides whether that host provides it, and heartbeats narrow
+  placement without ever creating a requirement. The cost is that an operator
+  must set the variable in two places for a worker-hosted grant -- which is
+  also the point: nothing a node says can make a project root-equivalent.

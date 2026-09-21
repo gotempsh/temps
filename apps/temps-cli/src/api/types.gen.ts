@@ -11089,6 +11089,17 @@ export type HeartbeatApiRequest = {
     containers?: Array<ContainerInventoryItem> | null;
     dns_resolver?: null | DnsResolverHeartbeat;
     /**
+     * Project slugs this node grants host Docker access to (ADR 045), read
+     * by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+     *
+     * Advisory only: it tells the scheduler where a granted project *may* be
+     * placed. It can never cause a socket to be mounted — that decision is
+     * made by the executing process against its own environment. `None` from
+     * a pre-ADR-045 agent leaves the stored value untouched; an empty array
+     * clears it.
+     */
+    docker_socket_projects?: Array<string> | null;
+    /**
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
@@ -45812,6 +45823,10 @@ export type CreateProjectErrors = {
      */
     400: unknown;
     /**
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
+     */
+    403: unknown;
+    /**
      * Expected project slug is already in use
      */
     409: unknown;
@@ -45911,7 +45926,7 @@ export type CreateProjectFromTemplateErrors = {
      */
     401: unknown;
     /**
-     * Insufficient permissions
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
      */
     403: unknown;
     /**
@@ -55333,7 +55348,7 @@ export type UpdateProjectSettingsErrors = {
      */
     401: unknown;
     /**
-     * Forbidden
+     * Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)
      */
     403: unknown;
     /**
