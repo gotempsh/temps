@@ -5,6 +5,7 @@ import { useState, type ReactNode } from 'react'
 import { AlertTriangle, CircleDollarSign, Cpu, HardDrive, Network, Rocket } from 'lucide-react'
 import {
   Article,
+  Tabs, TabsList, TabsTrigger, TabsContent,
   Disclosure,
   HelpPopover,
   Button,
@@ -25,6 +26,7 @@ import {
   Picker,
   ProjectAvatar,
   ResourceStat,
+  RecordLink,
   Status,
   STATUS_TONES,
   TimeChart,
@@ -70,6 +72,18 @@ export default function Components() {
         </div>
       </Block>
 
+      <Block title="Page tabs">
+        <Tabs defaultValue="checks" className="w-full">
+          <TabsList aria-label="Example record views">
+            <TabsTrigger value="checks" count={3}>Checks</TabsTrigger>
+            <TabsTrigger value="history" count={0}>History</TabsTrigger>
+            <TabsTrigger value="unavailable" disabled>Unavailable</TabsTrigger>
+          </TabsList>
+          <TabsContent value="checks">Current verification checks. Counts are optional; zero remains visible.</TabsContent>
+          <TabsContent value="history">Variable changes and verification runs.</TabsContent>
+        </Tabs>
+      </Block>
+
       <Block title="Settings sections">
         <div className="w-full">
           <SettingsSection title="Resource limits" icon={Cpu}>
@@ -83,6 +97,13 @@ export default function Components() {
       <Block title="Contextual help">
         <div className="flex items-center gap-1">Retention <HelpPopover label="About retention">Older logs are removed automatically after the retention period.</HelpPopover></div>
         <Disclosure label="Retention details"><p>Export logs you need to keep before changing retention.</p></Disclosure>
+      </Block>
+
+      <Block title="Resource detail links">
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">In tables, open details through the underlined resource name and arrow. Row whitespace never navigates; selection and actions stay independent.</p>
+          <RecordLink to="/detail">api-gateway</RecordLink>
+        </div>
       </Block>
 
       <Block title="Status">

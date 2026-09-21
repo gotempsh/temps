@@ -1,15 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useNavigate } from 'react-router'
 import { PackageOpen } from 'lucide-react'
-import { Ledger, PageState, Status, fmtDuration, fmtRelativeTime, useUrlState } from '@temps-sdk/ds'
+import { Ledger, RecordLink, PageState, Status, fmtDuration, fmtRelativeTime, useUrlState } from '@temps-sdk/ds'
 import { Input } from '@temps-sdk/ui'
 import { DEPLOYMENTS, type DeploymentFixture } from '../fixtures'
 
 /** Reference screen for the `Ledger` template — a "Deployments" list. */
 export default function DeploymentsLedger() {
-  const navigate = useNavigate()
   const { state, patch } = useUrlState<'q' | 'page'>()
   const q = state.q?.toLowerCase() ?? ''
 
@@ -30,7 +28,7 @@ export default function DeploymentsLedger() {
         />
       }
       columns={[
-        { key: 'service', header: 'Service', render: (d) => <span className="font-medium">{d.service}</span> },
+        { key: 'service', header: 'Service', render: (d) => <RecordLink to="/detail">{d.service}</RecordLink> },
         {
           key: 'branch',
           header: 'Branch',
@@ -51,7 +49,6 @@ export default function DeploymentsLedger() {
       ]}
       rows={rows}
       rowKey={(d) => d.id}
-      onRowClick={() => navigate('/detail')}
       empty={
         <PageState
           variant="empty"

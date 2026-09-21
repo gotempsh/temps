@@ -19,3 +19,7 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
     trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
 };
 pub use migration::Migrator;
+
+pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
+
+pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;

@@ -11091,6 +11091,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-credential-checks"
+version = "0.1.0-beta.56"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.8.23",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-database"
 version = "0.1.0-beta.56"
 dependencies = [
@@ -12268,16 +12283,19 @@ dependencies = [
  "chrono",
  "futures",
  "maplit",
+ "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
  "temps-auth",
  "temps-config",
  "temps-core",
+ "temps-credential-checks",
  "temps-database",
  "temps-deployer",
  "temps-entities",
  "temps-metrics",
+ "temps-migrations",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

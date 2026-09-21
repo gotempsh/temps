@@ -241,3 +241,68 @@ the form group should collapse; each caller retains its own save scope.
 
 SettingsGroup descriptions are optional: one short sentence beneath the heading
 that clarifies scope or outcome. Omit repeated labels and detailed instructions.
+
+## Resource detail navigation
+
+- Use `RecordLink` for the resource name in a table's identity column. Its
+  underline and right arrow are always visible, including on touch screens.
+- No row-click navigation, overlay links, or duplicate View/Details buttons in
+  the actions column. `DataTable` and `Ledger` intentionally have no `onRowClick`.
+- Keep selection, expansion, copy, menus, Edit, and Delete independently operable.
+  Use a labeled button for expansion; row whitespace does not navigate.
+- Use real routed URLs for details/configuration; preserve Enter, modifier-click,
+  new-tab, refresh, and browser history. Do not replace links with buttons.
+- Records without a detail route use plain text, with no navigation arrow.
+- Detail facts, checks, forms, and history fill the parent width. No page-level
+  `max-w-*`; reserve aside space only when an aside exists.
+- Migrate touched legacy tables to this pattern. Reference: sandbox `/ledger`,
+  production environment-variable table, and root `DESIGN.md` section 4.
+
+
+### Shared breadcrumbs
+
+Use the application's general breadcrumbs in the dashboard `Header`, populated
+through `useBreadcrumbs` from `@/contexts/BreadcrumbContext`. Do not render a
+second breadcrumb trail inside a page or assemble local links with slash or
+chevron separators. The design system's breadcrumb primitives are for the shared
+renderer, not a separate page-level navigation pattern.
+
+The route/layout owning a trail must include linked ancestors and a non-linked
+current page, with human-readable resource names. Nested routes extend the trail
+(e.g. Projects → project → Environment variables → GITHUB_TOKEN → Check
+configuration). Keep one owner per trail to avoid parent/child effects overwriting
+each other. Update it on direct entry, refresh, back/forward, resource renames,
+and return to the list; loading, unavailable, and missing records need safe labels.
+Never include secret values. Keep full-width page content below the shared header.
+
+
+### Detail pages with ongoing activity
+
+Keep compact resource facts above URL-backed Checks and History tabs. Current
+health is the default view; a growing audit log must not extend that view.
+Use aligned tables, explicit status labels with icons, and expandable diagnostic
+findings. Sort checks needing attention first. Paginate checks and history using
+`ResponsivePagination`; preserve the selected view and page in URL parameters.
+Fetch history when its tab is opened. Use the shared page header, breadcrumbs,
+and full content width. Environment-variable details are the reference example.
+
+
+### Canonical tabs: underline navigation
+
+Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
+`@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
+transparent, full-width strip with a bottom divider and an underline on the
+active tab. No pill container, selected-card background, shadow, or page-local
+styling overrides. Keep labels text-first, with constant font weight.
+
+Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
+count until it is known; never invent totals or show the current page's item
+count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
+navigation, focus indicators, disabled states, and panel semantics; let long
+strips scroll horizontally. Meaningful detail views keep their selection in
+the URL. Use a segmented toggle only for a local value choice (such as chart
+interval or list/grid display), not for navigating content sections.
+
+The shared primitive applies this decision to its existing consumers. Remove
+legacy style overrides when touching a screen. The design-system Components
+page and environment-variable detail page are reference implementations.

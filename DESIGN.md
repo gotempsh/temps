@@ -134,12 +134,13 @@ administrative resources. Do not invent a different row component per page.
 - Use `TableHeader`, `TableBody`, `TableRow`, `TableHead`, and
   `TableCell`. Preserve their shared padding and typography.
 - The first meaningful column identifies the resource. Make its name a real
-  router link when a detail page exists. Secondary metadata is muted.
+  [RecordLink](web/packages/ds/src/record-link.tsx) when a detail page exists.
+  It is visibly underlined with a persistent right arrow. Secondary metadata is muted.
 - Put status in a text-labeled badge; color alone never carries the meaning.
 - Right-align row actions in the last column. Give icon-only actions an
   accessible name that identifies the resource.
-- Keep links, menus, and selection independently operable. A clickable row
-  must not replace a semantic link or swallow nested control events.
+- Keep links, menus, and selection independently operable. Table rows never
+  navigate: no row `onClick`, link overlay, or `role="button"`.
 - Use monospace only for identifiers, hashes, commands, and code. Truncate
   long values intentionally, with a way to inspect or copy the full value.
 - Sorting uses a real button in the header and exposes its sort state.
@@ -147,6 +148,51 @@ administrative resources. Do not invent a different row component per page.
   Bulk actions must state their scope.
 - Keep column alignment stable during loading. Do not use fake records as
   skeleton content.
+
+
+### Shared breadcrumbs
+
+Use the application's general breadcrumbs in the dashboard `Header`, populated
+through `useBreadcrumbs` from `@/contexts/BreadcrumbContext`. Do not render a
+second breadcrumb trail inside a page or assemble local links with slash or
+chevron separators. The design system's breadcrumb primitives are for the shared
+renderer, not a separate page-level navigation pattern.
+
+The route/layout owning a trail must include linked ancestors and a non-linked
+current page, with human-readable resource names. Nested routes extend the trail
+(e.g. Projects → project → Environment variables → GITHUB_TOKEN → Check
+configuration). Keep one owner per trail to avoid parent/child effects overwriting
+each other. Update it on direct entry, refresh, back/forward, resource renames,
+and return to the list; loading, unavailable, and missing records need safe labels.
+Never include secret values. Keep full-width page content below the shared header.
+
+### Resource-detail navigation decision
+
+Use **one `RecordLink` in the identity column** for a record's primary detail
+route. Its name is underlined and its arrow remains visible before hover, on
+touch screens, and in both themes. This is the canonical detail affordance;
+do not alternate between plain text links, a separate "View" button, and
+clickable rows. The record name is the link text; use `aria-label` when context
+is needed (for example, "View GITHUB_TOKEN details").
+
+Navigation is a real router link: Enter, modifier-click, middle-click, copy link,
+and open in a new tab work normally. Clicking row whitespace does nothing.
+Checkboxes, copy/reveal, status popovers, menus, Edit, and Delete remain separate
+controls; they never open details. Do not add a second primary-detail link in
+the Actions column. Links to related resources are allowed in their own columns.
+Rows without a detail route render plain identity text, without an arrow.
+
+Details and their configuration have stable URLs, not modal-only entry points.
+Their facts, checks, forms, and history fill the parent content width. A detail
+layout reserves an aside column only when an aside is actually present; never
+cap the whole page with `max-w-*`. Paragraphs may have a reading-width limit.
+
+Enforcement: `@temps-sdk/ds` exports `RecordLink`; `DataTable` and `Ledger` do
+not expose row-click navigation. The sandbox `/ledger` and the environment
+variables table are reference implementations. Existing screens are migrated
+when their tables are touched; this decision does not claim all legacy tables
+have already been converted. Preserve row expansion/selection as explicit,
+separately labeled controls during migration.
 
 The shared Table already owns a horizontal overflow wrapper. On narrow screens,
 scroll the table rather than the entire page. Keep identity and primary actions
@@ -280,3 +326,35 @@ The host owns plugin identity. Inside the plugin, use a compact view title rathe
 Separate history lists from record details using addressable routes. Paginate history and result collections with shared responsive pagination, clamp pages after filtering or deletion, and preserve keyboard navigation. Starting a job opens its detail view; returning to history must not cancel it.
 
 Plugin workspaces fill the available iframe height. Navigation and the view toolbar remain visible while the content region scrolls. Do not stack the creation form, entire history, and expanded report on one page. Bound expanded diagnostics so long referrer lists do not push every other control out of reach.
+
+
+### Detail pages with ongoing activity
+
+Keep compact resource facts above URL-backed Checks and History tabs. Current
+health is the default view; a growing audit log must not extend that view.
+Use aligned tables, explicit status labels with icons, and expandable diagnostic
+findings. Sort checks needing attention first. Paginate checks and history using
+`ResponsivePagination`; preserve the selected view and page in URL parameters.
+Fetch history when its tab is opened. Use the shared page header, breadcrumbs,
+and full content width. Environment-variable details are the reference example.
+
+
+### Canonical tabs: underline navigation
+
+Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
+`@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
+transparent, full-width strip with a bottom divider and an underline on the
+active tab. No pill container, selected-card background, shadow, or page-local
+styling overrides. Keep labels text-first, with constant font weight.
+
+Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
+count until it is known; never invent totals or show the current page's item
+count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
+navigation, focus indicators, disabled states, and panel semantics; let long
+strips scroll horizontally. Meaningful detail views keep their selection in
+the URL. Use a segmented toggle only for a local value choice (such as chart
+interval or list/grid display), not for navigating content sections.
+
+The shared primitive applies this decision to its existing consumers. Remove
+legacy style overrides when touching a screen. The design-system Components
+page and environment-variable detail page are reference implementations.

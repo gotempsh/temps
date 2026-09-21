@@ -88,7 +88,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `Article` | `children` | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail` | Honour-system |
 | `GitProviderMark` | `provider`, `variant?`, `className?`, `label?` | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers | Label and fallback unit tests |
 | `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
-| `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
+| `DataTable` | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
 | `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
 | `Wizard` | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
 
@@ -513,3 +513,33 @@ routes into the proxy's in-memory cache and returns the loaded route count.
 The UI retains that existing request; this pass changes its discoverability and
 copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
 and sandbox build passed; browser confirmed the named section and exposed action.
+
+## Resource navigation convention (2026-09-21)
+
+`RecordLink` is the single primary-detail affordance for tables: underlined name
+and persistent right arrow, implemented as a router link. `DataTable` and
+`Ledger` no longer accept `onRowClick`; render `RecordLink` in the identity
+column instead. The `/ledger` reference screen demonstrates this. Do not turn
+rows into buttons or add a redundant View action. Full-width details reserve
+aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
+
+
+### Canonical tabs: underline navigation
+
+Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
+`@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
+transparent, full-width strip with a bottom divider and an underline on the
+active tab. No pill container, selected-card background, shadow, or page-local
+styling overrides. Keep labels text-first, with constant font weight.
+
+Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
+count until it is known; never invent totals or show the current page's item
+count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
+navigation, focus indicators, disabled states, and panel semantics; let long
+strips scroll horizontally. Meaningful detail views keep their selection in
+the URL. Use a segmented toggle only for a local value choice (such as chart
+interval or list/grid display), not for navigating content sections.
+
+The shared primitive applies this decision to its existing consumers. Remove
+legacy style overrides when touching a screen. The design-system Components
+page and environment-variable detail page are reference implementations.

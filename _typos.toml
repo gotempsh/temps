@@ -8,7 +8,8 @@
 # Captured-payload fixtures: real trace/span ids are hex, and the checker
 # "corrects" letter runs inside them, silently corrupting the very data the
 # fixture exists to preserve.
-extend-exclude = ["README.*.md", "**/__fixtures__/**"]
+# Vendored detection rules contain opaque regex data and upstream identifiers.
+extend-exclude = ["README.*.md", "**/__fixtures__/**", "crates/temps-credential-checks/catalog/gitleaks.toml"]
 
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,

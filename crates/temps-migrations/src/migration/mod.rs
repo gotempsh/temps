@@ -5,6 +5,9 @@ mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
 mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
+pub mod m20260921_000001_http_checks;
+pub mod m20260921_000002_env_check_history;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -614,6 +617,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260921_000001_http_checks::Migration),
+            Box::new(m20260921_000002_env_check_history::Migration),
         ]
     }
 }

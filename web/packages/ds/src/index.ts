@@ -83,3 +83,7 @@ export { HelpPopover, Disclosure } from './help'
 export { SettingsSection } from './settings-section'
 
 export { SettingsGroup } from './settings-group'
+
+export { RecordLink } from './record-link'
+
+export { Tabs, TabsList, TabsTrigger, TabsContent, ScrollableTabsList } from '@temps-sdk/ui'
