@@ -1559,6 +1559,19 @@ impl ProjectService {
     /// The step-up lives here rather than in the three handlers so it cannot
     /// be forgotten by the fourth: every path that can move a slug already
     /// funnels through this one guard.
+    ///
+    /// This guarantees the *result* is correct -- no project is ever
+    /// created or renamed onto a granted slug without authority and step-up
+    /// -- but says nothing about side effects a caller performs *before*
+    /// reaching it. A template deploy in fork mode was found doing exactly
+    /// that: creating and pushing to an upstream repository before this
+    /// guard ever ran, so a 428 here left a real external repository with
+    /// no Temps project. [`Self::preflight_guard_reserved_slug`] exists for
+    /// callers with an irreversible step between planning a slug and
+    /// creating the project -- check it first, then still go through this
+    /// guard at creation, since a slug can change between the two calls
+    /// (another create/rename racing on the same name) and only this one is
+    /// authoritative.
     async fn guard_reserved_slug(
         &self,
         slug: &str,
@@ -1574,6 +1587,33 @@ impl ProjectService {
             change,
         )?;
         self.require_slug_claim_step_up(slug, caller, project_id, change)
+            .await
+    }
+
+    /// Check authority and step-up for creating a project with `slug`,
+    /// before a caller does anything irreversible on the strength of "this
+    /// creation will probably succeed".
+    ///
+    /// A template deploy in fork mode creates and pushes to a real upstream
+    /// repository before it ever calls [`Self::create_project_as`], using a
+    /// slug it already planned with [`Self::plan_project_slug`]. Without
+    /// this check, a refusal at creation time (403, or a 428 step-up
+    /// challenge) arrives *after* that external side effect, leaving a real
+    /// repository with no Temps project — and, for the 428 case, a retry
+    /// that resends the same repository name fails with "already exists"
+    /// instead of completing.
+    ///
+    /// This does not replace the check inside [`Self::create_project_as`]:
+    /// the planned slug can change between this call and creation (a
+    /// concurrent create or rename claiming the same name), so only the
+    /// creation-time guard is authoritative. This is purely fail-fast for
+    /// the common case, at the cost of one extra check.
+    pub async fn preflight_guard_reserved_slug(
+        &self,
+        slug: &str,
+        caller: &SlugClaimCaller<'_>,
+    ) -> Result<(), ProjectError> {
+        self.guard_reserved_slug(slug, caller, None, ReservedSlugChange::Claim)
             .await
     }
 

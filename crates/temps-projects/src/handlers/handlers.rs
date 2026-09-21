@@ -3626,6 +3626,22 @@ pub async fn create_project_from_template(
         .await
         .map_err(Problem::from)?;
 
+    // ADR 045: same claim rule as plain project creation — a template deploy
+    // is another way to name a slug. Built here, ahead of the fork-mode
+    // repository creation below, so it can pre-flight-check authorization
+    // and step-up before that irreversible external side effect — and then
+    // reused for the authoritative check at creation time.
+    let slug_claim_caller = crate::services::types::SlugClaimCaller::from_request(
+        &auth,
+        state.sensitive_action_authorizer.as_ref(),
+    );
+    state
+        .project_service
+        .preflight_guard_reserved_slug(&planned_project_slug, &slug_claim_caller)
+        .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
+        .map_err(Problem::from)?;
+
     // The browser normally enforces this selection, but the API must fail
     // before creating a project when a required managed dependency is absent
     // or the caller supplied a service of the wrong type.
@@ -3899,12 +3915,9 @@ pub async fn create_project_from_template(
         (create_request, repository_url, deploy_mode, None)
     };
 
-    // ADR 045: same claim rule as plain project creation — a template deploy
-    // is another way to name a slug.
-    let slug_claim_caller = crate::services::types::SlugClaimCaller::from_request(
-        &auth,
-        state.sensitive_action_authorizer.as_ref(),
-    );
+    // `slug_claim_caller` was already built above, ahead of the fork-mode
+    // repository creation, and pre-flight-checked against the planned slug —
+    // reused here as the authoritative check at actual creation time.
     let project = if let Some(service_template) = service_template_instance {
         state
             .project_service
