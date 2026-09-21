@@ -12,6 +12,17 @@ export const CONTROL_PLANE_NODE_NAME = 'control-plane'
 export const HOST_DOCKER_ACCESS_LABEL = 'Host Docker access'
 
 /**
+ * Short form of {@link HOST_DOCKER_ACCESS_LABEL} for narrow viewports.
+ *
+ * The badge is the only place the console says a project is root-equivalent on
+ * its host, so it must survive a phone-width header rather than being hidden
+ * with the other secondary badges. "Host root" is the shortest phrasing that
+ * still says the dangerous part out loud; the full label and the reason stay
+ * in the accessible name and the tooltip.
+ */
+export const HOST_DOCKER_ACCESS_SHORT_LABEL = 'Host root'
+
+/**
  * What the grant actually does, in one sentence, for an operator who has never
  * heard of it. Said in full wherever it is offered — nobody reading this has a
  * support channel to ask what "host Docker access" means.

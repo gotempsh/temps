@@ -4,7 +4,10 @@
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
-import { describeDockerSocket } from '@/lib/docker-socket'
+import {
+  describeDockerSocket,
+  HOST_DOCKER_ACCESS_SHORT_LABEL,
+} from '@/lib/docker-socket'
 import { projectDeploymentStatus } from '@/lib/project-deployment-status'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Badge } from '@/components/ui/badge'
@@ -21,7 +24,7 @@ import {
   repositoryWebUrl,
   type GitProviderKind,
 } from '@/lib/project-header-actions'
-import { ExternalLink, GitFork, Rocket, Users } from 'lucide-react'
+import { ExternalLink, GitFork, Plug, Rocket, Users } from 'lucide-react'
 import BitbucketIcon from '@/icons/Bitbucket'
 import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
@@ -149,12 +152,23 @@ export function ProjectDetailHeader({
                   : 'Checking deployment…')}
             </Badge>
             {dockerSocket.state === 'granted' && (
+              // Deliberately NOT hidden below `sm` like the badges around it:
+              // this is the only place the console states that the project is
+              // root-equivalent on its host, and a phone-width console that
+              // showed nothing would be a silent omission of exactly the fact
+              // an operator needs. It degrades to an icon plus a short label
+              // instead of disappearing.
               <Badge
                 variant="outline"
-                className="hidden sm:inline-flex shrink-0"
+                className="inline-flex shrink-0 gap-1"
                 title={dockerSocket.detail}
+                aria-label={`${dockerSocket.label}: ${dockerSocket.detail}`}
               >
-                {dockerSocket.label}
+                <Plug aria-hidden="true" className="size-3" />
+                <span className="sm:hidden">
+                  {HOST_DOCKER_ACCESS_SHORT_LABEL}
+                </span>
+                <span className="hidden sm:inline">{dockerSocket.label}</span>
               </Badge>
             )}
             <Link
