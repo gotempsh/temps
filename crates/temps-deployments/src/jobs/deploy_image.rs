@@ -359,7 +359,13 @@ pub struct DeploymentJobConfig {
     /// a worker would mount the socket from its local grant alone, for a slug
     /// nobody declared and which therefore passed neither the admin-only
     /// claim guard nor the placement gate.
-    pub control_plane_grants_socket: bool,
+    ///
+    /// `pub(crate)`, not `pub`: it is set exactly once, inside
+    /// [`DeployImageJobBuilder::new`], from this process's own grant --
+    /// never from a caller-supplied value. A `pub` setter would let code
+    /// outside this crate construct a config that claims control-plane
+    /// authorization it was never given.
+    pub(crate) control_plane_grants_socket: bool,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
     /// (linked-service container names are replaced with their internal
@@ -535,7 +541,12 @@ impl std::fmt::Debug for DeployImageJob {
 }
 
 impl DeployImageJob {
-    pub fn new(
+    /// `pub(crate)`, not `pub`: the only production constructor is
+    /// [`DeployImageJobBuilder::build`], which runs
+    /// `refuse_granted_project_deploy` as its first statement. A `pub`
+    /// constructor here would let code outside this crate assemble an
+    /// executable job that never passed through that check.
+    pub(crate) fn new(
         job_id: String,
         build_job_id: String,
         target: DeploymentTarget,
