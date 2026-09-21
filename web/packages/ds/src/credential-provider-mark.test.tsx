@@ -13,7 +13,22 @@ test('canonical providers have accessible locally bundled original marks', () =>
     expect(html).toContain(`alt="${asset.name}"`)
     expect(html).toContain('src="data:image/')
     expect(html).toContain('object-contain')
-    expect(html).toContain('bg-white')
+    expect(html).not.toContain('bg-white')
+    expect(html).not.toContain('image/png')
+    const svg = Buffer.from(asset.src.split(',')[1], 'base64').toString()
+    expect(svg).toContain('<svg')
+    expect(svg).not.toMatch(/<image\b/)
+    // Rectangles inside clip paths define clipping, not opaque backgrounds.
+    expect(svg.replace(/<defs>[\s\S]*?<\/defs>/g, '')).not.toMatch(/<rect\b/)
+    if (asset.darkSrc) {
+      expect(html).toContain('dark:hidden')
+      expect(html).toContain('dark:block')
+      expect(
+        Buffer.from(asset.darkSrc.split(',')[1], 'base64').toString()
+      ).toContain('<svg')
+    }
+    if (provider === 'gitlab') expect(html).not.toContain('invert')
+    if (provider === 'anthropic') expect(html).toContain('dark:invert')
     expect(html).not.toContain('https://')
   }
 })

@@ -14,7 +14,8 @@ export function CredentialProviderMark({
   className?: string
 }) {
   const asset =
-    provider && Object.prototype.hasOwnProperty.call(credentialProviderAssets, provider)
+    provider &&
+    Object.prototype.hasOwnProperty.call(credentialProviderAssets, provider)
       ? credentialProviderAssets[
           provider as keyof typeof credentialProviderAssets
         ]
@@ -22,18 +23,34 @@ export function CredentialProviderMark({
   return (
     <span
       className={cn(
-        'inline-flex size-6 shrink-0 items-center justify-center',
+        'inline-flex h-6 shrink-0 items-center justify-center',
+        asset?.wordmark ? 'w-20' : 'w-6',
         className
       )}
     >
       {asset ? (
-        <img
-          src={asset.src}
-          alt={asset.name}
-          width={24}
-          height={24}
-          className="size-full rounded-sm bg-white object-contain p-0.5"
-        />
+        <>
+          <img
+            src={asset.src}
+            alt={asset.name}
+            width={asset.wordmark ? 80 : 24}
+            height={24}
+            className={cn(
+              'size-full object-contain',
+              asset.darkSrc && 'dark:hidden',
+              asset.invertInDark && 'dark:invert'
+            )}
+          />
+          {asset.darkSrc && (
+            <img
+              src={asset.darkSrc}
+              alt={asset.name}
+              width={24}
+              height={24}
+              className="hidden size-full object-contain dark:block"
+            />
+          )}
+        </>
       ) : (
         <KeyRound
           className="size-4 text-muted-foreground"
