@@ -1296,7 +1296,12 @@ pub async fn update_environment_settings(
     // make that guard pointless. `password`/`security` are the only control
     // on whether the platform proxy serves this granted project's container
     // publicly on its subdomain (the private-address bind only protects the
-    // *published host port*, not the proxy route).
+    // *published host port*, not the proxy route); `force_https`/
+    // `attack_mode` are the two other proxy-level protections on that same
+    // public URL -- disabling the HTTPS redirect makes an operator's
+    // environment password interceptable on-path, and disabling the CAPTCHA
+    // challenge removes the other half of what stands in front of a
+    // host-root-equivalent service's public endpoint.
     if settings.branch.is_some()
         || settings.automatic_deploy.is_some()
         || settings.protected.is_some()
@@ -1305,6 +1310,8 @@ pub async fn update_environment_settings(
         || settings.exposed_port.is_some()
         || settings.password.is_some()
         || settings.security.is_some()
+        || settings.force_https.is_some()
+        || settings.attack_mode.is_some()
     {
         require_granted_project_write_authority(
             &state.environment_service,
