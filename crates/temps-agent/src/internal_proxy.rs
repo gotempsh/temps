@@ -48,6 +48,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,7 +57,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
@@ -86,6 +87,8 @@ const ACME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACME_CACHE_CAPACITY: usize = 256;
 const ACME_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const ACME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
+const ACME_GCRA_PERIOD_MICROS: u64 = 500_000;
+const ACME_GCRA_BURST_TOLERANCE_MICROS: u64 = 1_500_000;
 
 /// Hop-by-hop headers per RFC 7230 §6.1. Lowercased so comparison is
 /// trivial (axum normalises, but be explicit).
@@ -176,33 +179,55 @@ struct ProxyState {
     acme_relay: Arc<AcmeRelayState>,
 }
 
+#[derive(Clone)]
 struct AcmeCacheEntry {
     value: Option<String>,
     expires_at: Instant,
 }
 
-struct AcmeRateBudget {
-    tokens: f64,
-    updated_at: Instant,
-    cache: HashMap<String, AcmeCacheEntry>,
-}
-
 struct AcmeRelayState {
-    budget: Mutex<AcmeRateBudget>,
+    started_at: Instant,
+    theoretical_arrival_micros: AtomicU64,
+    cache: arc_swap::ArcSwap<HashMap<String, AcmeCacheEntry>>,
     concurrency: Semaphore,
 }
 
 impl AcmeRelayState {
     fn new() -> Self {
         Self {
-            budget: Mutex::new(AcmeRateBudget {
-                tokens: 4.0,
-                updated_at: Instant::now(),
-                cache: HashMap::new(),
-            }),
+            started_at: Instant::now(),
+            theoretical_arrival_micros: AtomicU64::new(0),
+            cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             concurrency: Semaphore::new(2),
         }
     }
+
+    fn try_take(&self) -> bool {
+        self.try_take_at(duration_micros(self.started_at.elapsed()))
+    }
+
+    fn try_take_at(&self, now_micros: u64) -> bool {
+        loop {
+            let current = self.theoretical_arrival_micros.load(Ordering::Acquire);
+            if current > now_micros.saturating_add(ACME_GCRA_BURST_TOLERANCE_MICROS) {
+                return false;
+            }
+            let next = current
+                .max(now_micros)
+                .saturating_add(ACME_GCRA_PERIOD_MICROS);
+            if self
+                .theoretical_arrival_micros
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -503,23 +528,18 @@ async fn proxy_acme_challenge(state: &ProxyState, host: &str, req: Request) -> R
         );
     };
     let cache_key = format!("{host}\0{token}");
-    {
-        let mut budget = state.acme_relay.budget.lock();
-        let now = Instant::now();
-        budget.cache.retain(|_, entry| entry.expires_at > now);
-        if let Some(entry) = budget.cache.get(&cache_key) {
+    let cache = state.acme_relay.cache.load();
+    if let Some(entry) = cache.get(&cache_key) {
+        if entry.expires_at > Instant::now() {
             return match &entry.value {
                 Some(value) => Response::new(Body::from(value.clone())),
                 None => error_body(StatusCode::NOT_FOUND, "ACME challenge not available"),
             };
         }
-        let elapsed = now.duration_since(budget.updated_at).as_secs_f64();
-        budget.tokens = (budget.tokens + elapsed * 2.0).min(4.0);
-        budget.updated_at = now;
-        if budget.tokens < 1.0 {
-            return acme_rate_limited();
-        }
-        budget.tokens -= 1.0;
+    }
+    drop(cache);
+    if !state.acme_relay.try_take() {
+        return acme_rate_limited();
     }
     let Ok(_lookup_permit) = state.acme_relay.concurrency.try_acquire() else {
         return acme_rate_limited();
@@ -585,24 +605,29 @@ fn acme_rate_limited() -> Response {
 }
 
 fn cache_acme_result(state: &ProxyState, key: String, value: Option<String>, ttl: Duration) {
-    let mut budget = state.acme_relay.budget.lock();
-    if budget.cache.len() >= ACME_CACHE_CAPACITY {
-        if let Some(oldest) = budget
-            .cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.expires_at)
-            .map(|(key, _)| key.clone())
-        {
-            budget.cache.remove(&oldest);
+    let expires_at = Instant::now() + ttl;
+    state.acme_relay.cache.rcu(|current| {
+        let mut cache = (**current).clone();
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= ACME_CACHE_CAPACITY {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
         }
-    }
-    budget.cache.insert(
-        key,
-        AcmeCacheEntry {
-            value,
-            expires_at: Instant::now() + ttl,
-        },
-    );
+        cache.insert(
+            key.clone(),
+            AcmeCacheEntry {
+                value: value.clone(),
+                expires_at,
+            },
+        );
+        Arc::new(cache)
+    });
 }
 
 async fn caller_may_access_route(
@@ -1089,20 +1114,37 @@ where
 {
     let (client_read, client_write) = tokio::io::split(client);
     let (backend_read, backend_write) = tokio::io::split(backend);
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let activity_origin = Instant::now();
+    let last_activity_micros = Arc::new(AtomicU64::new(0));
     let tunnel = async {
         tokio::try_join!(
-            copy_tunnel_direction(client_read, backend_write, Arc::clone(&last_activity)),
-            copy_tunnel_direction(backend_read, client_write, Arc::clone(&last_activity))
+            copy_tunnel_direction(
+                client_read,
+                backend_write,
+                activity_origin,
+                Arc::clone(&last_activity_micros)
+            ),
+            copy_tunnel_direction(
+                backend_read,
+                client_write,
+                activity_origin,
+                Arc::clone(&last_activity_micros)
+            )
         )
     };
     tokio::pin!(tunnel);
     let result = loop {
-        let deadline = *last_activity.lock() + idle_timeout;
+        let observed = last_activity_micros.load(Ordering::Acquire);
+        let deadline = activity_origin + Duration::from_micros(observed) + idle_timeout;
         tokio::select! {
             result = &mut tunnel => break result,
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                if last_activity.lock().elapsed() >= idle_timeout {
+                let elapsed_since_observed = activity_origin
+                    .elapsed()
+                    .saturating_sub(Duration::from_micros(observed));
+                if elapsed_since_observed >= idle_timeout
+                    && last_activity_micros.load(Ordering::Acquire) == observed
+                {
                     break Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "tunnel idle timeout",
@@ -1117,7 +1159,8 @@ where
 async fn copy_tunnel_direction<R, W>(
     mut reader: R,
     mut writer: W,
-    last_activity: Arc<Mutex<Instant>>,
+    activity_origin: Instant,
+    last_activity_micros: Arc<AtomicU64>,
 ) -> std::io::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1142,7 +1185,10 @@ where
         )
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tunnel write timeout"))??;
-        *last_activity.lock() = Instant::now();
+        last_activity_micros.fetch_max(
+            duration_micros(activity_origin.elapsed()),
+            Ordering::Release,
+        );
         copied = copied.saturating_add(read as u64);
     }
 }
@@ -1610,6 +1656,41 @@ mod tests {
         assert!(project_a.concurrency.try_acquire().is_err());
         drop((first, second));
         assert!(project_a.concurrency.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn acme_gcra_allows_burst_four_and_refills_twice_per_second() {
+        let relay = AcmeRelayState::new();
+        for _ in 0..4 {
+            assert!(relay.try_take_at(0));
+        }
+        assert!(!relay.try_take_at(0));
+        assert!(relay.try_take_at(ACME_GCRA_PERIOD_MICROS));
+        assert!(!relay.try_take_at(ACME_GCRA_PERIOD_MICROS));
+        assert!(relay.try_take_at(ACME_GCRA_PERIOD_MICROS * 2));
+    }
+
+    #[test]
+    fn acme_gcra_concurrent_callers_cannot_exceed_global_burst() {
+        let relay = Arc::new(AcmeRelayState::new());
+        let start = Arc::new(std::sync::Barrier::new(17));
+        let callers = (0..16)
+            .map(|_| {
+                let relay = Arc::clone(&relay);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    relay.try_take_at(0)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let admitted = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("rate-limit caller completes"))
+            .filter(|allowed| *allowed)
+            .count();
+        assert_eq!(admitted, 4);
     }
 
     #[tokio::test]
