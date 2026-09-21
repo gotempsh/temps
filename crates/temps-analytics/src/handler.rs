@@ -1078,6 +1078,43 @@ pub async fn get_session_logs(
     }
 }
 
+/// Largest serialized `custom_data` a deployment token may write per call.
+const MAX_TOKEN_ENRICHMENT_BYTES: usize = 8 * 1024;
+/// Most top-level keys a deployment token may write per call.
+const MAX_TOKEN_ENRICHMENT_KEYS: usize = 32;
+
+/// Bound what a machine credential baked into a container can write into a
+/// visitor row: a flat JSON object of limited size and key count.
+fn validate_token_enrichment_data(custom_data: &serde_json::Value) -> Result<(), Problem> {
+    let Some(map) = custom_data.as_object() else {
+        return Err(bad_request()
+            .title("Invalid Enrichment Data")
+            .detail("custom_data must be a JSON object")
+            .build());
+    };
+    if map.len() > MAX_TOKEN_ENRICHMENT_KEYS {
+        return Err(bad_request()
+            .title("Invalid Enrichment Data")
+            .detail(format!(
+                "custom_data has {} keys; deployment tokens may set at most {}",
+                map.len(),
+                MAX_TOKEN_ENRICHMENT_KEYS
+            ))
+            .build());
+    }
+    let size = custom_data.to_string().len();
+    if size > MAX_TOKEN_ENRICHMENT_BYTES {
+        return Err(bad_request()
+            .title("Invalid Enrichment Data")
+            .detail(format!(
+                "custom_data is {} bytes; deployment tokens may send at most {}",
+                size, MAX_TOKEN_ENRICHMENT_BYTES
+            ))
+            .build());
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     tag = "Analytics",
     put,
@@ -1122,7 +1159,14 @@ pub async fn enrich_visitor(
             "Deployment tokens can only enrich a visitor identified by its \
              encrypted visitor ID (enc_...) from the _temps_visitor_id cookie",
         )
+        .permission_denial(
+            temps_core::problemdetails::PermissionDenialKind::DeploymentTokenNotAllowed,
+            None,
+        )
         .build());
+    }
+    if auth.is_deployment_token() {
+        validate_token_enrichment_data(&request.custom_data)?;
     }
 
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
@@ -2112,5 +2156,36 @@ mod api_traffic_window_tests {
         assert!(!api_summary_permissions_granted(true, false));
         assert!(!api_summary_permissions_granted(false, true));
         assert!(!api_summary_permissions_granted(false, false));
+    }
+}
+
+#[cfg(test)]
+mod enrich_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn token_enrichment_accepts_small_object() {
+        assert!(validate_token_enrichment_data(&json!({"user_id": "u1"})).is_ok());
+    }
+
+    #[test]
+    fn token_enrichment_rejects_non_object() {
+        assert!(validate_token_enrichment_data(&json!(["a"])).is_err());
+        assert!(validate_token_enrichment_data(&json!("s")).is_err());
+    }
+
+    #[test]
+    fn token_enrichment_rejects_too_many_keys() {
+        let map: serde_json::Map<String, serde_json::Value> = (0..=MAX_TOKEN_ENRICHMENT_KEYS)
+            .map(|i| (format!("k{i}"), json!(1)))
+            .collect();
+        assert!(validate_token_enrichment_data(&serde_json::Value::Object(map)).is_err());
+    }
+
+    #[test]
+    fn token_enrichment_rejects_oversized_payload() {
+        let big = "x".repeat(MAX_TOKEN_ENRICHMENT_BYTES);
+        assert!(validate_token_enrichment_data(&json!({ "blob": big })).is_err());
     }
 }

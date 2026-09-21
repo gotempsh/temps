@@ -2084,7 +2084,10 @@ impl Analytics for AnalyticsService {
         let Some(visitor_model) = visitor else {
             return Ok(EnrichVisitorResponse {
                 success: false,
-                visitor_id: actual_visitor_id,
+                // Echo the caller's own input, never the decrypted plaintext:
+                // the cookie key is shared with auth cookies, so returning it
+                // would make this endpoint a decryption oracle.
+                visitor_id: visitor_guid.to_string(),
                 message: "Visitor not found".to_string(),
             });
         };
@@ -2119,7 +2122,7 @@ impl Analytics for AnalyticsService {
 
         Ok(EnrichVisitorResponse {
             success: true,
-            visitor_id: actual_visitor_id,
+            visitor_id: visitor_guid.to_string(),
             message: "Visitor enriched successfully".to_string(),
         })
     }
@@ -4961,6 +4964,10 @@ mod tests {
             .enrich_visitor_by_guid(&sealed, Some(visitor.project_id + 1), data.clone())
             .await?;
         assert!(!other.success, "cross-project enrichment must be refused");
+        assert_eq!(
+            other.visitor_id, sealed,
+            "must not echo decrypted plaintext"
+        );
         let unchanged = temps_entities::visitor::Entity::find_by_id(visitor.id)
             .one(db.as_ref())
             .await?
