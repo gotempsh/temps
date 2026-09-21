@@ -107,6 +107,11 @@ impl TempsPlugin for AnalyticsPlugin {
             project_access_checker,
             api_traffic_service,
             audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            // At most 30 enrichment audit rows per token per minute.
+            audit_throttle: Arc::new(crate::visitor_audit::AuditThrottle::new(
+                30,
+                std::time::Duration::from_secs(60),
+            )),
         });
 
         // ADR-040 ingest-key admin CRUD. Its own state so the key service and

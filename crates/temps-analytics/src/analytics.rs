@@ -246,9 +246,9 @@ pub const MAX_SCOPED_ENRICHMENT_BYTES: usize = 8 * 1024;
 pub const MAX_SCOPED_ENRICHMENT_KEYS: usize = 32;
 
 /// Bound what a machine credential baked into a container can store on a
-/// visitor row: a JSON object of limited size and key count. Applied to both
-/// the incoming payload and the merged document, so repeated calls with fresh
-/// keys cannot grow a row without limit.
+/// visitor row: a JSON object of limited size and key count. Applied to the
+/// merged document, so repeated calls with fresh keys cannot grow a row
+/// without limit.
 pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(), AnalyticsError> {
     let Some(map) = custom_data.as_object() else {
         return Err(AnalyticsError::InvalidEnrichmentData(
@@ -257,7 +257,7 @@ pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(),
     };
     if map.len() > MAX_SCOPED_ENRICHMENT_KEYS {
         return Err(AnalyticsError::InvalidEnrichmentData(format!(
-            "custom_data would have {} keys; at most {} are allowed",
+            "custom_data would have {} keys after this change; at most {} are allowed",
             map.len(),
             MAX_SCOPED_ENRICHMENT_KEYS
         )));
@@ -265,12 +265,48 @@ pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(),
     let size = custom_data.to_string().len();
     if size > MAX_SCOPED_ENRICHMENT_BYTES {
         return Err(AnalyticsError::InvalidEnrichmentData(format!(
-            "custom_data would be {} bytes; at most {} are allowed",
+            "custom_data would be {} bytes after this change; at most {} are allowed",
             size, MAX_SCOPED_ENRICHMENT_BYTES
         )));
     }
     Ok(())
 }
+
+/// `(top-level key count, serialized bytes)` of a `custom_data` document.
+fn custom_data_footprint(custom_data: Option<&serde_json::Value>) -> (usize, usize) {
+    custom_data.map_or((0, 0), |value| {
+        (
+            value.as_object().map_or(0, |map| map.len()),
+            value.to_string().len(),
+        )
+    })
+}
+
+/// Validate the document a project-scoped write would leave behind.
+///
+/// A row that an unscoped caller already pushed past the cap stays editable by
+/// a scoped caller as long as the write does not make it larger, so identity
+/// enrichment does not stop working for that visitor; it just can't grow it.
+fn validate_scoped_merge(
+    existing: Option<&serde_json::Value>,
+    merged: &serde_json::Value,
+) -> Result<(), AnalyticsError> {
+    match validate_scoped_enrichment(merged) {
+        Ok(()) => Ok(()),
+        Err(error) if merged.is_object() => {
+            let (existing_keys, existing_bytes) = custom_data_footprint(existing);
+            let (merged_keys, merged_bytes) = custom_data_footprint(Some(merged));
+            if merged_keys <= existing_keys && merged_bytes <= existing_bytes {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+const ENRICHED_MESSAGE: &str = "Visitor enriched successfully";
 
 fn visitor_not_found(visitor_id: String) -> EnrichVisitorResponse {
     EnrichVisitorResponse {
@@ -282,21 +318,26 @@ fn visitor_not_found(visitor_id: String) -> EnrichVisitorResponse {
     }
 }
 
-/// Merge `incoming` into `existing` at the top level. Anything that is not an
-/// object on both sides is replaced by `incoming`.
+/// Merge `incoming` into `existing` at the top level; a `null` value removes
+/// the key. Anything that is not an object on both sides is replaced by
+/// `incoming`.
 fn merge_custom_data(
     existing: Option<&serde_json::Value>,
     incoming: &serde_json::Value,
 ) -> serde_json::Value {
     match (existing.and_then(|v| v.as_object()), incoming.as_object()) {
-        (Some(existing), Some(incoming)) => {
-            let mut merged = existing.clone();
+        (existing, Some(incoming)) => {
+            let mut merged = existing.cloned().unwrap_or_default();
             for (key, value) in incoming {
-                merged.insert(key.clone(), value.clone());
+                if value.is_null() {
+                    merged.remove(key);
+                } else {
+                    merged.insert(key.clone(), value.clone());
+                }
             }
             serde_json::Value::Object(merged)
         }
-        _ => incoming.clone(),
+        (_, None) => incoming.clone(),
     }
 }
 
@@ -316,18 +357,24 @@ impl AnalyticsService {
         use temps_entities::visitor;
 
         let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
-        if project_scoped {
-            validate_scoped_enrichment(&merged)?;
-        }
         let visitor_row_id = visitor_model.id;
-        if visitor_model.custom_data.as_ref() == Some(&merged) {
+        // Nothing to store: an identical document, or removing keys from a row
+        // that has no data. Identical text for both outcomes, so a caller that
+        // may only write cannot tell "already had this value" from "just set it".
+        let unchanged = visitor_model.custom_data.as_ref() == Some(&merged)
+            || (visitor_model.custom_data.is_none()
+                && merged.as_object().is_some_and(|map| map.is_empty()));
+        if unchanged {
             return Ok(EnrichVisitorResponse {
                 success: true,
                 visitor_id: response_visitor_id,
-                message: "Visitor already up to date".to_string(),
+                message: ENRICHED_MESSAGE.to_string(),
                 updated: false,
                 visitor_row_id: Some(visitor_row_id),
             });
+        }
+        if project_scoped {
+            validate_scoped_merge(visitor_model.custom_data.as_ref(), &merged)?;
         }
 
         let mut active_model: visitor::ActiveModel = visitor_model.into();
@@ -340,7 +387,7 @@ impl AnalyticsService {
         Ok(EnrichVisitorResponse {
             success: true,
             visitor_id: response_visitor_id,
-            message: "Visitor enriched successfully".to_string(),
+            message: ENRICHED_MESSAGE.to_string(),
             updated: true,
             visitor_row_id: Some(visitor_row_id),
         })
@@ -5089,6 +5136,44 @@ mod tests {
 
         cleanup_test_analytics!(db);
         Ok(())
+    }
+
+    #[test]
+    fn merge_custom_data_merges_and_null_removes_keys() {
+        let existing = serde_json::json!({"a": 1, "b": 2});
+        let merged = merge_custom_data(Some(&existing), &serde_json::json!({"b": null, "c": 3}));
+        assert_eq!(merged, serde_json::json!({"a": 1, "c": 3}));
+        // No existing data: nulls are simply dropped.
+        let fresh = merge_custom_data(None, &serde_json::json!({"a": null, "b": 1}));
+        assert_eq!(fresh, serde_json::json!({"b": 1}));
+        // A non-object incoming value replaces, as before.
+        assert_eq!(
+            merge_custom_data(Some(&existing), &serde_json::json!([1])),
+            serde_json::json!([1])
+        );
+    }
+
+    #[test]
+    fn scoped_merge_may_shrink_or_hold_an_oversized_row_but_not_grow_it() {
+        let big: serde_json::Map<String, serde_json::Value> = (0..MAX_SCOPED_ENRICHMENT_KEYS + 8)
+            .map(|i| (format!("k{i}"), serde_json::json!(1)))
+            .collect();
+        let existing = serde_json::Value::Object(big.clone());
+        // Same size: allowed. One fewer key: allowed. One more key: rejected.
+        assert!(validate_scoped_merge(Some(&existing), &existing).is_ok());
+        let mut smaller = big.clone();
+        smaller.remove("k0");
+        assert!(
+            validate_scoped_merge(Some(&existing), &serde_json::Value::Object(smaller)).is_ok()
+        );
+        let mut larger = big;
+        larger.insert("extra".to_string(), serde_json::json!(1));
+        assert!(matches!(
+            validate_scoped_merge(Some(&existing), &serde_json::Value::Object(larger)),
+            Err(AnalyticsError::InvalidEnrichmentData(_))
+        ));
+        // A fresh document over the cap is rejected outright.
+        assert!(validate_scoped_merge(None, &existing).is_err());
     }
 
     #[tokio::test]

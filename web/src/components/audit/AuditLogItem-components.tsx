@@ -8,9 +8,15 @@ import { Button } from '@/components/ui/button'
 import { TableCell, TableRow } from '@/components/ui/table'
 import { describePermissionDenial } from '@/lib/permission-denial-display'
 import { pluginAuditActor } from '@/lib/plugin-audit-actor'
+import {
+  VISITOR_ENRICHED_OPERATION,
+  deploymentTokenAuditActor,
+  describeVisitorEnrichment,
+  type DeploymentTokenAuditActor,
+} from '@/lib/visitor-enrich-audit'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
-import { ChevronDown, ChevronRight, Plug } from 'lucide-react'
+import { ChevronDown, ChevronRight, KeyRound, Plug } from 'lucide-react'
 import { ReactNode, useState } from 'react'
 import { Link } from 'react-router'
 import {
@@ -390,6 +396,10 @@ function describe(
     case 'KV_SERVICE_DISABLED':
       return 'Disabled KV storage'
 
+    // Analytics
+    case VISITOR_ENRICHED_OPERATION:
+      return describeVisitorEnrichment(data)
+
     // Platform
     case 'SETTINGS_UPDATED':
       return 'Updated platform settings'
@@ -411,6 +421,60 @@ function describe(
   }
 }
 
+/** How a deployment token is named in the Actor column and on mobile. */
+function deploymentTokenLabel(actor: DeploymentTokenAuditActor): string {
+  return actor.name ? `Deployment token · ${actor.name}` : 'Deployment token'
+}
+
+/**
+ * Who performed the action. Records written by a non-user actor (a plugin, or
+ * a deployment token enriching a visitor) carry their identity in the payload —
+ * showing "system" for those would hide which credential did the write.
+ */
+function actorCell(
+  user: AuditLogUserInfo | undefined,
+  pluginActor: { id: string; name: string } | null,
+  tokenActor: DeploymentTokenAuditActor | null
+): ReactNode {
+  if (pluginActor) {
+    return (
+      <div title={`Plugin actor ${pluginActor.id}`}>
+        <span className="inline-flex items-center gap-1.5">
+          <Plug className="size-3.5" aria-hidden="true" />
+          {pluginActor.name}
+        </span>
+        <span className="block text-xs text-muted-foreground">
+          {user ? `Plugin acting for ${user.name}` : 'Plugin'}
+        </span>
+      </div>
+    )
+  }
+  if (tokenActor) {
+    return (
+      <div
+        title={
+          tokenActor.id != null
+            ? `Deployment token #${tokenActor.id}`
+            : 'Deployment token'
+        }
+      >
+        <span className="inline-flex items-center gap-1.5">
+          <KeyRound className="size-3.5" aria-hidden="true" />
+          {deploymentTokenLabel(tokenActor)}
+        </span>
+        <span className="block text-xs text-muted-foreground">
+          {tokenActor.id != null
+            ? `Token #${tokenActor.id}`
+            : 'No user account'}
+        </span>
+      </div>
+    )
+  }
+  return (
+    user?.name ?? <span className="text-muted-foreground italic">system</span>
+  )
+}
+
 export function AuditLogItemRow({
   operation_type,
   audit_date,
@@ -424,6 +488,11 @@ export function AuditLogItemRow({
   const Icon = meta.icon
   const hasData = data && Object.keys(data).length > 0
   const pluginActor = pluginAuditActor(operation_type, data)
+  // A deployment token has no `users` row, so it only stands in where the
+  // record genuinely has no user attached.
+  const tokenActor = user
+    ? null
+    : deploymentTokenAuditActor(operation_type, data)
   const location = ip_address
     ? [ip_address.city, ip_address.country].filter(Boolean).join(', ')
     : ''
@@ -464,23 +533,14 @@ export function AuditLogItemRow({
               Plugin: {pluginActor.name}
             </div>
           )}
+          {tokenActor && (
+            <div className="mt-1 text-xs text-muted-foreground md:hidden">
+              {deploymentTokenLabel(tokenActor)}
+            </div>
+          )}
         </TableCell>
         <TableCell className="hidden md:table-cell text-sm">
-          {pluginActor ? (
-            <div title={`Plugin actor ${pluginActor.id}`}>
-              <span className="inline-flex items-center gap-1.5">
-                <Plug className="size-3.5" aria-hidden="true" />
-                {pluginActor.name}
-              </span>
-              <span className="block text-xs text-muted-foreground">
-                {user ? `Plugin acting for ${user.name}` : 'Plugin'}
-              </span>
-            </div>
-          ) : (
-            (user?.name ?? (
-              <span className="text-muted-foreground italic">system</span>
-            ))
-          )}
+          {actorCell(user, pluginActor, tokenActor)}
         </TableCell>
         <TableCell className="hidden lg:table-cell text-sm text-muted-foreground">
           {ip_address ? (

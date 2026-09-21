@@ -33,6 +33,8 @@ pub struct AppState {
     pub api_traffic_service: Arc<ApiTrafficService>,
     /// Audit trail for writes made through this module's handlers.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Caps the enrichment audit rows a single deployment token can create.
+    pub audit_throttle: Arc<crate::visitor_audit::AuditThrottle>,
 }
 
 #[derive(OpenApi)]
@@ -1125,8 +1127,7 @@ fn deployment_token_enrich_guard(
     ),
     request_body = EnrichVisitorRequest,
     responses(
-        (status = 200, description = "Successfully enriched visitor data", body = EnrichVisitorResponse),
-        (status = 404, description = "Visitor not found"),
+        (status = 200, description = "Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed.", body = EnrichVisitorResponse),
         (status = 400, description = "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"),
         (status = 403, description = "Deployment token used with a non-encrypted visitor ID"),
         (status = 500, description = "Internal server error")
@@ -1135,6 +1136,14 @@ fn deployment_token_enrich_guard(
         ("bearer_auth" = [])
     )
 )]
+/// Attach attributes (for example the signed-in user's id, name and email) to a
+/// visitor.
+///
+/// The top-level keys of `custom_data` are merged into what is already stored;
+/// a key set to `null` is removed. A deployed app can call this with its
+/// injected deployment token (permission `visitors:enrich`), using the sealed
+/// `enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own
+/// project only.
 pub async fn enrich_visitor(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
@@ -1150,11 +1159,12 @@ pub async fn enrich_visitor(
         deployment_token_enrich_guard(&visitor_id, &request.custom_data)?;
     }
 
-    // Names only: values are routinely personal data and stay out of the audit trail.
-    let custom_data_keys: Vec<String> = request
+    // Names only, bounded: values are routinely personal data and stay out of the
+    // audit trail, and key names are caller-chosen so they are truncated.
+    let (custom_data_keys, custom_data_key_count) = request
         .custom_data
         .as_object()
-        .map(|map| map.keys().cloned().collect())
+        .map(|map| crate::visitor_audit::bounded_key_names(map.keys()))
         .unwrap_or_default();
 
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
@@ -1171,7 +1181,20 @@ pub async fn enrich_visitor(
     };
     let response = result.map_err(handle_analytics_error)?;
 
-    if response.updated {
+    let audit_decision = match (response.updated, auth.deployment_token_info()) {
+        (false, _) => None,
+        (true, Some(token)) => Some(app_state.audit_throttle.decide(token.token_id)),
+        (true, None) => Some(crate::visitor_audit::AuditDecision::Record),
+    };
+    if audit_decision == Some(crate::visitor_audit::AuditDecision::SuppressFirst) {
+        // The enrichment above still happened; only its audit row is dropped.
+        tracing::warn!(
+            project_id = ?scope_project_id,
+            "Visitor enrichment audit rows are being dropped for a deployment token \
+             that exceeded its per-minute audit budget"
+        );
+    }
+    if audit_decision == Some(crate::visitor_audit::AuditDecision::Record) {
         let token = auth.deployment_token_info();
         let audit = crate::visitor_audit::VisitorEnrichedAudit {
             context: temps_core::AuditContext {
@@ -1189,6 +1212,7 @@ pub async fn enrich_visitor(
             project_id: scope_project_id,
             visitor_row_id: response.visitor_row_id,
             custom_data_keys,
+            custom_data_key_count,
         };
         // A failed audit write must not fail the enrichment that already happened.
         if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -2277,6 +2301,10 @@ mod enrich_handler_tests {
                 Arc::new(UnavailableAi),
             )),
             audit_service: audit.clone(),
+            audit_throttle: Arc::new(crate::visitor_audit::AuditThrottle::new(
+                30,
+                std::time::Duration::from_secs(60),
+            )),
         });
         let call = |auth: AuthContext, id: &str, data: serde_json::Value| {
             let state = state.clone();
@@ -2363,6 +2391,9 @@ mod enrich_handler_tests {
         .await
         .expect("same-project enrichment succeeds");
         assert_eq!(ok.status(), StatusCode::OK);
+        let written_body = axum::body::to_bytes(ok.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         assert_eq!(
             stored().await,
             Some(json!({"user_id": "u1", "email": "a@b.example"}))
@@ -2381,7 +2412,7 @@ mod enrich_handler_tests {
         }
 
         // Re-sending the same identity is a no-op: no rewrite, no second audit row.
-        call(
+        let noop = call(
             can_enrich(),
             &sealed,
             json!({"user_id": "u1", "email": "a@b.example"}),
@@ -2389,6 +2420,13 @@ mod enrich_handler_tests {
         .await
         .expect("idempotent enrichment succeeds");
         assert_eq!(audit.0.lock().unwrap().len(), 1);
+        let noop_body = axum::body::to_bytes(noop.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            written_body, noop_body,
+            "a write-only caller must not be able to tell a no-op from a write"
+        );
 
         // Later enrichment merges instead of replacing what is already stored.
         call(can_enrich(), &sealed, json!({"name": "Ada"}))
@@ -2399,6 +2437,21 @@ mod enrich_handler_tests {
             Some(json!({"user_id": "u1", "email": "a@b.example", "name": "Ada"}))
         );
         assert_eq!(audit.0.lock().unwrap().len(), 2);
+
+        // A null value removes the key, and the audit entry names it.
+        call(can_enrich(), &sealed, json!({"name": null}))
+            .await
+            .expect("removal succeeds");
+        assert_eq!(
+            stored().await,
+            Some(json!({"user_id": "u1", "email": "a@b.example"}))
+        );
+        {
+            let log = audit.0.lock().unwrap();
+            assert_eq!(log.len(), 3);
+            assert!(log[2].2.contains("\"custom_data_keys\":[\"name\"]"));
+            assert!(log[2].2.contains("\"custom_data_key_count\":1"));
+        }
 
         cleanup_test_analytics!(db);
     }

@@ -10,6 +10,8 @@ import {
   getVisitorSessionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VisitorJourney } from './VisitorJourney'
+import { buildEnrichPayload, isPayloadTooLargeError } from './enrich-payload'
+import { problemDetail } from '@/lib/api-problem'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -256,7 +258,16 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   // Mutation for enriching visitor data
   const enrichMutation = useMutation({
     ...enrichVisitorMutation(),
-    onSuccess: () => {
+    onSuccess: (response) => {
+      // The endpoint answers 200 with `success: false` when the visitor could
+      // not be found, so a green toast here would be a lie: nothing was saved.
+      if (response?.success === false) {
+        setEnrichJsonError(
+          response.message || 'Visitor not found — nothing was saved'
+        )
+        toast.error('Visitor not found — nothing was saved')
+        return
+      }
       toast.success('Visitor data enriched successfully')
       setIsEnrichDialogOpen(false)
       setEnrichJsonValue('')
@@ -269,9 +280,18 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         }),
       })
     },
-    onError: (error: any) => {
+    // Typed as `Error` by React Query; the generated client actually throws
+    // the parsed problem body, which is why both helpers take `unknown`.
+    onError: (error: Error) => {
+      if (isPayloadTooLargeError(error)) {
+        const description =
+          'Custom data is limited to 16 KB per visitor. Remove some keys or shorten their values and try again.'
+        setEnrichJsonError(description)
+        toast.error('Custom data is too large', { description })
+        return
+      }
       toast.error('Failed to enrich visitor data', {
-        description: error?.message || 'Please try again',
+        description: problemDetail(error, 'Please try again'),
       })
     },
   })
@@ -310,9 +330,16 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
       // Use visitor_id GUID if available, otherwise use numeric ID
       const visitorIdToUse = visitorDetails?.visitor_id || visitorId.toString()
 
+      // The API merges, so keys the operator deleted from the editor have to be
+      // sent explicitly as `null` to actually be removed from the visitor.
+      const custom_data = buildEnrichPayload(
+        visitorDetails?.custom_data,
+        parsedData as Record<string, unknown>
+      )
+
       enrichMutation.mutate({
         path: { visitor_id: visitorIdToUse },
-        body: { custom_data: parsedData },
+        body: { custom_data },
       })
     } catch {
       setEnrichJsonError('Invalid JSON format')
@@ -977,8 +1004,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               Enrich Visitor Data
             </DialogTitle>
             <DialogDescription>
-              Add or update custom data for this visitor. The data will be
-              merged with existing custom data. Enter valid JSON object format.
+              Edit the custom data for this visitor as a JSON object. Saving
+              merges the keys below into the visitor&rsquo;s existing custom
+              data, and any key you remove from the JSON is removed from the
+              visitor. Custom data is limited to 16 KB per visitor.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -1011,6 +1040,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                   <code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code>
                 </li>
               </ul>
+              <p className="mt-2">
+                Delete a key from the JSON above to remove it from the visitor;
+                every key you leave in place is merged into the stored data.
+              </p>
             </div>
           </div>
           <DialogFooter>
