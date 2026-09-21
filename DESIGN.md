@@ -377,8 +377,8 @@ shared registry currently includes GitHub, GitLab, OpenAI, and Anthropic.
   Use transparent SVGs in both themes, never raster favicons or opaque backing
   chips. Use the supplied white SVG in dark mode for monochrome marks; a
   currentColor monochrome SVG may invert to white. Keep full-color marks unchanged.
-  Use a 24px-high slot (24px wide for symbols; 80px for the Anthropic wordmark)
-  and contain the asset without cropping. Keep a text name nearby
+  Use a fixed 24px square slot and contain the symbol without cropping.
+  Anthropic uses the compact A-and-slash company symbol, never its full wordmark. Keep a text name nearby
   and expose the provider name as image alt text.
 - Add a provider only with an official source URL, retrieval date, original-byte
   SHA-256, and light/dark visual verification. Provenance lives beside the shared
@@ -389,5 +389,6 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 [GitLab press kit](https://about.gitlab.com/press/press-kit/),
 [OpenAI design guidelines](https://openai.com/brand/) and its
 [official SVG archive](https://cdn.openai.com/brand/OpenAI-Logos-2025.zip), and
-[Anthropic's console](https://console.anthropic.com/) (inline company wordmark).
+[Anthropic's company site](https://www.anthropic.com/) (compact company symbol;
+vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.

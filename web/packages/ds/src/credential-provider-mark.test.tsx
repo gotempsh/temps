@@ -52,3 +52,20 @@ test('names, ambiguous IDs, and prototype keys never guess a company', () => {
     expect(html).not.toContain('<img')
   }
 })
+
+// Prevent substituting the wide company wordmark in compact credential rows.
+test('Anthropic uses the compact company symbol in the standard square slot', () => {
+  const svg = Buffer.from(
+    credentialProviderAssets.anthropic.src.split(',')[1],
+    'base64'
+  ).toString()
+  expect(svg).toContain('viewBox="0 0 24 24"')
+  expect(svg).toContain('M17.3041 3.541h-3.6718')
+  const html = renderToStaticMarkup(
+    <CredentialProviderMark provider="anthropic" />
+  )
+  expect(html).toContain('width="24"')
+  expect(html).toContain('size-6')
+  expect(html).not.toContain('w-20')
+  expect(html).toContain('dark:invert')
+})

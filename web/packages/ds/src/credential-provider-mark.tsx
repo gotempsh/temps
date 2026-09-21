@@ -23,8 +23,7 @@ export function CredentialProviderMark({
   return (
     <span
       className={cn(
-        'inline-flex h-6 shrink-0 items-center justify-center',
-        asset?.wordmark ? 'w-20' : 'w-6',
+        'inline-flex size-6 shrink-0 items-center justify-center',
         className
       )}
     >
@@ -33,7 +32,7 @@ export function CredentialProviderMark({
           <img
             src={asset.src}
             alt={asset.name}
-            width={asset.wordmark ? 80 : 24}
+            width={24}
             height={24}
             className={cn(
               'size-full object-contain',
