@@ -566,7 +566,14 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
                 domain: "app.example.test".to_string(),
                 ciphertext: encrypted.ciphertext,
                 nonce: encrypted.nonce,
-                fingerprint: temps_core::ecies::cert_fingerprint(signed.cert_pem.trim()),
+                // Fingerprint the certificate exactly as `decrypt_certified_key` will
+                // re-extract it from the encrypted payload below: it strips only the
+                // single `\n` separator this test's own `format!` inserts, leaving
+                // rcgen's own trailing newline on `signed.cert_pem` intact. Trimming
+                // here (as an earlier version of this test did) fingerprints a
+                // different string than what gets compared against on decrypt and
+                // makes every handshake fail with a bogus fingerprint mismatch.
+                fingerprint: temps_core::ecies::cert_fingerprint(&signed.cert_pem),
             }],
         }),
         unsupported_route_count: 0,
