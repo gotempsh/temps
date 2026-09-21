@@ -89,6 +89,32 @@ pub enum WorkflowError {
     /// an ordinary build/deploy failure.
     #[error("{0}")]
     LocalWorkloadsDisabled(String),
+
+    /// A deployment the scheduler gated on the host Docker socket (ADR 045)
+    /// was started by a host that reported it did **not** mount it.
+    ///
+    /// This is a hard failure rather than a log line because the two possible
+    /// causes are both things the operator must see: the host's own
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS` disagrees with the control plane's
+    /// declaration (a half-finished configuration change, or an agent that was
+    /// never restarted), or the placement gate was bypassed. Accepting the
+    /// deployment would leave a service whose entire purpose is the socket
+    /// running without it, reported as healthy.
+    #[error(
+        "Deployment of project '{project_slug}' was placed on host '{node}' because it requires \
+         host Docker access (ADR 045), but that host reported it did not mount \
+         /var/run/docker.sock. Set {env}={project_slug} on '{node}' — `temps agent` on a worker \
+         node, `temps serve` on the control plane — and restart it, then redeploy"
+    )]
+    DockerSocketNotMounted {
+        /// Node name the replica was placed on (`control-plane` for local).
+        node: String,
+        /// Project whose deployment was gated.
+        project_slug: String,
+        /// Variable to set, carried in the message so it cannot drift from
+        /// the one the deployer actually reads.
+        env: &'static str,
+    },
 }
 
 /// Trait for writing logs in real-time during workflow execution

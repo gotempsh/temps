@@ -424,7 +424,7 @@ mod public_repo_tests {
         env_vars.insert("HOST".to_string(), "0.0.0.0".to_string());
         env_vars.insert("HOSTNAME".to_string(), "0.0.0.0".to_string());
 
-        let deploy_job = DeployImageJobBuilder::new()
+        let deploy_job = DeployImageJobBuilder::new("public-repo-test")
             .job_id("deploy_public_repo".to_string())
             .build_job_id("build_public_repo".to_string())
             .target(DeploymentTarget::Docker {

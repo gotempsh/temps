@@ -274,7 +274,7 @@ async fn test_nodejs_three_stage_deployment() {
     env_vars.insert("NODE_ENV".to_string(), "production".to_string());
     env_vars.insert("PORT".to_string(), "3000".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
+    let deploy_job = DeployImageJobBuilder::new("nodejs-integration-test")
         .job_id("deploy_nodejs".to_string())
         .build_job_id("build_nodejs".to_string())
         .target(DeploymentTarget::Docker {

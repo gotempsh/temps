@@ -273,7 +273,7 @@ async fn test_container_cleanup_on_deployment_failure() {
     let mut env_vars = HashMap::new();
     env_vars.insert("TEST_VAR".to_string(), "test_value".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
+    let deploy_job = DeployImageJobBuilder::new("container-cleanup-test")
         .job_id("deploy_failing".to_string())
         .build_job_id("build_failing".to_string())
         .target(DeploymentTarget::Docker {

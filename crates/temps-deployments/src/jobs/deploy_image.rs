@@ -373,6 +373,19 @@ pub struct DeploymentJobConfig {
     pub exclude_node_ids: Vec<i32>,
 }
 
+/// One replica's placement, and the guarantee the scheduler attached to it.
+///
+/// A struct rather than two more positional arguments: `docker_socket_required`
+/// (ADR 045) is not a detail of the deploy call, it is the thing the executing
+/// host's self-report is checked against, and a bare `bool` at a seven-argument
+/// call site is exactly how that check would end up inverted.
+#[derive(Clone, Copy)]
+struct ReplicaTarget<'a> {
+    assignment: &'a crate::services::NodeAssignment,
+    /// Whether the scheduler gated this placement on the host Docker socket.
+    docker_socket_required: bool,
+}
+
 fn has_explicit_placement_constraints(
     target_node_ids: Option<&[i32]>,
     target_labels: Option<&serde_json::Value>,
@@ -1487,8 +1500,16 @@ impl DeployImageJob {
         .await?;
         self.validate_deployment_config(context).await?;
 
-        // Schedule replicas across nodes (or deploy locally if no scheduler/no nodes)
-        let node_assignments = if let Some(ref scheduler) = self.node_scheduler {
+        // Schedule replicas across nodes (or deploy locally if no scheduler/no nodes).
+        //
+        // The pass also reports whether the ADR-045 socket gate applied. That
+        // travels with the assignments so the deploy step can verify the host
+        // actually mounted the socket: a gated deployment the executing host
+        // silently started *without* it is a service running with none of the
+        // access it exists for, reported as healthy.
+        let (node_assignments, docker_socket_required) = if let Some(ref scheduler) =
+            self.node_scheduler
+        {
             let target_ids = self.config.target_nodes.as_deref();
             let target_labels = self.config.target_labels.as_ref();
             let has_explicit_constraints =
@@ -1555,7 +1576,7 @@ impl DeployImageJob {
                             }
                         }
                     }
-                    assignments
+                    (assignments, outcome.docker_socket_required)
                 }
                 // A cluster with no node able to run this image is a hard
                 // error: falling back to Local would deploy the very container
@@ -1583,6 +1604,19 @@ impl DeployImageJob {
                     // take the replicas. Degrading to Local would produce a
                     // "successful" deployment whose containers never start.
                     | crate::services::node_service::NodeError::LocalWorkloadsDisabled {
+                        ..
+                    }
+                    // ADR 045: no host that grants this project the Docker
+                    // socket can take it. Unreachable today — a gate only
+                    // exists when this control plane declares the project,
+                    // and declaring it also grants it here, so `Local` is
+                    // always a candidate — but that is a two-file invariant
+                    // (`declares()` delegating to `allows()`), not a property
+                    // of this match. Listing it means a future split of
+                    // "declared" from "granted" cannot silently reopen the
+                    // silent-mount-miss this ADR exists to prevent: falling
+                    // back to Local would deploy without the socket.
+                    | crate::services::node_service::NodeError::DockerSocketNotSchedulable {
                         ..
                     }),
                 ) => {
@@ -1629,7 +1663,13 @@ impl DeployImageJob {
                         ),
                     )
                     .await?;
-                    vec![crate::services::NodeAssignment::Local; self.config.replicas as usize]
+                    // No placement pass completed, so no gate was established
+                    // for this deployment — the executing host still answers
+                    // from its own environment, it is simply not verified.
+                    (
+                        vec![crate::services::NodeAssignment::Local; self.config.replicas as usize],
+                        false,
+                    )
                 }
             }
         } else {
@@ -1650,7 +1690,10 @@ impl DeployImageJob {
             let image_platforms = self.available_image_platforms(image_output).await;
             self.ensure_local_can_run(&image_platforms, context, "no node scheduler is configured")
                 .await?;
-            vec![crate::services::NodeAssignment::Local; self.config.replicas as usize]
+            (
+                vec![crate::services::NodeAssignment::Local; self.config.replicas as usize],
+                false,
+            )
         };
 
         // Deploy multiple replicas
@@ -1783,7 +1826,10 @@ impl DeployImageJob {
                     replica_index as u32,
                     health_check_override.as_deref(),
                     &deployer,
-                    assignment,
+                    ReplicaTarget {
+                        assignment,
+                        docker_socket_required,
+                    },
                 )
                 .await
             {
@@ -1922,8 +1968,12 @@ impl DeployImageJob {
         replica_index: u32,
         health_check_override: Option<&str>,
         deployer: &Arc<dyn ContainerDeployer>,
-        assignment: &crate::services::NodeAssignment,
+        target: ReplicaTarget<'_>,
     ) -> Result<(String, u16, u16), WorkflowError> {
+        let ReplicaTarget {
+            assignment,
+            docker_socket_required,
+        } = target;
         // Prepare deployment request using temps-deployer types
         self.log(context, "Deploying container image...".to_string())
             .await?;
@@ -2134,6 +2184,38 @@ impl DeployImageJob {
         // Store both the ID and its owning deployer before status checks,
         // startup log streaming, health checks, or any other fallible work.
         self.track_container(deploy_result.container_id.clone(), deployer.clone());
+
+        // ADR 045: the scheduler placed this replica here *because* the
+        // project requires the socket, and the host started it without one.
+        // Either that host's own `TEMPS_DOCKER_SOCKET_PROJECTS` disagrees with
+        // the control plane's declaration (a half-applied config change, or an
+        // agent that was never restarted) or the gate was bypassed. Accepting
+        // it would leave the workload running with none of the access it
+        // exists for, reported as healthy.
+        //
+        // Checked after `track_container` so the container this rejects is
+        // torn down with the rest of the failed deployment rather than left
+        // running untracked.
+        if docker_socket_required && !deploy_result.docker_socket_mounted {
+            let error = WorkflowError::DockerSocketNotMounted {
+                node: audited_node_name.clone(),
+                project_slug: self
+                    .config
+                    .project_slug
+                    .clone()
+                    .unwrap_or_else(|| self.config.service_name.clone()),
+                env: temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            };
+            tracing::error!(
+                node = %audited_node_name,
+                container_id = %deploy_result.container_id,
+                project_slug = self.config.project_slug.as_deref().unwrap_or("<unknown>"),
+                "Gated deployment started without the host Docker socket"
+            );
+            // The deploy log is the only place the user sees this.
+            self.log(context, format!("❌ {}", error)).await?;
+            return Err(error);
+        }
 
         // A rolling-upgrade cluster may still have an older agent that ignores
         // PortMapping.host_ip. Inspect what Docker actually published before
@@ -2867,12 +2949,25 @@ pub struct DeployImageJobBuilder {
 }
 
 impl DeployImageJobBuilder {
-    pub fn new() -> Self {
+    /// Start a deploy-image job for `project_slug`.
+    ///
+    /// The slug is a constructor argument rather than an optional setter
+    /// because omitting it is not a smaller deployment — it is a *different*
+    /// one (ADR 045): the executing host compares it against its own
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS`, and the scheduler gates placement on
+    /// it. Two call sites (rollback and promotion) silently omitted it when it
+    /// was a setter, which meant a granted project redeployed by either path
+    /// would be placed anywhere and started without its socket. A required
+    /// argument makes that omission impossible to reintroduce.
+    pub fn new(project_slug: impl Into<String>) -> Self {
         Self {
             job_id: None,
             build_job_id: None,
             target: None,
-            config: DeploymentJobConfig::default(),
+            config: DeploymentJobConfig {
+                project_slug: Some(project_slug.into()),
+                ..DeploymentJobConfig::default()
+            },
             node_scheduler: None,
             log_id: None,
             log_service: None,
@@ -2917,17 +3012,6 @@ impl DeployImageJobBuilder {
 
     pub fn namespace(mut self, namespace: String) -> Self {
         self.config.namespace = namespace;
-        self
-    }
-
-    /// Slug of the project being deployed (ADR 045).
-    ///
-    /// Set by every caller that has a project in hand. It travels to the
-    /// executing host in the `DeployRequest` so that host can evaluate its own
-    /// `TEMPS_DOCKER_SOCKET_PROJECTS`, and it gates placement so a granted
-    /// project can never land on a host that does not grant it.
-    pub fn project_slug(mut self, project_slug: impl Into<String>) -> Self {
-        self.config.project_slug = Some(project_slug.into());
         self
     }
 
@@ -3160,12 +3244,6 @@ impl DeployImageJobBuilder {
         job.audit_logger = self.audit_logger;
 
         Ok(job)
-    }
-}
-
-impl Default for DeployImageJobBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -3509,7 +3587,7 @@ mod tests {
     fn job_with_image_builder(builder: PlatformOnlyImageBuilder) -> DeployImageJob {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
-        DeployImageJobBuilder::new()
+        DeployImageJobBuilder::new("test-project")
             .job_id("deploy".to_string())
             .build_job_id("build".to_string())
             .target(DeploymentTarget::Docker {
@@ -3921,7 +3999,7 @@ mod tests {
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
         );
 
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("test_deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(target)
@@ -3954,7 +4032,7 @@ mod tests {
                 .into_connection(),
         );
         let deployer = Arc::new(TrackingMockContainerDeployer::new());
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("deploy".to_string())
             .build_job_id("build".to_string())
             .target(DeploymentTarget::Docker {
@@ -4019,11 +4097,70 @@ mod tests {
         );
     }
 
+    /// ADR 045: a gated deployment whose executing host reports it did not
+    /// mount the socket must fail, not be silently accepted.
+    #[tokio::test]
+    async fn a_gated_replica_whose_host_did_not_mount_the_socket_fails_the_deployment() {
+        let deployer: Arc<dyn ContainerDeployer> = Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new("node-daemon")
+            .build_job_id("build_image".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("node-daemon".to_string())
+            .build(deployer.clone())
+            .expect("valid deploy job");
+        let context = WorkflowContext::new("run-45".to_string(), 45, 2, 3, Arc::new(TestLogWriter));
+
+        // The mock reports `docker_socket_mounted: false`, which is exactly
+        // what a host whose agent was never restarted would report.
+        let error = job
+            .deploy_single_replica(
+                "node-daemon:latest",
+                &context,
+                0,
+                None,
+                &deployer,
+                ReplicaTarget {
+                    assignment: &crate::services::NodeAssignment::Local,
+                    docker_socket_required: true,
+                },
+            )
+            .await
+            .expect_err("a gated replica without the socket must not be accepted");
+
+        match error {
+            WorkflowError::DockerSocketNotMounted {
+                ref node,
+                ref project_slug,
+                env,
+            } => {
+                assert_eq!(node, "control-plane");
+                assert_eq!(project_slug, "node-daemon");
+                assert_eq!(
+                    env,
+                    temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+                );
+                // The operator reading the deploy log is alone: the message
+                // must name the host and the exact variable to set on it.
+                let rendered = error.to_string();
+                assert!(rendered.contains("control-plane"), "{rendered}");
+                assert!(
+                    rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS=node-daemon"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("temps agent"), "{rendered}");
+            }
+            other => panic!("expected DockerSocketNotMounted, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_health_check_path_override_default_is_none() {
         // By default there is no deploy-time override; only the standard
         // health_check_path ("/") is set.
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("d".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4042,7 +4179,7 @@ mod tests {
     fn test_health_check_path_override_flows_to_config() {
         // An explicit deploy-time override is captured separately so it can win
         // over .temps.yaml at execution time.
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("d".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4070,7 +4207,7 @@ mod tests {
     /// must be returned without ever needing a successful inspection.
     #[tokio::test]
     async fn test_resolve_container_port_prefers_explicit_override_over_image_detection() {
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4098,7 +4235,7 @@ mod tests {
     /// configured/default port.
     #[tokio::test]
     async fn test_resolve_container_port_falls_back_to_default_without_override() {
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4138,7 +4275,7 @@ mod tests {
         };
 
         // Create job with 2 replicas
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("test_deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(target)
@@ -4229,7 +4366,7 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("test_deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4258,7 +4395,7 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("test_deploy".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -4317,7 +4454,7 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("test".to_string())
             .build_job_id("build".to_string())
             .target(DeploymentTarget::Docker {
@@ -4583,7 +4720,7 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new()
+        let job = DeployImageJobBuilder::new("test-project")
             .job_id("deploy".to_string())
             .build_job_id("build".to_string())
             .target(DeploymentTarget::Docker {

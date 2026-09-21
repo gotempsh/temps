@@ -334,7 +334,7 @@ fn validate_job_creation() -> Result<(), String> {
     env_vars.insert("NODE_ENV".to_string(), "production".to_string());
     env_vars.insert("PORT".to_string(), "8080".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
+    let deploy_job = DeployImageJobBuilder::new("webapp")
         .job_id("deploy_image".to_string())
         .build_job_id("build_image".to_string()) // Typed dependency!
         .target(DeploymentTarget::Docker {
@@ -510,7 +510,7 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
     );
 
     let deploy_job = Arc::new(
-        DeployImageJobBuilder::new()
+        DeployImageJobBuilder::new("webapp")
             .job_id("deploy_image".to_string())
             .build_job_id("build_image".to_string())
             .target(DeploymentTarget::Docker {
@@ -629,7 +629,7 @@ pub fn validate_deployment_configurations() -> Result<(), String> {
     let container_deployer: Arc<dyn ContainerDeployer> = Arc::new(MockContainerDeployer);
 
     // Test Docker deployment
-    let docker_job = DeployImageJobBuilder::new()
+    let docker_job = DeployImageJobBuilder::new("webapp")
         .job_id("deploy_docker".to_string())
         .build_job_id("build_image".to_string())
         .target(DeploymentTarget::Docker {

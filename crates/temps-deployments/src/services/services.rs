@@ -2482,7 +2482,10 @@ impl DeploymentService {
                     )
                 };
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
-            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
+            // ADR 045: the slug travels with every deploy, including this
+            // one. A rollback or promotion of a granted project that omitted
+            // it would be placed anywhere and started without its socket.
+            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new(project.slug.clone())
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
                 .target(crate::jobs::DeploymentTarget::Docker {
@@ -3153,7 +3156,10 @@ impl DeploymentService {
             let configured_port =
                 super::port_resolver::configured_port_override(&target_env, &project);
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
-            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
+            // ADR 045: the slug travels with every deploy, including this
+            // one. A rollback or promotion of a granted project that omitted
+            // it would be placed anywhere and started without its socket.
+            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new(project.slug.clone())
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
                 .target(crate::jobs::DeploymentTarget::Docker {

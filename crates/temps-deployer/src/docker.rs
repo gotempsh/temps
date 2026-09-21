@@ -3344,7 +3344,14 @@ impl ContainerDeployer for DockerRuntime {
         let docker_socket_bind =
             docker_socket_bind_for(&self.docker_socket_grant, request.project_slug.as_deref());
         if docker_socket_bind.is_some() {
+            // Carries a stable `event` field so host-side log shipping can
+            // select these lines without pattern-matching prose. The control
+            // plane's audit record for the same mount is written from this
+            // host's *self-report* and is therefore not tamper-evident against
+            // a compromise of this host; this line is the independent,
+            // host-local record of the same fact (ADR 045).
             warn!(
+                event = "docker_socket_mounted",
                 container_name = %request.container_name,
                 project_slug = request.project_slug.as_deref().unwrap_or("<unknown>"),
                 "Mounting the host Docker socket into this container: the project is named in \

@@ -1633,7 +1633,9 @@ impl WorkflowExecutionService {
                     memory_request: memory_request_mb.map(|mb| format!("{}Mi", mb)),
                 };
 
-                let mut builder = DeployImageJobBuilder::new()
+                // ADR 045: the executing host compares this against its own
+                // grant. A constructor argument, so no deploy path can omit it.
+                let mut builder = DeployImageJobBuilder::new(project.slug.clone())
                     .job_id(db_job.job_id.clone())
                     .build_job_id(build_job_id)
                     .target(DeploymentTarget::Docker {
@@ -1642,10 +1644,6 @@ impl WorkflowExecutionService {
                     })
                     .service_name(deployment.slug.clone())
                     .namespace("default".to_string())
-                    // ADR 045: the executing host compares this against its
-                    // own grant. Set unconditionally — an absent slug simply
-                    // means no grant can ever match.
-                    .project_slug(project.slug.clone())
                     .audit_logger(self.audit_logger.get().cloned())
                     .port(port as u32)
                     .configured_port(configured_port)
