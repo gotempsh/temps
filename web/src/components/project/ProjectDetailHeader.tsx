@@ -4,6 +4,7 @@
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
+import { describeDockerSocket } from '@/lib/docker-socket'
 import { projectDeploymentStatus } from '@/lib/project-deployment-status'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Badge } from '@/components/ui/badge'
@@ -89,6 +90,11 @@ export function ProjectDetailHeader({
     error: healthQuery.isError,
     windowHours: 1,
   })
+  // Only the project *detail* responses carry this, and this header only ever
+  // renders one of those — but `describeDockerSocket` still treats a missing
+  // field as "unknown", so the badge stays hidden rather than claiming the
+  // grant is absent.
+  const dockerSocket = describeDockerSocket(project.docker_socket)
   const screenshotLocation = lastDeployment?.screenshot_location
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
@@ -142,6 +148,15 @@ export function ProjectDetailHeader({
                   ? 'Deployment status unavailable'
                   : 'Checking deployment…')}
             </Badge>
+            {dockerSocket.state === 'granted' && (
+              <Badge
+                variant="outline"
+                className="hidden sm:inline-flex shrink-0"
+                title={dockerSocket.detail}
+              >
+                {dockerSocket.label}
+              </Badge>
+            )}
             <Link
               to={`/projects/${project.slug}/monitors`}
               title={`${healthIndicator.label}: ${healthIndicator.detail}`}
