@@ -26,7 +26,7 @@ use serde::Serialize;
 use super::types::{
     CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
     ProjectSettingsUpdate, ProjectStatistics, ReservedSlugChange, SlugClaimAuthority,
-    UpdateDeploymentSettingsRequest, UpdateProjectSettingsParams,
+    SlugClaimCaller, UpdateDeploymentSettingsRequest, UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
@@ -854,7 +854,7 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
-        self.create_project_as(request, SlugClaimAuthority::default())
+        self.create_project_as(request, &SlugClaimCaller::project_writer())
             .await
     }
 
@@ -866,9 +866,9 @@ impl ProjectService {
     pub async fn create_project_as(
         &self,
         request: CreateProjectRequest,
-        authority: SlugClaimAuthority,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
-        self.create_project_with_identity(request, None, authority)
+        self.create_project_with_identity(request, None, caller)
             .await
     }
 
@@ -880,8 +880,12 @@ impl ProjectService {
         request: CreateProjectRequest,
         service_template: temps_core::templates::ServiceTemplateInstance,
     ) -> Result<Project, ProjectError> {
-        self.create_service_project_as(request, service_template, SlugClaimAuthority::default())
-            .await
+        self.create_service_project_as(
+            request,
+            service_template,
+            &SlugClaimCaller::project_writer(),
+        )
+        .await
     }
 
     /// [`Self::create_service_project`] with the caller's slug-claim authority
@@ -890,7 +894,7 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
         service_template: temps_core::templates::ServiceTemplateInstance,
-        authority: SlugClaimAuthority,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         if service_template.template.kind != temps_core::templates::TemplateKind::Service {
             return Err(ProjectError::InvalidInput(format!(
@@ -910,7 +914,7 @@ impl ProjectService {
                 service_template.slug
             )));
         }
-        self.create_project_with_identity(request, Some(service_template), authority)
+        self.create_project_with_identity(request, Some(service_template), caller)
             .await
     }
 
@@ -918,7 +922,7 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
         service_template: Option<temps_core::templates::ServiceTemplateInstance>,
-        authority: SlugClaimAuthority,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         if request.template_slug.as_deref().is_some_and(|slug| {
             slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
@@ -983,7 +987,8 @@ impl ProjectService {
         // admin-only act. Checked here rather than in the handler because the
         // slug can also be *derived* from the display name a line above —
         // a caller never has to name it to claim it.
-        self.guard_reserved_slug(&project_slug, authority, None, ReservedSlugChange::Claim)?;
+        self.guard_reserved_slug(&project_slug, caller, None, ReservedSlugChange::Claim)
+            .await?;
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -1546,20 +1551,84 @@ impl ProjectService {
     ///
     /// Answers from this process's own grant, exactly like the deployer's bind
     /// decision and the capability response, so the three can never disagree.
-    fn guard_reserved_slug(
+    /// Two questions, in this order: *may* this caller move the slug, and is
+    /// their session *recent enough* to. The order is the security property —
+    /// a project writer gets the 403 that names ADR 045, never an MFA prompt
+    /// for an operation they still would not be allowed to perform.
+    ///
+    /// The step-up lives here rather than in the three handlers so it cannot
+    /// be forgotten by the fourth: every path that can move a slug already
+    /// funnels through this one guard.
+    async fn guard_reserved_slug(
         &self,
         slug: &str,
-        authority: SlugClaimAuthority,
+        caller: &SlugClaimCaller<'_>,
         project_id: Option<i32>,
         change: ReservedSlugChange,
     ) -> Result<(), ProjectError> {
         Self::guard_reserved_slug_against(
             &self.docker_socket_grant,
             slug,
-            authority,
+            caller.authority,
             project_id,
             change,
-        )
+        )?;
+        self.require_slug_claim_step_up(slug, caller, project_id, change)
+            .await
+    }
+
+    /// The step-up half of [`Self::guard_reserved_slug`], reached only once
+    /// the authority check has already said yes.
+    ///
+    /// Returns `Ok(())` immediately for a slug this host does not reserve, so
+    /// an ordinary project create or rename never sees an MFA prompt.
+    async fn require_slug_claim_step_up(
+        &self,
+        slug: &str,
+        caller: &SlugClaimCaller<'_>,
+        project_id: Option<i32>,
+        change: ReservedSlugChange,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::slug_is_reserved(&self.docker_socket_grant, slug) {
+            return Ok(());
+        }
+        let Some(step_up) = caller.step_up.as_ref() else {
+            // Admin authority with nothing to challenge. No production path
+            // constructs that — `SlugClaimCaller::from_request` always carries
+            // the authorizer, and `project_writer()` can never reach this line
+            // because the authority check above refuses it first. Reaching it
+            // means a future caller asserted an authority out of band, so
+            // refuse rather than silently skip the challenge.
+            warn!(
+                slug = %slug,
+                project_id = ?project_id,
+                change = ?change,
+                "Refused a reserved-slug change from a caller claiming admin authority with no \
+                 session to challenge (ADR 045)"
+            );
+            return Err(ProjectError::DockerSocketSlugReserved {
+                slug: slug.to_string(),
+                change,
+            });
+        };
+        // `project_id` is `None` on create, where there is no row yet to name.
+        // `0` is the "not yet persisted" sentinel in the action identity; it
+        // only ever appears in the challenge's `action` payload and the
+        // step-up audit trail, never as a lookup key.
+        let project_id = project_id.unwrap_or(0);
+        let action = match change {
+            ReservedSlugChange::Claim => {
+                temps_core::SensitiveAction::ClaimDockerSocketSlug { project_id }
+            }
+            ReservedSlugChange::Release => {
+                temps_core::SensitiveAction::ReleaseDockerSocketSlug { project_id }
+            }
+        };
+        temps_auth::require_sensitive_action(step_up.authorizer, step_up.auth, action)
+            .await
+            .map_err(|problem| ProjectError::SlugClaimStepUpRequired {
+                problem: Box::new(problem),
+            })
     }
 
     /// [`Self::guard_reserved_slug`] with the grant injected.
@@ -2005,7 +2074,7 @@ impl ProjectService {
         project_id: i32,
         params: UpdateProjectSettingsParams,
     ) -> Result<ProjectSettingsUpdate, ProjectError> {
-        self.update_project_settings_as(project_id, params, SlugClaimAuthority::default())
+        self.update_project_settings_as(project_id, params, &SlugClaimCaller::project_writer())
             .await
     }
 
@@ -2018,7 +2087,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         params: UpdateProjectSettingsParams,
-        authority: SlugClaimAuthority,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<ProjectSettingsUpdate, ProjectError> {
         let UpdateProjectSettingsParams {
             name: new_name,
@@ -2123,16 +2192,18 @@ impl ProjectService {
             if slug_value != project.slug {
                 self.guard_reserved_slug(
                     &slug_value,
-                    authority,
+                    caller,
                     Some(project_id),
                     ReservedSlugChange::Claim,
-                )?;
+                )
+                .await?;
                 self.guard_reserved_slug(
                     &project.slug,
-                    authority,
+                    caller,
                     Some(project_id),
                     ReservedSlugChange::Release,
-                )?;
+                )
+                .await?;
             }
             let txn = self.db.begin().await?;
             txn.execute(Statement::from_sql_and_values(
@@ -7419,6 +7490,96 @@ mod tests {
         }
     }
 
+    /// What the acting user has done about MFA — the whole input to the
+    /// step-up policy (ADR 045).
+    #[derive(Clone, Copy)]
+    enum MfaState {
+        /// No factor enrolled. `DefaultSensitiveActionAuthorizer` has nothing
+        /// to re-verify and allows the action through without a challenge —
+        /// deliberate, and documented in the ADR.
+        NotEnrolled,
+        /// Enrolled, but the session has not verified recently (or ever).
+        EnrolledStale,
+        /// Enrolled and verified inside the step-up window.
+        EnrolledVerified,
+    }
+
+    static NEXT_SLUG_CLAIM_USER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(1);
+
+    /// A signed-in caller for the reserved-slug guard: their session, and the
+    /// real step-up policy evaluated against the same database the session
+    /// lives in.
+    ///
+    /// Built through [`SlugClaimCaller::from_request`], exactly as the
+    /// handlers build it, so a test cannot assert an authority the request
+    /// itself would not have carried.
+    struct SlugClaimSession {
+        auth: temps_auth::AuthContext,
+        authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    }
+
+    impl SlugClaimSession {
+        async fn create(
+            db: &Arc<temps_database::DbConnection>,
+            role: temps_auth::Role,
+            mfa: MfaState,
+        ) -> Self {
+            let seq = NEXT_SLUG_CLAIM_USER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let user = temps_entities::users::ActiveModel {
+                name: Set(format!("Slug Claimant {seq}")),
+                email: Set(format!("slug-claimant-{seq}@example.com")),
+                mfa_enabled: Set(!matches!(mfa, MfaState::NotEnrolled)),
+                mfa_secret: Set(match mfa {
+                    MfaState::NotEnrolled => None,
+                    _ => Some("TOTPSECRET".to_string()),
+                }),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("the acting user is inserted");
+            let session = temps_entities::sessions::ActiveModel {
+                user_id: Set(user.id),
+                session_token: Set(format!("slug-claim-session-{seq}")),
+                expires_at: Set(chrono::Utc::now() + chrono::Duration::hours(1)),
+                mfa_pending: Set(false),
+                step_up_expires_at: Set(match mfa {
+                    MfaState::EnrolledVerified => {
+                        Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+                    }
+                    _ => None,
+                }),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("the acting session is inserted");
+            Self {
+                auth: temps_auth::AuthContext::new_persisted_session(user, role, session.id),
+                authorizer: Arc::new(temps_auth::DefaultSensitiveActionAuthorizer::new(
+                    db.clone(),
+                )),
+            }
+        }
+
+        /// An instance admin who never enrolled MFA — the shape most existing
+        /// ADR 045 tests need, and the documented pass-through case.
+        async fn admin(db: &Arc<temps_database::DbConnection>) -> Self {
+            Self::create(db, temps_auth::Role::Admin, MfaState::NotEnrolled).await
+        }
+
+        /// An ordinary project writer, MFA enrolled and *not* stepped up, so
+        /// a test can prove the 403 comes out before step-up is consulted.
+        async fn project_writer(db: &Arc<temps_database::DbConnection>) -> Self {
+            Self::create(db, temps_auth::Role::User, MfaState::EnrolledStale).await
+        }
+
+        fn caller(&self) -> SlugClaimCaller<'_> {
+            SlugClaimCaller::from_request(&self.auth, self.authorizer.as_ref())
+        }
+    }
+
     /// A non-admin creating a project whose slug this host grants the Docker
     /// socket to is refused — including when the slug is only *derived* from
     /// the display name, which is how the claim would be made in practice.
@@ -7435,14 +7596,12 @@ mod tests {
             .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
                 Some("node-daemon"),
             ));
+        let writer = SlugClaimSession::project_writer(&db).await;
 
         // `Project`/`ProjectSettingsUpdate` are not `Debug`, so the error is
         // taken by match rather than `expect_err`.
         let error = match project_service
-            .create_project_as(
-                create_request("Node Daemon"),
-                SlugClaimAuthority::ProjectWriter,
-            )
+            .create_project_as(create_request("Node Daemon"), &writer.caller())
             .await
         {
             Ok(project) => panic!("a project writer claimed a granted slug: {}", project.slug),
@@ -7478,12 +7637,10 @@ mod tests {
             .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
                 Some("node-daemon"),
             ));
+        let admin = SlugClaimSession::admin(&db).await;
 
         let project = project_service
-            .create_project_as(
-                create_request("Node Daemon"),
-                SlugClaimAuthority::InstanceAdmin,
-            )
+            .create_project_as(create_request("Node Daemon"), &admin.caller())
             .await
             .expect("an admin may create the granted project");
         assert_eq!(project.slug, "node-daemon");
@@ -7502,6 +7659,8 @@ mod tests {
             .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
                 Some("node-daemon"),
             ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+        let admin = SlugClaimSession::admin(&db).await;
 
         let project = temps_entities::projects::ActiveModel {
             name: Set("Ordinary App".to_string()),
@@ -7524,7 +7683,7 @@ mod tests {
                     slug: Some("node-daemon".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::ProjectWriter,
+                &writer.caller(),
             )
             .await
         {
@@ -7554,7 +7713,7 @@ mod tests {
                     slug: Some("node-daemon".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::InstanceAdmin,
+                &admin.caller(),
             )
             .await
             .expect("an admin may claim the granted slug");
@@ -7577,6 +7736,8 @@ mod tests {
             .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
                 Some("node-daemon"),
             ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+        let admin = SlugClaimSession::admin(&db).await;
 
         let project = temps_entities::projects::ActiveModel {
             name: Set("Node Daemon".to_string()),
@@ -7599,7 +7760,7 @@ mod tests {
                     slug: Some("something-else".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::ProjectWriter,
+                &writer.caller(),
             )
             .await
         {
@@ -7632,7 +7793,7 @@ mod tests {
                     slug: Some("something-else".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::InstanceAdmin,
+                &admin.caller(),
             )
             .await
             .expect("an admin may rename a granted project away");
@@ -7655,6 +7816,7 @@ mod tests {
             .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
                 Some("node-daemon"),
             ));
+        let writer = SlugClaimSession::project_writer(&db).await;
 
         let project = temps_entities::projects::ActiveModel {
             name: Set("Node Daemon".to_string()),
@@ -7678,7 +7840,7 @@ mod tests {
                     name: Some("Node Daemon v2".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::ProjectWriter,
+                &writer.caller(),
             )
             .await
             .expect("an unrelated settings change is not a claim");
@@ -7691,7 +7853,7 @@ mod tests {
                     slug: Some("node-daemon".to_string()),
                     ..Default::default()
                 },
-                SlugClaimAuthority::ProjectWriter,
+                &writer.caller(),
             )
             .await
             .expect("re-sending the existing slug is not a claim");
@@ -7783,6 +7945,284 @@ mod tests {
             .await
             .expect("the capability is computed");
         assert!(!undeclared.granted);
+    }
+
+    // ── ADR 045: MFA step-up on top of the instance-admin check ─────────
+    //
+    // The admin check answers "may this principal move host root between
+    // projects". These answer "and is this really them, right now". The order
+    // is load-bearing and is asserted explicitly below.
+
+    /// A granted project, so both directions of the guard have something to
+    /// bite on.
+    async fn insert_granted_project(
+        db: &Arc<temps_database::DbConnection>,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("the granted project is inserted")
+    }
+
+    /// The 428 body the console's step-up dialog reads. Asserted here rather
+    /// than trusted, because `ProjectError::SlugClaimStepUpRequired` passes
+    /// the `Problem` through verbatim — if the contract ever changed, this is
+    /// where it must fail.
+    fn assert_step_up_challenge(error: &ProjectError, expected_action: &str) {
+        let ProjectError::SlugClaimStepUpRequired { problem } = error else {
+            panic!("expected a step-up challenge, got {error:?}");
+        };
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            problem.body.get("error_code").and_then(|v| v.as_str()),
+            Some("STEP_UP_REQUIRED")
+        );
+        assert_eq!(
+            problem.body.get("action").and_then(|v| v.as_str()),
+            Some(expected_action),
+            "the challenge must name the exact action, not a shared one"
+        );
+    }
+
+    /// An MFA-enrolled admin whose session has not verified recently is
+    /// challenged for the claim, and nothing is written until they do.
+    #[tokio::test]
+    async fn claiming_a_granted_slug_challenges_an_mfa_enrolled_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .create_project_as(create_request("Node Daemon"), &stale.caller())
+            .await
+        {
+            Ok(project) => panic!(
+                "an admin claimed host root without recent verification: {}",
+                project.slug
+            ),
+            Err(error) => error,
+        };
+        assert_step_up_challenge(&error, "claim_docker_socket_slug");
+
+        // The challenge is a refusal, not a warning: the project must not
+        // exist yet.
+        assert!(
+            projects::Entity::find()
+                .filter(projects::Column::Slug.eq("node-daemon"))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a challenged claim must not create the project"
+        );
+
+        // Same admin, same authority — only the verification is new.
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+        let project = project_service
+            .create_project_as(create_request("Node Daemon"), &verified.caller())
+            .await
+            .expect("a verified admin may claim the granted slug");
+        assert_eq!(project.slug, "node-daemon");
+    }
+
+    /// Giving the slug up is a separate action with its own name, so an
+    /// operator reading the audit trail can tell a grant from a revocation.
+    #[tokio::test]
+    async fn releasing_a_granted_slug_challenges_with_its_own_action_name() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let project = insert_granted_project(&db).await;
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &stale.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("an admin revoked host Docker access without recent verification"),
+            Err(error) => error,
+        };
+        // The claim half of the rename passes first (`something-else` is not
+        // reserved), so the challenge that surfaces is the release.
+        assert_step_up_challenge(&error, "release_docker_socket_slug");
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(
+            reloaded.slug, "node-daemon",
+            "a challenged release must not persist"
+        );
+
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &verified.caller(),
+            )
+            .await
+            .expect("a verified admin may release the granted slug");
+        assert_eq!(updated.project.slug, "something-else");
+    }
+
+    /// An admin who never enrolled MFA is allowed through with no challenge.
+    ///
+    /// Asserted rather than left implicit, because it is a deliberate policy
+    /// choice of `DefaultSensitiveActionAuthorizer` (there is no second factor
+    /// to re-verify, and denying would lock the only admin out of their own
+    /// instance), not an oversight in this guard. An operator who wants the
+    /// stronger rule enrolls MFA — or registers an authorizer that denies
+    /// unenrolled principals. See ADR 045.
+    #[tokio::test]
+    async fn an_admin_without_mfa_is_allowed_through_without_a_challenge() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let unenrolled =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::NotEnrolled).await;
+
+        let project = project_service
+            .create_project_as(create_request("Node Daemon"), &unenrolled.caller())
+            .await
+            .expect("an admin with no enrolled factor is not challenged");
+        assert_eq!(project.slug, "node-daemon");
+    }
+
+    /// Order matters: a project writer is refused by the authority check,
+    /// *before* step-up is considered. They must get the 403 that explains the
+    /// rule, never an MFA prompt for an operation they still could not perform
+    /// after satisfying it.
+    #[tokio::test]
+    async fn a_non_admin_is_refused_before_step_up_is_considered() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        // MFA enrolled and stale: this session *would* be challenged if the
+        // guard ever reached step-up for it.
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .create_project_as(create_request("Node Daemon"), &writer.caller())
+            .await
+        {
+            Ok(project) => panic!("a project writer claimed a granted slug: {}", project.slug),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ProjectError::DockerSocketSlugReserved {
+                    change: ReservedSlugChange::Claim,
+                    ..
+                }
+            ),
+            "a non-admin must be refused outright, not challenged: {error:?}"
+        );
+    }
+
+    /// The challenge is scoped to reserved slugs. Every other project an
+    /// MFA-enrolled admin creates or renames goes through untouched — this is
+    /// the regression that would turn one operator control into friction on
+    /// every project in the console.
+    #[tokio::test]
+    async fn an_unreserved_slug_never_challenges_anyone() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let project = project_service
+            .create_project_as(create_request("Ordinary App"), &stale.caller())
+            .await
+            .expect("an ordinary project is not a sensitive action");
+        assert_eq!(project.slug, "ordinary-app");
+
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("still-ordinary".to_string()),
+                    ..Default::default()
+                },
+                &stale.caller(),
+            )
+            .await
+            .expect("renaming between two unreserved slugs is not a sensitive action");
+        assert_eq!(updated.project.slug, "still-ordinary");
     }
 
     fn create_request(name: &str) -> CreateProjectRequest {

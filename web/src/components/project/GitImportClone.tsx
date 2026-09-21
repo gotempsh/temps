@@ -47,6 +47,7 @@ import {
   type ProjectSource,
 } from '@/components/project/NewProjectShell'
 import { Drop } from '@/pages/Drop'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { parsePublicRepositoryUrl } from '@/lib/public-repository'
@@ -385,6 +386,11 @@ export function GitImportClone({
   // Use the appropriate branches based on whether it's a public repo
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
+  // ADR 045: creating a project on a slug this host grants the Docker socket
+  // to is admin-only and step-up verified, so the create can come back 428.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
@@ -586,6 +592,7 @@ export function GitImportClone({
         activeSource={useGitUrl ? 'git-url' : 'browse'}
         onSelectSource={setSelectedSource}
       >
+        {verificationDialog}
         <div className="space-y-6">
           <div className="flex items-center gap-4">
             <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
@@ -631,58 +638,68 @@ export function GitImportClone({
             branches={branches?.branches}
             mode="wizard"
             onSubmit={async (data) => {
-              try {
-                await createProjectMutationM.mutateAsync({
-                  body: {
-                    name: data.name,
-                    preset: data.preset,
-                    directory: data.rootDirectory,
-                    main_branch: data.branch,
-                    repo_name: selectedRepository.name || '',
-                    repo_owner: selectedRepository.owner || owner || '',
-                    git_url: useGitUrl ? gitUrl : undefined,
-                    git_provider_connection_id: useGitUrl
-                      ? undefined
-                      : Number(selectedConnection),
-                    is_public_repo: useGitUrl ? true : undefined,
-                    project_type:
-                      data.preset === 'custom' ? 'static' : undefined,
-                    automatic_deploy: data.autoDeploy,
-                    storage_service_ids: data.storageServices || [],
-                    environment_variables: data.environmentVariables?.map(
-                      (env) => ({
-                        key: env.key,
-                        value: env.value,
-                        is_secret: env.isSecret,
-                      })
-                    ),
-                    preset_config:
-                      data.preset === 'dockerfile' && data.dockerfilePath
-                        ? {
-                            dockerfilePath: data.dockerfilePath,
-                          }
-                        : data.preset === 'docker-compose'
+              // A named local so the step-up retry below can re-run exactly
+              // this submission after verification (ADR 045).
+              const submit = async (): Promise<void> => {
+                try {
+                  await createProjectMutationM.mutateAsync({
+                    body: {
+                      name: data.name,
+                      preset: data.preset,
+                      directory: data.rootDirectory,
+                      main_branch: data.branch,
+                      repo_name: selectedRepository.name || '',
+                      repo_owner: selectedRepository.owner || owner || '',
+                      git_url: useGitUrl ? gitUrl : undefined,
+                      git_provider_connection_id: useGitUrl
+                        ? undefined
+                        : Number(selectedConnection),
+                      is_public_repo: useGitUrl ? true : undefined,
+                      project_type:
+                        data.preset === 'custom' ? 'static' : undefined,
+                      automatic_deploy: data.autoDeploy,
+                      storage_service_ids: data.storageServices || [],
+                      environment_variables: data.environmentVariables?.map(
+                        (env) => ({
+                          key: env.key,
+                          value: env.value,
+                          is_secret: env.isSecret,
+                        })
+                      ),
+                      preset_config:
+                        data.preset === 'dockerfile' && data.dockerfilePath
                           ? {
-                              composePath:
-                                (data as any).composePath ||
-                                'docker-compose.yml',
-                              ...(data.excludedServices &&
-                              data.excludedServices.length > 0
-                                ? { excludedServices: data.excludedServices }
-                                : {}),
-                              ...(data.composeServices &&
-                              data.composeServices.length > 0
-                                ? { composeServices: data.composeServices }
-                                : {}),
+                              dockerfilePath: data.dockerfilePath,
                             }
-                          : undefined,
-                    exposed_port:
-                      data.preset === 'docker-compose' ? undefined : data.port,
-                  },
-                })
-              } catch (error) {
-                console.error('Project creation error:', error)
+                          : data.preset === 'docker-compose'
+                            ? {
+                                composePath:
+                                  (data as any).composePath ||
+                                  'docker-compose.yml',
+                                ...(data.excludedServices &&
+                                data.excludedServices.length > 0
+                                  ? { excludedServices: data.excludedServices }
+                                  : {}),
+                                ...(data.composeServices &&
+                                data.composeServices.length > 0
+                                  ? { composeServices: data.composeServices }
+                                  : {}),
+                              }
+                            : undefined,
+                      exposed_port:
+                        data.preset === 'docker-compose'
+                          ? undefined
+                          : data.port,
+                    },
+                  })
+                } catch (error) {
+                  if (handleSensitiveActionError(error, () => void submit())) {
+                    return
+                  }
+                  console.error('Project creation error:', error)
+                }
               }
+              await submit()
             }}
             onCancel={goBackFromRepo}
           />

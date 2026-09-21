@@ -140,6 +140,34 @@ instead of one. Only a slug *change* is gated -- an existing granted project
 keeps working through every update that does not move its slug, whoever sends
 it.
 
+Being an instance admin answers *who may*; it does not answer *is this really
+them, right now*. Moving a granted slug in either direction is therefore also
+a sensitive action in the existing step-up sense
+(`SensitiveAction::ClaimDockerSocketSlug` / `ReleaseDockerSocketSlug`): a
+session that has not verified a second factor recently gets a `428` with
+`error_code: STEP_UP_REQUIRED` and the action name, and the console re-runs the
+save once the operator verifies. The check lives inside `guard_reserved_slug`,
+next to the admin check and reached only after it passes, rather than in the
+three handlers that can reach it -- a handler-level pre-check is one call site
+away from being forgotten, and the fourth caller is the one that matters. It is
+consulted *only* for a slug this host actually reserves, so ordinary project
+creation and renaming are untouched.
+
+The ordering is deliberate and is asserted in tests: a project writer is
+refused with the 403 above *before* step-up is considered. Prompting them to
+re-verify would be asking for proof of an identity that still would not be
+permitted to do it.
+
+`DefaultSensitiveActionAuthorizer` allows a user with no enrolled MFA factor
+through without a challenge -- there is no second factor to re-verify, and
+denying would lock the only admin of a fresh instance out of their own
+install. That is a deliberate property of the existing policy, not an
+oversight in this guard, and it means the step-up raises the bar for operators
+who have enrolled MFA without changing anything for those who have not. An
+operator who wants the stronger rule enrols MFA, or registers a
+`SensitiveActionAuthorizer` that denies unenrolled principals; the guard here
+asks the policy and does not second-guess it.
+
 #### What the audit record does and does not prove
 
 The audit event is written on the control plane from the executing host's

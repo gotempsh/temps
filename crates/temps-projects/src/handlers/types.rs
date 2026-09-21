@@ -41,6 +41,12 @@ pub struct AppState {
     /// is guaranteed to see all registered services because `configure_routes`
     /// runs after every plugin's `initialize_plugin_services` has completed.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central policy evaluator for sensitive mutations — challenges with MFA
+    /// step-up when the acting user has one enrolled. Threaded into
+    /// `ProjectService` on the slug-claim path (ADR 045) rather than checked
+    /// in the handler, so the challenge cannot drift away from the guard it
+    /// protects. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 // Domain-related types
@@ -1208,6 +1214,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            // Passed through verbatim: `require_sensitive_action` already
+            // built the 428 the console's step-up dialog parses (error_code,
+            // action name, mfa_setup_required). Rebuilding it here would be a
+            // second, drifting copy of that contract.
+            ProjectError::SlugClaimStepUpRequired { problem } => *problem,
+
             // Also 403 and also admin-only, but a different refusal: the
             // caller may write this project, just not run code as host root
             // on its behalf.
@@ -1448,5 +1460,26 @@ mod tests {
         // The two must not read alike — one is about naming the project, the
         // other about running code inside it.
         assert_ne!(reserved.body.get("title"), deploy.body.get("title"));
+    }
+
+    /// The step-up challenge is passed through byte for byte. Rebuilding it
+    /// here would be a second, drifting copy of the contract the console's
+    /// verification dialog parses.
+    #[test]
+    fn a_step_up_challenge_reaches_the_client_unchanged() {
+        let built = temps_core::error_builder::ErrorBuilder::new(StatusCode::PRECONDITION_REQUIRED)
+            .title("Additional Verification Required")
+            .value("error_code", "STEP_UP_REQUIRED")
+            .value("action", "claim_docker_socket_slug")
+            .value("mfa_setup_required", false)
+            .build();
+
+        let problem: Problem = ProjectError::SlugClaimStepUpRequired {
+            problem: Box::new(built.clone()),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(problem.body, built.body);
     }
 }

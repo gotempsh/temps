@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use temps_core::problemdetails::Problem;
 use temps_core::UtcDateTime;
 use temps_entities::source_type::SourceType;
 use thiserror::Error;
@@ -161,6 +162,55 @@ impl SlugClaimAuthority {
     /// Whether this caller may claim a slug reserved by the host grant.
     pub fn may_claim_reserved_slug(self) -> bool {
         matches!(self, Self::InstanceAdmin)
+    }
+}
+
+/// Everything the reserved-slug guard needs to know about the caller: what
+/// they are allowed to claim, and how to challenge them for it (ADR 045).
+///
+/// A struct rather than two more parameters because the two are only ever
+/// meaningful together — an authority with no way to be challenged is exactly
+/// the gap the MFA step-up exists to close, and keeping them in one value
+/// means a call site cannot supply one and forget the other.
+pub struct SlugClaimCaller<'a> {
+    pub authority: SlugClaimAuthority,
+    /// Authorizer and principal for the MFA step-up challenge.
+    ///
+    /// `None` for callers that have no browser session at all (importers, the
+    /// AI tools, tests). Those can only ever be [`SlugClaimAuthority::
+    /// ProjectWriter`], which the guard refuses *before* step-up is ever
+    /// consulted — and if one ever claimed `InstanceAdmin` without a way to
+    /// be challenged, the guard fails closed rather than skipping the
+    /// challenge.
+    pub step_up: Option<SlugClaimStepUp<'a>>,
+}
+
+/// The step-up half of [`SlugClaimCaller`].
+pub struct SlugClaimStepUp<'a> {
+    pub authorizer: &'a dyn temps_core::SensitiveActionAuthorizer,
+    pub auth: &'a temps_auth::AuthContext,
+}
+
+impl<'a> SlugClaimCaller<'a> {
+    /// The caller behind an HTTP request: their authority, and the authorizer
+    /// that can challenge them.
+    pub fn from_request(
+        auth: &'a temps_auth::AuthContext,
+        authorizer: &'a dyn temps_core::SensitiveActionAuthorizer,
+    ) -> Self {
+        Self {
+            authority: SlugClaimAuthority::from_instance_admin(auth.is_instance_admin()),
+            step_up: Some(SlugClaimStepUp { authorizer, auth }),
+        }
+    }
+
+    /// A caller with no browser session and no admin authority — every
+    /// non-HTTP path (importers, tests). Fail-closed by construction.
+    pub fn project_writer() -> Self {
+        Self {
+            authority: SlugClaimAuthority::ProjectWriter,
+            step_up: None,
+        }
     }
 }
 
@@ -462,6 +512,20 @@ pub enum ProjectError {
         temps_core::docker_socket_grant::granted_project_deploy_reason(slug)
     )]
     DockerSocketDeployRequiresAdmin { slug: String },
+
+    /// An admin cleared the reserved-slug authority check but has not
+    /// verified recently enough (ADR 045 + the shared sensitive-action
+    /// policy).
+    ///
+    /// Carries the `Problem` that `require_sensitive_action` already built —
+    /// a 428 with `error_code: STEP_UP_REQUIRED`, the action name and the
+    /// MFA-setup hint. Re-deriving that here would be a second copy of a
+    /// contract the console already parses, so it is passed through verbatim
+    /// by `From<ProjectError> for Problem`.
+    #[error(
+        "Additional verification is required before moving a slug that grants host Docker access"
+    )]
+    SlugClaimStepUpRequired { problem: Box<Problem> },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

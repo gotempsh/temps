@@ -950,6 +950,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         (status = 400, description = "Invalid input"),
         (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 409, description = "Expected project slug is already in use"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -1013,11 +1014,13 @@ pub async fn create_project(
     let new_project = state
         .project_service
         // ADR 045: only an instance admin may claim a slug this host grants
-        // host Docker access to — including one derived from the name.
+        // host Docker access to — including one derived from the name — and
+        // only with a recently MFA-verified session.
         .create_project_as(
             project_req,
-            crate::services::types::SlugClaimAuthority::from_instance_admin(
-                auth.is_instance_admin(),
+            &crate::services::types::SlugClaimCaller::from_request(
+                &auth,
+                state.sensitive_action_authorizer.as_ref(),
             ),
         )
         .await
@@ -1595,6 +1598,7 @@ pub async fn delete_project(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)"),
         (status = 404, description = "Project not found"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1649,10 +1653,12 @@ pub async fn update_project_settings(
         .update_project_settings_as(
             project_id,
             settings.clone().into(),
-            // ADR 045: renaming onto a granted slug is admin-only. Every other
-            // settings change, including on an already-granted project, is not.
-            crate::services::types::SlugClaimAuthority::from_instance_admin(
-                auth.is_instance_admin(),
+            // ADR 045: renaming onto or off a granted slug is admin-only and
+            // step-up verified. Every other settings change, including on an
+            // already-granted project, is neither.
+            &crate::services::types::SlugClaimCaller::from_request(
+                &auth,
+                state.sensitive_action_authorizer.as_ref(),
             ),
         )
         .await
@@ -3509,6 +3515,7 @@ async fn canonical_template_app_url(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 404, description = "Template not found"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3849,17 +3856,19 @@ pub async fn create_project_from_template(
 
     // ADR 045: same claim rule as plain project creation — a template deploy
     // is another way to name a slug.
-    let authority =
-        crate::services::types::SlugClaimAuthority::from_instance_admin(auth.is_instance_admin());
+    let slug_claim_caller = crate::services::types::SlugClaimCaller::from_request(
+        &auth,
+        state.sensitive_action_authorizer.as_ref(),
+    );
     let project = if let Some(service_template) = service_template_instance {
         state
             .project_service
-            .create_service_project_as(create_request, service_template, authority)
+            .create_service_project_as(create_request, service_template, &slug_claim_caller)
             .await
     } else {
         state
             .project_service
-            .create_project_as(create_request, authority)
+            .create_project_as(create_request, &slug_claim_caller)
             .await
     }
     .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))

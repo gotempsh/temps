@@ -87,6 +87,19 @@ pub enum SensitiveAction {
     RetentionRetroactiveApply {
         project_id: i32,
     },
+    /// Create a project with — or rename one onto — a slug this host grants
+    /// `/var/run/docker.sock` to (ADR 045). The project's containers become
+    /// root-equivalent on every host that grants the slug.
+    ClaimDockerSocketSlug {
+        project_id: i32,
+    },
+    /// Rename a project away from a slug this host grants the Docker socket
+    /// to (ADR 045). Revokes that service's host access everywhere and frees
+    /// the slug for the next project created — a separate variant from the
+    /// claim so the audit record and the 428 response name the direction.
+    ReleaseDockerSocketSlug {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -118,6 +131,8 @@ impl SensitiveAction {
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
             Self::RetentionRetroactiveApply { .. } => "retention_retroactive_apply",
+            Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
+            Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
         }
     }
 }

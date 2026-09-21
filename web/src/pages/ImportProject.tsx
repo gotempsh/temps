@@ -13,6 +13,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { NewProjectShell } from '@/components/project/NewProjectShell'
@@ -69,6 +70,12 @@ export function ImportProject() {
 
   usePageTitle(`Import ${selectedRepository?.full_name || 'Repository'}`)
 
+  // Importing a project whose slug this host grants the Docker socket to is
+  // a sensitive action (ADR 045); the create can come back 428 asking the
+  // admin to re-verify rather than failing.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
@@ -93,6 +100,7 @@ export function ImportProject() {
 
   return (
     <PageContainer>
+      {verificationDialog}
       <NewProjectShell
         activeSource="browse"
         onSelectSource={(source) => navigate(`/projects/new?source=${source}`)}
@@ -216,55 +224,69 @@ export function ImportProject() {
               mode="inline"
               showRepositoryCard={false}
               onSubmit={async (data) => {
-                try {
-                  await createProjectMutationM.mutateAsync({
-                    body: {
-                      name: data.name,
-                      preset: data.preset,
-                      directory: data.rootDirectory,
-                      main_branch: data.branch,
-                      repo_name: selectedRepository.name || '',
-                      repo_owner: selectedRepository.owner || '',
-                      git_url: undefined,
-                      git_provider_connection_id: selectedConnectionId!,
-                      project_type:
-                        data.preset === 'custom' ? 'static' : undefined,
-                      automatic_deploy: data.autoDeploy,
-                      storage_service_ids: data.storageServices || [],
-                      environment_variables: data.environmentVariables?.map(
-                        (env) => ({
-                          key: env.key,
-                          value: env.value,
-                          is_secret: env.isSecret,
-                        })
-                      ),
-                      preset_config:
-                        data.preset === 'dockerfile' && data.dockerfilePath
-                          ? { dockerfilePath: data.dockerfilePath }
-                          : data.preset === 'docker-compose'
-                            ? {
-                                composePath:
-                                  (data as any).composePath ||
-                                  'docker-compose.yml',
-                                ...(data.excludedServices &&
-                                data.excludedServices.length > 0
-                                  ? { excludedServices: data.excludedServices }
-                                  : {}),
-                                ...(data.composeServices &&
-                                data.composeServices.length > 0
-                                  ? { composeServices: data.composeServices }
-                                  : {}),
-                              }
-                            : undefined,
-                      exposed_port:
-                        data.preset === 'docker-compose'
-                          ? undefined
-                          : data.port,
-                    },
-                  })
-                } catch (error) {
-                  console.error('Project import error:', error)
+                // A named local so the step-up retry below can re-run exactly
+                // this submission after verification (ADR 045: a slug this
+                // host grants the Docker socket to is admin-only and
+                // step-up verified).
+                const submit = async (): Promise<void> => {
+                  try {
+                    await createProjectMutationM.mutateAsync({
+                      body: {
+                        name: data.name,
+                        preset: data.preset,
+                        directory: data.rootDirectory,
+                        main_branch: data.branch,
+                        repo_name: selectedRepository.name || '',
+                        repo_owner: selectedRepository.owner || '',
+                        git_url: undefined,
+                        git_provider_connection_id: selectedConnectionId!,
+                        project_type:
+                          data.preset === 'custom' ? 'static' : undefined,
+                        automatic_deploy: data.autoDeploy,
+                        storage_service_ids: data.storageServices || [],
+                        environment_variables: data.environmentVariables?.map(
+                          (env) => ({
+                            key: env.key,
+                            value: env.value,
+                            is_secret: env.isSecret,
+                          })
+                        ),
+                        preset_config:
+                          data.preset === 'dockerfile' && data.dockerfilePath
+                            ? { dockerfilePath: data.dockerfilePath }
+                            : data.preset === 'docker-compose'
+                              ? {
+                                  composePath:
+                                    (data as any).composePath ||
+                                    'docker-compose.yml',
+                                  ...(data.excludedServices &&
+                                  data.excludedServices.length > 0
+                                    ? {
+                                        excludedServices: data.excludedServices,
+                                      }
+                                    : {}),
+                                  ...(data.composeServices &&
+                                  data.composeServices.length > 0
+                                    ? { composeServices: data.composeServices }
+                                    : {}),
+                                }
+                              : undefined,
+                        exposed_port:
+                          data.preset === 'docker-compose'
+                            ? undefined
+                            : data.port,
+                      },
+                    })
+                  } catch (error) {
+                    if (
+                      handleSensitiveActionError(error, () => void submit())
+                    ) {
+                      return
+                    }
+                    console.error('Project import error:', error)
+                  }
                 }
+                await submit()
               }}
             />
           )}

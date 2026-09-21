@@ -33,6 +33,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -69,6 +70,12 @@ type ProjectFormValues = z.infer<typeof projectSchema>
 
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
+  // Renaming a project onto — or off — a slug this host grants the Docker
+  // socket to is a sensitive action (ADR 045), so the save can come back 428
+  // asking the admin to re-verify rather than failing. Every other save here
+  // is unaffected and never reaches the dialog.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
@@ -114,20 +121,32 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         slug: values.slug,
       },
     })
-    toast.promise(request, {
-      loading: 'Updating project...',
-      success: 'Project updated successfully',
-      error: 'Failed to update project',
-    })
-    // The toast surfaces the failure; bail out here so a rejected save never
-    // falls through to refetch/navigate, and never escapes as an unhandled
-    // rejection.
+    // Hand-rolled rather than `toast.promise`, because one outcome is neither
+    // success nor failure: a 428 means "prove it's you and this will go
+    // through". Attaching a fixed error toast up front would flash a red
+    // "Failed to update project" behind the verification dialog for a save
+    // that is about to succeed.
+    const toastId = toast.loading('Updating project...')
     let updated
     try {
       updated = await request
-    } catch {
+    } catch (error) {
+      toast.dismiss(toastId)
+      // Opens the step-up dialog and re-runs this save once verified. The
+      // global mutation handler already suppresses its own toast for
+      // STEP_UP_REQUIRED, so nothing else fires in the meantime.
+      if (
+        handleSensitiveActionError(error, () => void handleSaveProject(values))
+      ) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to update project'
+      )
       return
     }
+    toast.success('Project updated successfully', { id: toastId })
     refetch()
     // Navigate to the slug the server persisted, not the one submitted: the
     // server normalizes it, so routing on the raw input can land on a URL that
@@ -206,6 +225,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
   return (
     <div className="space-y-3">
+      {verificationDialog}
       {/* Project Settings Card */}
       <Form {...projectForm}>
         <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
