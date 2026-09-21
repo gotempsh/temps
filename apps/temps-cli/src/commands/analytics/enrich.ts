@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { readFileSync } from 'node:fs'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { enrichVisitor } from '../../api/sdk.gen.js'
@@ -280,7 +279,7 @@ export async function enrichVisitorAction(
   let fileContents: string | undefined
   if (options.file !== undefined) {
     try {
-      fileContents = readFileSync(options.file, 'utf-8')
+      fileContents = await Bun.file(options.file).text()
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e)
       throw new Error(

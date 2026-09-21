@@ -194,6 +194,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const [limit, setLimit] = React.useState(25)
   const [isEnrichDialogOpen, setIsEnrichDialogOpen] = React.useState(false)
   const [enrichJsonValue, setEnrichJsonValue] = React.useState('')
+  // The custom_data the operator was shown when the dialog opened. Removals are
+  // computed against this, not the live query: a key an app adds while the
+  // dialog is open is not in the editor, so it must not be sent as a removal.
+  const [enrichBaseline, setEnrichBaseline] = React.useState<unknown>(undefined)
   const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(
     null
   )
@@ -298,6 +302,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
 
   // Handle opening the enrich dialog
   const handleOpenEnrichDialog = () => {
+    setEnrichBaseline(visitorDetails?.custom_data)
     // Pre-populate with existing custom_data if available
     if (
       visitorDetails?.custom_data &&
@@ -333,7 +338,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
       // The API merges, so keys the operator deleted from the editor have to be
       // sent explicitly as `null` to actually be removed from the visitor.
       const custom_data = buildEnrichPayload(
-        visitorDetails?.custom_data,
+        enrichBaseline,
         parsedData as Record<string, unknown>
       )
 

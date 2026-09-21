@@ -941,6 +941,9 @@ Deployment tokens are deliberately more restricted than an API key:
   <Property name="Values stay private">
     Every enrichment that changes a visitor is written to the audit log with the key names only — never the values.
   </Property>
+  <Property name="Rate limit">
+    A token can make up to 300 visitor-changing enrichments per minute. Beyond that the API answers `429 Too Many Requests` and writes nothing, so no change is ever left unaudited. Calls that change nothing, such as re-sending the same identity on every page load, don't count.
+  </Property>
 </Properties>
 
 <Note>

@@ -33,8 +33,9 @@ pub struct AppState {
     pub api_traffic_service: Arc<ApiTrafficService>,
     /// Audit trail for writes made through this module's handlers.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
-    /// Caps the enrichment audit rows a single deployment token can create.
-    pub audit_throttle: Arc<crate::visitor_audit::AuditThrottle>,
+    /// Caps the visitor-changing enrichments (and so the audit rows) a single
+    /// deployment token can create per minute.
+    pub enrich_budget: Arc<crate::visitor_audit::EnrichWriteBudget>,
 }
 
 #[derive(OpenApi)]
@@ -1130,6 +1131,7 @@ fn deployment_token_enrich_guard(
         (status = 200, description = "Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed.", body = EnrichVisitorResponse),
         (status = 400, description = "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"),
         (status = 403, description = "Deployment token used with a non-encrypted visitor ID"),
+        (status = 429, description = "The deployment token made too many visitor-changing enrichments in the last minute; retry shortly"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -1155,8 +1157,18 @@ pub async fn enrich_visitor(
 
     // `Some` only for deployment tokens, which are confined to their project.
     let scope_project_id = auth.project_id();
-    if auth.is_deployment_token() {
+    if let Some(token) = auth.deployment_token_info() {
         deployment_token_enrich_guard(&visitor_id, &request.custom_data)?;
+        // Every change is audited, so the change rate is what bounds the audit
+        // trail. Refuse instead of writing an unaudited change.
+        if !app_state.enrich_budget.has_budget(token.token_id) {
+            return Err(too_many_requests()
+                .detail(
+                    "This deployment token made too many visitor-changing enrichments in \
+                     the last minute; retry shortly",
+                )
+                .build());
+        }
     }
 
     // Names only, bounded: values are routinely personal data and stay out of the
@@ -1181,20 +1193,10 @@ pub async fn enrich_visitor(
     };
     let response = result.map_err(handle_analytics_error)?;
 
-    let audit_decision = match (response.updated, auth.deployment_token_info()) {
-        (false, _) => None,
-        (true, Some(token)) => Some(app_state.audit_throttle.decide(token.token_id)),
-        (true, None) => Some(crate::visitor_audit::AuditDecision::Record),
-    };
-    if audit_decision == Some(crate::visitor_audit::AuditDecision::SuppressFirst) {
-        // The enrichment above still happened; only its audit row is dropped.
-        tracing::warn!(
-            project_id = ?scope_project_id,
-            "Visitor enrichment audit rows are being dropped for a deployment token \
-             that exceeded its per-minute audit budget"
-        );
-    }
-    if audit_decision == Some(crate::visitor_audit::AuditDecision::Record) {
+    if response.updated {
+        if let Some(token) = auth.deployment_token_info() {
+            app_state.enrich_budget.record(token.token_id);
+        }
         let token = auth.deployment_token_info();
         let audit = crate::visitor_audit::VisitorEnrichedAudit {
             context: temps_core::AuditContext {
@@ -2301,8 +2303,9 @@ mod enrich_handler_tests {
                 Arc::new(UnavailableAi),
             )),
             audit_service: audit.clone(),
-            audit_throttle: Arc::new(crate::visitor_audit::AuditThrottle::new(
-                30,
+            // Three visitor-changing writes per minute, so the test reaches the limit.
+            enrich_budget: Arc::new(crate::visitor_audit::EnrichWriteBudget::new(
+                3,
                 std::time::Duration::from_secs(60),
             )),
         });
@@ -2452,6 +2455,39 @@ mod enrich_handler_tests {
             assert!(log[2].2.contains("\"custom_data_keys\":[\"name\"]"));
             assert!(log[2].2.contains("\"custom_data_key_count\":1"));
         }
+
+        // The token has now made its 3 visitor-changing writes for the window:
+        // the next change is refused (429) rather than written unaudited, and no
+        // audit row was dropped along the way. No-op repeats did not count.
+        let refused = call(can_enrich(), &sealed, json!({"plan": "pro"}))
+            .await
+            .expect_err("a token over its budget is refused");
+        assert_eq!(
+            refused.into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            stored().await,
+            Some(json!({"user_id": "u1", "email": "a@b.example"})),
+            "a refused enrichment must not write"
+        );
+        assert_eq!(audit.0.lock().unwrap().len(), 3);
+        // Another project's token has its own budget.
+        let other_budget = AuthContext::new_deployment_token(
+            project + 1,
+            None,
+            None,
+            10,
+            "other-app-token".to_string(),
+            vec![DeploymentTokenPermission::VisitorsEnrich],
+        );
+        assert_eq!(
+            call(other_budget, &sealed, json!({"plan": "pro"}))
+                .await
+                .expect("a different token is unaffected")
+                .status(),
+            StatusCode::OK
+        );
 
         cleanup_test_analytics!(db);
     }

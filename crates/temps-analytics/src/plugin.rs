@@ -107,9 +107,9 @@ impl TempsPlugin for AnalyticsPlugin {
             project_access_checker,
             api_traffic_service,
             audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
-            // At most 30 enrichment audit rows per token per minute.
-            audit_throttle: Arc::new(crate::visitor_audit::AuditThrottle::new(
-                30,
+            // At most 300 visitor-changing enrichments per token per minute.
+            enrich_budget: Arc::new(crate::visitor_audit::EnrichWriteBudget::new(
+                300,
                 std::time::Duration::from_secs(60),
             )),
         });

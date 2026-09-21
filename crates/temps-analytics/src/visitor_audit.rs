@@ -37,31 +37,23 @@ pub fn bounded_key_names<'a>(keys: impl Iterator<Item = &'a String>) -> (Vec<Str
     (names, total)
 }
 
-/// What to do with the audit entry for one enrichment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditDecision {
-    /// Write it.
-    Record,
-    /// Over the per-token budget: drop it. Log the first drop of a window.
-    SuppressFirst,
-    /// Over the per-token budget: drop it silently.
-    Suppress,
-}
-
-/// Bounds how many enrichment audit rows one deployment token can create.
+/// Bounds how many visitor-changing enrichments one deployment token can make.
 ///
-/// A leaked token could otherwise flip a value back and forth and write one
-/// audit row per request. Beyond the budget the entry is dropped (the
-/// enrichment itself still happens) and the first drop of each window is
-/// logged, so the gap is visible instead of silent. Memory is bounded by the
-/// number of tokens seen inside one window.
-pub struct AuditThrottle {
+/// Every change is audited, so the audit trail is only as bounded as the writes
+/// behind it. A leaked token could otherwise flip a value back and forth and
+/// create an audit row per request. Rather than drop audit rows past a budget,
+/// the enrichment itself is refused (HTTP 429) once a token has made
+/// `max_per_window` changes inside `window`: no write ever goes unaudited.
+/// Only writes that change data are counted, so an app that re-sends the same
+/// identity on every page load is unaffected. Memory is bounded by the number
+/// of tokens seen inside one window.
+pub struct EnrichWriteBudget {
     windows: Mutex<HashMap<i32, (Instant, u32)>>,
     max_per_window: u32,
     window: Duration,
 }
 
-impl AuditThrottle {
+impl EnrichWriteBudget {
     pub fn new(max_per_window: u32, window: Duration) -> Self {
         Self {
             windows: Mutex::new(HashMap::new()),
@@ -70,9 +62,22 @@ impl AuditThrottle {
         }
     }
 
-    pub fn decide(&self, token_id: i32) -> AuditDecision {
+    /// Whether `token_id` may still make a visitor-changing enrichment now.
+    pub fn has_budget(&self, token_id: i32) -> bool {
         let now = Instant::now();
         // The map only holds counters, so a poisoned lock is still usable.
+        let windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        match windows.get(&token_id) {
+            Some((started, used)) if now.duration_since(*started) < self.window => {
+                *used < self.max_per_window
+            }
+            _ => true,
+        }
+    }
+
+    /// Count one visitor-changing enrichment made by `token_id`.
+    pub fn record(&self, token_id: i32) {
+        let now = Instant::now();
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         if windows.len() > 4096 {
             windows.retain(|_, (started, _)| now.duration_since(*started) < self.window);
@@ -82,11 +87,6 @@ impl AuditThrottle {
             *entry = (now, 0);
         }
         entry.1 = entry.1.saturating_add(1);
-        match entry.1 {
-            n if n <= self.max_per_window => AuditDecision::Record,
-            n if n == self.max_per_window.saturating_add(1) => AuditDecision::SuppressFirst,
-            _ => AuditDecision::Suppress,
-        }
     }
 }
 
@@ -182,22 +182,26 @@ mod tests {
     }
 
     #[test]
-    fn throttle_records_within_budget_then_suppresses_per_token() {
-        let throttle = AuditThrottle::new(2, Duration::from_secs(60));
-        assert_eq!(throttle.decide(1), AuditDecision::Record);
-        assert_eq!(throttle.decide(1), AuditDecision::Record);
-        assert_eq!(throttle.decide(1), AuditDecision::SuppressFirst);
-        assert_eq!(throttle.decide(1), AuditDecision::Suppress);
+    fn budget_allows_up_to_the_limit_then_refuses_per_token() {
+        let budget = EnrichWriteBudget::new(2, Duration::from_secs(60));
+        assert!(budget.has_budget(1));
+        budget.record(1);
+        assert!(budget.has_budget(1));
+        budget.record(1);
+        assert!(
+            !budget.has_budget(1),
+            "third change in the window is refused"
+        );
         // Another token has its own budget.
-        assert_eq!(throttle.decide(2), AuditDecision::Record);
+        assert!(budget.has_budget(2));
     }
 
     #[test]
-    fn throttle_budget_resets_after_the_window() {
-        let throttle = AuditThrottle::new(1, Duration::from_millis(20));
-        assert_eq!(throttle.decide(1), AuditDecision::Record);
-        assert_eq!(throttle.decide(1), AuditDecision::SuppressFirst);
+    fn budget_resets_after_the_window() {
+        let budget = EnrichWriteBudget::new(1, Duration::from_millis(20));
+        budget.record(1);
+        assert!(!budget.has_budget(1));
         std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(throttle.decide(1), AuditDecision::Record);
+        assert!(budget.has_budget(1));
     }
 }
