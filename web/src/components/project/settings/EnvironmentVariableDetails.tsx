@@ -434,10 +434,7 @@ export function EnvironmentVariableDetails({
                 </TableHeader>
                 <TableBody>
                   {history.data.items.map((event) => {
-                    const details = event.details as {
-                      check_name?: string
-                      result?: VerificationResult
-                    }
+                    const details = event.details
                     return (
                       <TableRow key={event.id}>
                         <TableCell className="align-top py-2">

@@ -3,11 +3,26 @@
 use super::*;
 use temps_entities::env_var_history;
 
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct VariableHistoryDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<VerificationResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_secret: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_in_preview: Option<bool>,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct VariableHistoryEntry {
     pub id: i64,
     pub kind: String,
-    pub details: serde_json::Value,
+    pub details: VariableHistoryDetails,
     #[schema(value_type=String,format=DateTime)]
     pub created_at: DateTime<Utc>,
 }
@@ -53,13 +68,22 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(project_id, "list variable history", e))?
             .into_iter()
-            .map(|row| VariableHistoryEntry {
-                id: row.id,
-                kind: row.kind,
-                details: row.details,
-                created_at: row.created_at,
+            .map(|row| {
+                let details = serde_json::from_value(row.details).map_err(|_| {
+                    HttpChecksError::HistoryStored {
+                        project_id,
+                        env_var_id,
+                        entry_id: row.id,
+                    }
+                })?;
+                Ok(VariableHistoryEntry {
+                    id: row.id,
+                    kind: row.kind,
+                    details,
+                    created_at: row.created_at,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, HttpChecksError>>()?;
         Ok(VariableHistoryList {
             items,
             total,
@@ -121,5 +145,29 @@ impl HttpChecksService {
         tx.commit()
             .await
             .map_err(|e| db_error(0, "commit automatic detection", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn history_details_only_serialize_known_fields() {
+        let details: VariableHistoryDetails = serde_json::from_value(
+            serde_json::json!({"check_name":"GitHub","unexpected_secret":"must-not-leave-storage"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(details).unwrap(),
+            serde_json::json!({"check_name":"GitHub"})
+        );
+        assert!(serde_json::from_value::<VariableHistoryDetails>(
+            serde_json::json!({"result":"invalid"})
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::to_value(VariableHistoryDetails::default()).unwrap(),
+            serde_json::json!({})
+        );
     }
 }

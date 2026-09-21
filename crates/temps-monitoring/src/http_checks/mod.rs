@@ -25,7 +25,7 @@ use temps_credential_checks::{
 };
 use temps_entities::{env_vars, http_checks, projects};
 use utoipa::ToSchema;
-pub use variable_history::{VariableHistoryEntry, VariableHistoryList};
+pub use variable_history::{VariableHistoryDetails, VariableHistoryEntry, VariableHistoryList};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpChecksError {
@@ -46,6 +46,12 @@ pub enum HttpChecksError {
     Encryption { project_id: i32 },
     #[error("HTTP check {id} contains unreadable stored configuration or results")]
     Stored { id: i32 },
+    #[error("History entry {entry_id} for variable {env_var_id} in project {project_id} contains invalid stored details")]
+    HistoryStored {
+        project_id: i32,
+        env_var_id: i32,
+        entry_id: i64,
+    },
 }
 fn db_error(project_id: i32, operation: &'static str, source: DbErr) -> HttpChecksError {
     HttpChecksError::Database {

@@ -31,7 +31,8 @@ impl From<HttpChecksError> for Problem {
             HttpChecksError::Busy { .. } => StatusCode::CONFLICT,
             HttpChecksError::Database { .. }
             | HttpChecksError::Encryption { .. }
-            | HttpChecksError::Stored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | HttpChecksError::Stored { .. }
+            | HttpChecksError::HistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         problemdetails::new(status)
             .with_title("HTTP check failed")
@@ -350,7 +351,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
         )
 }
 #[derive(OpenApi)]
-#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history),components(schemas(VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Provider-independent HTTP credential checks")))]
+#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Provider-independent HTTP credential checks")))]
 pub struct HttpChecksApiDoc;
 
 fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Result<(), Problem> {

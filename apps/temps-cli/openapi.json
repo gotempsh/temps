@@ -52968,13 +52968,59 @@
         ],
         "type": "object"
       },
+      "VariableHistoryDetails": {
+        "properties": {
+          "check_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_in_preview": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "is_secret": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "key": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VerificationResult"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "VariableHistoryEntry": {
         "properties": {
           "created_at": {
             "format": "date-time",
             "type": "string"
           },
-          "details": {},
+          "details": {
+            "$ref": "#/components/schemas/VariableHistoryDetails"
+          },
           "id": {
             "format": "int64",
             "type": "integer"

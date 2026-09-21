@@ -24549,9 +24549,17 @@ export type ValidationSummary = {
     warning_count: number;
 };
 
+export type VariableHistoryDetails = {
+    check_name?: string | null;
+    include_in_preview?: boolean | null;
+    is_secret?: boolean | null;
+    key?: string | null;
+    result?: null | VerificationResult;
+};
+
 export type VariableHistoryEntry = {
     created_at: string;
-    details: unknown;
+    details: VariableHistoryDetails;
     id: number;
     kind: string;
 };
