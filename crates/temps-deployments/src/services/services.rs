@@ -5805,6 +5805,7 @@ mod tests {
                 container_port: 3000,
                 host_port: readiness_host_port,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         });
         deployer.expect_start_container().returning(|_| Ok(()));
@@ -6861,6 +6862,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         });
         deployer.expect_stop_container().returning(|_| Ok(()));

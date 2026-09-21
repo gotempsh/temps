@@ -351,7 +351,13 @@ impl TempsPlugin for DeploymentsPlugin {
                     // Without this the `Local` slot stays in the pool even in a
                     // profile with no Docker daemon, and a zero-node install
                     // would place every replica on a host that cannot start it.
-                    .with_local_workloads_enabled(local_workloads.local_workloads_enabled()),
+                    .with_local_workloads_enabled(local_workloads.local_workloads_enabled())
+                    // ADR 045: the control plane's OWN grant, so a project
+                    // granted host Docker access can be placed on `Local`
+                    // when — and only when — this process grants it.
+                    .with_docker_socket_grant(
+                        temps_core::docker_socket_grant::process_grant().clone(),
+                    ),
             );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 
@@ -372,6 +378,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // deploy_succeeded, deploy_failed, first_deploy_succeeded).
             workflow_execution_service.set_telemetry(telemetry.clone());
             tracing::debug!("Telemetry wired into workflow execution service");
+
+            // The audit sink is wired in `initialize_plugin_services`, which is
+            // the first phase where every plugin has registered.
 
             // Get ExternalServiceManager for accessing external service env vars
             let external_service_manager =
@@ -524,6 +533,26 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             }
 
+            // Wire auditing for deploy-path security events — currently the
+            // ADR-045 record that a deployment received the host Docker
+            // socket. Optional: an install with no audit sink still deploys,
+            // it just logs the event instead of persisting it.
+            if let Some(workflow_execution_service) =
+                context.get_service::<WorkflowExecutionService>()
+            {
+                match context.get_service::<dyn temps_core::AuditLogger>() {
+                    Some(audit_logger) => {
+                        workflow_execution_service.set_audit_logger(audit_logger);
+                        tracing::debug!("Audit logger wired into workflow execution service");
+                    }
+                    None => tracing::warn!(
+                        "No audit logger is registered; a deployment that receives the host \
+                         Docker socket (ADR 045) will be logged but not recorded in the audit \
+                         trail"
+                    ),
+                }
+            }
+
             Ok(())
         })
     }
@@ -641,12 +670,14 @@ impl TempsPlugin for DeploymentsPlugin {
         // endpoint cannot report "schedulable" for a process that would then
         // refuse every replica.
         let node_scheduler = Arc::new(
-            crate::services::NodeScheduler::new(node_service.clone()).with_local_workloads_enabled(
-                temps_core::policy_or_default(
-                    context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            crate::services::NodeScheduler::new(node_service.clone())
+                .with_local_workloads_enabled(
+                    temps_core::policy_or_default(
+                        context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                    )
+                    .local_workloads_enabled(),
                 )
-                .local_workloads_enabled(),
-            ),
+                .with_docker_socket_grant(temps_core::docker_socket_grant::process_grant().clone()),
         );
 
         // Re-fetch encryption service for AppState (the first ref was moved into WorkflowPlanner)

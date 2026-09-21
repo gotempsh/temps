@@ -631,6 +631,13 @@ pub struct WorkflowExecutionService {
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// Currently the ADR-045 "this deployment received the host Docker socket"
+    /// record. Late-bound like `telemetry` so the deploy path never depends on
+    /// auditing being wired, and a missing sink degrades to a log line rather
+    /// than failing a deployment.
+    audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
 }
 
 impl WorkflowExecutionService {
@@ -669,7 +676,13 @@ impl WorkflowExecutionService {
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            audit_logger: OnceCell::new(),
         }
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045).
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
@@ -1629,6 +1642,11 @@ impl WorkflowExecutionService {
                     })
                     .service_name(deployment.slug.clone())
                     .namespace("default".to_string())
+                    // ADR 045: the executing host compares this against its
+                    // own grant. Set unconditionally — an absent slug simply
+                    // means no grant can ever match.
+                    .project_slug(project.slug.clone())
+                    .audit_logger(self.audit_logger.get().cloned())
                     .port(port as u32)
                     .configured_port(configured_port)
                     .replicas(replicas)
@@ -4159,6 +4177,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         }
 

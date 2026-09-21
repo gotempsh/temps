@@ -417,6 +417,7 @@ async fn test_heartbeat_reactivates_offline_node() {
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
             },
         )
         .await;
@@ -443,6 +444,7 @@ async fn test_heartbeat_preserves_draining_status() {
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
             },
         )
         .await;
@@ -525,6 +527,7 @@ async fn test_heartbeat_records_reported_architecture() {
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
             },
         )
         .await;
@@ -558,6 +561,7 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
             },
         )
         .await;

@@ -297,12 +297,19 @@ impl TempsPlugin for DeployerPlugin {
             // defers any actual daemon access to the point of use, so constructing
             // it here is always safe regardless of whether a daemon is present.
             let server_config = config_service.get_server_config();
+            // ADR 045: read this host's Docker socket grant exactly once, here,
+            // and inject it. Re-reading it per deploy would let a later
+            // `set_var` change container privileges at runtime.
+            let docker_socket_grant = temps_core::docker_socket_grant::process_grant().clone();
+            docker_socket_grant.log_startup("temps serve");
+
             let mut docker_runtime = DockerRuntime::new_with_handle(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
             )
-            .with_extra_networks(server_config.docker_extra_networks.clone());
+            .with_extra_networks(server_config.docker_extra_networks.clone())
+            .with_docker_socket_grant(docker_socket_grant.clone());
             if let Some(limits) = build_limits {
                 let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
                     Some(crate::docker::BuildResourceLimits {

@@ -969,6 +969,7 @@ mod tests {
             command,
             log_config: None,
             labels: std::collections::HashMap::new(),
+            project_slug: None,
         };
 
         let result = deployer
@@ -1328,6 +1329,7 @@ mod tests {
             command: None,
             log_config: None,
             labels: std::collections::HashMap::new(),
+            project_slug: None,
         };
 
         let result = deployer.deploy_container(request).await;

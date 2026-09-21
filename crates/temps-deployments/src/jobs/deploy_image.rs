@@ -340,6 +340,15 @@ pub struct DeploymentJobConfig {
     /// Label selector for node-based scheduling. Nodes whose labels match
     /// the selector are eligible. Applied after `target_nodes` filtering.
     pub target_labels: Option<serde_json::Value>,
+    /// Slug of the project being deployed.
+    ///
+    /// Carried for exactly one reason (ADR 045): it is sent to the executing
+    /// host in the `DeployRequest` so that host can compare it against its own
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS`, and it gates placement so a granted
+    /// project never lands on a host that would start it without the socket.
+    /// `None` disables both, which is the correct behaviour for job configs
+    /// built outside a project context (and for tests).
+    pub project_slug: Option<String>,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
     /// (linked-service container names are replaced with their internal
@@ -392,6 +401,7 @@ impl Default for DeploymentJobConfig {
             health_check_timeout_secs: 300,
             target_nodes: None,
             target_labels: None,
+            project_slug: None,
             remote_environment_variables: None,
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
@@ -425,6 +435,10 @@ pub struct DeployImageJob {
     container_ids: Arc<Mutex<Vec<String>>>,
     /// Per-replica deployers: maps container_id → deployer for cleanup on correct node
     replica_deployers: Arc<Mutex<HashMap<String, Arc<dyn ContainerDeployer>>>>,
+    /// Audit sink for the ADR-045 "this deployment received the host Docker
+    /// socket" record. `None` on installs with no audit sink wired (and in
+    /// tests): the event is then logged, never silently dropped.
+    audit_logger: Option<Arc<dyn temps_core::AuditLogger>>,
     /// Candidate metadata is persisted on a failed readiness check so the
     /// authenticated container-log endpoints can still resolve the container.
     failed_candidates: Arc<Mutex<Vec<FailedContainerCandidate>>>,
@@ -513,6 +527,7 @@ impl DeployImageJob {
             log_service: None,
             container_ids: Arc::new(Mutex::new(Vec::new())),
             replica_deployers: Arc::new(Mutex::new(HashMap::new())),
+            audit_logger: None,
             failed_candidates: Arc::new(Mutex::new(Vec::new())),
             retained_failure: Arc::new(AtomicBool::new(false)),
             retention_forbidden: Arc::new(AtomicBool::new(false)),
@@ -1139,6 +1154,54 @@ impl DeployImageJob {
     /// Record a newly-created container and the deployer that owns it before
     /// any subsequent fallible operation. Cleanup must never guess which
     /// Docker daemon owns a container created on a worker node.
+    /// Record that this deployment received the host Docker socket (ADR 045).
+    ///
+    /// Never fails the deployment: auditing is a graceful-degradation
+    /// dependency, and the container is already running by the time we get
+    /// here. A missing sink, or a sink that errors, still leaves the event in
+    /// the process log and in the deploy log the user reads.
+    async fn audit_docker_socket_mount(&self, context: &WorkflowContext, node: &str) {
+        tracing::warn!(
+            project_id = context.project_id,
+            deployment_id = context.deployment_id,
+            node,
+            "Deployment received the host Docker socket; it is root-equivalent on that host"
+        );
+
+        let Some(audit_logger) = self.audit_logger.as_ref() else {
+            tracing::warn!(
+                project_id = context.project_id,
+                deployment_id = context.deployment_id,
+                "No audit sink is wired; the host-Docker-socket mount was logged but not \
+                 recorded in the audit trail"
+            );
+            return;
+        };
+
+        let audit = crate::handlers::audit::DeploymentDockerSocketMountedAudit {
+            context: temps_core::AuditContext {
+                // Not a user action: the grant is host policy, set by whoever
+                // has a shell on the machine, and this event is produced by
+                // the deploy pipeline. `0` is the codebase's convention for
+                // an actor that is not a user.
+                user_id: 0,
+                ip_address: None,
+                user_agent: format!("temps-deployer/node-{node}"),
+            },
+            project_id: context.project_id,
+            deployment_id: context.deployment_id,
+            node: node.to_string(),
+        };
+        if let Err(e) = audit_logger.create_audit_log(&audit).await {
+            tracing::error!(
+                project_id = context.project_id,
+                deployment_id = context.deployment_id,
+                error = %e,
+                "Failed to create the host-Docker-socket audit log"
+            );
+        }
+    }
+
     fn track_container(&self, container_id: String, deployer: Arc<dyn ContainerDeployer>) {
         // Insert ownership first. This prevents cleanup from observing a
         // container ID without the node-aware deployer needed to remove it.
@@ -1435,13 +1498,19 @@ impl DeployImageJob {
             // handed a container that cannot start.
             let image_platforms = self.available_image_platforms(image_output).await;
             match scheduler
-                .schedule_replicas_excluding(
-                    self.config.replicas,
-                    target_labels,
-                    target_ids,
-                    self.config.anti_affinity,
-                    &self.config.exclude_node_ids,
-                    &image_platforms,
+                .schedule_placement(
+                    crate::services::node_scheduler::ReplicaPlacementRequest {
+                        replica_count: self.config.replicas,
+                        labels: target_labels,
+                        target_node_ids: target_ids,
+                        anti_affinity: self.config.anti_affinity,
+                        exclude_node_ids: &self.config.exclude_node_ids,
+                        image_platforms: &image_platforms,
+                        // ADR 045: lets the scheduler refuse, up front, to
+                        // place a socket-granted project on a host that does
+                        // not grant it.
+                        project_slug: self.config.project_slug.as_deref(),
+                    },
                 )
                 .await
             {
@@ -1974,6 +2043,7 @@ impl DeployImageJob {
                 ("control-plane".to_string(), "0".to_string())
             }
         };
+        let audited_node_name = assigned_node_name.clone();
         environment_vars.insert("TEMPS_NODE_NAME".to_string(), assigned_node_name);
         environment_vars.insert("TEMPS_NODE_ID".to_string(), assigned_node_id);
         environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
@@ -2028,6 +2098,10 @@ impl DeployImageJob {
             command: self.config.command.clone(),
             log_config: self.log_config.clone(),
             labels,
+            // ADR 045: the slug, never an instruction. The executing host
+            // answers from its own environment whether this project gets
+            // `/var/run/docker.sock`.
+            project_slug: self.config.project_slug.clone(),
         };
 
         let deploy_result = deployer
@@ -2036,6 +2110,26 @@ impl DeployImageJob {
             .map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
+
+        // ADR 045: the executing host reports back whether it actually mounted
+        // `/var/run/docker.sock`. Audited here rather than inferred from the
+        // control plane's view, because only that host knows its own grant —
+        // and this record is the only durable evidence that a given container
+        // was root-equivalent on a given machine.
+        if deploy_result.docker_socket_mounted {
+            self.audit_docker_socket_mount(context, &audited_node_name)
+                .await;
+            self.log(
+                context,
+                format!(
+                    "⚠️  Host Docker socket mounted into this container on '{}' — this \
+                     project is granted host Docker access there and is root-equivalent on \
+                     that machine (ADR 045)",
+                    audited_node_name
+                ),
+            )
+            .await?;
+        }
 
         // Store both the ID and its owning deployer before status checks,
         // startup log streaming, health checks, or any other fallible work.
@@ -2769,6 +2863,7 @@ pub struct DeployImageJobBuilder {
     registry_credentials: Option<temps_deployer::remote::RemotePullCredentials>,
     failed_container_db: Option<Arc<DbConnection>>,
     deployment_id: Option<i32>,
+    audit_logger: Option<Arc<dyn temps_core::AuditLogger>>,
 }
 
 impl DeployImageJobBuilder {
@@ -2789,7 +2884,15 @@ impl DeployImageJobBuilder {
             registry_credentials: None,
             failed_container_db: None,
             deployment_id: None,
+            audit_logger: None,
         }
+    }
+
+    /// Audit sink for the ADR-045 host-Docker-socket record. Optional: an
+    /// install with no sink logs the event instead of persisting it.
+    pub fn audit_logger(mut self, logger: Option<Arc<dyn temps_core::AuditLogger>>) -> Self {
+        self.audit_logger = logger;
+        self
     }
 
     pub fn job_id(mut self, job_id: String) -> Self {
@@ -2814,6 +2917,17 @@ impl DeployImageJobBuilder {
 
     pub fn namespace(mut self, namespace: String) -> Self {
         self.config.namespace = namespace;
+        self
+    }
+
+    /// Slug of the project being deployed (ADR 045).
+    ///
+    /// Set by every caller that has a project in hand. It travels to the
+    /// executing host in the `DeployRequest` so that host can evaluate its own
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS`, and it gates placement so a granted
+    /// project can never land on a host that does not grant it.
+    pub fn project_slug(mut self, project_slug: impl Into<String>) -> Self {
+        self.config.project_slug = Some(project_slug.into());
         self
     }
 
@@ -3043,6 +3157,7 @@ impl DeployImageJobBuilder {
         if let (Some(db), Some(deployment_id)) = (self.failed_container_db, self.deployment_id) {
             job = job.with_failed_container_retention(db, deployment_id);
         }
+        job.audit_logger = self.audit_logger;
 
         Ok(job)
     }
@@ -3711,6 +3826,7 @@ mod tests {
                 container_port,
                 host_port,
                 status: DeployerContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         }
 

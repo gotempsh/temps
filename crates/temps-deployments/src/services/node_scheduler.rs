@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::node_service::{NodeError, NodeService};
+use temps_core::docker_socket_grant::DockerSocketGrant;
 
 /// Describes where a replica should be deployed.
 #[derive(Debug, Clone)]
@@ -85,6 +86,10 @@ pub enum ExclusionReason {
     /// The node never reported an architecture, so it was kept in the pool but
     /// its compatibility could not be verified.
     UnverifiedArchitecture,
+    /// The project is granted host Docker access somewhere, but not on this
+    /// node (ADR 045). Placing it here would quietly start it without the
+    /// socket it exists to use.
+    DockerSocketNotGranted { project_slug: String },
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -103,6 +108,13 @@ impl std::fmt::Display for ExclusionReason {
                 f,
                 "has not reported its architecture, so image compatibility could not be \
                  verified — upgrade the node agent"
+            ),
+            ExclusionReason::DockerSocketNotGranted { project_slug } => write!(
+                f,
+                "does not grant project '{project_slug}' host Docker access — set \
+                 {}={project_slug} on that host and restart its agent, or remove the grant \
+                 everywhere to deploy without the socket",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
             ),
         }
     }
@@ -123,6 +135,42 @@ impl std::fmt::Display for NodeExclusion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "'{}' {}", self.node_name, self.reason)
     }
+}
+
+/// Where a project granted host Docker access (ADR 045) may be placed.
+///
+/// Only constructed when *some* host grants the project. Its absence is the
+/// common case and means the gate does not apply at all.
+#[derive(Debug, Clone)]
+struct DockerSocketGate {
+    project_slug: String,
+    /// Worker nodes advertising the grant, of any status. Placement is
+    /// restricted to these plus (separately) the control plane.
+    granting_node_ids: std::collections::HashSet<i32>,
+    /// Names of the same nodes, for the failure message — an operator needs to
+    /// be told *which* host to bring back, not just that there isn't one.
+    granting_node_names: Vec<String>,
+}
+
+/// Inputs to one placement pass.
+///
+/// A struct rather than a growing positional argument list, so the call site
+/// names what it is asking for — in particular `project_slug`, which decides
+/// whether the ADR-045 host Docker socket gate applies at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicaPlacementRequest<'a> {
+    pub replica_count: u32,
+    pub labels: Option<&'a serde_json::Value>,
+    pub target_node_ids: Option<&'a [i32]>,
+    pub anti_affinity: bool,
+    pub exclude_node_ids: &'a [i32],
+    pub image_platforms: &'a [String],
+    /// Slug of the project being placed, when known.
+    ///
+    /// `None` disables the Docker socket gate entirely — the historical
+    /// behaviour, and the right answer for callers that are not placing an
+    /// application deployment.
+    pub project_slug: Option<&'a str>,
 }
 
 /// Result of a scheduling pass: where the replicas go, plus what was left out.
@@ -256,6 +304,13 @@ pub struct NodeScheduler {
     /// Local" behaviour would turn a scheduling problem into a container that
     /// silently never comes up.
     local_workloads_enabled: bool,
+    /// The **control plane's own** host Docker socket grant (ADR 045), read
+    /// from this process's environment at startup.
+    ///
+    /// Used for exactly one thing: deciding whether the `Local` slot is an
+    /// eligible placement for a granted project. It says nothing about worker
+    /// nodes — each of those answers for itself through its heartbeat.
+    docker_socket_grant: DockerSocketGrant,
 }
 
 impl NodeScheduler {
@@ -269,7 +324,61 @@ impl NodeScheduler {
             local_platform: None,
             platform_source: None,
             local_workloads_enabled: true,
+            docker_socket_grant: DockerSocketGrant::default(),
         }
+    }
+
+    /// Resolve the ADR-045 gate for `project_slug`, or `None` when no host
+    /// anywhere grants it.
+    ///
+    /// `None` is the overwhelmingly common answer and means "ordinary
+    /// placement, socket never mounted" — the behaviour of every install that
+    /// never set the variable.
+    ///
+    /// Reads **all** nodes rather than only active ones on purpose: a project
+    /// granted solely on a node that is currently offline must fail with
+    /// "that host is not schedulable right now", not silently land somewhere
+    /// that would start it without the socket.
+    async fn docker_socket_gate(
+        &self,
+        project_slug: &str,
+    ) -> Result<Option<DockerSocketGate>, NodeError> {
+        let control_plane_grants = self.docker_socket_grant.allows(project_slug);
+        let nodes = self.node_service.list_all().await?;
+
+        let mut granting_node_ids = std::collections::HashSet::new();
+        let mut granting_node_names = Vec::new();
+        for node in &nodes {
+            if temps_core::docker_socket_grant::capacity_grants(&node.capacity)
+                .iter()
+                .any(|slug| slug == project_slug)
+            {
+                granting_node_ids.insert(node.id);
+                granting_node_names.push(node.name.clone());
+            }
+        }
+
+        if !control_plane_grants && granting_node_ids.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(DockerSocketGate {
+            project_slug: project_slug.to_string(),
+            granting_node_ids,
+            granting_node_names,
+        }))
+    }
+
+    /// Declare which projects the **control plane** grants host Docker access
+    /// to, so a granted project can be placed on the `Local` slot.
+    pub fn with_docker_socket_grant(mut self, grant: DockerSocketGrant) -> Self {
+        self.docker_socket_grant = grant;
+        self
+    }
+
+    /// The control plane's own grant, for the projects capability response.
+    pub fn docker_socket_grant(&self) -> &DockerSocketGrant {
+        &self.docker_socket_grant
     }
 
     /// Declare whether the control plane itself may host replicas.
@@ -594,6 +703,36 @@ impl NodeScheduler {
         exclude_node_ids: &[i32],
         image_platforms: &[String],
     ) -> Result<SchedulingOutcome, NodeError> {
+        self.schedule_placement(ReplicaPlacementRequest {
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity,
+            exclude_node_ids,
+            image_platforms,
+            project_slug: None,
+        })
+        .await
+    }
+
+    /// Full placement pass, including the ADR-045 Docker socket gate.
+    ///
+    /// Takes a struct rather than an eighth positional argument: the existing
+    /// six are already hard to read at a call site, and the new one changes
+    /// the security properties of the placement, which should be named.
+    pub async fn schedule_placement(
+        &self,
+        request: ReplicaPlacementRequest<'_>,
+    ) -> Result<SchedulingOutcome, NodeError> {
+        let ReplicaPlacementRequest {
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity,
+            exclude_node_ids,
+            image_platforms,
+            project_slug,
+        } = request;
         let target_node_ids = placement_node_ids(target_node_ids);
         let targets_control_plane =
             target_node_ids.is_some_and(|ids| ids.contains(&CONTROL_PLANE_NODE_ID));
@@ -627,15 +766,80 @@ impl NodeScheduler {
             }
         }
 
+        // Collected rather than only logged: the caller writes these into the
+        // deploy log, which is the only place the user can see them.
+        let mut exclusions: Vec<NodeExclusion> = Vec::new();
+
+        // ADR 045 Docker socket gate.
+        //
+        // The control plane cannot know whether a project "needs" the socket —
+        // there is no such flag, deliberately, because it would be an
+        // API-writable path to host root. What it can know is where the socket
+        // is *granted*. So: a project requires socket-capable placement iff
+        // some host grants it. Granted nowhere means ordinary placement and no
+        // socket, which is exactly the behaviour of every install that never
+        // set the variable.
+        let socket_gate = match project_slug {
+            Some(slug) => self.docker_socket_gate(slug).await?,
+            None => None,
+        };
+        // The `Local` slot answers from the control plane's own environment,
+        // never from anything a worker or a request said.
+        let local_grants_socket = socket_gate
+            .as_ref()
+            .is_none_or(|gate| self.docker_socket_grant.allows(&gate.project_slug));
+        if let Some(gate) = &socket_gate {
+            eligible_nodes.retain(|node| {
+                let grants = gate.granting_node_ids.contains(&node.id);
+                if !grants {
+                    tracing::info!(
+                        node_id = node.id,
+                        node_name = %node.name,
+                        project_slug = %gate.project_slug,
+                        "Excluding node from scheduling: it does not grant this project host \
+                         Docker access"
+                    );
+                    exclusions.push(NodeExclusion {
+                        node_id: node.id,
+                        node_name: node.name.clone(),
+                        reason: ExclusionReason::DockerSocketNotGranted {
+                            project_slug: gate.project_slug.clone(),
+                        },
+                        excluded: true,
+                    });
+                }
+                grants
+            });
+
+            // Nothing left anywhere. Fail here, before a single image is
+            // built or transferred, rather than letting the deployment land
+            // somewhere that would silently omit the socket.
+            if eligible_nodes.is_empty() && !(self.local_workloads_enabled && local_grants_socket) {
+                return Err(NodeError::DockerSocketNotSchedulable {
+                    project_slug: gate.project_slug.clone(),
+                    reason: if gate.granting_node_names.is_empty() {
+                        "only this control plane grants it, and this control plane cannot host \
+                         the workload (local workloads are disabled, or the requested \
+                         placement excludes it)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "the only host(s) that grant it ({}) are not schedulable right now \
+                             — inactive, draining, or excluded by the requested node/label \
+                             placement",
+                            gate.granting_node_names.join(", ")
+                        )
+                    },
+                });
+            }
+        }
+
         // Architecture filter. A node whose Docker daemon runs a different
         // architecture than every image we have cannot start the container —
         // it would pull the tar, create the container, and die with
         // `exec format error`. Drop it here so the failure is a scheduling
         // decision with a readable message instead of a crash loop.
         let local_compatible = self.local_supports(image_platforms);
-        // Collected rather than only logged: the caller writes these into the
-        // deploy log, which is the only place the user can see them.
-        let mut exclusions: Vec<NodeExclusion> = Vec::new();
         if !image_platforms.is_empty() {
             eligible_nodes.retain(|node| {
                 match node.architecture.as_deref() {
@@ -718,11 +922,15 @@ impl NodeScheduler {
         let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
         let local_matches_constraints =
             !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
-        // Three independent reasons Local can drop out of the pool: it cannot
+        // Four independent reasons Local can drop out of the pool: it cannot
         // run the image, it does not satisfy an explicit placement constraint,
-        // or this process is not allowed to run workloads at all.
-        let include_local =
-            self.local_workloads_enabled && local_compatible && local_matches_constraints;
+        // this process is not allowed to run workloads at all, or — for a
+        // project granted host Docker access somewhere — this control plane's
+        // own environment does not grant it (ADR 045).
+        let include_local = self.local_workloads_enabled
+            && local_compatible
+            && local_matches_constraints
+            && local_grants_socket;
 
         // An explicit "deploy to the control plane" request (synthetic node ID
         // 0) in a profile that runs no workloads is not a constraint the
@@ -1233,6 +1441,205 @@ mod tests {
         MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![nodes_list])
             .into_connection()
+    }
+
+    // ── ADR 045: host Docker socket placement gate ───────────────────────
+
+    mod docker_socket_gate {
+        use super::*;
+
+        fn granting_node(id: i32, name: &str, slugs: &[&str]) -> nodes::Model {
+            make_node_with_capacity(
+                id,
+                name,
+                serde_json::json!({ "docker_socket_projects": slugs }),
+            )
+        }
+
+        /// `schedule_placement` queries `list_active` first, then `list_all`
+        /// for the gate, so the mock must answer both in that order.
+        fn scheduler_for_gate(
+            active: Vec<nodes::Model>,
+            all: Vec<nodes::Model>,
+            grant: DockerSocketGrant,
+        ) -> NodeScheduler {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![active, all])
+                .into_connection();
+            NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(grant)
+        }
+
+        fn placement<'a>(
+            replica_count: u32,
+            project_slug: Option<&'a str>,
+        ) -> ReplicaPlacementRequest<'a> {
+            ReplicaPlacementRequest {
+                replica_count,
+                labels: None,
+                target_node_ids: None,
+                anti_affinity: false,
+                exclude_node_ids: &[],
+                image_platforms: &[],
+                project_slug,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_project_granted_nowhere_is_scheduled_normally() {
+            // The state of every install that never set the variable: the gate
+            // must not narrow the pool at all.
+            let nodes = vec![make_node(1, "worker-1"), make_node(2, "worker-2")];
+            let scheduler = scheduler_for_gate(
+                nodes.clone(),
+                nodes,
+                DockerSocketGrant::parse(Some("some-other-project")),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(2, Some("node-daemon")))
+                .await
+                .expect("ungated placement succeeds");
+
+            assert_eq!(outcome.assignments.len(), 2);
+            assert!(
+                outcome.exclusions.is_empty(),
+                "no node should be excluded for a project nobody grants"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_granted_project_excludes_nodes_that_do_not_advertise_it() {
+            let granting = granting_node(1, "node-daemon-host", &["node-daemon"]);
+            let plain = make_node(2, "worker-2");
+            let scheduler = scheduler_for_gate(
+                vec![granting.clone(), plain.clone()],
+                vec![granting, plain],
+                // The control plane itself does not grant it, so `Local` is
+                // out too and only the advertising node remains.
+                DockerSocketGrant::default(),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(2, Some("node-daemon")))
+                .await
+                .expect("one granting node is enough");
+
+            for assignment in &outcome.assignments {
+                match assignment {
+                    NodeAssignment::Remote { node_id, .. } => assert_eq!(*node_id, 1),
+                    NodeAssignment::Local => {
+                        panic!("the control plane does not grant this project")
+                    }
+                }
+            }
+
+            let excluded: Vec<&NodeExclusion> =
+                outcome.exclusions.iter().filter(|e| e.excluded).collect();
+            assert_eq!(excluded.len(), 1);
+            assert_eq!(excluded[0].node_name, "worker-2");
+            assert_eq!(
+                excluded[0].reason,
+                ExclusionReason::DockerSocketNotGranted {
+                    project_slug: "node-daemon".to_string()
+                }
+            );
+            // The deploy log renders this verbatim, so it must name the fix.
+            let rendered = excluded[0].to_string();
+            assert!(
+                rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS=node-daemon"),
+                "{rendered}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_project_granted_only_on_an_inactive_node_fails_before_anything_is_built() {
+            // The node grants it but is not in `list_active` — offline,
+            // draining, or stale heartbeat.
+            let offline = granting_node(7, "node-daemon-host", &["node-daemon"]);
+            let scheduler = scheduler_for_gate(
+                vec![make_node(2, "worker-2")],
+                vec![offline, make_node(2, "worker-2")],
+                DockerSocketGrant::default(),
+            );
+
+            let error = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect_err("placement must be refused, not silently relocated");
+
+            match error {
+                NodeError::DockerSocketNotSchedulable {
+                    ref project_slug,
+                    ref reason,
+                } => {
+                    assert_eq!(project_slug, "node-daemon");
+                    assert!(
+                        reason.contains("node-daemon-host"),
+                        "the operator must be told which host to bring back: {reason}"
+                    );
+                }
+                other => panic!("expected DockerSocketNotSchedulable, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_control_plane_is_eligible_only_when_its_own_environment_grants_it() {
+            // No worker advertises it; the control plane's own grant does.
+            let scheduler = scheduler_for_gate(
+                vec![make_node(2, "worker-2")],
+                vec![make_node(2, "worker-2")],
+                DockerSocketGrant::parse(Some("node-daemon")),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect("the control plane grants it, so Local is eligible");
+
+            assert_eq!(outcome.assignments.len(), 1);
+            assert!(matches!(outcome.assignments[0], NodeAssignment::Local));
+        }
+
+        #[tokio::test]
+        async fn a_granted_project_with_no_granting_host_at_all_is_never_gated() {
+            // Belt and braces on the rule that makes this safe to ship: if the
+            // slug appears in nobody's grant, placement is exactly what it was
+            // before ADR 045 and the socket is never mounted.
+            let scheduler = scheduler_for_gate(
+                vec![make_node(1, "worker-1")],
+                vec![make_node(1, "worker-1")],
+                DockerSocketGrant::default(),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("infra-agent")))
+                .await
+                .expect("ordinary placement");
+
+            assert_eq!(outcome.assignments.len(), 1);
+            assert!(outcome.exclusions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_placement_with_no_project_slug_never_queries_the_gate() {
+            // Callers that are not placing an application deployment keep the
+            // historical behaviour — and must not pay for a second query.
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_node(1, "worker-1")]])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, None))
+                .await
+                .expect("placement without a slug succeeds on one query");
+
+            assert_eq!(outcome.assignments.len(), 1);
+        }
     }
 
     // ── Scheduling capability (onboarding surface) ───────────────────────

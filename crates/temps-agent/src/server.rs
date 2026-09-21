@@ -17,6 +17,7 @@ use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
 use crate::service_handlers;
 use crate::AgentConfig;
+use temps_deployer::docker_socket_grant::DockerSocketGrant;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 
 /// The node's container platform once discovered, shared between the HTTP
@@ -192,11 +193,18 @@ fn spawn_heartbeat_loop(
     platform: SharedPlatform,
     docker: Option<bollard::Docker>,
     dns_health: crate::network_sync::SharedDnsHealth,
+    docker_socket_grant: DockerSocketGrant,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
     let token = config.token.clone();
     let labels = config.labels.clone();
+    // ADR 045: advertise this host's own grant so the control plane can gate
+    // placement up front instead of discovering mid-deploy that the node would
+    // have deployed the project without the socket. Snapshotted once at
+    // startup, like the grant itself — the list cannot change without a
+    // restart, so recomputing it per beat would only invite drift.
+    let docker_socket_projects = docker_socket_grant.to_vec();
 
     tokio::spawn(async move {
         // Strict TLS — the worker→control-plane heartbeat carries the
@@ -279,6 +287,12 @@ fn spawn_heartbeat_loop(
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
+                // Sent on EVERY beat, including as an empty array: "this node
+                // grants nothing" is a fact the scheduler must be able to act
+                // on, and an operator who *removes* a grant and restarts the
+                // agent needs the control plane to stop placing that project
+                // here on the next beat rather than at the next re-join.
+                "docker_socket_projects": docker_socket_projects,
             });
             // `architecture` goes out on EVERY beat once known, not just at
             // registration: it's how a node upgraded from a pre-multi-arch
@@ -548,6 +562,7 @@ pub async fn start_agent_server(
     config: AgentConfig,
     overlay_peers: crate::network_sync::SharedPeers,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    docker_socket_grant: DockerSocketGrant,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
 
@@ -593,6 +608,7 @@ pub async fn start_agent_server(
         platform,
         docker,
         dns_health.clone(),
+        docker_socket_grant,
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the

@@ -80,6 +80,20 @@ pub enum NodeError {
         requested_replicas: u32,
     },
 
+    #[error(
+        "Project '{project_slug}' is granted host Docker access (ADR 045), but {reason}. \
+         Deploying it on a host that does not grant it would start the container without \
+         the Docker socket it exists to use, so placement is refused instead"
+    )]
+    DockerSocketNotSchedulable {
+        /// Project the deployment is for.
+        project_slug: String,
+        /// Which of the two failure shapes this is, already phrased for the
+        /// operator: no host grants it and is schedulable, or the hosts that
+        /// grant it are not schedulable right now.
+        reason: String,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -139,6 +153,15 @@ pub struct HeartbeatRequest {
     /// columns are left untouched rather than cleared, same treatment as
     /// `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+    /// Project slugs this node grants host Docker access to (ADR 045), as
+    /// reported by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// `Some(vec![])` is meaningful and must be honoured: it is how an
+    /// operator who *removed* a grant and restarted the agent tells the
+    /// scheduler to stop placing that project here. `None` means "not
+    /// reported" — a pre-ADR-045 agent — and leaves the stored value
+    /// untouched, same rule as `architecture` above.
+    pub docker_socket_projects: Option<Vec<String>>,
 }
 
 /// Service-layer view of the agent-reported DNS resolver health, decoupled
@@ -158,6 +181,34 @@ pub struct DnsResolverHeartbeatUpdate {
 /// "active") is considered live, and its identity may not be silently rebound
 /// by a re-registration. Mirrors the health-check stale threshold.
 const NODE_LIVE_THRESHOLD_SECS: i64 = 90;
+
+/// Merge the ADR-045 advertised Docker socket grant into the capacity JSON a
+/// heartbeat will persist.
+///
+/// Pure so the two rules that matter can be asserted without a database:
+/// an explicitly reported list always wins — including an **empty** one, which
+/// is how an operator who removed a grant and restarted the agent stops the
+/// scheduler placing that project there — and an absent list carries the
+/// previous value forward rather than clearing it, so a pre-ADR-045 agent
+/// binary cannot silently drop a grant the node is in fact honouring.
+fn resolve_heartbeat_capacity(
+    mut capacity: serde_json::Value,
+    reported: Option<Vec<String>>,
+    previous_capacity: &serde_json::Value,
+) -> serde_json::Value {
+    match reported {
+        Some(slugs) => {
+            temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &slugs);
+        }
+        None => {
+            let previous = temps_core::docker_socket_grant::capacity_grants(previous_capacity);
+            if !previous.is_empty() {
+                temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &previous);
+            }
+        }
+    }
+    capacity
+}
 
 /// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
 /// token hashes) to avoid leaking a match via timing.
@@ -491,7 +542,16 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.clone().into();
         active.last_heartbeat = Set(Some(chrono::Utc::now()));
-        active.capacity = Set(request.capacity);
+        // ADR 045: the advertised Docker socket grant rides in `capacity`
+        // rather than a dedicated column. `capacity` is agent-derived, wholly
+        // replaced on every beat and never written through the API — exactly
+        // the lifecycle this list has — so a migration would buy nothing but
+        // a column that can disagree with the beat that set it.
+        active.capacity = Set(resolve_heartbeat_capacity(
+            request.capacity,
+            request.docker_socket_projects,
+            &node.capacity,
+        ));
         // Only transition to "active" if the node was "offline" (reconnecting).
         // Preserve managed states like "draining" and "drained".
         if node.status == "offline" {
@@ -1098,6 +1158,60 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 045: how an agent's advertised Docker socket grant is persisted
+    /// into the node's `capacity` JSON.
+    mod docker_socket_advertisement {
+        use super::super::resolve_heartbeat_capacity;
+        use temps_core::docker_socket_grant::capacity_grants;
+
+        #[test]
+        fn a_reported_list_is_persisted_alongside_the_rest_of_capacity() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.4}),
+                Some(vec!["node-daemon".to_string()]),
+                &serde_json::json!({}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["node-daemon".to_string()]);
+            assert_eq!(capacity["cpu_usage"], serde_json::json!(0.4));
+        }
+
+        #[test]
+        fn an_empty_reported_list_clears_a_previous_grant() {
+            // The operator removed the grant and restarted the agent. The
+            // scheduler must stop placing the project there on the next beat,
+            // not at the next re-join.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({}),
+                Some(Vec::new()),
+                &serde_json::json!({"docker_socket_projects": ["node-daemon"]}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+
+        #[test]
+        fn an_unreported_list_carries_the_previous_value_forward() {
+            // A pre-ADR-045 agent binary reports nothing. Clearing here would
+            // make the control plane refuse placements the node would in fact
+            // have honoured.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({"docker_socket_projects": ["infra-agent"]}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["infra-agent".to_string()]);
+        }
+
+        #[test]
+        fn an_unreported_list_with_no_previous_value_stays_absent() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+    }
+
     /// A node registering under a fresh name must not be able to claim
     /// another node's address — the cluster CA signs SANs built from exactly
     /// these fields, so that certificate would be good for the victim's
@@ -1677,6 +1791,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                 },
             )
             .await;
@@ -1705,6 +1820,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                 },
             )
             .await;
@@ -1742,6 +1858,7 @@ mod tests {
                         last_sync_error: Some("resolver crashed: too many open files".into()),
                         record_count: 37,
                     }),
+                    docker_socket_projects: None,
                 },
             )
             .await;
@@ -1798,6 +1915,7 @@ mod tests {
                         capacity: serde_json::json!({}),
                         labels: None,
                         dns_resolver: None,
+                        docker_socket_projects: None,
                     },
                 )
                 .await;
@@ -1854,6 +1972,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                 },
             )
             .await;
@@ -1926,6 +2045,7 @@ mod tests {
                         last_sync_error: None,
                         record_count: 0,
                     }),
+                    docker_socket_projects: None,
                 },
             )
             .await;

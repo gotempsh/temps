@@ -42,6 +42,22 @@ pub struct DeploymentTeardownAudit {
     pub deployment_id: i32,
 }
 
+/// A deployment received the host's Docker socket (ADR 045).
+///
+/// Recorded per deployment that actually got the mount, naming the project and
+/// the host that granted it. The grant itself is not API-writable, so this is
+/// the only durable record that a given container was root-equivalent on a
+/// given machine — which is exactly what an operator reconstructing an
+/// incident needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentDockerSocketMountedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub deployment_id: i32,
+    /// Host that mounted it: a worker node's name, or `control-plane`.
+    pub node: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvironmentTeardownAudit {
     pub context: AuditContext,
@@ -288,6 +304,10 @@ impl_audit_operation!(DeploymentPromotedAudit, "DEPLOYMENT_PROMOTED");
 impl_audit_operation!(
     DeploymentFailureReportedAudit,
     "DEPLOYMENT_FAILURE_REPORTED"
+);
+impl_audit_operation!(
+    DeploymentDockerSocketMountedAudit,
+    "DEPLOYMENT_DOCKER_SOCKET_MOUNTED"
 );
 impl_audit_operation!(EnvironmentTeardownAudit, "ENVIRONMENT_TEARDOWN");
 impl_audit_operation!(ContainerActionAudit, "CONTAINER_ACTION");

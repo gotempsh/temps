@@ -42,6 +42,8 @@ pub mod release_images {
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
+/// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
+pub mod docker_socket_grant;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
@@ -62,6 +64,7 @@ pub use docker_handle::{
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
     WORKER_NODE_REQUIRED_TYPE, WORKER_NODE_SETUP_PATH,
 };
+pub use docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,

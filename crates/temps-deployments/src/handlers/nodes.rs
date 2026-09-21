@@ -204,6 +204,15 @@ pub struct HeartbeatApiRequest {
     /// expected, not stale data. The stored columns are left untouched when
     /// `None`, same treatment as `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeat>,
+    /// Project slugs this node grants host Docker access to (ADR 045), read
+    /// by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// Advisory only: it tells the scheduler where a granted project *may* be
+    /// placed. It can never cause a socket to be mounted — that decision is
+    /// made by the executing process against its own environment. `None` from
+    /// a pre-ADR-045 agent leaves the stored value untouched; an empty array
+    /// clears it.
+    pub docker_socket_projects: Option<Vec<String>>,
 }
 
 /// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
@@ -1338,6 +1347,7 @@ async fn node_heartbeat(
         labels: request.labels,
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
+        docker_socket_projects: request.docker_socket_projects.clone(),
     };
 
     let architecture_change = app_state
@@ -3071,6 +3081,13 @@ impl From<NodeError> for Problem {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
+            }
+            // Reuses the platform's existing worker-node problem rather than
+            // inventing a second "nowhere to put this" shape: the remedy is
+            // the same page, and the console already renders this error code
+            // as an actionable onboarding state.
+            NodeError::DockerSocketNotSchedulable { .. } => {
+                temps_core::worker_node_required_problem(error.to_string())
             }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);

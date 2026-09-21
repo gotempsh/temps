@@ -32,6 +32,13 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+/// Host-level Docker socket grant (ADR 045).
+///
+/// Re-exported from `temps-core`, where the type lives so the agent, the
+/// scheduler, the projects API and the CLI can all read it without depending
+/// on the deployer's Docker toolchain. The deployer is where it is *applied*,
+/// so it is also reachable here.
+pub use temps_core::docker_socket_grant;
 pub mod metadata_egress;
 pub mod platform;
 pub mod plugin;
@@ -329,6 +336,18 @@ pub struct DeployRequest {
     /// `sh.temps.service`, and optionally `sh.temps.deploy_id`.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Slug of the project this container belongs to.
+    ///
+    /// Carried so the process that actually creates the container can compare
+    /// it against *its own* host-level Docker socket grant (ADR 045). The
+    /// control plane never tells a worker "mount the socket"; it says "this is
+    /// project X" and the worker answers from its own environment.
+    ///
+    /// `Option` + `#[serde(default)]` keeps the wire format compatible with
+    /// agents and control planes built before ADR 045: an absent slug can
+    /// never match a grant, so it means "no grant possible".
+    #[serde(default)]
+    pub project_slug: Option<String>,
 }
 
 /// Docker container log rotation configuration
@@ -418,6 +437,15 @@ pub struct DeployResult {
     pub container_port: u16,
     pub host_port: u16,
     pub status: ContainerStatus,
+    /// Whether the executing host mounted `/var/run/docker.sock` into this
+    /// container because its own grant named the project (ADR 045).
+    ///
+    /// Reported back rather than inferred by the caller: only the process that
+    /// built the `HostConfig` knows its own environment, and this is what the
+    /// control plane audits. `#[serde(default)]` so a pre-ADR-045 agent's
+    /// response still deserialises as `false`.
+    #[serde(default)]
+    pub docker_socket_mounted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -968,6 +996,67 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// A control plane built before ADR 045 sends no `project_slug`, and an
+    /// agent built before it sends no `docker_socket_mounted`. Both directions
+    /// of the agent wire protocol must keep deserialising.
+    #[test]
+    fn deploy_request_without_project_slug_deserialises() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+        });
+
+        let request: DeployRequest =
+            serde_json::from_value(wire).expect("legacy DeployRequest must still deserialise");
+        assert_eq!(request.project_slug, None);
+    }
+
+    #[test]
+    fn deploy_request_round_trips_the_project_slug() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert_eq!(request.project_slug.as_deref(), Some("node-daemon"));
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(encoded["project_slug"], serde_json::json!("node-daemon"));
+    }
+
+    #[test]
+    fn deploy_result_without_socket_flag_deserialises_as_not_mounted() {
+        let wire = serde_json::json!({
+            "container_id": "abc",
+            "container_name": "app-1",
+            "container_port": 3000,
+            "host_port": 32768,
+            "status": "Running",
+        });
+
+        let result: DeployResult =
+            serde_json::from_value(wire).expect("legacy DeployResult must still deserialise");
+        assert!(!result.docker_socket_mounted);
+    }
+
     fn stats_with_cpu(cpu_percent: f64, cpu_limit_cores: Option<f64>) -> ContainerStats {
         ContainerStats {
             cpu_percent,
@@ -1130,6 +1219,7 @@ mod tests {
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -1257,6 +1347,7 @@ mod tests {
             container_port: 3000,
             host_port: 8080,
             status: ContainerStatus::Running,
+            docker_socket_mounted: false,
         };
 
         assert_eq!(result.container_id, "xyz789");
@@ -1453,6 +1544,7 @@ CMD ["echo", "Hello from container"]
             command: None, // No custom command, use default from image
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
         };
 
         assert_eq!(request.environment_vars.len(), 3);

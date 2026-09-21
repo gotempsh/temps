@@ -104,6 +104,7 @@ impl ContainerDeployer for MockContainerDeployer {
             container_port: 8080,
             host_port: 8080,
             status: ContainerStatus::Running,
+            docker_socket_mounted: false,
         })
     }
 

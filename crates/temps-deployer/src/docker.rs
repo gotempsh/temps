@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use sysinfo::System;
 use tempfile::TempDir;
+use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
 use temps_core::DockerHandle;
 use tokio::io::AsyncWriteExt;
@@ -663,6 +664,52 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
     merge_dns_with_fallback(primary, &host_default_dns_servers())
 }
 
+/// The one bind a project granted host Docker access receives, or `None`.
+///
+/// Pure so the decision — the single most security-relevant branch in the
+/// deployer — is unit-testable without a daemon. An absent `project_slug`
+/// (a pre-ADR-045 caller) can never match, and an empty grant (every install
+/// that never set the variable) can never match either.
+pub fn docker_socket_bind_for(
+    grant: &DockerSocketGrant,
+    project_slug: Option<&str>,
+) -> Option<&'static str> {
+    project_slug
+        .filter(|slug| grant.allows(slug))
+        .map(|_| temps_core::docker_socket_grant::DOCKER_SOCKET_BIND)
+}
+
+/// The security-hardening half of every application container's `HostConfig`.
+///
+/// Split out from the single build site so the invariant that matters can be
+/// asserted in a test: adding the Docker socket bind does **not** relax
+/// `cap_drop: ALL`, `no-new-privileges`, the PID limit or the init process.
+/// The socket is one extra file descriptor, not a privileged container.
+///
+/// Binds are collected rather than assigned so adding a second bind here can
+/// never silently drop the secrets mount.
+pub fn hardened_host_config(
+    secrets_bind: Option<String>,
+    docker_socket_bind: Option<&str>,
+) -> bollard::models::HostConfig {
+    let binds: Vec<String> = secrets_bind
+        .into_iter()
+        .chain(docker_socket_bind.map(str::to_string))
+        .collect();
+    bollard::models::HostConfig {
+        // Security hardening: drop all Linux capabilities by default
+        cap_drop: Some(vec!["ALL".to_string()]),
+        // Security hardening: prevent privilege escalation via setuid/setgid
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        // Security hardening: limit number of processes to prevent fork bombs
+        pids_limit: Some(512),
+        // Security hardening: use init process for proper signal handling and zombie reaping
+        init: Some(true),
+        binds: (!binds.is_empty()).then_some(binds),
+        ..Default::default()
+    }
+}
+
 pub struct DockerRuntime {
     /// The process-wide Docker client, which may be unavailable on a
     /// control-plane node that has no local daemon. All operations that
@@ -722,6 +769,14 @@ pub struct DockerRuntime {
     /// which is tmpfs on most Linux distros and got wiped on every
     /// reboot, forcing a redeploy. Override via [`Self::with_secrets_root`].
     secrets_root: PathBuf,
+    /// Projects this host grants `/var/run/docker.sock` to (ADR 045).
+    ///
+    /// Read once from this process's own environment at startup and injected
+    /// via [`Self::with_docker_socket_grant`]; empty by default, which is the
+    /// behaviour of every install that never sets the variable. The comparison
+    /// happens here, in the process that creates the container, so a control
+    /// plane can never talk a worker into mounting the socket.
+    docker_socket_grant: DockerSocketGrant,
     /// Optional global cap on concurrent `build_image` calls. Set via
     /// [`Self::with_build_limits`] on the control plane to prevent N
     /// simultaneous deploys from each grabbing 50% of host CPU/RAM and
@@ -1301,6 +1356,7 @@ impl DockerRuntime {
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
+            docker_socket_grant: DockerSocketGrant::default(),
             build_semaphore: None,
             build_permits: None,
             builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1491,6 +1547,25 @@ impl DockerRuntime {
     pub fn with_host_bind_address(mut self, address: String) -> Self {
         self.host_bind_address = address;
         self
+    }
+
+    /// Declare which projects this host grants `/var/run/docker.sock` to
+    /// (ADR 045).
+    ///
+    /// Built from this process's own environment
+    /// (`TEMPS_DOCKER_SOCKET_PROJECTS`) exactly once at startup by
+    /// `temps serve` and `temps agent`. Left at the default (empty) everywhere
+    /// else — including tests and the proxy's on-demand lifecycle adapter,
+    /// which never creates a container from a `DeployRequest`.
+    pub fn with_docker_socket_grant(mut self, grant: DockerSocketGrant) -> Self {
+        self.docker_socket_grant = grant;
+        self
+    }
+
+    /// The grant this runtime evaluates. Exposed so a caller can report what
+    /// this host would do without re-reading the environment.
+    pub fn docker_socket_grant(&self) -> &DockerSocketGrant {
+        &self.docker_socket_grant
     }
 
     /// Configure a secondary multi-host overlay network. When set, every
@@ -3263,6 +3338,21 @@ impl ContainerDeployer for DockerRuntime {
 
         let dns_for_container = self.dns_for_container();
 
+        // ADR 045: this host's own grant decides, not the caller. The control
+        // plane only says "this is project X"; the answer comes from the
+        // environment of the process creating the container.
+        let docker_socket_bind =
+            docker_socket_bind_for(&self.docker_socket_grant, request.project_slug.as_deref());
+        if docker_socket_bind.is_some() {
+            warn!(
+                container_name = %request.container_name,
+                project_slug = request.project_slug.as_deref().unwrap_or("<unknown>"),
+                "Mounting the host Docker socket into this container: the project is named in \
+                 {}. It is root-equivalent on this host.",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+            );
+        }
+
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(self.network_name.clone()),
@@ -3293,21 +3383,12 @@ impl ContainerDeployer for DockerRuntime {
                 .cpu_limit
                 .map(|cores| (cores * 1_000_000_000.0) as i64),
             log_config,
-            // Security hardening: drop all Linux capabilities by default
-            cap_drop: Some(vec!["ALL".to_string()]),
-            // Security hardening: prevent privilege escalation via setuid/setgid
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // Security hardening: limit number of processes to prevent fork bombs
-            pids_limit: Some(512),
-            // Security hardening: use init process for proper signal handling and zombie reaping
-            init: Some(true),
-            // Collected rather than assigned so adding a second bind here does
-            // not silently drop the secrets mount.
-            binds: {
-                let binds: Vec<String> = secrets_bind.into_iter().collect();
-                (!binds.is_empty()).then_some(binds)
-            },
-            ..Default::default()
+            // Capability drops, no-new-privileges, the PID limit, the init
+            // process and every bind (secrets, plus the ADR-045 Docker socket
+            // when this host grants it) come from one pure helper so the
+            // hardening cannot drift between call sites or be weakened by
+            // adding a mount.
+            ..hardened_host_config(secrets_bind, docker_socket_bind)
         };
 
         // Build container labels (used by log aggregator for container discovery)
@@ -3450,6 +3531,7 @@ impl ContainerDeployer for DockerRuntime {
             container_port,
             host_port,
             status: ContainerStatus::Running,
+            docker_socket_mounted: docker_socket_bind.is_some(),
         })
     }
 
@@ -4140,6 +4222,97 @@ mod docker_tests {
     use tokio::fs;
     use tokio::time::{timeout, Duration};
 
+    /// ADR 045: the grant is evaluated here, by the process that builds the
+    /// container, and it adds exactly one bind without relaxing anything else.
+    mod docker_socket_grant {
+        use super::*;
+        use temps_core::docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_BIND};
+
+        fn binds_of(config: &bollard::models::HostConfig) -> Vec<String> {
+            config.binds.clone().unwrap_or_default()
+        }
+
+        fn assert_still_hardened(config: &bollard::models::HostConfig) {
+            assert_eq!(config.cap_drop, Some(vec!["ALL".to_string()]));
+            assert_eq!(
+                config.security_opt,
+                Some(vec!["no-new-privileges:true".to_string()])
+            );
+            assert_eq!(config.pids_limit, Some(512));
+            assert_eq!(config.init, Some(true));
+            assert_ne!(config.privileged, Some(true));
+        }
+
+        #[test]
+        fn granted_slug_gets_the_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon,infra-agent"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"));
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+
+            let config = hardened_host_config(None, bind);
+            assert_eq!(binds_of(&config), vec![DOCKER_SOCKET_BIND.to_string()]);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn granted_slug_keeps_the_secrets_bind_alongside_the_socket() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"));
+            let config = hardened_host_config(
+                Some("/var/lib/temps/secrets/c:/run/secrets:ro".into()),
+                bind,
+            );
+
+            let binds = binds_of(&config);
+            assert!(binds.contains(&"/var/lib/temps/secrets/c:/run/secrets:ro".to_string()));
+            assert!(binds.contains(&DOCKER_SOCKET_BIND.to_string()));
+            assert_eq!(binds.len(), 2);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn ungranted_slug_gets_no_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(docker_socket_bind_for(&grant, Some("infra-agent")), None);
+
+            let config = hardened_host_config(None, None);
+            assert!(config.binds.is_none());
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn absent_slug_gets_no_socket_bind_even_when_the_host_grants_something() {
+            // A pre-ADR-045 control plane sends no slug at all. It must never
+            // be interpreted as "any project".
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(docker_socket_bind_for(&grant, None), None);
+        }
+
+        #[test]
+        fn a_host_that_grants_nothing_never_mounts_the_socket() {
+            let grant = DockerSocketGrant::default();
+            assert_eq!(docker_socket_bind_for(&grant, Some("node-daemon")), None);
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn runtime_defaults_to_granting_nothing() {
+            let runtime = DockerRuntime::new_with_handle(
+                Arc::new(DockerHandle::disabled(
+                    temps_core::PROFILE_CONTROL_PLANE,
+                    temps_core::CONTROL_PLANE_DOCKER_REASON,
+                )),
+                false,
+                "temps".to_string(),
+            );
+            assert!(runtime.docker_socket_grant().is_empty());
+
+            let runtime =
+                runtime.with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+            assert!(runtime.docker_socket_grant().allows("node-daemon"));
+        }
+    }
+
     #[test]
     fn docker_log_tail_keeps_memory_bounded_and_retains_newest_bytes() {
         let mut logs = DockerLogTail::new(8);
@@ -4748,6 +4921,7 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "60".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
         };
 
         let info = match runtime.deploy_container(deploy_request).await {
@@ -4812,6 +4986,7 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
         }
     }
 
@@ -5658,6 +5833,7 @@ CMD ["cat", "/hello.txt"]
                     command: Some(vec!["sleep".to_string(), "30".to_string()]),
                     log_config: Some(ContainerLogConfig::app_default()),
                     labels: HashMap::new(),
+                    project_slug: None,
                 };
 
                 let deploy_result = runtime.deploy_container(deploy_request).await;
@@ -5747,6 +5923,7 @@ CMD ["cat", "/hello.txt"]
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
         };
 
         let inspect_caps = |id: String| {
@@ -6668,6 +6845,7 @@ CMD ["cat", "/hello.txt"]
             command: None,
             log_config: None,
             labels: HashMap::new(),
+            project_slug: None,
         };
         let err = runtime
             .deploy_container(req)
