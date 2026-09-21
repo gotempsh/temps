@@ -1089,6 +1089,13 @@ impl ManifestRepo {
     /// the error for diagnostics. Never drops a row on its own — only
     /// [`Self::resolve_forgets`] does, and only once the index itself
     /// confirms the rows are gone.
+    ///
+    /// Upsert, not a plain UPDATE: the immediate forget can fail on the same
+    /// call where [`Self::enqueue_forget`] itself also failed (e.g. a
+    /// transient Postgres blip), in which case no backlog row exists yet to
+    /// UPDATE and the retry would be silently lost — every call site enqueues
+    /// best-effort before attempting, but this is the one place that must
+    /// leave a durable row regardless of whether that enqueue landed.
     pub async fn record_forget_failure(
         &self,
         seqs: &[i64],
@@ -1100,9 +1107,13 @@ impl ManifestRepo {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE log_line_forget_backlog \
-                 SET attempts = attempts + 1, last_error = $2, last_attempted_at = now() \
-                 WHERE chunk_seq = ANY($1::bigint[])",
+                "INSERT INTO log_line_forget_backlog \
+                     (chunk_seq, attempts, last_error, last_attempted_at) \
+                 SELECT s, 1, $2, now() FROM unnest($1::bigint[]) AS s \
+                 ON CONFLICT (chunk_seq) DO UPDATE \
+                 SET attempts = log_line_forget_backlog.attempts + 1, \
+                     last_error = EXCLUDED.last_error, \
+                     last_attempted_at = EXCLUDED.last_attempted_at",
                 vec![Value::from(seqs.to_vec()), Value::from(error)],
             ))
             .await
@@ -1552,5 +1563,37 @@ mod tests {
         repo.resolve_forgets(&[b]).await.unwrap();
         let remaining = repo.pending_forgets(10).await.unwrap();
         assert!(!remaining.contains(&a) && !remaining.contains(&b));
+    }
+
+    /// A call site enqueues best-effort before attempting the immediate
+    /// forget — if that enqueue itself fails (Postgres blip) there is no
+    /// backlog row yet when the immediate forget also fails. This is the one
+    /// path that must not lose the retry: `record_forget_failure` has to
+    /// create its own row rather than assume one already exists.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn record_forget_failure_creates_the_row_when_enqueue_never_ran() {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let repo = ManifestRepo::new(db.connection_arc());
+        let seq = -900_003_i64;
+
+        assert!(!repo.pending_forgets(1000).await.unwrap().contains(&seq));
+
+        repo.record_forget_failure(&[seq], "simulated: enqueue and forget both failed")
+            .await
+            .unwrap();
+
+        assert!(
+            repo.pending_forgets(1000).await.unwrap().contains(&seq),
+            "the failure must be durably queued even though nothing enqueued it first"
+        );
+
+        repo.resolve_forgets(&[seq]).await.unwrap();
     }
 }
