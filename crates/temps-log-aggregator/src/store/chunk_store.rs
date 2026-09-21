@@ -1112,8 +1112,31 @@ impl LogLineStore for ChunkStore {
         before: DateTime<Utc>,
     ) -> Result<u64, LogAggregatorError> {
         let (lines, seqs) = self.manifests.purge_project(project_id, before).await?;
-        if let Err(e) = self.line_index.forget_chunks(&seqs).await {
-            tracing::warn!(project_id, chunks = seqs.len(), error = %e, "line index forget after purge failed; rows age out by TTL");
+        // Durably queued before the immediate attempt (ADR-047 §8a): a purge
+        // is an explicit user request to delete data, so leaving its rows
+        // queryable in the index for a whole retention window on a single
+        // failed remote call is worse here than anywhere else this pattern
+        // is used. `ForgetSweeper` retries whatever this attempt could not
+        // confirm.
+        if let Err(e) = self.manifests.enqueue_forget(&seqs).await {
+            tracing::warn!(project_id, chunks = seqs.len(), error = %e, "could not durably queue purged chunks for line index forget");
+        }
+        match self.line_index.forget_chunks(&seqs).await {
+            Ok(()) => {
+                if let Err(e) = self.manifests.resolve_forgets(&seqs).await {
+                    tracing::warn!(project_id, chunks = seqs.len(), error = %e, "line index forget succeeded but the backlog entry could not be cleared");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_id, chunks = seqs.len(), error = %e, "line index forget after purge failed; queued for the forget sweeper to retry");
+                if let Err(record_err) = self
+                    .manifests
+                    .record_forget_failure(&seqs, &e.to_string())
+                    .await
+                {
+                    tracing::warn!(project_id, chunks = seqs.len(), error = %record_err, "could not record the failed forget attempt");
+                }
+            }
         }
         Ok(lines)
     }

@@ -204,6 +204,7 @@ export function LogHistogram({
                 setup_path: '/settings/metrics-monitoring',
                 live_chunks: 0,
                 indexed_chunks: 0,
+                forget_backlog: 0,
               }
             }
           />

@@ -282,6 +282,7 @@ pub mod m20260920_000001_log_chunks_indexed_at;
 pub mod m20260920_000002_log_collector_positions;
 pub mod m20260921_000001_log_lines_index;
 pub mod m20260921_000002_log_line_index_state;
+pub mod m20260921_000003_log_line_forget_backlog;
 
 mod m20260920_000001_compose_security_policies;
 
@@ -624,6 +625,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260920_000002_log_collector_positions::Migration),
             Box::new(m20260921_000001_log_lines_index::Migration),
             Box::new(m20260921_000002_log_line_index_state::Migration),
+            Box::new(m20260921_000003_log_line_forget_backlog::Migration),
         ]
     }
 }

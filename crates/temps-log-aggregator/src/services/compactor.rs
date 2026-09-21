@@ -167,10 +167,36 @@ impl CompactorService {
         self
     }
 
-    /// Forget retired chunks in the line index; logged, never fatal.
+    /// Forget retired chunks in the line index. Never fatal to compaction —
+    /// but never just logged and dropped either: `seqs` is durably enqueued
+    /// in `log_line_forget_backlog` *before* the immediate attempt, so a
+    /// failure (or a crash between the two) leaves `ForgetSweeper` something
+    /// to retry until the index actually confirms the rows are gone (ADR-047
+    /// §8a; see the "Backend Switch Skips Reindexing" / "Failed Tombstones
+    /// Preserve Deleted Rows" review findings this replaced).
     async fn forget_in_index(&self, seqs: &[i64], why: &str) {
-        if let Err(e) = self.line_index.forget_chunks(seqs).await {
-            warn!(chunks = seqs.len(), why, error = %e, "line index forget failed; rows age out by TTL");
+        if seqs.is_empty() {
+            return;
+        }
+        if let Err(e) = self.manifests.enqueue_forget(seqs).await {
+            warn!(chunks = seqs.len(), why, error = %e, "could not durably queue chunks for line index forget");
+        }
+        match self.line_index.forget_chunks(seqs).await {
+            Ok(()) => {
+                if let Err(e) = self.manifests.resolve_forgets(seqs).await {
+                    warn!(chunks = seqs.len(), why, error = %e, "line index forget succeeded but the backlog entry could not be cleared");
+                }
+            }
+            Err(e) => {
+                warn!(chunks = seqs.len(), why, error = %e, "line index forget failed; queued for the forget sweeper to retry");
+                if let Err(record_err) = self
+                    .manifests
+                    .record_forget_failure(seqs, &e.to_string())
+                    .await
+                {
+                    warn!(chunks = seqs.len(), why, error = %record_err, "could not record the failed forget attempt");
+                }
+            }
         }
     }
 

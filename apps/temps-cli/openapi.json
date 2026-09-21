@@ -2682,6 +2682,12 @@
             "description": "What analytics would do here — shown as the example in the\nonboarding state.",
             "type": "string"
           },
+          "forget_backlog": {
+            "description": "Chunks retired (compacted, purged, or expired by retention) whose\nremoval from the line index has not yet been confirmed — durably\nqueued in `log_line_forget_backlog` and drained by `ForgetSweeper`\n(ADR-047 §8a). Non-zero for more than a few sweep intervals (30s,\nsee [`crate::services::FORGET_SWEEP_INTERVAL`]) means the index\nstill holds rows for chunks that no longer exist — over-counted in\nfacets/histograms/aggregates until the sweeper catches up.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "indexed_chunks": {
             "format": "int64",
             "minimum": 0,
@@ -2719,7 +2725,8 @@
           "setup_path",
           "example",
           "live_chunks",
-          "indexed_chunks"
+          "indexed_chunks",
+          "forget_backlog"
         ],
         "type": "object"
       },

@@ -882,7 +882,7 @@ fn build_chunk_meta(
 /// Retry `f` up to `RETRY_DELAYS.len()` additional times (so
 /// `1 + RETRY_DELAYS.len()` attempts total) with the ADR-046 backoff
 /// schedule, returning the last error if every attempt fails.
-async fn retry_with_backoff<T, E, F, Fut>(mut f: F) -> Result<T, E>
+pub(crate) async fn retry_with_backoff<T, E, F, Fut>(mut f: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,

@@ -1160,6 +1160,16 @@ export type AnalyticsCapability = {
      * onboarding state.
      */
     example: string;
+    /**
+     * Chunks retired (compacted, purged, or expired by retention) whose
+     * removal from the line index has not yet been confirmed — durably
+     * queued in `log_line_forget_backlog` and drained by `ForgetSweeper`
+     * (ADR-047 §8a). Non-zero for more than a few sweep intervals (30s,
+     * see [`crate::services::FORGET_SWEEP_INTERVAL`]) means the index
+     * still holds rows for chunks that no longer exist — over-counted in
+     * facets/histograms/aggregates until the sweeper catches up.
+     */
+    forget_backlog: number;
     indexed_chunks: number;
     /**
      * Live chunks in the manifest and how many of them are indexed. Equal

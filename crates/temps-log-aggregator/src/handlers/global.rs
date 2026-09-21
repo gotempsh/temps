@@ -252,6 +252,14 @@ pub struct AnalyticsCapability {
     /// numbers mean the index is complete; a gap is the reindexer's queue.
     pub live_chunks: u64,
     pub indexed_chunks: u64,
+    /// Chunks retired (compacted, purged, or expired by retention) whose
+    /// removal from the line index has not yet been confirmed — durably
+    /// queued in `log_line_forget_backlog` and drained by `ForgetSweeper`
+    /// (ADR-047 §8a). Non-zero for more than a few sweep intervals (30s,
+    /// see [`crate::services::FORGET_SWEEP_INTERVAL`]) means the index
+    /// still holds rows for chunks that no longer exist — over-counted in
+    /// facets/histograms/aggregates until the sweeper catches up.
+    pub forget_backlog: u64,
 }
 
 #[utoipa::path(get, path="/logs/global/capabilities", tag="Logs",
@@ -269,6 +277,12 @@ pub async fn global_log_capabilities(
             .with_title("Could not read log index status")
             .with_detail(e.to_string())
     })?;
+    let forget_backlog = state.manifests.forget_backlog_size().await.map_err(|e| {
+        tracing::error!(error = %e, "forget backlog size query failed");
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Could not read log index status")
+            .with_detail(e.to_string())
+    })?;
     Ok(Json(GlobalLogCapabilities {
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
@@ -281,6 +295,7 @@ pub async fn global_log_capabilities(
                 .to_string(),
             live_chunks,
             indexed_chunks,
+            forget_backlog,
         },
     }))
 }

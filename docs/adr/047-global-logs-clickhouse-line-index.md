@@ -371,7 +371,28 @@ configures ClickHouse after weeks on TimescaleDB, or links Cloud), every
 live chunk is marked un-indexed and the reindexer rebuilds the index where
 queries now look; rows left in the previous store are never read again and
 age out by that store's retention. `GET /logs/global/capabilities` reports
-which store is active (`backend`).
+which store is active (`backend`). Recording the transition is itself
+retried with the seal path's backoff and, if it still fails, the index is
+disabled rather than exposed against stale `indexed_at` marks it cannot
+trust — the same "never expose a state nothing can distinguish from
+correct" reasoning as "Durable forgets" below.
+
+**Durable forgets.** Compaction, purge and retention each retire chunks and
+must tell the index to forget their rows — otherwise deleted or superseded
+lines keep counting in facets/histograms/aggregates, and search can return
+pointers into chunks the reader can no longer resolve. The forget call
+crosses the network (ClickHouse, or Cloud's proxies) and can fail
+transiently; "log a warning and move on" left that failure as the end of
+the story, with the stale rows visible for the rest of the index's own
+retention window (30 days by default). Every retiring call site now
+enqueues the chunk into `log_line_forget_backlog` in the control-plane
+Postgres *before* attempting the immediate forget, so a crash between the
+two still leaves a durable record; a background `ForgetSweeper` drains
+whatever is still pending every 30s until the index confirms it, regardless
+of which call site or which past server run created the entry.
+`GET /logs/global/capabilities` reports the current backlog size
+(`forget_backlog`) so a stuck Cloud outage is visible rather than a silent,
+slowly-growing discrepancy.
 
 ## Alternatives considered
 

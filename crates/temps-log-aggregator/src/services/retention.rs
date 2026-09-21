@@ -80,8 +80,30 @@ impl RetentionService {
             Ok(seqs) => {
                 let n = seqs.len() as u64;
                 debug!(tombstoned = n, "Tombstoned expired log chunks");
-                if let Err(e) = self.line_index.forget_chunks(&seqs).await {
-                    error!(error = %e, chunks = seqs.len(), "line index forget after retention failed; rows age out by TTL");
+                // Durably queued before the immediate attempt (ADR-047 §8a):
+                // a failure here must not leave expired rows queryable in
+                // the index for the rest of its retention window —
+                // `ForgetSweeper` retries whatever this attempt could not
+                // confirm.
+                if let Err(e) = self.manifests.enqueue_forget(&seqs).await {
+                    error!(error = %e, chunks = seqs.len(), "could not durably queue expired chunks for line index forget");
+                }
+                match self.line_index.forget_chunks(&seqs).await {
+                    Ok(()) => {
+                        if let Err(e) = self.manifests.resolve_forgets(&seqs).await {
+                            error!(error = %e, chunks = seqs.len(), "line index forget succeeded but the backlog entry could not be cleared");
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, chunks = seqs.len(), "line index forget after retention failed; queued for the forget sweeper to retry");
+                        if let Err(record_err) = self
+                            .manifests
+                            .record_forget_failure(&seqs, &e.to_string())
+                            .await
+                        {
+                            error!(error = %record_err, chunks = seqs.len(), "could not record the failed forget attempt");
+                        }
+                    }
                 }
                 (n, ids.len() as u64 - n.min(ids.len() as u64), bytes)
             }

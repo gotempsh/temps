@@ -1021,6 +1021,114 @@ impl ManifestRepo {
         Ok(changed)
     }
 
+    /// Durably record that `seqs` must be forgotten from the line index
+    /// (ADR-047 §8a): retired manifests (compacted, purged, or tombstoned by
+    /// retention) whose rows a caller has not yet confirmed removed from the
+    /// index. Idempotent — a `seq` already queued keeps its original
+    /// `requested_at` and attempt count.
+    ///
+    /// This is the durability half of the forget path: a caller enqueues
+    /// *before* attempting the immediate forget, so a crash between the two
+    /// still leaves [`crate::services::forget_sweeper::ForgetSweeper`]
+    /// something to retry. A successful immediate forget resolves the entry
+    /// right away ([`Self::resolve_forgets`]); the sweeper only ever sees
+    /// the ones that failed or that never got to run.
+    pub async fn enqueue_forget(&self, seqs: &[i64]) -> Result<(), LogAggregatorError> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO log_line_forget_backlog (chunk_seq) \
+                 SELECT * FROM unnest($1::bigint[]) \
+                 ON CONFLICT (chunk_seq) DO NOTHING",
+                vec![Value::from(seqs.to_vec())],
+            ))
+            .await
+            .map_err(LogAggregatorError::Database)?;
+        Ok(())
+    }
+
+    /// Oldest-first page of chunks still waiting to be forgotten from the
+    /// line index.
+    pub async fn pending_forgets(&self, limit: u32) -> Result<Vec<i64>, LogAggregatorError> {
+        let rows = self
+            .query_all(
+                "SELECT chunk_seq FROM log_line_forget_backlog \
+                 ORDER BY requested_at ASC LIMIT $1"
+                    .to_string(),
+                vec![Value::from(limit as i64)],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<i64>("", "chunk_seq")
+                    .map_err(LogAggregatorError::Database)
+            })
+            .collect()
+    }
+
+    /// Confirmed forgotten: drop the backlog entries.
+    pub async fn resolve_forgets(&self, seqs: &[i64]) -> Result<(), LogAggregatorError> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM log_line_forget_backlog WHERE chunk_seq = ANY($1::bigint[])",
+                vec![Value::from(seqs.to_vec())],
+            ))
+            .await
+            .map_err(LogAggregatorError::Database)?;
+        Ok(())
+    }
+
+    /// The attempt failed again: keep the entry, bump the counter, and keep
+    /// the error for diagnostics. Never drops a row on its own — only
+    /// [`Self::resolve_forgets`] does, and only once the index itself
+    /// confirms the rows are gone.
+    pub async fn record_forget_failure(
+        &self,
+        seqs: &[i64],
+        error: &str,
+    ) -> Result<(), LogAggregatorError> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE log_line_forget_backlog \
+                 SET attempts = attempts + 1, last_error = $2, last_attempted_at = now() \
+                 WHERE chunk_seq = ANY($1::bigint[])",
+                vec![Value::from(seqs.to_vec()), Value::from(error)],
+            ))
+            .await
+            .map_err(LogAggregatorError::Database)?;
+        Ok(())
+    }
+
+    /// Count of chunks still waiting on a confirmed line-index forget — the
+    /// capabilities endpoint's "forget backlog" figure, so a stuck Cloud
+    /// outage is visible rather than a silent, slowly-growing discrepancy.
+    pub async fn forget_backlog_size(&self) -> Result<u64, LogAggregatorError> {
+        let rows = self
+            .query_all(
+                "SELECT COUNT(*)::bigint AS n FROM log_line_forget_backlog".to_string(),
+                vec![],
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => {
+                let n: i64 = row.try_get("", "n")?;
+                Ok(n.max(0) as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Total live bytes and chunk count — the "log storage used" figure.
     pub async fn usage(&self) -> Result<(u64, u64), LogAggregatorError> {
         let rows = self
@@ -1389,5 +1497,60 @@ mod tests {
             .await
             .unwrap();
         assert!(!tombstoned_after.iter().any(|(id, _)| *id == meta.id));
+    }
+
+    /// The forget backlog round trip a `ForgetSweeper` relies on: enqueue is
+    /// idempotent, `pending_forgets` returns oldest-first, a failure keeps
+    /// the row and records why, and only `resolve_forgets` ever removes one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn forget_backlog_enqueue_fail_resolve_round_trip() {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let repo = ManifestRepo::new(db.connection_arc());
+
+        // Unique, out-of-range sequence numbers so this test never collides
+        // with another test's or a real chunk's seq in the shared schema.
+        let (a, b) = (-900_001_i64, -900_002_i64);
+
+        repo.enqueue_forget(&[a]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.enqueue_forget(&[b]).await.unwrap();
+        // Re-enqueuing `a` must not disturb its position or reset anything.
+        repo.enqueue_forget(&[a]).await.unwrap();
+        assert_eq!(repo.forget_backlog_size().await.unwrap(), 2);
+
+        let pending = repo.pending_forgets(10).await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|s| **s == a || **s == b)
+                .collect::<Vec<_>>(),
+            vec![&a, &b],
+            "oldest-first"
+        );
+
+        repo.record_forget_failure(&[a], "simulated ClickHouse timeout")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.forget_backlog_size().await.unwrap(),
+            2,
+            "a failure keeps the row, it does not drop it"
+        );
+
+        repo.resolve_forgets(&[a]).await.unwrap();
+        let remaining = repo.pending_forgets(10).await.unwrap();
+        assert!(!remaining.contains(&a), "resolved entries are gone");
+        assert!(remaining.contains(&b), "unresolved entries survive");
+
+        repo.resolve_forgets(&[b]).await.unwrap();
+        let remaining = repo.pending_forgets(10).await.unwrap();
+        assert!(!remaining.contains(&a) && !remaining.contains(&b));
     }
 }

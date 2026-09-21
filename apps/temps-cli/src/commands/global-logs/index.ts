@@ -274,6 +274,8 @@ interface AnalyticsCapability {
   example: string
   live_chunks: number
   indexed_chunks: number
+  /** Retired chunks whose forget from the line index is still pending. */
+  forget_backlog: number
 }
 
 interface GlobalLogCapabilities {
@@ -1016,6 +1018,12 @@ async function capabilitiesAction(options: { json?: boolean }): Promise<void> {
   }
   keyValue('Live chunks', analytics.live_chunks.toLocaleString())
   keyValue('Indexed chunks', analytics.indexed_chunks.toLocaleString())
+  if (analytics.forget_backlog > 0) {
+    keyValue(
+      'Pending forgets',
+      `${analytics.forget_backlog.toLocaleString()} (retried automatically every 30s)`,
+    )
+  }
   newline()
   if (analytics.configured) {
     info(`Attribute facets, histograms and aggregates are available. Example: ${analytics.example}`)

@@ -25,7 +25,10 @@ use crate::services::{
     ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
     RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
 };
-use crate::services::{ReindexService, DEFAULT_REINDEX_BATCH};
+use crate::services::{
+    ForgetSweeper, ReindexService, DEFAULT_FORGET_BATCH, DEFAULT_REINDEX_BATCH,
+    FORGET_SWEEP_BURST_PAUSE, FORGET_SWEEP_INTERVAL,
+};
 use crate::storage::{FilesystemStorage, LogStorage, S3Storage};
 use crate::store::chunk_store::ChunkStore;
 use crate::store::manifest::ManifestRepo;
@@ -171,7 +174,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // skipped is logged; the chosen store is reported by the
             // capabilities endpoint so the operator always knows where the
             // index is (never a silent downgrade).
-            let line_index = select_line_index(
+            let selected_index = select_line_index(
                 self.line_index_config.as_ref(),
                 context.get_service::<temps_cloud_client::CloudLink>(),
                 db.clone(),
@@ -181,21 +184,48 @@ impl TempsPlugin for LogAggregatorPlugin {
             // A different store than last start means the existing
             // `indexed_at` marks describe rows queries will never read
             // again: clear them so the reindexer rebuilds the index here.
-            if let Some(backend) = line_index.backend() {
+            // This must succeed *before* the new store is exposed to any
+            // reader or writer — if it silently failed, chunks that really
+            // do need reindexing would keep their old `indexed_at` marks,
+            // the reindexer would skip them (it only looks at
+            // `indexed_at IS NULL`), and facets/histograms/aggregates/
+            // attribute search would read as complete while actually
+            // missing everything not yet in the new store, with nothing
+            // short of a lucky future backend flap ever correcting it.
+            // Retried with the seal path's backoff (a transient control-
+            // plane blip should not be treated the same as "will never
+            // work"); if it still fails, the index stays disabled rather
+            // than exposed in a state nothing can distinguish from correct.
+            let line_index: Arc<dyn LineIndex> = if let Some(backend) = selected_index.backend() {
                 let manifests = ManifestRepo::new(db.clone());
-                match manifests.activate_index_backend(backend.as_str()).await {
-                    Ok(true) => tracing::info!(
-                        backend = backend.as_str(),
-                        "log line index store changed; every live chunk queued for reindex"
-                    ),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "could not record the log line index store; a store change \
-                         will not trigger a reindex until this succeeds"
-                    ),
+                match crate::services::retry_with_backoff(|| {
+                    manifests.activate_index_backend(backend.as_str())
+                })
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            backend = backend.as_str(),
+                            "log line index store changed; every live chunk queued for reindex"
+                        );
+                        selected_index
+                    }
+                    Ok(false) => selected_index,
+                    Err(e) => {
+                        let reason = format!(
+                            "log line index disabled: could not durably record the active \
+                             backend ({backend}: {e}) — refusing to serve or write to a store \
+                             whose transition from the previous one is not confirmed; this \
+                             will retry on the next restart",
+                            backend = backend.as_str(),
+                        );
+                        tracing::error!(error = %e, backend = backend.as_str(), "{reason}");
+                        Arc::new(NoLineIndex::new(reason))
+                    }
                 }
-            }
+            } else {
+                selected_index
+            };
 
             let chunk_writer = ChunkWriterService::open_with_index(
                 storage.clone(),
@@ -569,6 +599,36 @@ impl TempsPlugin for LogAggregatorPlugin {
                 tracing::info!(
                     "Log line reindexer scheduled (interval: {:?})",
                     REINDEX_INTERVAL
+                );
+            }
+
+            // ── Forget sweeper (ADR-047 §8a) ────────────────────────────
+            // Drains `log_line_forget_backlog`: chunks compaction, purge and
+            // retention retired but could not immediately confirm forgotten
+            // from the line index (a transient ClickHouse error, or a
+            // rejected Cloud insert during an outage). Without this,
+            // that first failure was the end of the story and the rows
+            // stayed queryable — double-counted in facets/histograms/
+            // aggregates, or pointing at chunks the reader can no longer
+            // resolve — for the rest of the index's retention window.
+            // Gated the same way the reindexer is.
+            if line_index.backend().is_some() {
+                let sweeper =
+                    ForgetSweeper::new(Arc::new(ManifestRepo::new(db.clone())), line_index.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let report = sweeper.run_once(DEFAULT_FORGET_BATCH).await;
+                        let pause = if report.more && report.failed == 0 {
+                            FORGET_SWEEP_BURST_PAUSE
+                        } else {
+                            FORGET_SWEEP_INTERVAL
+                        };
+                        tokio::time::sleep(pause).await;
+                    }
+                });
+                tracing::info!(
+                    "Log line forget sweeper scheduled (interval: {:?})",
+                    FORGET_SWEEP_INTERVAL
                 );
             }
 
