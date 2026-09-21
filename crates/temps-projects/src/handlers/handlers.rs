@@ -1326,7 +1326,13 @@ pub async fn update_project(
     };
     let updated_project = state
         .project_service
-        .update_project(id, project_req)
+        .update_project(
+            id,
+            project_req,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
     // Create audit event
     let audit_context = AuditContext {
@@ -1395,7 +1401,13 @@ pub async fn change_project_source(
 
     let updated = state
         .project_service
-        .set_source_type(id, req.source_type)
+        .set_source_type(
+            id,
+            req.source_type,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit_event = ProjectUpdatedAudit {
@@ -1461,7 +1473,13 @@ pub async fn set_alternate_sources(
 
     let updated = state
         .project_service
-        .set_allow_alternate_sources(id, req.allow_alternate_sources)
+        .set_allow_alternate_sources(
+            id,
+            req.allow_alternate_sources,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit_event = ProjectUpdatedAudit {
@@ -1744,7 +1762,13 @@ pub async fn update_automatic_deploy(
 
     let updated_project = state
         .project_service
-        .update_automatic_deploy(project_id, request.automatic_deploy)
+        .update_automatic_deploy(
+            project_id,
+            request.automatic_deploy,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Error updating automatic deployment setting: {:?}", e);
@@ -1993,6 +2017,9 @@ pub async fn update_project_deployment_config(
             // meaningfully constrained by them.
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
             ),
         )
         .await

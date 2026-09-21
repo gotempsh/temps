@@ -1893,6 +1893,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         request: CreateProjectRequest,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Find the existing project
         let project = projects::Entity::find_by_id(project_id)
@@ -1908,6 +1909,18 @@ impl ProjectService {
                     .to_string(),
             ));
         }
+
+        // ADR 045: this method unconditionally rewrites repo_owner, repo_name,
+        // directory, main_branch and preset/preset_config below -- the same
+        // source-definition fields `update_project_settings_as` gates -- but
+        // took no caller at all until this was found to bypass that guard
+        // entirely through a sibling handler. The guard is therefore
+        // unconditional here too, since every call rewrites every field.
+        self.guard_granted_project_write(
+            &project.slug,
+            "the source repository, branch, directory or build preset",
+            caller,
+        )?;
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
@@ -1962,6 +1975,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         source_type: temps_entities::source_type::SourceType,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         use temps_entities::source_type::SourceType;
         let project = projects::Entity::find_by_id(project_id)
@@ -1976,6 +1990,14 @@ impl ProjectService {
                 "A service project's source type is fixed by its applied template".to_string(),
             ));
         }
+        // ADR 045, defense in depth: `source_type` decides which deploy
+        // pipeline runs, and every image/static/drop deploy path already
+        // gates on `guard_deploy` and `DeployImageJobBuilder::build`
+        // independently of this flag -- so this is not currently a way
+        // around those gates. Gated anyway, unconditionally, since this
+        // method has exactly one caller-facing effect and the alternative is
+        // trusting that stays true as the deploy pipelines evolve.
+        self.guard_granted_project_write(&project.slug, "the source type", caller)?;
 
         // Switching to Git is a direct flip only when a repository is already
         // configured (repo owner + name). A project can carry git info without
@@ -2030,12 +2052,24 @@ impl ProjectService {
         &self,
         project_id: i32,
         allow: bool,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+
+        // ADR 045, defense in depth: accepting an alternate source (a
+        // dropped archive) is not by itself a deploy -- `SourceDropService`
+        // plans with the fail-closed `DeployCaller::default()` regardless of
+        // this flag -- but it does widen what can trigger one, so it is
+        // gated the same way as `set_source_type`.
+        self.guard_granted_project_write(
+            &project.slug,
+            "whether alternate sources are accepted",
+            caller,
+        )?;
 
         let mut active_project: projects::ActiveModel = project.into();
         active_project.allow_alternate_sources = Set(Some(allow));
@@ -2242,6 +2276,14 @@ impl ProjectService {
         // connection, not from a stored URL, so repointing the connection
         // alone -- without touching owner/name/branch -- is the same
         // escalation through a field this list previously missed.
+        // `enable_preview_environments` belongs here for the same reason:
+        // once on, any push to a branch no environment already tracks gets a
+        // preview environment auto-created and deployed
+        // (`find_environments_for_branch`) as `DeployCaller::Platform`, which
+        // neither the deploy gate nor the exec gate refuses -- so flipping
+        // this one boolean turns "push a branch" into the same host-root
+        // execution path a repository repoint gives, without needing the
+        // project's primary source touched at all.
         if git_provider_connection_id.is_some()
             || main_branch.is_some()
             || repo_owner.is_some()
@@ -2249,10 +2291,12 @@ impl ProjectService {
             || directory.is_some()
             || preset.is_some()
             || preset_config.is_some()
+            || enable_preview_environments.is_some()
         {
             self.guard_granted_project_write(
                 &project.slug,
-                "the source repository, connection, branch, directory or build preset",
+                "the source repository, connection, branch, directory, build preset or preview \
+                 environments",
                 DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
             )?;
         }
@@ -2773,6 +2817,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         automatic_deploy: bool,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Get the current project
         let project = projects::Entity::find_by_id(project_id)
@@ -2782,6 +2827,15 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        // ADR 045: arming automatic_deploy is what turns a plain git push
+        // into a deployment (`DeployCaller::Platform`, which the deploy gate
+        // does not refuse) -- the same mechanism the preview-environment and
+        // environment-settings guards close for their own trigger fields.
+        self.guard_granted_project_write(
+            &project.slug,
+            "whether pushes deploy automatically",
+            caller,
+        )?;
         // Update automatic_deploy setting in deployment_config
         let mut active_project: projects::ActiveModel = project.clone().into();
 
@@ -4197,6 +4251,7 @@ impl ProjectService {
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -4205,6 +4260,19 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+
+        // ADR 045: `automatic_deploy` arms the same push-deploy trigger
+        // `ProjectService::update_automatic_deploy` guards, and `exposed_port`
+        // republishes a *different* port of a host-root-equivalent container
+        // on the node's private address -- both change the attack surface of
+        // a granted project without going through a deploy at all.
+        if config.exposed_port.is_some() || config.automatic_deploy.is_some() {
+            self.guard_granted_project_write(
+                &project.slug,
+                "the exposed port or whether pushes deploy automatically",
+                caller,
+            )?;
+        }
 
         // Get existing deployment config or create default
         let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
@@ -6247,7 +6315,11 @@ mod tests {
         assert_eq!(project.allow_alternate_sources, None, "defaults to off");
 
         let opted_in = service
-            .set_allow_alternate_sources(project.id, true)
+            .set_allow_alternate_sources(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
 
@@ -6263,7 +6335,11 @@ mod tests {
 
         // And it must be reversible, without disturbing git config either.
         let opted_out = service
-            .set_allow_alternate_sources(project.id, false)
+            .set_allow_alternate_sources(
+                project.id,
+                false,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(opted_out.allow_alternate_sources, Some(false));
@@ -6394,7 +6470,11 @@ mod tests {
         // mutation response would otherwise downgrade a connected project to
         // "no provider" until its next read.
         let after_write = service
-            .set_allow_alternate_sources(connected.id, true)
+            .set_allow_alternate_sources(
+                connected.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6404,7 +6484,11 @@ mod tests {
         );
 
         let after_write_unconnected = service
-            .set_allow_alternate_sources(standalone.id, true)
+            .set_allow_alternate_sources(
+                standalone.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(after_write_unconnected.git_provider_type, None);
@@ -6465,7 +6549,11 @@ mod tests {
         };
 
         let result = project_service
-            .update_project(inserted_project.id, update_request)
+            .update_project(
+                inserted_project.id,
+                update_request,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await;
 
         assert!(result.is_ok(), "update_project should succeed");
@@ -6950,7 +7038,11 @@ mod tests {
         };
 
         project_service
-            .update_project(project_id, update_request)
+            .update_project(
+                project_id,
+                update_request,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
 
@@ -8130,6 +8222,205 @@ mod tests {
             .expect("an instance admin may repoint a granted project's git connection");
     }
 
+    /// `enable_preview_environments` was missing from the guard predicate:
+    /// once on, any push to an untracked branch gets a preview environment
+    /// auto-created and deployed as `DeployCaller::Platform`, which neither
+    /// the deploy gate nor the exec gate refuses.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_enabling_preview_environments_on_a_granted_project(
+    ) {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    enable_preview_environments: Some(true),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer enabled preview environments on a granted project"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let admin = SlugClaimSession::admin(&db).await;
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    enable_preview_environments: Some(true),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an instance admin may enable preview environments on a granted project");
+    }
+
+    /// ADR 045: `update_project` took no `caller` at all until this test —
+    /// it unconditionally rewrites the same source-definition fields
+    /// `update_project_settings_as` gates, through a sibling handler that
+    /// bypassed the guard entirely.
+    #[tokio::test]
+    async fn update_project_refuses_a_non_admin_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let mut attacker_request = create_request("Node Daemon");
+        attacker_request.repo_owner = Some("attacker".to_string());
+        attacker_request.repo_name = Some("payload".to_string());
+
+        let error = match project_service
+            .update_project(
+                project.id,
+                attacker_request,
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter,
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer repointed a granted project's repository"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(reloaded.repo_owner, "operator");
+        assert_eq!(reloaded.repo_name, "node-daemon");
+
+        // An instance admin may still update it.
+        let mut admin_request = create_request("Node Daemon");
+        admin_request.repo_owner = Some("attacker".to_string());
+        admin_request.repo_name = Some("payload".to_string());
+        project_service
+            .update_project(
+                project.id,
+                admin_request,
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin,
+            )
+            .await
+            .expect("an instance admin may update a granted project");
+    }
+
+    /// A new environment is a new push-deploy target bound to whatever
+    /// branch the request names, and inherits the project's
+    /// `automatic_deploy` — reachable by `EnvironmentsCreate`
+    /// (`Role::User`) with no ADR-045 check until this test.
+    #[tokio::test]
+    async fn update_automatic_deploy_refuses_a_non_admin_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_automatic_deploy(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter,
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer armed auto-deploy on a granted project"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        project_service
+            .update_automatic_deploy(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin,
+            )
+            .await
+            .expect("an instance admin may arm auto-deploy on a granted project");
+    }
+
     /// The symmetric case: renaming a project *away* from a granted slug is
     /// admin-only too. It revokes that project's host Docker access on every
     /// host, and frees the slug for the next project created — so allowing it
@@ -9040,7 +9331,11 @@ mod tests {
         let mut update = create_request("Leave Nixpacks");
         update.preset = "nextjs".to_string();
         let updated = project_service
-            .update_project(created.id, update)
+            .update_project(
+                created.id,
+                update,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .expect("switch to nextjs");
 
@@ -9460,7 +9755,11 @@ mod tests {
         let mut update = create_request("Reset Through Full Update");
         update.preset = "nixpacks".to_string();
         let updated = project_service
-            .update_project(created.id, update)
+            .update_project(
+                created.id,
+                update,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .expect("select base nixpacks");
 
