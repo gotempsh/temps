@@ -83,6 +83,39 @@ for (const width of [1440, 390]) {
           page: historyPage,
           page_size: 15,
         }
+      } else if (path === '/projects/1/http-checks/presets') {
+        body = [
+          'airtable',
+          'anthropic',
+          'digitalocean',
+          'doppler',
+          'github',
+          'gitlab',
+          'groq',
+          'openai',
+        ].map((id) => ({
+          id,
+          name: id === 'github' ? 'GitHub' : id === 'gitlab' ? 'GitLab' : id,
+          description:
+            id === 'gitlab'
+              ? 'Checks expiration. Confirm the GitLab host.'
+              : 'Checks account access.',
+          automatic: id !== 'gitlab',
+          documentation_url: 'https://example.com/docs',
+          spec: {
+            url:
+              id === 'github'
+                ? 'https://api.github.com/user'
+                : `https://api.${id}.example/account`,
+            method: 'get',
+            headers: {},
+            credential_header: 'Authorization',
+            credential_prefix: 'Bearer ',
+            accepted_statuses: [200],
+            expiration: null,
+            numeric_rules: [],
+          },
+        }))
       } else if (path === '/projects/1/http-checks/capabilities') {
         body = {
           detection_rule_count: 221,
@@ -372,6 +405,41 @@ for (const width of [1440, 390]) {
     await expect(
       dialog.getByRole('link', { name: 'configure notifications' })
     ).toBeVisible()
+    const catalog = dialog.getByRole('region', {
+      name: 'Credential provider catalog',
+    })
+    await expect(
+      catalog.getByText('8 providers', { exact: false })
+    ).toBeVisible()
+    await catalog.getByRole('button', { name: 'Next providers' }).click()
+    await expect(catalog.getByRole('img', { name: 'OpenAI' })).toBeVisible()
+    const search = catalog.getByRole('textbox', {
+      name: 'Search credential providers',
+    })
+    await search.fill('GITHUB user')
+    await expect(catalog.getByRole('listitem')).toHaveCount(1)
+    await expect(catalog.getByRole('img', { name: 'GitHub' })).toBeVisible()
+    await catalog.getByRole('button', { name: 'Use GitHub template' }).click()
+    await expect(dialog.getByLabel('Endpoint', { exact: true })).toHaveValue(
+      'https://api.github.com/user'
+    )
+    expect(saved).toBeUndefined()
+    await search.fill('expiration')
+    await expect(catalog.getByRole('listitem')).toHaveCount(1)
+    await expect(
+      catalog.getByText('Configure manually', { exact: true })
+    ).toBeVisible()
+    await search.fill('no-provider-matches')
+    await expect(
+      catalog.getByText('No matching providers.', { exact: false })
+    ).toBeVisible()
+    await search.fill('')
+    await expect(catalog.getByRole('listitem')).toHaveCount(6)
+    await page.screenshot({
+      path: testInfo.outputPath(`provider-catalog-${width}.png`),
+      fullPage: true,
+    })
+    await catalog.getByRole('button', { name: 'Custom HTTP check' }).click()
     await dialog.getByRole('button', { name: 'Detect provider' }).click()
     await expect(dialog).toContainText('Suggested matches: github')
     await dialog

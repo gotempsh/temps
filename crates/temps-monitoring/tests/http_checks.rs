@@ -4,8 +4,8 @@
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{
-    DetectionRetryMigration, EnvCheckHistoryMigration, HttpChecksMigration, MigrationTrait,
-    SchemaManager,
+    CredentialCatalogMigration, DetectionRetryMigration, EnvCheckHistoryMigration,
+    HttpChecksMigration, MigrationTrait, SchemaManager,
 };
 
 #[tokio::test]
@@ -24,6 +24,16 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
+    db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars").await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    assert!(db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT env_var_id FROM env_check_detection"
+        ))
+        .await
+        .unwrap()
+        .is_empty());
     db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'test','ciphertext')").await.unwrap();
     let claim = |token: &str| {
         Statement::from_sql_and_values(DatabaseBackend::Postgres,
@@ -91,6 +101,7 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
         rows.is_empty(),
         "deleting a credential removes its scheduled checks"
     );
+    CredentialCatalogMigration.down(&schema).await.unwrap();
     DetectionRetryMigration.down(&schema).await.unwrap();
     EnvCheckHistoryMigration.down(&schema).await.unwrap();
     HttpChecksMigration.down(&schema).await.unwrap();
@@ -129,6 +140,16 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
+    db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars").await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    assert!(db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT env_var_id FROM env_check_detection"
+        ))
+        .await
+        .unwrap()
+        .is_empty());
     let service = temps_monitoring::http_checks::HttpChecksService::new(
         database.connection_arc(),
         std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
@@ -210,6 +231,31 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
     .unwrap();
     service.reconcile_variables().await.unwrap();
     assert_eq!(service.list(1, 1, 20).await.unwrap().total, 1);
+    // Upgrading the catalog rescans old variables, without unpausing existing checks.
+    db.execute_unprepared("UPDATE http_checks SET enabled=FALSE")
+        .await
+        .unwrap();
+    // Assemble an intentionally synthetic token so source scanners cannot
+    // mistake a token-shaped literal for a live credential.
+    let synthetic_digitalocean = format!("dop_v1_{}", "0123456789abcdef".repeat(4));
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO env_vars(id,project_id,key,value) VALUES(3,1,'DIGITALOCEAN_TOKEN',$1)",
+        [synthetic_digitalocean.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars WHERE id=3").await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    service.reconcile_variables().await.unwrap();
+    let checks = service.list(1, 1, 20).await.unwrap().items;
+    assert!(checks.iter().any(|check| check.env_var_id == Some(3)
+        && check.automatic_provider.as_deref() == Some("digitalocean")
+        && check.enabled));
+    assert!(checks
+        .iter()
+        .filter(|check| check.env_var_id != Some(3))
+        .all(|check| !check.enabled));
     let small = service.variable_history(1, 1, 1, 2).await.unwrap();
     let next = service.variable_history(1, 1, 2, 2).await.unwrap();
     assert_eq!(small.page_size, 2);

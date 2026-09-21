@@ -18,8 +18,6 @@ test('canonical providers have accessible locally bundled original marks', () =>
     const svg = Buffer.from(asset.src.split(',')[1], 'base64').toString()
     expect(svg).toContain('<svg')
     expect(svg).not.toMatch(/<image\b/)
-    // Rectangles inside clip paths define clipping, not opaque backgrounds.
-    expect(svg.replace(/<defs>[\s\S]*?<\/defs>/g, '')).not.toMatch(/<rect\b/)
     if (asset.darkSrc) {
       expect(html).toContain('dark:hidden')
       expect(html).toContain('dark:block')

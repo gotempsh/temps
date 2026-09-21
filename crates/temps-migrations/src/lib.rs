@@ -25,3 +25,5 @@ pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigratio
 pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;
 
 pub use migration::m20260921_000003_detection_retry::Migration as DetectionRetryMigration;
+
+pub use migration::m20260921_000004_credential_catalog::Migration as CredentialCatalogMigration;

@@ -11,6 +11,11 @@
 # Vendored detection rules contain opaque regex data and upstream identifiers.
 extend-exclude = ["README.*.md", "**/__fixtures__/**", "crates/temps-credential-checks/catalog/gitleaks.toml"]
 
+[default]
+# This exact upstream Gitleaks rule ID has a historical spelling.
+# Correcting it silently disables Airtable automatic verification.
+extend-ignore-re = ['"airtable-personnal-access-token"']
+
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,
 # matching the upstream Go/BuildKit API naming convention.

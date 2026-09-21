@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { CredentialProviderMark } from '@temps-sdk/ds'
 
+import { CredentialProviderCatalog } from './CredentialProviderCatalog'
 import { CheckLoading } from './CheckLoading'
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -284,6 +285,40 @@ export function HttpChecksSettings({
           ))}
         </div>
       )}
+      {presets.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          Could not load provider catalog.{' '}
+          <Button variant="link" onClick={() => void presets.refetch()}>
+            Retry providers
+          </Button>
+        </p>
+      )}
+      {presets.data && (
+        <CredentialProviderCatalog
+          providers={presets.data ?? []}
+          selectedId={presetId}
+          onSelect={(id) => {
+            setPresetId(id)
+            const preset = presets.data?.find((p) => p.id === id)
+            setUrl(preset?.spec.url ?? '')
+            setHeader(preset?.spec.credential_header ?? 'Authorization')
+            setPrefix(preset?.spec.credential_prefix ?? 'Bearer ')
+            setName(
+              preset ? `${preset.name} verification` : `${variable.key} check`
+            )
+            const field = preset?.spec.expiration?.field
+            setExpiry(
+              field
+                ? field.kind === 'header'
+                  ? `header:${field.value}`
+                  : field.value
+                : ''
+            )
+            setMetric('')
+          }}
+        />
+      )}
+
       <form
         className="space-y-4 border-t pt-4"
         onSubmit={(event) => {
@@ -316,41 +351,14 @@ export function HttpChecksSettings({
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="http-check-template">Template</Label>
-            <Select
-              value={presetId}
-              onValueChange={(id) => {
-                setPresetId(id)
-                const preset = presets.data?.find((p) => p.id === id)
-                if (preset) {
-                  setUrl(preset.spec.url)
-                  setHeader(preset.spec.credential_header ?? '')
-                  setPrefix(preset.spec.credential_prefix ?? '')
-                  const field = preset.spec.expiration?.field
-                  setExpiry(
-                    field
-                      ? field.kind === 'header'
-                        ? `header:${field.value}`
-                        : field.value
-                      : ''
-                  )
-                }
-              }}
+            <p
+              id="http-check-template"
+              className="flex min-h-9 items-center gap-2 text-sm"
             >
-              <SelectTrigger id="http-check-template">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="custom">Custom HTTP / Temps</SelectItem>
-                {presets.data?.map((preset) => (
-                  <SelectItem key={preset.id} value={preset.id}>
-                    <span className="inline-flex items-center gap-2">
-                      <CredentialProviderMark provider={preset.id} />
-                      {preset.name}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <CredentialProviderMark provider={presetId} />
+              {presets.data?.find((preset) => preset.id === presetId)?.name ??
+                'Custom HTTP / Temps'}
+            </p>
           </div>
           <div className="space-y-2">
             <Label htmlFor="http-check-name">Name</Label>

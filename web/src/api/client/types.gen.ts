@@ -16986,7 +16986,12 @@ export type ProviderModelResponse = {
 };
 
 export type ProviderPreset = {
+    /**
+     * Whether a value-pattern match can safely identify the public issuer.
+     */
+    automatic: boolean;
     description: string;
+    documentation_url: string;
     id: string;
     name: string;
     spec: HttpCheckSpec;

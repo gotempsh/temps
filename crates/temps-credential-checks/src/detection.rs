@@ -69,7 +69,26 @@ impl CatalogDetector {
         let catalog: Catalog = toml::from_str(include_str!("../catalog/gitleaks.toml"))
             .map_err(DetectionError::Catalog)?;
         let mut rules = Vec::with_capacity(catalog.rules.len());
-        for rule in catalog.rules {
+        let mut catalog_rules = catalog.rules;
+        // Public issuer-specific formats absent from the pinned upstream catalog.
+        for (id, description, pattern) in [
+            ("groq-api-key", "Groq API key", r"\b(gsk_[A-Za-z0-9]{52})\b"),
+            (
+                "replicate-api-token",
+                "Replicate API token",
+                r"\b(r8_[A-Za-z0-9]{37})\b",
+            ),
+        ] {
+            catalog_rules.push(Rule {
+                id: id.into(),
+                description: description.into(),
+                regex: Some(pattern.into()),
+                entropy: 3.0,
+                secret_group: Some(1),
+                keywords: vec![],
+            });
+        }
+        for rule in catalog_rules {
             let Some(expression) = &rule.regex else {
                 continue;
             };
@@ -119,14 +138,8 @@ impl CredentialDetector for CatalogDetector {
             };
             // Never let a name or a token embedded in another secret authorize
             // automatic transmission of the whole environment-variable value.
-            if matches!(
-                entry.rule.id.as_str(),
-                "github-pat"
-                    | "github-fine-grained-pat"
-                    | "github-oauth"
-                    | "openai-api-key"
-                    | "anthropic-api-key"
-            ) && (secret.as_bytes() != value.as_bytes() || secret.start() != name.len() + 2)
+            if crate::presets::automatic_provider_for_rule(&entry.rule.id).is_some()
+                && (secret.as_bytes() != value.as_bytes() || secret.start() != name.len() + 2)
             {
                 continue;
             }
@@ -203,6 +216,68 @@ mod tests {
         assert!(
             crate::automatic_preset(&detector.detect("GITHUB_TOKEN", &token), &token).is_some()
         );
+    }
+    #[test]
+    fn expanded_issuers_require_complete_high_entropy_values() {
+        let detector = CatalogDetector::bundled().unwrap();
+        let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let token = |prefix: &str, length: usize| {
+            format!(
+                "{prefix}{}",
+                chars.chars().cycle().take(length).collect::<String>()
+            )
+        };
+        let hex = "0123456789abcdef".repeat(4);
+        for (provider, name, value) in [
+            ("digitalocean", "TOKEN", format!("dop_v1_{hex}")),
+            ("digitalocean", "TOKEN", format!("doo_v1_{hex}")),
+            ("doppler", "TOKEN", token("dp.pt.", 43)),
+            (
+                "huggingface",
+                "TOKEN",
+                format!("hf_{}", "abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+            ),
+            ("npm", "TOKEN", token("npm_", 36)),
+            (
+                "airtable",
+                "AIRTABLE_TOKEN",
+                format!("patabcdefghijkLMN.{hex}"),
+            ),
+            ("stripe", "TOKEN", token("sk_test_", 48)),
+            ("typeform", "TYPEFORM_TOKEN", token("tfp_", 59)),
+            (
+                "readme",
+                "TOKEN",
+                format!(
+                    "rdme_{}",
+                    "abcdefghijklmnopqrstuvwxyz0123456789"
+                        .repeat(2)
+                        .chars()
+                        .take(70)
+                        .collect::<String>()
+                ),
+            ),
+            ("groq", "TOKEN", token("gsk_", 52)),
+            ("replicate", "TOKEN", token("r8_", 37)),
+        ] {
+            assert_eq!(
+                crate::automatic_preset(&detector.detect(name, &value), &value).map(|p| p.id),
+                Some(provider.to_string()),
+                "{provider}"
+            );
+            for (bad_name, bad_value) in [
+                (name, format!("unrelated;{value}")),
+                (name, format!("{value};unrelated")),
+                (value.as_str(), "unrelated-secret".into()),
+                (name, "synthetic-placeholder".into()),
+            ] {
+                assert!(
+                    crate::automatic_preset(&detector.detect(bad_name, &bad_value), &bad_value)
+                        .is_none(),
+                    "{provider} must not transmit ambiguous credentials"
+                );
+            }
+        }
     }
     #[test]
     fn compiles_entire_catalog_and_finds_named_credentials() {

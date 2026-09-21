@@ -36703,7 +36703,14 @@
       },
       "ProviderPreset": {
         "properties": {
+          "automatic": {
+            "description": "Whether a value-pattern match can safely identify the public issuer.",
+            "type": "boolean"
+          },
           "description": {
+            "type": "string"
+          },
+          "documentation_url": {
             "type": "string"
           },
           "id": {
@@ -36720,7 +36727,9 @@
           "id",
           "name",
           "description",
-          "spec"
+          "spec",
+          "automatic",
+          "documentation_url"
         ],
         "type": "object"
       },

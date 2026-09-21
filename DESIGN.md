@@ -363,7 +363,11 @@ page and environment-variable detail page are reference implementations.
 
 Use `CredentialProviderMark` from `@temps-sdk/ds` for credential identity in
 check rows, per-variable check summaries, and provider template choices. The
-shared registry currently includes GitHub, GitLab, OpenAI, and Anthropic.
+shared registry covers every provider returned by the credential preset API.
+The searchable per-variable catalog displays the provider name, logo, automatic
+versus manual setup, verification limits, endpoint, and documentation link.
+Search matches names, descriptions, and endpoints; paginate results to keep the
+page compact. Selecting a template never sends a credential or creates a check.
 
 - Accept only a canonical provider ID from backend `automatic_provider` or an
   explicit provider preset. Never infer a brand from variable names, check names,
