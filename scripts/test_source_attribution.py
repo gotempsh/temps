@@ -14,6 +14,12 @@ import source_attribution
 
 
 class SourceAttributionTests(unittest.TestCase):
+    def test_only_pinned_vendor_catalog_is_excluded(self) -> None:
+        root = source_attribution.repository_root()
+        self.assertFalse(source_attribution.is_source_file(root / "crates/temps-credential-checks/catalog/gitleaks.toml"))
+        self.assertTrue(source_attribution.is_source_file(root / "crates/temps-credential-checks/Cargo.toml"))
+        self.assertTrue(source_attribution.is_source_file(root / "catalog/gitleaks.toml"))
+
     def test_rust_header_is_added_before_inner_attributes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "lib.rs"

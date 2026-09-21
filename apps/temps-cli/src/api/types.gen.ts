@@ -2900,6 +2900,15 @@ export type CancelBackupResponse = {
 };
 
 /**
+ * Detection output deliberately contains neither the secret nor matching substrings.
+ */
+export type Candidate = {
+    description: string;
+    evidence: DetectionEvidence;
+    id: string;
+};
+
+/**
  * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
  * `GET /domains/by-host/{hostname}/cert-status`.
  */
@@ -3084,6 +3093,8 @@ export type ChatReadinessResponse = {
      */
     ai_configured: boolean;
 };
+
+export type CheckStatus = 'healthy' | 'warning' | 'error' | 'unknown';
 
 /**
  * A single child backup entry in the `GET /backups/{id}/children` response.
@@ -3801,6 +3812,8 @@ export type CommitListResponse = {
  * `temps-monitoring::compare`).
  */
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
+
+export type Comparison = 'below' | 'above';
 
 /**
  * A Docker Compose service port mapping, reduced to the information the UI
@@ -6874,6 +6887,14 @@ export type DetectionConfig = (StaticParams & {
     kind: 'auto_watch';
 });
 
+export type DetectionEvidence = 'value_pattern' | 'variable_name';
+
+export type DetectionView = {
+    candidates: Array<Candidate>;
+    detection_rule_count: number;
+    env_var_id: number;
+};
+
 export type DeviceCount = {
     count: number;
     device_type: string;
@@ -9247,6 +9268,11 @@ export type ExecuteOperationRequest = {
     operation: string;
 };
 
+export type ExpirationRule = {
+    field: ResponseField;
+    warning_days: Array<number>;
+};
+
 /**
  * Request to set expiration on a key
  */
@@ -9566,6 +9592,12 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+export type Finding = {
+    code: string;
+    message: string;
+    status: CheckStatus;
 };
 
 /**
@@ -11203,6 +11235,54 @@ export type HttpChallengeDebugResponse = {
      * The ACME validation URL (internal to ACME protocol)
      */
     validation_url?: string | null;
+};
+
+export type HttpCheckList = {
+    items: Array<HttpCheckView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type HttpCheckMethod = 'get' | 'head';
+
+/**
+ * This is a declarative HTTP recipe, never executable code.
+ * Headers may contain secrets: hosts must encrypt this specification at rest.
+ */
+export type HttpCheckSpec = {
+    accepted_statuses: Array<number>;
+    /**
+     * Credential injection is separate from detection and always explicitly selected.
+     */
+    credential_header?: string | null;
+    credential_prefix?: string;
+    expiration?: null | ExpirationRule;
+    headers?: {
+        [key: string]: string;
+    };
+    method: HttpCheckMethod;
+    numeric_rules?: Array<NumericRule>;
+    url: string;
+};
+
+export type HttpCheckView = {
+    automatic_provider?: string | null;
+    enabled: boolean;
+    env_var_id?: number | null;
+    id: number;
+    interval_seconds: number;
+    last_checked_at?: string | null;
+    name: string;
+    next_check_at: string;
+    project_id: number;
+    result?: null | VerificationResult;
+};
+
+export type HttpChecksCapabilities = {
+    alerts_configured: boolean;
+    alerts_setup_path: string;
+    detection_rule_count: number;
 };
 
 /**
@@ -13756,6 +13836,14 @@ export type NotificationRoutePage = {
     page: number;
     page_size: number;
     total: number;
+};
+
+export type NumericRule = {
+    comparison: Comparison;
+    critical?: number | null;
+    field: ResponseField;
+    name: string;
+    warning: number;
 };
 
 /**
@@ -16657,6 +16745,18 @@ export type ProviderModelResponse = {
     updated_at: string;
 };
 
+export type ProviderPreset = {
+    /**
+     * Whether a value-pattern match can safely identify the public issuer.
+     */
+    automatic: boolean;
+    description: string;
+    documentation_url: string;
+    id: string;
+    name: string;
+    spec: HttpCheckSpec;
+};
+
 export type ProviderResponse = {
     auth_method: string;
     base_url?: string | null;
@@ -17907,6 +18007,14 @@ export type ResourcesBody = {
     vcpus?: number | null;
 };
 
+export type ResponseField = {
+    kind: 'header';
+    value: string;
+} | {
+    kind: 'json_pointer';
+    value: string;
+};
+
 /**
  * Capabilities a service exposes for the generic restore framework.
  *
@@ -18495,6 +18603,18 @@ export type SaveCredentialResponse = {
     provider_id: string;
     saved: boolean;
     verification_hint?: string | null;
+};
+
+/**
+ * Credentials and recipe headers are write-only and encrypted at rest.
+ */
+export type SaveHttpCheck = {
+    credential?: string | null;
+    enabled?: boolean;
+    env_var_id?: number | null;
+    interval_seconds?: number;
+    name: string;
+    spec: HttpCheckSpec;
 };
 
 export type ScalewayCredentialsRequest = {
@@ -19932,6 +20052,10 @@ export type SetFlagEnvironmentRequest = {
      * flag default), anything else sets it. Must match `value_type`.
      */
     value?: unknown;
+};
+
+export type SetHttpCheckEnabled = {
+    enabled: boolean;
 };
 
 export type SetNodePublicIngressRequest = {
@@ -24070,6 +24194,34 @@ export type ValidationSummary = {
      * Warning-level results
      */
     warning_count: number;
+};
+
+export type VariableHistoryDetails = {
+    check_name?: string | null;
+    include_in_preview?: boolean | null;
+    is_secret?: boolean | null;
+    key?: string | null;
+    result?: null | VerificationResult;
+};
+
+export type VariableHistoryEntry = {
+    created_at: string;
+    details: VariableHistoryDetails;
+    id: number;
+    kind: string;
+};
+
+export type VariableHistoryList = {
+    items: Array<VariableHistoryEntry>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type VerificationResult = {
+    checked_at: string;
+    findings: Array<Finding>;
+    status: CheckStatus;
 };
 
 export type VerifyMfaRequest = {
@@ -50511,6 +50663,95 @@ export type GetResolvedEnvironmentVariableValueResponses = {
 
 export type GetResolvedEnvironmentVariableValueResponse = GetResolvedEnvironmentVariableValueResponses[keyof GetResolvedEnvironmentVariableValueResponses];
 
+export type DetectEnvCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment variable ID
+         */
+        env_var_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/env-vars/{env_var_id}/detect';
+};
+
+export type DetectEnvCredentialErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DetectEnvCredentialResponses = {
+    /**
+     * Success
+     */
+    200: DetectionView;
+};
+
+export type DetectEnvCredentialResponse = DetectEnvCredentialResponses[keyof DetectEnvCredentialResponses];
+
+export type ListVariableHistoryData = {
+    body?: never;
+    path: {
+        project_id: number;
+        env_var_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/env-vars/{env_var_id}/history';
+};
+
+export type ListVariableHistoryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type ListVariableHistoryResponses = {
+    /**
+     * Variable activity and verification history
+     */
+    200: VariableHistoryList;
+};
+
+export type ListVariableHistoryResponse = ListVariableHistoryResponses[keyof ListVariableHistoryResponses];
+
 export type GetEnvironmentVariableValueData = {
     body?: never;
     path: {
@@ -53866,6 +54107,374 @@ export type GetHourlyVisitsResponses = {
 };
 
 export type GetHourlyVisitsResponse = GetHourlyVisitsResponses[keyof GetHourlyVisitsResponses];
+
+export type ListHttpChecksData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/http-checks';
+};
+
+export type ListHttpChecksErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListHttpChecksResponses = {
+    /**
+     * Success
+     */
+    200: HttpCheckList;
+};
+
+export type ListHttpChecksResponse = ListHttpChecksResponses[keyof ListHttpChecksResponses];
+
+export type CreateHttpCheckData = {
+    body: SaveHttpCheck;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks';
+};
+
+export type CreateHttpCheckErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type CreateHttpCheckResponses = {
+    /**
+     * Success
+     */
+    200: HttpCheckView;
+};
+
+export type CreateHttpCheckResponse = CreateHttpCheckResponses[keyof CreateHttpCheckResponses];
+
+export type GetHttpChecksCapabilitiesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/capabilities';
+};
+
+export type GetHttpChecksCapabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+};
+
+export type GetHttpChecksCapabilitiesResponses = {
+    /**
+     * Capabilities
+     */
+    200: HttpChecksCapabilities;
+};
+
+export type GetHttpChecksCapabilitiesResponse = GetHttpChecksCapabilitiesResponses[keyof GetHttpChecksCapabilitiesResponses];
+
+export type ListHttpCheckPresetsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/presets';
+};
+
+export type ListHttpCheckPresetsErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListHttpCheckPresetsResponses = {
+    /**
+     * Success
+     */
+    200: Array<ProviderPreset>;
+};
+
+export type ListHttpCheckPresetsResponse = ListHttpCheckPresetsResponses[keyof ListHttpCheckPresetsResponses];
+
+export type DeleteHttpCheckData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Check ID
+         */
+        check_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/{check_id}';
+};
+
+export type DeleteHttpCheckErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DeleteHttpCheckResponses = {
+    /**
+     * Success
+     */
+    200: unknown;
+};
+
+export type SetHttpCheckEnabledData = {
+    body: SetHttpCheckEnabled;
+    path: {
+        project_id: number;
+        check_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/{check_id}';
+};
+
+export type SetHttpCheckEnabledErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type SetHttpCheckEnabledResponses = {
+    /**
+     * Updated check
+     */
+    200: HttpCheckView;
+};
+
+export type SetHttpCheckEnabledResponse = SetHttpCheckEnabledResponses[keyof SetHttpCheckEnabledResponses];
+
+export type UpdateHttpCheckData = {
+    body: SaveHttpCheck;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Check ID
+         */
+        check_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/{check_id}';
+};
+
+export type UpdateHttpCheckErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type UpdateHttpCheckResponses = {
+    /**
+     * Success
+     */
+    200: HttpCheckView;
+};
+
+export type UpdateHttpCheckResponse = UpdateHttpCheckResponses[keyof UpdateHttpCheckResponses];
+
+export type RunHttpCheckData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Check ID
+         */
+        check_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/{check_id}/run';
+};
+
+export type RunHttpCheckErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Check busy
+     */
+    409: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type RunHttpCheckResponses = {
+    /**
+     * Success
+     */
+    200: HttpCheckView;
+};
+
+export type RunHttpCheckResponse = RunHttpCheckResponses[keyof RunHttpCheckResponses];
 
 export type ListExternalImagesData = {
     body?: never;

@@ -11,6 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-credential-checks = { path = "../temps-credential-checks" }
+reqwest = { workspace = true }
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
@@ -32,5 +34,6 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-migrations = { path = "../temps-migrations" }
 futures = { workspace = true }
 maplit = "1.0"

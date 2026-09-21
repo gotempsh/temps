@@ -20,7 +20,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-dirs = "6.0"
+dirs = "7.0"
 flate2 = { workspace = true }
 gethostname = "1.1"
 hkdf = { workspace = true }
