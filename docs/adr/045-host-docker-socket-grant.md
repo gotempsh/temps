@@ -168,6 +168,24 @@ operator who wants the stronger rule enrols MFA, or registers a
 `SensitiveActionAuthorizer` that denies unenrolled principals; the guard here
 asks the policy and does not second-guess it.
 
+The same policy passes **machine credentials** -- API keys, CLI device tokens
+and deployment tokens -- through without a challenge, for the same structural
+reason and one more: they have no interactive factor that could ever be
+re-verified, and denying them would break scripted and CI usage rather than
+add friction to it. `DefaultSensitiveActionAuthorizer` returns `Allow` for
+each of them and logs `step_up = "skipped_machine_principal"`. The practical
+consequence for this ADR is worth stating plainly, because it is easy to read
+"admin-only plus MFA step-up" as stronger than it is: **an admin's API key is
+sufficient on its own to move a granted slug.** The step-up narrows the
+browser-session path, not the token path. Their blast radius is bounded only
+by the key's own role/permissions, which `permission_guard!` checks before the
+authorizer runs -- so an admin-scoped API key is, for this purpose, equivalent
+to an admin session that has already verified. An operator who wants the
+slug-moving path to require a human present should scope machine credentials
+below instance-admin, or register a `SensitiveActionAuthorizer` that denies
+non-interactive principals for `ClaimDockerSocketSlug` /
+`ReleaseDockerSocketSlug`.
+
 #### What the audit record does and does not prove
 
 The audit event is written on the control plane from the executing host's
