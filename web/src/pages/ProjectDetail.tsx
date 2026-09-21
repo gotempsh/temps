@@ -3,6 +3,7 @@
 
 import {
   getLastDeploymentOptions,
+  getEnvironmentVariablesOptions,
   getProjectBySlugOptions,
   getActiveVisitorsOptions,
   getRepositoryByNameOptions,
@@ -24,6 +25,7 @@ import { ProjectRevenue } from '@/components/project/ProjectRevenue'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
+import { EnvironmentVariablePage } from '@/components/project/settings/EnvironmentVariablePage'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
@@ -83,6 +85,7 @@ import {
   Route,
   Routes,
   useNavigate,
+  useMatch,
   useParams,
   useSearchParams,
 } from 'react-router'
@@ -96,6 +99,9 @@ export function ProjectDetail() {
   const { slug } = useParams()
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
+  const variableRoute = useMatch('/projects/:slug/environment-variables/*')
+  const variableSubpath = variableRoute?.params['*'] ?? ''
+  const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
   const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
 
@@ -115,6 +121,30 @@ export function ProjectDetail() {
     retry: false,
     enabled: !!slug,
   })
+
+  // The project layout owns this trail so parent refreshes cannot overwrite
+  // a nested page's breadcrumbs. Reuse the detail page's query cache.
+  const breadcrumbVariables = useQuery({
+    ...getEnvironmentVariablesOptions({
+      path: { project_id: project?.id || 0 },
+    }),
+    enabled:
+      !!project?.id &&
+      !!breadcrumbVariableId &&
+      Number.isSafeInteger(Number(breadcrumbVariableId)) &&
+      Number(breadcrumbVariableId) > 0,
+  })
+  const breadcrumbVariable = breadcrumbVariables.data?.find(
+    (variable) => variable.id === Number(breadcrumbVariableId)
+  )
+  const variableBreadcrumbLabel =
+    breadcrumbVariable?.key ||
+    (breadcrumbVariables.isFetching
+      ? 'Loading variable…'
+      : breadcrumbVariables.isError
+        ? 'Variable unavailable'
+        : 'Variable not found')
+  const isVariableRoute = !!variableRoute
 
   const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
     {
@@ -272,10 +302,39 @@ export function ProjectDetail() {
   }
 
   useEffect(() => {
+    const projectPath = `/projects/${project?.slug || slug}`
+    const variablesPath = `${projectPath}/environment-variables`
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: project?.slug || 'Project Details' },
+      { label: project?.slug || 'Project Details', href: projectPath },
+      ...(isVariableRoute
+        ? [
+            { label: 'Environment variables', href: variablesPath },
+            ...(breadcrumbVariableId
+              ? [
+                  {
+                    label: variableBreadcrumbLabel,
+                    href: `${variablesPath}/${breadcrumbVariableId}`,
+                  },
+                  ...(breadcrumbSection === 'checks'
+                    ? [{ label: 'Check configuration' }]
+                    : []),
+                ]
+              : []),
+          ]
+        : []),
     ])
+  }, [
+    setBreadcrumbs,
+    project?.slug,
+    slug,
+    isVariableRoute,
+    breadcrumbVariableId,
+    breadcrumbSection,
+    variableBreadcrumbLabel,
+  ])
+
+  useEffect(() => {
     // Remove confetti parameter after showing
     if (showConfetti) {
       const timer = setTimeout(() => {
@@ -284,7 +343,7 @@ export function ProjectDetail() {
       }, 500)
       return () => clearTimeout(timer)
     }
-  }, [setBreadcrumbs, project, showConfetti, searchParams, setSearchParams])
+  }, [showConfetti, searchParams, setSearchParams])
 
   usePageTitle(project?.slug ? `${project.slug}` : '')
 
@@ -468,6 +527,16 @@ export function ProjectDetail() {
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="environment-variables/:variableId"
+                element={<EnvironmentVariablePage project={project} />}
+              />
+              <Route
+                path="environment-variables/:variableId/checks"
+                element={
+                  <EnvironmentVariablePage project={project} configure />
+                }
               />
               <Route
                 path="flags"

@@ -74,3 +74,27 @@ unrelated, effort.
   inventing an unrelated API.
 - `kbd-badge.tsx` already exists; the package's `Kbd` wraps/re-exports it
   rather than duplicating it.
+
+## 2026-09-21 — Resource navigation and detail width
+
+Following the request to make environment-variable details discoverable and
+persist a consistent convention, the chosen standard is `RecordLink` in the
+identity column: a visibly underlined name plus a persistent right arrow.
+No whole-row navigation and no duplicate View button; actions stay separate.
+Details/configuration are routed and full width, with no empty aside reservation.
+Implemented in the shared DS, its ledger example, and environment variables.
+Existing legacy tables migrate when touched; this is not a completed global
+migration. Root `DESIGN.md` section 4 and DS `RULES.md` define the contract.
+
+## 2026-09-21: One shared breadcrumb trail
+
+Application pages publish their route hierarchy through `useBreadcrumbs` to the
+dashboard Header. No custom page-level breadcrumb trails. The project layout
+owns environment-variable list, detail, and check-configuration breadcrumbs,
+including linked ancestors and resource names. See DESIGN.md, Shared breadcrumbs.
+
+## 2026-09-21: Underlined tabs for page views
+
+Adopt the Checks/History underline style as the shared tab default, with optional
+count badges. Segmented toggles are reserved for local value choices. See
+DESIGN.md, Canonical tabs.

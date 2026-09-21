@@ -18,6 +18,7 @@ import {
   updateEnvironmentVariableMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { RecordLink } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -71,7 +72,12 @@ import {
   type ScopedCredentialValue,
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
-import { Link } from 'react-router'
+import {
+  EnvironmentVariableChecks,
+  type EnvironmentVariableCheck,
+} from './EnvironmentVariableChecks'
+import { useHttpChecks, checkIndicators } from './http-checks'
+import { Link, useNavigate } from 'react-router'
 import {
   parsePublicRepositoryUrl,
   publicRepositoryProvider,
@@ -90,6 +96,8 @@ interface EnvironmentVariableRowProps {
   onSelect: (id: number) => void
   showAllValues: boolean
   resolved?: ResolvedEnvVar
+  checks: EnvironmentVariableCheck[]
+  onManageChecks: () => void
 }
 
 function EnvironmentVariableRow({
@@ -100,6 +108,8 @@ function EnvironmentVariableRow({
   onSelect,
   showAllValues,
   resolved,
+  checks,
+  onManageChecks,
 }: EnvironmentVariableRowProps) {
   const overridesService =
     resolved?.source.type === 'manual'
@@ -324,20 +334,30 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <div className="py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-        <div className="flex items-start gap-3 flex-1 min-w-0">
+      <tr
+        className="border-b border-border/60"
+        data-state={isSelected ? 'selected' : undefined}
+      >
+        <td className="py-4 pr-3 align-middle">
           <Checkbox
             checked={isSelected}
             onCheckedChange={() => onSelect(variable.id)}
-            className="mt-1 sm:mt-0"
             aria-label={`Select ${variable.key}`}
           />
-          <div className="space-y-1 flex-1 min-w-0">
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <div className="space-y-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               {overridesService && (
                 <IntegrationBadge service={overridesService} overridden />
               )}
-              <p className="font-medium break-all">{variable.key}</p>
+              <RecordLink
+                to={`/projects/${project.slug}/environment-variables/${variable.id}`}
+                className="font-mono"
+                aria-label={`View ${variable.key} details`}
+              >
+                {variable.key}
+              </RecordLink>
               {isSecret && (
                 <span
                   title="Sensitive value — write-only"
@@ -355,24 +375,9 @@ function EnvironmentVariableRow({
                 </Link>
               )}
             </div>
-            <div className="flex flex-wrap gap-2">
-              {variable.environments.map((env) => (
-                <span
-                  key={env.name}
-                  className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                >
-                  {env.name}
-                </span>
-              ))}
-              {variable.include_in_preview && (
-                <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-                  Preview
-                </span>
-              )}
-            </div>
           </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
+        </td>
+        <td className="py-4 pr-4 align-middle">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
               {isVisible && !isSecret
@@ -400,63 +405,95 @@ function EnvironmentVariableRow({
               </Button>
             )}
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void openEditDialog()}
-            disabled={deleteMutation.isPending || updateMutation.isPending}
-          >
-            Edit
-          </Button>
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="destructive"
-                size="sm"
-                disabled={deleteMutation.isPending || updateMutation.isPending}
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <div className="flex flex-wrap gap-2">
+            {variable.environments.map((env) => (
+              <span
+                key={env.name}
+                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
               >
-                Delete
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete environment variable</AlertDialogTitle>
-                <AlertDialogDescription className="space-y-3">
-                  <p>
-                    Are you sure you want to delete{' '}
-                    <span className="font-medium">{variable.key}</span>? This
-                    action cannot be undone.
-                  </p>
-                  {variable.environments &&
-                    variable.environments.length > 0 && (
-                      <div className="space-y-2">
-                        <p className="text-sm font-medium text-foreground">
-                          This variable is active on:
-                        </p>
-                        <div className="flex flex-wrap gap-2">
-                          {variable.environments.map((env) => (
-                            <span
-                              key={env.name}
-                              className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                            >
-                              {env.name}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={handleDelete}>
+                {env.name}
+              </span>
+            ))}
+            {variable.include_in_preview && (
+              <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+                Preview
+              </span>
+            )}
+          </div>
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <EnvironmentVariableChecks
+            checks={checks}
+            onManage={onManageChecks}
+          />
+        </td>
+        <td className="py-4 text-right align-middle">
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void openEditDialog()}
+              disabled={deleteMutation.isPending || updateMutation.isPending}
+            >
+              Edit
+            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  className="text-muted-foreground hover:text-destructive"
+                  size="sm"
+                  disabled={
+                    deleteMutation.isPending || updateMutation.isPending
+                  }
+                >
                   Delete
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </div>
-      </div>
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    Delete environment variable
+                  </AlertDialogTitle>
+                  <AlertDialogDescription className="space-y-3">
+                    <p>
+                      Are you sure you want to delete{' '}
+                      <span className="font-medium">{variable.key}</span>? This
+                      action cannot be undone.
+                    </p>
+                    {variable.environments &&
+                      variable.environments.length > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-sm font-medium text-foreground">
+                            This variable is active on:
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {variable.environments.map((env) => (
+                              <span
+                                key={env.name}
+                                className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+                              >
+                                {env.name}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={handleDelete}>
+                    Delete
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+        </td>
+      </tr>
 
       <Dialog open={isEditModalOpen} onOpenChange={handleEditDialogOpenChange}>
         <DialogContent>
@@ -691,13 +728,13 @@ function IntegrationEnvVarRow({
     : '••••••••••••'
 
   return (
-    <div className="py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-      <div className="flex items-start gap-3 flex-1 min-w-0">
-        <div className="hidden sm:block w-4 shrink-0" aria-hidden />
+    <tr className="border-b border-border/60">
+      <td />
+      <td className="py-4 pr-4 align-middle">
         <div className="space-y-1 flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <IntegrationBadge service={service} />
-            <p className="font-medium break-all">{resolved.key}</p>
+            <p className="font-mono text-sm break-all">{resolved.key}</p>
             <span className="text-xs text-muted-foreground">
               from{' '}
               <Link
@@ -708,41 +745,57 @@ function IntegrationEnvVarRow({
               </Link>
             </span>
           </div>
-          <div className="flex gap-2 flex-wrap">
-            {resolved.environments.map((env) => (
-              <span
-                key={env.name}
-                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-              >
-                {env.name}
-              </span>
-            ))}
-            {resolved.include_in_preview && (
-              <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-                Preview
-              </span>
-            )}
-          </div>
         </div>
-      </div>
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="font-mono text-sm text-muted-foreground truncate max-w-[200px] sm:max-w-[240px]">
-          {valueText}
-        </span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void toggleVisibility()}
-          aria-label={isVisible ? 'Hide value' : 'Reveal value'}
-        >
-          {isVisible ? (
-            <EyeOff className="h-4 w-4" />
-          ) : (
-            <Eye className="h-4 w-4" />
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-mono text-sm text-muted-foreground truncate max-w-[200px] sm:max-w-[240px]">
+            {valueText}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void toggleVisibility()}
+            aria-label={isVisible ? 'Hide value' : 'Reveal value'}
+          >
+            {isVisible ? (
+              <EyeOff className="h-4 w-4" />
+            ) : (
+              <Eye className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        {' '}
+        <div className="flex gap-2 flex-wrap">
+          {resolved.environments.map((env) => (
+            <span
+              key={env.name}
+              className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+            >
+              {env.name}
+            </span>
+          ))}
+          {resolved.include_in_preview && (
+            <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+              Preview
+            </span>
           )}
-        </Button>
-      </div>
-    </div>
+        </div>
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        <EnvironmentVariableChecks />
+      </td>
+      <td className="py-4 text-right align-middle">
+        <Link
+          className="text-sm text-muted-foreground hover:text-foreground underline-offset-4 hover:underline"
+          to={`/storage/${service.service_id}`}
+        >
+          Manage service
+        </Link>
+      </td>
+    </tr>
   )
 }
 
@@ -1084,40 +1137,58 @@ function DiscoveredEnvironmentVariableRow({
   variable: DiscoveredEnvironmentVariable
 }) {
   return (
-    <div className="py-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-      <div className="space-y-1 min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="font-medium font-mono break-all">{variable.key}</p>
-          <span className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20">
-            Not added
-          </span>
-        </div>
-        {variable.description ? (
-          <p className="text-xs text-muted-foreground">
+    <tr className="border-b border-border/60">
+      <td />
+      <td className="py-4 pr-4 align-middle">
+        <p className="font-mono text-sm break-all">{variable.key}</p>
+        {variable.description && (
+          <p className="mt-1 text-sm text-muted-foreground max-w-xs">
             {variable.description}
           </p>
-        ) : null}
-        <div className="flex flex-wrap gap-1.5">
-          {variable.sources.map((source) => (
-            <span
-              key={source}
-              className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-            >
-              {source}
-            </span>
-          ))}
-        </div>
-      </div>
-      <span className="font-mono text-xs text-muted-foreground break-all sm:max-w-[320px]">
-        Value required
-      </span>
-    </div>
+        )}
+        <p className="mt-1 text-xs text-muted-foreground">
+          {variable.sources.join(', ')}
+        </p>
+      </td>
+      <td className="py-4 pr-4 text-sm text-muted-foreground">
+        Not configured
+      </td>
+      <td className="py-4 pr-4 text-sm text-muted-foreground">—</td>
+      <td className="py-4 pr-4 align-middle">
+        <EnvironmentVariableChecks
+          checks={[
+            {
+              id: 'configuration',
+              status: 'warning',
+              label: 'Value missing',
+              detail:
+                'Declared in your repository but not configured in Temps.',
+            },
+          ]}
+        />
+      </td>
+      <td className="py-4 text-right text-sm text-muted-foreground">
+        Not added
+      </td>
+    </tr>
   )
 }
 
 export function EnvironmentVariablesSettings({
   project,
 }: EnvironmentVariablesSettingsProps) {
+  const checksQuery = useHttpChecks(project.id)
+  const navigate = useNavigate()
+  const checksByVariable = useMemo(() => {
+    const map = new Map<number, EnvironmentVariableCheck[]>()
+    for (const check of checksQuery.data ?? []) {
+      if (check.env_var_id == null) continue
+      const checks = map.get(check.env_var_id) ?? []
+      checks.push(...checkIndicators([check]))
+      map.set(check.env_var_id, checks)
+    }
+    return map
+  }, [checksQuery.data])
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
 
@@ -1498,6 +1569,9 @@ export function EnvironmentVariablesSettings({
   const hasDiscoveredVariables = discoveredMissingVariables.length > 0
   const hasVariables =
     hasManualVariables || hasIntegrationVariables || hasDiscoveredVariables
+  const hasRevealableVariables =
+    (envVariables?.some((variable) => !variable.is_secret) ?? false) ||
+    hasIntegrationVariables
   const selectedCount = selectedVariables.size
   const allSelected =
     selectedCount === (envVariables?.length ?? 0) && hasManualVariables
@@ -1505,22 +1579,44 @@ export function EnvironmentVariablesSettings({
   return (
     <div className="space-y-6">
       <div>
-        <div className="flex flex-col gap-4 mb-6 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex flex-col gap-4 mb-5 sm:flex-row sm:items-start sm:justify-between">
           <div className="space-y-1.5">
             <h2 className="text-2xl font-semibold tracking-tight">
               Environment Variables
             </h2>
-            <p className="text-base/6 sm:text-sm text-muted-foreground">
-              Manage your project&apos;s environment variables across different
-              environments.
+            <p className="text-sm text-muted-foreground">
+              Manage values and automatic credential checks across environments.
             </p>
+          </div>
+          {hasVariables && (
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setIsImportDialogOpen(true)}
+              >
+                <Upload className="h-4 w-4 mr-2" />
+                Import .env
+              </Button>
+              <Button
+                onClick={() => setIsAddDialogOpen(true)}
+                className="flex-1 sm:flex-initial"
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                Add Variable
+                <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+              </Button>
+            </div>
+          )}
+        </div>
+        {hasVariables && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-y py-3">
             {projectEnvironments && projectEnvironments.length > 0 ? (
-              <div className="flex flex-wrap items-center gap-2 pt-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Label
                   htmlFor="env-preview-select"
                   className="text-xs text-muted-foreground"
                 >
-                  Preview values for
+                  Environment
                 </Label>
                 <Select
                   value={selectedEnvId !== null ? String(selectedEnvId) : ''}
@@ -1540,62 +1636,27 @@ export function EnvironmentVariablesSettings({
                     ))}
                   </SelectContent>
                 </Select>
-                <span className="text-[11px] text-muted-foreground">
-                  Linked services show{' '}
-                  <code className="font-mono">{`<project>_<env>`}</code> values.
-                </span>
               </div>
             ) : null}
-          </div>
-          {hasVariables && (
-            <div className="flex flex-wrap gap-2">
-              {selectedCount > 0 && (
-                <Button
-                  variant="destructive"
-                  onClick={() => setIsBulkDeleteDialogOpen(true)}
-                  className="flex-1 sm:flex-initial"
-                >
-                  Delete {selectedCount} Variable
-                  {selectedCount !== 1 ? 's' : ''}
-                </Button>
-              )}
+            {hasRevealableVariables && (
               <Button
-                variant="outline"
+                variant="ghost"
+                size="sm"
                 onClick={() => setShowAllValues(!showAllValues)}
                 title={showAllValues ? 'Hide all values' : 'Show all values'}
               >
                 {showAllValues ? (
-                  <>
-                    <EyeOff className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Hide all</span>
-                  </>
+                  <EyeOff className="h-4 w-4 mr-2" />
                 ) : (
-                  <>
-                    <Eye className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Show all</span>
-                  </>
+                  <Eye className="h-4 w-4 mr-2" />
                 )}
+                {showAllValues ? 'Hide all' : 'Show all'}
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => setIsImportDialogOpen(true)}
-              >
-                <Upload className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Import .env</span>
-              </Button>
-              <Button
-                onClick={() => setIsAddDialogOpen(true)}
-                className="flex-1 sm:flex-initial"
-              >
-                <Plus className="h-4 w-4 mr-2" />
-                Add Variable
-                <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-              </Button>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
-        <div className="mt-6">
+        <div className="mt-2">
           {!hasVariables ? (
             <EmptyPlaceholder>
               <EmptyPlaceholder.Icon>
@@ -1641,36 +1702,98 @@ export function EnvironmentVariablesSettings({
                       ? `${selectedCount} of ${envVariables?.length ?? 0} selected`
                       : 'Select all'}
                   </span>
+                  {selectedCount > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto text-destructive"
+                      onClick={() => setIsBulkDeleteDialogOpen(true)}
+                    >
+                      Delete {selectedCount} selected
+                    </Button>
+                  )}
                 </div>
               )}
-              <div className="divide-y divide-border">
-                {(envVariables ?? []).map((variable) => (
-                  <EnvironmentVariableRow
-                    key={variable.id}
-                    variable={variable}
-                    project={project}
-                    refetchEnvVariables={() => refetch()}
-                    isSelected={selectedVariables.has(variable.id)}
-                    onSelect={handleSelectVariable}
-                    showAllValues={showAllValues}
-                    resolved={resolvedByKey.get(variable.key)}
-                  />
-                ))}
-                {integrationOnlyResolved.map((entry) => (
-                  <IntegrationEnvVarRow
-                    key={`integration-${entry.key}`}
-                    projectId={project.id}
-                    resolved={entry}
-                    showAllValues={showAllValues}
-                    environmentId={selectedEnvId}
-                  />
-                ))}
-                {discoveredMissingVariables.map((variable) => (
-                  <DiscoveredEnvironmentVariableRow
-                    key={`discovered-${variable.key}`}
-                    variable={variable}
-                  />
-                ))}
+              <div className="w-full overflow-x-auto">
+                <table
+                  className="w-full min-w-[900px] text-sm"
+                  aria-label="Environment variables"
+                >
+                  <thead>
+                    <tr className="border-b border-border/60 text-left text-muted-foreground [&>th]:py-3 [&>th]:pr-4 [&>th]:font-medium [&>th]:whitespace-nowrap">
+                      <th scope="col" className="w-8">
+                        <span className="sr-only">Select</span>
+                      </th>
+                      <th scope="col" className="w-[28%]">
+                        Variable
+                      </th>
+                      <th scope="col" className="w-[22%]">
+                        Value
+                      </th>
+                      <th scope="col">Environments</th>
+                      <th scope="col">Checks</th>
+                      <th scope="col" className="text-right">
+                        Actions
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(envVariables ?? []).map((variable) => (
+                      <EnvironmentVariableRow
+                        key={variable.id}
+                        variable={variable}
+                        project={project}
+                        refetchEnvVariables={() => refetch()}
+                        isSelected={selectedVariables.has(variable.id)}
+                        onSelect={handleSelectVariable}
+                        showAllValues={showAllValues}
+                        resolved={resolvedByKey.get(variable.key)}
+                        checks={
+                          checksQuery.isError
+                            ? [
+                                {
+                                  id: 'load',
+                                  status: 'unknown',
+                                  label: 'Checks unavailable',
+                                  detail:
+                                    'Could not load check results. Open variable details to retry.',
+                                },
+                              ]
+                            : checksQuery.isPending
+                              ? [
+                                  {
+                                    id: 'load',
+                                    status: 'pending',
+                                    label: 'Loading checks',
+                                    detail: 'Loading configured checks.',
+                                  },
+                                ]
+                              : (checksByVariable.get(variable.id) ?? [])
+                        }
+                        onManageChecks={() =>
+                          navigate(
+                            `/projects/${project.slug}/environment-variables/${variable.id}`
+                          )
+                        }
+                      />
+                    ))}
+                    {integrationOnlyResolved.map((entry) => (
+                      <IntegrationEnvVarRow
+                        key={`integration-${entry.key}`}
+                        projectId={project.id}
+                        resolved={entry}
+                        showAllValues={showAllValues}
+                        environmentId={selectedEnvId}
+                      />
+                    ))}
+                    {discoveredMissingVariables.map((variable) => (
+                      <DiscoveredEnvironmentVariableRow
+                        key={`discovered-${variable.key}`}
+                        variable={variable}
+                      />
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </>
           )}

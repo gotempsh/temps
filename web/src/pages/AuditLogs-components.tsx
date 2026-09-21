@@ -92,7 +92,7 @@ export function AuditLogs() {
   const hasFilters =
     range !== '24h' || operation !== ALL_FILTER || selectedUserId !== ALL_FILTER
 
-  const operationOptions = useMemo(buildOperationOptions, [])
+  const operationOptions = useMemo(() => buildOperationOptions(), [])
 
   const userOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [

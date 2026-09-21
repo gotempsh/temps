@@ -5,6 +5,11 @@ mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
 mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
+pub mod m20260921_000001_http_checks;
+pub mod m20260921_000002_env_check_history;
+pub mod m20260921_000003_detection_retry;
+pub mod m20260921_000004_credential_catalog;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -623,9 +628,20 @@ impl MigratorTrait for Migrator {
             Box::new(m20260920_000001_compose_security_policies::Migration),
             Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
             Box::new(m20260920_000002_log_collector_positions::Migration),
+            // This branch and main each shipped migrations stamped
+            // m20260921_0000{1,2,3}, independently and for unrelated
+            // features (line-index stores here vs. monitoring credential
+            // checks on main). This branch's landed first (07:22 UTC vs
+            // main's 17:31 UTC); DeriveMigrationName keys on the full
+            // module name, so the shared stamps are not a collision in
+            // seaql_migrations.
             Box::new(m20260921_000001_log_lines_index::Migration),
             Box::new(m20260921_000002_log_line_index_state::Migration),
             Box::new(m20260921_000003_log_line_forget_backlog::Migration),
+            Box::new(m20260921_000001_http_checks::Migration),
+            Box::new(m20260921_000002_env_check_history::Migration),
+            Box::new(m20260921_000003_detection_retry::Migration),
+            Box::new(m20260921_000004_credential_catalog::Migration),
         ]
     }
 }

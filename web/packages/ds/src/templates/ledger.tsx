@@ -17,7 +17,6 @@ export interface LedgerProps<T> {
   columns: LedgerColumn<T>[]
   rows: T[]
   rowKey: (row: T) => string | number
-  onRowClick?: (row: T) => void
   isLoading?: boolean
   /** Rendered instead of the table when `rows` is empty and not loading — pass a `PageState`. */
   empty?: ReactNode
@@ -44,7 +43,6 @@ export function Ledger<T>({
   columns,
   rows,
   rowKey,
-  onRowClick,
   isLoading = false,
   empty,
   pagination,
@@ -63,7 +61,6 @@ export function Ledger<T>({
           columns={columns}
           rows={rows}
           rowKey={rowKey}
-          onRowClick={onRowClick}
           isLoading={isLoading}
           pagination={pagination}
         />
