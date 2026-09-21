@@ -2237,8 +2237,13 @@ impl ProjectService {
         // principal, so there is nothing for the deploy guard to check and no
         // HTTP deploy request is ever made. Gating the source here is what
         // closes that two-step path, at the same choke point the slug claim
-        // and release are already gated.
-        if main_branch.is_some()
+        // and release are already gated. `git_provider_connection_id` belongs
+        // in this list too: `DownloadRepoJob` resolves the clone host from the
+        // connection, not from a stored URL, so repointing the connection
+        // alone -- without touching owner/name/branch -- is the same
+        // escalation through a field this list previously missed.
+        if git_provider_connection_id.is_some()
+            || main_branch.is_some()
             || repo_owner.is_some()
             || repo_name.is_some()
             || directory.is_some()
@@ -2247,7 +2252,7 @@ impl ProjectService {
         {
             self.guard_granted_project_write(
                 &project.slug,
-                "the source repository, branch, directory or build preset",
+                "the source repository, connection, branch, directory or build preset",
                 DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
             )?;
         }
@@ -8003,6 +8008,126 @@ mod tests {
             )
             .await
             .expect("an undeclared project's source is writable by any project writer");
+    }
+
+    /// `git_provider_connection_id` alone, with owner/name/branch untouched.
+    /// `DownloadRepoJob` resolves the clone host from the *connection*, not
+    /// from a stored URL, so repointing only the connection is the same
+    /// escalation as the repo-owner/repo-name case above through a field the
+    /// guard's predicate previously missed.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_connection_change_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        // Two real connections on the same provider -- the escalation is
+        // repointing *which one* the project trusts, not whether the target
+        // id exists, so both ends of the move must resolve.
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("Operator Git".to_string()),
+            provider_type: Set("gitea".to_string()),
+            base_url: Set(Some("https://git.example.internal".to_string())),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let operator_connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("operator".to_string()),
+            account_type: Set("Organization".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let attacker_connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("attacker".to_string()),
+            account_type: Set("User".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            git_provider_connection_id: Set(Some(operator_connection.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    git_provider_connection_id: Some(attacker_connection.id),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer repointed a granted project's git connection"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(
+            reloaded.git_provider_connection_id,
+            Some(operator_connection.id)
+        );
+
+        // An instance admin may still repoint it.
+        let admin = SlugClaimSession::admin(&db).await;
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    git_provider_connection_id: Some(attacker_connection.id),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an instance admin may repoint a granted project's git connection");
     }
 
     /// The symmetric case: renaming a project *away* from a granted slug is
