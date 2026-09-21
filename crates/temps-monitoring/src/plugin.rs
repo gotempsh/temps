@@ -75,8 +75,27 @@ impl TempsPlugin for MonitoringPlugin {
             //      via `service_context.get_service::<AlarmService>()`.
             //   2. `configure_routes` below can require it.
             context.register_service(alarm_service);
+            let checks = crate::http_checks::HttpChecksService::new(
+                db,
+                context.require_service::<temps_core::EncryptionService>(),
+                context.require_service::<dyn temps_core::notifications::NotificationService>(),
+            )
+            .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            context.register_service(Arc::new(checks));
 
             tracing::debug!("MonitoringPlugin: AlarmService registered");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            context
+                .require_service::<crate::http_checks::HttpChecksService>()
+                .start();
             Ok(())
         })
     }
@@ -95,11 +114,21 @@ impl TempsPlugin for MonitoringPlugin {
         let alarm_router =
             crate::handlers::alarm_handlers::configure_routes().with_state(alarm_state);
 
-        Some(PluginRoutes::new(alarm_router))
+        let checks = crate::http_checks::handlers::routes().with_state(Arc::new(
+            crate::http_checks::handlers::HttpChecksState {
+                service: context.require_service::<crate::http_checks::HttpChecksService>(),
+                audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            },
+        ));
+        Some(PluginRoutes::new(alarm_router.merge(checks)))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<AlarmsApiDoc as OpenApiTrait>::openapi())
+        let mut api = <AlarmsApiDoc as OpenApiTrait>::openapi();
+        api.merge(<crate::http_checks::handlers::HttpChecksApiDoc as OpenApiTrait>::openapi());
+        Some(api)
     }
 }
 

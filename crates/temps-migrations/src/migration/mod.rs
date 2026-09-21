@@ -5,6 +5,11 @@ mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
 mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
+pub mod m20260921_000001_http_checks;
+pub mod m20260921_000002_env_check_history;
+pub mod m20260921_000003_detection_retry;
+pub mod m20260921_000004_credential_catalog;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -279,7 +284,7 @@ pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 pub mod m20260919_000001_add_failover_at_to_nodes;
 
 mod m20260920_000001_compose_security_policies;
-mod m20260921_000001_add_docker_socket_mounted_to_deployments;
+mod m20260921_000005_add_docker_socket_mounted_to_deployments;
 
 pub struct Migrator;
 
@@ -615,7 +620,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
-            Box::new(m20260921_000001_add_docker_socket_mounted_to_deployments::Migration),
+            Box::new(m20260921_000001_http_checks::Migration),
+            Box::new(m20260921_000002_env_check_history::Migration),
+            Box::new(m20260921_000003_detection_retry::Migration),
+            Box::new(m20260921_000004_credential_catalog::Migration),
+            Box::new(m20260921_000005_add_docker_socket_mounted_to_deployments::Migration),
         ]
     }
 }
