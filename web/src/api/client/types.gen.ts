@@ -46359,9 +46359,17 @@ export type CreateProjectErrors = {
      */
     400: unknown;
     /**
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
+     */
+    403: unknown;
+    /**
      * Expected project slug is already in use
      */
     409: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -46458,13 +46466,17 @@ export type CreateProjectFromTemplateErrors = {
      */
     401: unknown;
     /**
-     * Insufficient permissions
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
      */
     403: unknown;
     /**
      * Template not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -56299,13 +56311,17 @@ export type UpdateProjectSettingsErrors = {
      */
     401: unknown;
     /**
-     * Forbidden
+     * Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)
      */
     403: unknown;
     /**
      * Project not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
