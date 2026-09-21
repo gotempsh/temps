@@ -134,12 +134,12 @@ impl HttpChecksService {
                     .map_err(|_| HttpChecksError::Encryption { project_id })?;
                 // Existing manual checks take precedence; a paused automatic check stays paused.
                 tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                    "INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM http_checks WHERE env_var_id=$2 AND automatic_provider IS NULL) ON CONFLICT(env_var_id) WHERE automatic_provider IS NOT NULL DO UPDATE SET automatic_provider=EXCLUDED.automatic_provider,encrypted_spec=EXCLUDED.encrypted_spec,name=EXCLUDED.name,last_result=NULL,last_checked_at=NULL,lease_token=NULL,lease_until=NULL,next_check_at=NOW() WHERE http_checks.automatic_provider IS DISTINCT FROM EXCLUDED.automatic_provider",
+                    "INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM http_checks WHERE env_var_id=$2 AND automatic_provider IS NULL) AND NOT EXISTS(SELECT 1 FROM env_check_suppressions WHERE env_var_id=$2 AND automatic_provider IN ($5,'*')) ON CONFLICT(env_var_id) WHERE automatic_provider IS NOT NULL DO UPDATE SET automatic_provider=EXCLUDED.automatic_provider,encrypted_spec=EXCLUDED.encrypted_spec,name=EXCLUDED.name,last_result=NULL,last_checked_at=NULL,lease_token=NULL,lease_until=NULL,next_check_at=NOW() WHERE http_checks.automatic_provider IS DISTINCT FROM EXCLUDED.automatic_provider",
                     [project_id.into(),variable.id.into(),format!("{} verification",preset.name).into(),encrypted.into(),preset.id.into()])).await.map_err(|e|db_error(project_id,"create automatic check",e))?;
             } else {
                 // A renamed/replaced credential must never keep being sent to its former issuer.
                 tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL",[variable.id.into()])).await.map_err(|e|db_error(project_id,"remove obsolete automatic check",e))?;
-            }
+            };
             tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO UPDATE SET observed_updated_at=EXCLUDED.observed_updated_at,retry_after=NULL",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record automatic detection",e))?;
         }
         tx.commit()

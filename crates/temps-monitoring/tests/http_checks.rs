@@ -19,21 +19,39 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
         Err(error) => panic!("Could not create isolated test database: {error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'GITHUB_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'GITHUB_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1),(2);").await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
-    db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars").await.unwrap();
+    db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars; INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) VALUES(1,2,'GitHub verification','ciphertext','github'); DELETE FROM http_checks WHERE env_var_id=2").await.unwrap();
     CredentialCatalogMigration.up(&schema).await.unwrap();
-    assert!(db
+    let detection_rows = db
         .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT env_var_id FROM env_check_detection"
+            "SELECT env_var_id FROM env_check_detection ORDER BY env_var_id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detection_rows.len(), 1);
+    assert_eq!(
+        detection_rows[0].try_get::<i32>("", "env_var_id").unwrap(),
+        2
+    );
+    let suppression = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT automatic_provider FROM env_check_suppressions WHERE env_var_id=2",
         ))
         .await
         .unwrap()
-        .is_empty());
+        .unwrap();
+    assert_eq!(
+        suppression
+            .try_get::<String>("", "automatic_provider")
+            .unwrap(),
+        "*"
+    );
     db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'test','ciphertext')").await.unwrap();
     let claim = |token: &str| {
         Statement::from_sql_and_values(DatabaseBackend::Postgres,
@@ -256,6 +274,43 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
         .iter()
         .filter(|check| check.env_var_id != Some(3))
         .all(|check| !check.enabled));
+    let automatic = checks
+        .iter()
+        .find(|check| check.env_var_id == Some(3))
+        .unwrap();
+    service.delete(1, automatic.id).await.unwrap();
+    let rotated_digitalocean = format!("dop_v1_{}", "fedcba9876543210".repeat(4));
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE env_vars SET include_in_preview=TRUE,value=$1 WHERE id=3",
+        [rotated_digitalocean.into()],
+    ))
+    .await
+    .unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    service.reconcile_variables().await.unwrap();
+    assert!(
+        service
+            .list(1, 1, 20)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|check| check.env_var_id != Some(3)),
+        "a catalog rescan must preserve explicit deletion of an automatic check"
+    );
+    db.execute_unprepared("INSERT INTO http_checks(project_id,name,encrypted_spec) VALUES(1,'manual without variable','ciphertext')").await.unwrap();
+    let manual_id = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM http_checks WHERE name='manual without variable'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i32>("", "id")
+        .unwrap();
+    service.delete(1, manual_id).await.unwrap();
     let small = service.variable_history(1, 1, 1, 2).await.unwrap();
     let next = service.variable_history(1, 1, 2, 2).await.unwrap();
     assert_eq!(small.page_size, 2);

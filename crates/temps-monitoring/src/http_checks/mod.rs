@@ -403,13 +403,29 @@ impl HttpChecksService {
         saved.try_into()
     }
     pub async fn delete(&self, project_id: i32, id: i32) -> Result<(), HttpChecksError> {
-        let deleted = http_checks::Entity::delete_many()
-            .filter(http_checks::Column::ProjectId.eq(project_id))
-            .filter(http_checks::Column::Id.eq(id))
-            .exec(self.db.as_ref())
+        let deleted = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "WITH variable_lock AS MATERIALIZED ( \
+                     SELECT id FROM env_vars WHERE id = (SELECT env_var_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR UPDATE \
+                 ), target AS ( \
+                     SELECT checks.id, checks.env_var_id, checks.automatic_provider FROM http_checks AS checks \
+                     WHERE checks.project_id = $1 AND checks.id = $2 \
+                       AND (checks.env_var_id IS NULL OR EXISTS(SELECT 1 FROM variable_lock)) \
+                     FOR UPDATE OF checks \
+                ), suppression AS ( \
+                     INSERT INTO env_check_suppressions(env_var_id, automatic_provider) \
+                     SELECT env_var_id, automatic_provider FROM target \
+                     WHERE env_var_id IS NOT NULL AND automatic_provider IS NOT NULL \
+                     ON CONFLICT (env_var_id, automatic_provider) DO NOTHING \
+                 ) \
+                 DELETE FROM http_checks WHERE id IN (SELECT id FROM target) RETURNING id",
+                [project_id.into(), id.into()],
+            ))
             .await
             .map_err(|e| db_error(project_id, "delete", e))?;
-        if deleted.rows_affected == 0 {
+        if deleted.is_none() {
             return Err(HttpChecksError::NotFound { project_id, id });
         }
         Ok(())
@@ -768,22 +784,29 @@ mod tests {
     #[tokio::test]
     async fn delete_requires_an_existing_scoped_row() {
         let s = service(
-            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }]),
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<http_checks::Model>::new()]),
         );
         assert!(matches!(
             s.delete(10, 2).await,
             Err(HttpChecksError::NotFound { .. })
         ));
         let s = service(
-            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }]),
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![row()]]),
         );
         assert!(s.delete(10, 1).await.is_ok());
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("delete failed".into())]),
+        );
+        assert!(matches!(
+            s.delete(10, 1).await,
+            Err(HttpChecksError::Database {
+                project_id: 10,
+                operation: "delete",
+                ..
+            })
+        ));
     }
     #[tokio::test]
     async fn save_rejects_invalid_input_before_database_or_network_access() {
