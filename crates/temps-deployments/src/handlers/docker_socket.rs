@@ -85,31 +85,56 @@ fn guard_deploy_against(
 /// builder or planner downstream to catch an omission — so it lives in the one
 /// helper both exec routes already funnel through
 /// (`container_exec::verify_container_exec_access`), not in each handler.
-pub(crate) fn guard_exec(project_slug: &str, auth: &AuthContext) -> Result<(), Problem> {
-    guard_exec_against(process_grant(), project_slug, auth)
+///
+/// `deployment_docker_socket_mounted` is the *specific container's* recorded
+/// history, not the project's current state: a project renamed away from a
+/// granted slug (admin-only) keeps its already-running containers, and one of
+/// them can still hold the socket even though `project_slug` alone no longer
+/// says so. Checking only the current slug would silently downgrade this
+/// guard the moment an admin renames the project for an unrelated reason —
+/// the container is exactly as root-equivalent as it was before the rename.
+pub(crate) fn guard_exec(
+    project_slug: &str,
+    deployment_docker_socket_mounted: bool,
+    auth: &AuthContext,
+) -> Result<(), Problem> {
+    guard_exec_against(
+        process_grant(),
+        project_slug,
+        deployment_docker_socket_mounted,
+        auth,
+    )
 }
 
 /// [`guard_exec`] with the grant injected, for the same reason as
 /// [`guard_deploy_against`].
 ///
-/// Reuses `deploy_requires_instance_admin` deliberately: entering a container
-/// that already holds the socket and deploying one that will are the same
-/// privilege, so they must never be able to disagree about who may do it.
-/// `DeployCaller::Platform` cannot occur here — an exec always has a request
-/// behind it — so the shared predicate does not widen this check.
+/// Reuses `deploy_requires_instance_admin` deliberately for the current-slug
+/// half of the check: entering a container that already holds the socket and
+/// deploying one that will are the same privilege, so they must never be able
+/// to disagree about who may do it. `DeployCaller::Platform` cannot occur
+/// here — an exec always has a request behind it — so the shared predicate
+/// does not widen this check.
 fn guard_exec_against(
     grant: &DockerSocketGrant,
     project_slug: &str,
+    deployment_docker_socket_mounted: bool,
     auth: &AuthContext,
 ) -> Result<(), Problem> {
-    if !deploy_requires_instance_admin(grant, project_slug, deploy_caller(auth)) {
+    let caller = deploy_caller(auth);
+    let currently_granted_and_refused = deploy_requires_instance_admin(grant, project_slug, caller);
+    let historically_mounted_and_refused =
+        deployment_docker_socket_mounted && !caller.may_deploy_granted_project();
+    if !currently_granted_and_refused && !historically_mounted_and_refused {
         return Ok(());
     }
     warn!(
         slug = %project_slug,
         user_id = auth.user_id(),
         env = DOCKER_SOCKET_PROJECTS_ENV,
-        "Refused a non-admin exec into a project that holds host Docker access (ADR 045)"
+        deployment_docker_socket_mounted,
+        "Refused a non-admin exec into a project that holds (or once held) host Docker access \
+         (ADR 045)"
     );
     Err(problemdetails::new(StatusCode::FORBIDDEN)
         .with_title("Host Docker Access Exec Requires An Admin")
@@ -211,23 +236,65 @@ mod tests {
     /// deploying anything. `ContainersExec` alone must not be enough.
     #[test]
     fn exec_into_a_declared_project_is_admin_only() {
-        let problem = guard_exec_against(&granted(), "node-daemon", &auth(Role::User))
+        let problem = guard_exec_against(&granted(), "node-daemon", false, &auth(Role::User))
             .expect_err("a non-admin must not get a shell in a host-root container");
         assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
         for role in [Role::Admin, Role::PlatformAdmin] {
             assert!(
-                guard_exec_against(&granted(), "node-daemon", &auth(role.clone())).is_ok(),
+                guard_exec_against(&granted(), "node-daemon", false, &auth(role.clone())).is_ok(),
                 "{role:?} is an instance admin and may exec into a granted project"
             );
         }
         for grant in [granted(), DockerSocketGrant::default()] {
             for role in [Role::User, Role::Admin] {
                 assert!(
-                    guard_exec_against(&grant, "my-app", &auth(role.clone())).is_ok(),
+                    guard_exec_against(&grant, "my-app", false, &auth(role.clone())).is_ok(),
                     "{role:?} exec'ing into an undeclared project must be untouched by ADR 045"
                 );
             }
         }
+    }
+
+    /// The bypass a security review found: a project renamed away from a
+    /// granted slug (admin-only) keeps its already-running containers, which
+    /// are not stopped or recreated by the rename. A container this specific
+    /// deployment is recorded as having mounted the socket for must stay
+    /// admin-only even though the project's *current* slug is no longer
+    /// reserved by any grant.
+    #[test]
+    fn exec_into_a_container_that_historically_mounted_the_socket_is_admin_only_even_after_a_rename(
+    ) {
+        // The project's current slug is unreserved (as it would be after an
+        // admin renamed it away from "node-daemon"), but this container was
+        // recorded as socket-mounted while it still held that slug.
+        let grant = DockerSocketGrant::default();
+        let problem = guard_exec_against(&grant, "renamed-app", true, &auth(Role::User))
+            .expect_err(
+                "a non-admin must not get a shell in a historically root-equivalent container",
+            );
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        for role in [Role::Admin, Role::PlatformAdmin] {
+            assert!(
+                guard_exec_against(&grant, "renamed-app", true, &auth(role.clone())).is_ok(),
+                "{role:?} is an instance admin and may exec into it regardless"
+            );
+        }
+    }
+
+    /// A container that never mounted the socket, on a project no host
+    /// currently declares, must be entirely untouched by this guard.
+    #[test]
+    fn exec_is_unaffected_when_neither_signal_fires() {
+        assert!(
+            guard_exec_against(
+                &DockerSocketGrant::default(),
+                "ordinary-app",
+                false,
+                &auth(Role::User)
+            )
+            .is_ok(),
+            "an ordinary container on an ordinary project must not require admin"
+        );
     }
 
     /// The two refusals must not read alike. Nothing is being deployed here,
@@ -243,7 +310,7 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         };
-        let exec = guard_exec_against(&granted(), "node-daemon", &auth(Role::User))
+        let exec = guard_exec_against(&granted(), "node-daemon", false, &auth(Role::User))
             .expect_err("expected an exec refusal");
         let deploy = guard_deploy_against(&granted(), "node-daemon", &auth(Role::User))
             .expect_err("expected a deploy refusal");

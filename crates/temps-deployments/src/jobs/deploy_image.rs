@@ -1238,6 +1238,52 @@ impl DeployImageJob {
         }
     }
 
+    /// Persist that this deployment received the host Docker socket, so
+    /// exec/terminal authorization can check the *deployment's* recorded
+    /// status instead of the project's current slug (ADR 045). A project
+    /// renamed away from a granted slug keeps working through this ADR's
+    /// admin-only rename guard, but its already-running containers are not
+    /// stopped or recreated by the rename -- checking the current slug alone
+    /// would silently downgrade exec authorization on a still-root-equivalent
+    /// container from admin-only to anyone holding `ContainersExec`.
+    ///
+    /// Uses `failed_container_db`/`deployment_id` -- the same pair
+    /// `record_failed_candidate` already relies on being set for every
+    /// production deploy (`failed_container_retention` is unconditional on
+    /// every builder chain that reaches this job). Best-effort: a write
+    /// failure is logged, not propagated, since refusing to complete an
+    /// already-running deployment over a follow-up bookkeeping write would
+    /// be worse than the (still-audited, still-logged) gap it would leave.
+    async fn persist_docker_socket_mounted(&self, context: &WorkflowContext) {
+        let (Some(db), Some(deployment_id)) =
+            (self.failed_container_db.as_ref(), self.deployment_id)
+        else {
+            tracing::warn!(
+                project_id = context.project_id,
+                deployment_id = context.deployment_id,
+                "No database handle wired into this job; the host-Docker-socket mount was \
+                 logged and audited but not persisted onto the deployment row"
+            );
+            return;
+        };
+        if let Err(error) = temps_entities::deployments::Entity::update_many()
+            .col_expr(
+                temps_entities::deployments::Column::DockerSocketMounted,
+                Expr::value(true),
+            )
+            .filter(temps_entities::deployments::Column::Id.eq(deployment_id))
+            .exec(db.as_ref())
+            .await
+        {
+            tracing::error!(
+                project_id = context.project_id,
+                deployment_id,
+                error = %error,
+                "Failed to persist docker_socket_mounted on the deployment row"
+            );
+        }
+    }
+
     fn track_container(&self, container_id: String, deployer: Arc<dyn ContainerDeployer>) {
         // Insert ownership first. This prevents cleanup from observing a
         // container ID without the node-aware deployer needed to remove it.
@@ -2203,6 +2249,7 @@ impl DeployImageJob {
         if deploy_result.docker_socket_mounted {
             self.audit_docker_socket_mount(context, &audited_node_name)
                 .await;
+            self.persist_docker_socket_mounted(context).await;
             self.log(
                 context,
                 format!(

@@ -32,28 +32,11 @@ async fn verify_container_exec_access(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // ADR 045, before the caller-supplied container id touches any Docker
-    // daemon: a running container of a project this control plane declares
-    // already has `/var/run/docker.sock` bound, so a shell inside it can drive
-    // the engine. That is the same host root a malicious deployment would have
-    // obtained, reached without deploying anything, so `ContainersExec` on its
-    // own is not sufficient here.
-    //
-    // This helper — not the two handlers that call it — is the enforcement
-    // point: `exec_command` and `container_terminal` both funnel through it,
-    // and unlike the deploy path there is no builder or planner downstream to
-    // catch an omission.
-    super::docker_socket::guard_exec(
-        &state
-            .deployment_service
-            .project_slug(project_id)
-            .await
-            .map_err(Problem::from)?,
-        auth,
-    )?;
-
     // Verify the container belongs to this project/environment before using
-    // the caller-supplied Docker ID against any Docker daemon.
+    // the caller-supplied Docker ID against any Docker daemon. A DB lookup by
+    // itself does not touch Docker, so resolving this first (to learn which
+    // deployment the container belongs to) is safe ahead of the ADR-045 guard
+    // below.
     let (container_record, _env) = state
         .deployment_service
         .get_container_detail(project_id, environment_id, container_id.clone())
@@ -66,6 +49,41 @@ async fn verify_container_exec_access(
                     container_id, project_id, environment_id
                 ))
         })?;
+
+    // ADR 045, before the caller-supplied container id touches any Docker
+    // daemon: a running container of a project this control plane declares
+    // already has `/var/run/docker.sock` bound, so a shell inside it can drive
+    // the engine. That is the same host root a malicious deployment would have
+    // obtained, reached without deploying anything, so `ContainersExec` on its
+    // own is not sufficient here.
+    //
+    // Checks two independent signals, because they can disagree: the
+    // project's *current* slug (does this control plane declare it granted
+    // right now) and this specific container's *recorded history* (was the
+    // socket ever mounted into it). A rename away from a granted slug is
+    // admin-only, but it does not stop or recreate the project's
+    // already-running containers -- so the current-slug signal alone would
+    // silently downgrade this guard the moment an admin renames the project
+    // for an unrelated reason, while the container itself stays exactly as
+    // root-equivalent as before.
+    //
+    // This helper — not the two handlers that call it — is the enforcement
+    // point: `exec_command` and `container_terminal` both funnel through it,
+    // and unlike the deploy path there is no builder or planner downstream to
+    // catch an omission.
+    super::docker_socket::guard_exec(
+        &state
+            .deployment_service
+            .project_slug(project_id)
+            .await
+            .map_err(Problem::from)?,
+        state
+            .deployment_service
+            .deployment_docker_socket_mounted(container_record.deployment_id)
+            .await
+            .map_err(Problem::from)?,
+        auth,
+    )?;
 
     if let Some(token) = auth.deployment_token_info() {
         if token

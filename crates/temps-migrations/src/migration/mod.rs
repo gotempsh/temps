@@ -279,6 +279,7 @@ pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 pub mod m20260919_000001_add_failover_at_to_nodes;
 
 mod m20260920_000001_compose_security_policies;
+mod m20260921_000001_add_docker_socket_mounted_to_deployments;
 
 pub struct Migrator;
 
@@ -614,6 +615,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260921_000001_add_docker_socket_mounted_to_deployments::Migration),
         ]
     }
 }

@@ -2418,6 +2418,7 @@ impl DeploymentService {
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
             upload_request_id: Set(None),
+            docker_socket_mounted: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -3160,6 +3161,7 @@ impl DeploymentService {
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
             upload_request_id: Set(None),
+            docker_socket_mounted: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -4894,6 +4896,31 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound(format!("Project {project_id} not found")))
+    }
+
+    /// Whether this deployment ever had the host Docker socket mounted into
+    /// one of its containers (ADR 045).
+    ///
+    /// Used by exec/terminal authorization alongside (never instead of) the
+    /// project's *current* slug: renaming a project away from a granted slug
+    /// is admin-only, but it does not stop or recreate that project's
+    /// already-running containers, so checking only the current slug would
+    /// silently downgrade exec authorization on a still-root-equivalent
+    /// container the moment an admin renames the project for an unrelated
+    /// reason.
+    pub async fn deployment_docker_socket_mounted(
+        &self,
+        deployment_id: i32,
+    ) -> Result<bool, DeploymentError> {
+        deployments::Entity::find_by_id(deployment_id)
+            .select_only()
+            .column(deployments::Column::DockerSocketMounted)
+            .into_tuple::<bool>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!("Deployment {deployment_id} not found"))
+            })
     }
 
     /// Check whether container exec/terminal access is enabled for an

@@ -178,6 +178,14 @@ pub struct Model {
     /// timing, and lets the server reject a literal retry of the same
     /// upload attempt instead of importing and deploying the image twice.
     pub upload_request_id: Option<String>,
+    /// ADR 045: true once any container of this deployment has ever had the
+    /// host Docker socket mounted into it, per the executing host's own
+    /// `DeployResult.docker_socket_mounted`. Never cleared once set --
+    /// exec/terminal authorization checks this instead of the project's
+    /// *current* slug, since renaming a project away from a granted slug
+    /// (admin-only) does not stop or recreate its already-running
+    /// containers.
+    pub docker_socket_mounted: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -2052,6 +2052,7 @@ async fn process_git_push_event(
             commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
             deployment_config: sea_orm::Set(deployment_config_snapshot),
             upload_request_id: sea_orm::Set(None),
+            docker_socket_mounted: sea_orm::Set(false),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };
@@ -2410,6 +2411,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
