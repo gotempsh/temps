@@ -986,6 +986,41 @@ impl ManifestRepo {
         }
     }
 
+    /// Record which store the line index lives in (ADR-047 §8). Returns
+    /// `true` when the backend changed since the last start, in which case
+    /// every live chunk has been marked un-indexed so the reindexer rebuilds
+    /// the index in the new store — rows left in the old store are never
+    /// queried again and age out by its own retention.
+    pub async fn activate_index_backend(&self, backend: &str) -> Result<bool, LogAggregatorError> {
+        let rows = self
+            .query_all(
+                "INSERT INTO log_line_index_state (id, backend, changed_at) \
+                 VALUES (1, $1, now()) \
+                 ON CONFLICT (id) DO UPDATE \
+                     SET backend = EXCLUDED.backend, changed_at = now() \
+                     WHERE log_line_index_state.backend <> EXCLUDED.backend \
+                 RETURNING backend"
+                    .to_string(),
+                vec![backend.into()],
+            )
+            .await?;
+        // `RETURNING` yields a row only when the insert or the conditional
+        // update actually wrote — i.e. first start or a real change.
+        let changed = !rows.is_empty();
+        if changed {
+            self.db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE log_chunks SET indexed_at = NULL \
+                     WHERE deleted_at IS NULL AND indexed_at IS NOT NULL",
+                    vec![],
+                ))
+                .await
+                .map_err(LogAggregatorError::Database)?;
+        }
+        Ok(changed)
+    }
+
     /// Total live bytes and chunk count — the "log storage used" figure.
     pub async fn usage(&self) -> Result<(u64, u64), LogAggregatorError> {
         let rows = self

@@ -5,8 +5,11 @@
   per-line index in ClickHouse for attribute-level facets, histograms and
   analytics, the way Datadog's Log Explorer works.
 - **Date:** 2026-09-20
-- **Requires:** ClickHouse ≥ 25.3 when configured (for the `JSON` column
-  type). Without ClickHouse everything in ADR-046 keeps working unchanged.
+- **Requires:** nothing new. The index lives in the instance's ClickHouse
+  (≥ 25.3, for the `JSON` column type) when one is configured, else in
+  Temps Cloud's ClickHouse when the instance is linked, else in the
+  control-plane TimescaleDB (§8). Everything in ADR-046 keeps working
+  unchanged whichever store is active.
 
 ## Context
 
@@ -305,6 +308,49 @@ user-visible reason ("ClickHouse 24.8 found; log analytics needs ≥ 25.3
 for the JSON column type") surfaced through the capabilities endpoint.
 Spans and metrics are unaffected.
 
+### 8. Index stores: ClickHouse, Temps Cloud, TimescaleDB
+
+The index is one abstraction — `LineIndexSink` for writes, `LogAnalytics`
+for reads — with three stores behind it. The plugin picks one at startup,
+in this order, and never mixes them:
+
+| Store | Chosen when | Owns schema / TTL | Deletes | Attribute keys |
+|---|---|---|---|---|
+| **Local ClickHouse** (`ServerConfig`, ADR-012) | `TEMPS_CLICKHOUSE_*` configured and ≥ 25.3 | yes — migrations, `MODIFY TTL` synced to retention | lightweight `DELETE` | `log_attr_keys` materialized view |
+| **Temps Cloud ClickHouse** | no local ClickHouse, instance linked to Cloud | Cloud — no DDL crosses the proxy | none; `forget_chunks` inserts tombstones into `telemetry_log_forgotten_chunks` and every read excludes them | `ARRAY JOIN JSONExtractKeys(attrs)` over the window |
+| **TimescaleDB** (control-plane Postgres) | neither of the above | yes — hypertable, compression after 2 h, retention policy synced | `DELETE … WHERE chunk_seq = ANY(…)`; segmenting compression by `chunk_seq` drops whole batches without decompressing | `jsonb_object_keys(attrs)` over the window |
+
+**Temps Cloud.** Uses the abstraction ADR-040/041/043 built for spans and
+metrics: `CloudLink::clickhouse_query_client()` (read proxy, wall-clock
+budget on every read, no silent fallback) and `clickhouse_insert_client()`
+(insert proxy, names-and-types validation). Rows are scoped by
+`project_ref` / `external_service_ref` — the same pseudonyms spans use —
+so Cloud never learns a local id; `attrs` travels as JSON text because
+per-request ClickHouse settings do not cross the proxy. Telemetry export
+being switched off makes the index *unavailable* (surfaced verbatim in the
+capabilities endpoint), not silently local: a sealed chunk that could not
+be indexed keeps `indexed_at = NULL` and the reindexer backfills it once
+export is enabled. The Cloud DDL this side relies on is written down next
+to the client as the only contract this repository owns.
+
+**TimescaleDB.** A per-line table on the control-plane database is exactly
+what ADR-046 removed for *message bytes*; this is the index only — no
+message, ≈ 90 B/row uncompressed, ~10–20 B/row once Timescale compresses
+the chunk — and it exists so that a TimescaleDB-only install has the same
+explorer as everyone else. Same columns as the ClickHouse table (`attrs` is
+`jsonb`), same `chunk_seq`/`line_index` pointer, same retention as the
+chunks. Coverage is deliberately partial where Postgres cannot be fast:
+anything the fallback refuses returns a validation error naming ClickHouse
+rather than a slow or wrong answer.
+
+**Switching stores.** The active store is recorded in
+`log_line_index_state`. When it differs from the last start (an operator
+configures ClickHouse after weeks on TimescaleDB, or links Cloud), every
+live chunk is marked un-indexed and the reindexer rebuilds the index where
+queries now look; rows left in the previous store are never read again and
+age out by that store's retention. `GET /logs/global/capabilities` reports
+which store is active (`backend`).
+
 ## Alternatives considered
 
 - **Everything in ClickHouse (messages too)** — a second copy of every log
@@ -326,8 +372,9 @@ Spans and metrics are unaffected.
 
 ## Consequences
 
-- Datadog-style attribute facets, group-by and charts when ClickHouse is
-  configured; ADR-046 behaviour, plus a clear onboarding state, when not.
+- Datadog-style attribute facets, group-by and charts on every install;
+  ClickHouse (local or Cloud) for volume, TimescaleDB otherwise, with the
+  onboarding state reserved for the case where even that is unavailable.
 - One more table to size: ≈ 5–6 bytes per indexed line (to be measured).
 - Analytics trail live data by the flush window; tail views do not.
 - Ingest does bounded attribute extraction on every line (target ≤ 2 µs).

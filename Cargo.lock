@@ -12205,6 +12205,7 @@ dependencies = [
  "tempfile",
  "temps-auth",
  "temps-clickhouse",
+ "temps-cloud-client",
  "temps-config",
  "temps-core",
  "temps-database",

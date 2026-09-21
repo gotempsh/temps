@@ -17,6 +17,7 @@
 //! silently ignoring the filter.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
@@ -225,6 +226,103 @@ pub trait LogAnalytics: Send + Sync {
 
 // ── SQL generation ───────────────────────────────────────────────────────
 
+/// How a target stores the residual-attributes bag.
+pub(crate) enum AttrStorage {
+    /// A `JSON` column with typed dynamic subcolumns — a filter on one
+    /// attribute reads one column (the instance's own ClickHouse).
+    Json,
+    /// A `String` column holding the JSON text, read with the `JSON*`
+    /// functions. Temps Cloud's telemetry proxies forward a fixed parameter
+    /// allow-list, and the per-request
+    /// `input_format_binary_read_json_as_string` /
+    /// `output_format_binary_write_json_as_string` settings the `JSON` type
+    /// needs are not on it, so the Cloud table stores text.
+    JsonString,
+}
+
+/// How rows are tied to a project or external service.
+pub(crate) enum Scoping {
+    /// Raw `project_id` / `external_service_id`, `0` meaning "none".
+    Raw,
+    /// Pseudonymous `project_ref` / `external_service_ref` — Cloud never
+    /// learns a local id (ADR-043). `''` is the external-service "none".
+    Pseudonymous(Arc<temps_cloud_client::CloudLink>),
+}
+
+/// Everything about a target that changes the SQL: where the rows live, how
+/// the attributes are stored, how a project is named, and whether forgotten
+/// chunks are masked by tombstones instead of deleted.
+pub(crate) struct Dialect {
+    pub lines_table: &'static str,
+    pub attrs: AttrStorage,
+    pub scoping: Scoping,
+    /// Table of chunk seqs the instance has forgotten. `Some` only where
+    /// `DELETE` is not available (Cloud): every read then excludes them, so
+    /// compaction and purge never double-count.
+    pub tombstones: Option<&'static str>,
+}
+
+impl Dialect {
+    /// The instance's own ClickHouse. Must render exactly the SQL this file
+    /// has always rendered.
+    pub fn local() -> Self {
+        Self {
+            lines_table: super::clickhouse::LOCAL_LINES_TABLE,
+            attrs: AttrStorage::Json,
+            scoping: Scoping::Raw,
+            tombstones: None,
+        }
+    }
+
+    /// Temps Cloud's tenant ClickHouse behind the telemetry proxies.
+    pub fn cloud(link: Arc<temps_cloud_client::CloudLink>) -> Self {
+        Self {
+            lines_table: super::clickhouse::CLOUD_LINES_TABLE,
+            attrs: AttrStorage::JsonString,
+            scoping: Scoping::Pseudonymous(link),
+            tombstones: Some(super::clickhouse::CLOUD_FORGOTTEN_CHUNKS_TABLE),
+        }
+    }
+
+    pub fn is_cloud(&self) -> bool {
+        matches!(self.scoping, Scoping::Pseudonymous(_))
+    }
+
+    /// The name Cloud knows a project by, or the id itself on a raw target.
+    pub fn project_ref(&self, id: i32) -> Result<String, LogAggregatorError> {
+        match &self.scoping {
+            Scoping::Raw => Ok(id.to_string()),
+            Scoping::Pseudonymous(link) => pseudonym(link, "project", &id.to_string()),
+        }
+    }
+
+    /// Same for an external service; `0` ("none") stays the empty sentinel
+    /// rather than becoming the pseudonym of the id `0`.
+    pub fn external_service_ref(&self, id: i32) -> Result<String, LogAggregatorError> {
+        match &self.scoping {
+            Scoping::Raw => Ok(id.to_string()),
+            Scoping::Pseudonymous(_) if id == 0 => Ok(String::new()),
+            Scoping::Pseudonymous(link) => pseudonym(link, "external_service", &id.to_string()),
+        }
+    }
+}
+
+/// The scoping keys are derived with the same function that produced them on
+/// the way out; a link that cannot derive one is reported rather than papered
+/// over with an unscoped query.
+fn pseudonym(
+    link: &temps_cloud_client::CloudLink,
+    domain: &'static str,
+    value: &str,
+) -> Result<String, LogAggregatorError> {
+    link.pseudonymize_telemetry_id(domain, value)
+        .map_err(|error| LogAggregatorError::LineIndex {
+            reason: format!(
+                "could not derive the Temps Cloud scoping key for {domain} {value}: {error}"
+            ),
+        })
+}
+
 /// A bound parameter for the `clickhouse` client (`?` placeholders).
 #[derive(Debug, Clone)]
 pub(crate) enum Param {
@@ -280,20 +378,30 @@ pub(crate) fn validate_key(key: &str) -> Result<(), LogAggregatorError> {
 }
 
 /// SQL expression (as a `String` value) for a group key.
-pub(crate) fn key_expr(key: &GroupKey) -> Result<String, LogAggregatorError> {
+///
+/// On a pseudonymous target `project` and `external_service` group by the
+/// ref, not the id — Cloud holds no ids. The caller maps the refs back for
+/// the response.
+pub(crate) fn key_expr(key: &GroupKey, d: &Dialect) -> Result<String, LogAggregatorError> {
     Ok(match key {
         GroupKey::Label(f) => match f {
             FacetField::Env => "env".into(),
             FacetField::Service => "service".into(),
             FacetField::Level => "toString(level)".into(),
             FacetField::Stream => "toString(stream)".into(),
-            FacetField::Project => "toString(project_id)".into(),
-            FacetField::ExternalService => "toString(external_service_id)".into(),
+            FacetField::Project => match d.scoping {
+                Scoping::Raw => "toString(project_id)".into(),
+                Scoping::Pseudonymous(_) => "project_ref".into(),
+            },
+            FacetField::ExternalService => match d.scoping {
+                Scoping::Raw => "toString(external_service_id)".into(),
+                Scoping::Pseudonymous(_) => "external_service_ref".into(),
+            },
             FacetField::Node => "toString(node_id)".into(),
             FacetField::Deploy => "toString(deploy_id)".into(),
             FacetField::Container => "container_id".into(),
         },
-        GroupKey::Attr(k) => attr_string_expr(k)?,
+        GroupKey::Attr(k) => attr_string_expr(k, d)?,
     })
 }
 
@@ -306,47 +414,92 @@ pub(crate) fn key_name(key: &GroupKey) -> String {
 }
 
 /// The column/subcolumn holding an attribute, as a raw (typed) expression.
-fn attr_raw_expr(key: &str) -> Result<String, LogAggregatorError> {
+///
+/// On a JSON-text target the "raw" form is the value's JSON text
+/// (`"hit"`, `3`, `{…}`), which is only ever consumed by the helpers below —
+/// see [`attr_equality_expr`] for why equality cannot use it there.
+fn attr_raw_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
     validate_key(key)?;
-    Ok(if is_canonical_key(key) {
-        key.to_string()
-    } else {
-        format!("attrs.`{key}`")
+    if is_canonical_key(key) {
+        return Ok(key.to_string());
+    }
+    Ok(match d.attrs {
+        AttrStorage::Json => format!("attrs.`{key}`"),
+        AttrStorage::JsonString => format!("JSONExtractRaw(attrs, '{key}')"),
     })
 }
 
 /// Attribute as a `String` (dynamic subcolumns are typed `Dynamic`; labels
 /// are `''`/`0` when absent and are shown as such).
-fn attr_string_expr(key: &str) -> Result<String, LogAggregatorError> {
-    let raw = attr_raw_expr(key)?;
-    Ok(if is_canonical_key(key) {
-        format!("toString({raw})")
-    } else {
-        format!("toString(ifNull({raw}, ''))")
+fn attr_string_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
+    let raw = attr_raw_expr(key, d)?;
+    if is_canonical_key(key) {
+        return Ok(format!("toString({raw})"));
+    }
+    Ok(match d.attrs {
+        AttrStorage::Json => format!("toString(ifNull({raw}, ''))"),
+        // `JSONExtractString` is the only form that unescapes a string value,
+        // but it returns `''` for a number — and the index compares values on
+        // their string form (`3` and `"3"` are the same value), so a number
+        // has to come back as its digits. Hence the branch on `JSONType`
+        // rather than either function alone. A missing key is `''`, matching
+        // the `ifNull` above.
+        AttrStorage::JsonString => format!(
+            "if(JSONType(attrs, '{key}') = 'String', JSONExtractString(attrs, '{key}'), \
+             trim(BOTH '\"' FROM {raw}))"
+        ),
     })
+}
+
+/// Attribute for an equality test.
+///
+/// On the `JSON` column this is the raw (possibly `Dynamic`) subcolumn: an
+/// absent key is NULL, which is simply not equal, and skipping the
+/// `toString(ifNull(…))` wrapper reads 2.4× faster at 50M lines. On the
+/// JSON-text column the raw form still carries its JSON quotes, so equality
+/// has to compare the decoded string.
+fn attr_equality_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
+    match d.attrs {
+        AttrStorage::Json => attr_raw_expr(key, d),
+        AttrStorage::JsonString => attr_string_expr(key, d),
+    }
 }
 
 /// Attribute as `Float64` for numeric metrics/comparisons (`NULL` when not
 /// numeric).
-fn attr_number_expr(key: &str) -> Result<String, LogAggregatorError> {
-    let raw = attr_raw_expr(key)?;
-    Ok(if is_canonical_key(key) {
-        format!("toFloat64({raw})")
-    } else {
-        format!("toFloat64OrNull(toString(ifNull({raw}, '')))")
+fn attr_number_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
+    let raw = attr_raw_expr(key, d)?;
+    if is_canonical_key(key) {
+        return Ok(format!("toFloat64({raw})"));
+    }
+    Ok(match d.attrs {
+        AttrStorage::Json => format!("toFloat64OrNull(toString(ifNull({raw}, '')))"),
+        // Both `7` and `"7"` are numeric here, as they are locally: the raw
+        // JSON text of a number parses directly, a quoted number is unescaped
+        // first, and anything else is NULL.
+        AttrStorage::JsonString => format!(
+            "toFloat64OrNull(if(JSONType(attrs, '{key}') = 'String', \
+             JSONExtractString(attrs, '{key}'), {raw}))"
+        ),
     })
 }
 
 /// Existence test for an attribute.
-fn attr_exists_expr(key: &str) -> Result<String, LogAggregatorError> {
-    let raw = attr_raw_expr(key)?;
-    Ok(if is_canonical_key(key) {
-        match key {
+fn attr_exists_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
+    let raw = attr_raw_expr(key, d)?;
+    if is_canonical_key(key) {
+        return Ok(match key {
             "status_code" | "duration_ms" => format!("{raw} != 0"),
             _ => format!("{raw} != ''"),
+        });
+    }
+    Ok(match d.attrs {
+        AttrStorage::Json => format!("{raw} IS NOT NULL"),
+        // `JSONHas` is true for a key whose value is `null`; locally a null
+        // is absent, so the type check keeps the two sides agreeing.
+        AttrStorage::JsonString => {
+            format!("(JSONHas(attrs, '{key}') AND JSONType(attrs, '{key}') != 'Null')")
         }
-    } else {
-        format!("{raw} IS NOT NULL")
     })
 }
 
@@ -365,14 +518,37 @@ fn ts_param(t: DateTime<Utc>) -> Param {
 }
 
 /// Scope / selection fragment: mirrors `manifest::scope_condition` exactly
-/// (`external_service_id = 0` is the index's "none").
-fn resource_condition(sql: &mut Sql, project_ids: &[i32], service_ids: &[i32]) -> String {
+/// (`external_service_id = 0` is the index's "none"; on a pseudonymous
+/// target the ids are mapped to refs and `''` is the "none").
+fn resource_condition(
+    sql: &mut Sql,
+    project_ids: &[i32],
+    service_ids: &[i32],
+    d: &Dialect,
+) -> Result<String, LogAggregatorError> {
     if project_ids.is_empty() && service_ids.is_empty() {
-        return "0".to_string();
+        return Ok("0".to_string());
     }
-    let p = sql.bind(Param::I32List(project_ids.to_vec()));
-    let s = sql.bind(Param::I32List(service_ids.to_vec()));
-    format!("((external_service_id = 0 AND project_id IN {p}) OR (external_service_id != 0 AND external_service_id IN {s}))")
+    Ok(match d.scoping {
+        Scoping::Raw => {
+            let p = sql.bind(Param::I32List(project_ids.to_vec()));
+            let s = sql.bind(Param::I32List(service_ids.to_vec()));
+            format!("((external_service_id = 0 AND project_id IN {p}) OR (external_service_id != 0 AND external_service_id IN {s}))")
+        }
+        Scoping::Pseudonymous(_) => {
+            let projects = project_ids
+                .iter()
+                .map(|id| d.project_ref(*id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let services = service_ids
+                .iter()
+                .map(|id| d.external_service_ref(*id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let p = sql.bind(Param::StrList(projects));
+            let s = sql.bind(Param::StrList(services));
+            format!("((external_service_ref = '' AND project_ref IN {p}) OR (external_service_ref != '' AND external_service_ref IN {s}))")
+        }
+    })
 }
 
 /// `WHERE` for a [`LogQuery`] plus attribute predicates. Never omits the
@@ -380,6 +556,7 @@ fn resource_condition(sql: &mut Sql, project_ids: &[i32], service_ids: &[i32]) -
 pub(crate) fn build_where(
     query: &LogQuery,
     attrs: &[AttrPredicate],
+    d: &Dialect,
 ) -> Result<Sql, LogAggregatorError> {
     let mut sql = Sql::default();
 
@@ -396,13 +573,17 @@ pub(crate) fn build_where(
             project_ids,
             external_service_ids,
         } => {
-            let c = resource_condition(&mut sql, project_ids, external_service_ids);
+            let c = resource_condition(&mut sql, project_ids, external_service_ids, d)?;
             sql.conditions.push(c);
         }
     }
+    let (no_service, some_service) = match d.scoping {
+        Scoping::Raw => ("external_service_id = 0", "external_service_id != 0"),
+        Scoping::Pseudonymous(_) => ("external_service_ref = ''", "external_service_ref != ''"),
+    };
     match query.source {
-        LogSourceKind::Application => sql.conditions.push("external_service_id = 0".into()),
-        LogSourceKind::Service => sql.conditions.push("external_service_id != 0".into()),
+        LogSourceKind::Application => sql.conditions.push(no_service.into()),
+        LogSourceKind::Service => sql.conditions.push(some_service.into()),
         LogSourceKind::Collected => {}
     }
     if let Some(LogSelection {
@@ -410,8 +591,16 @@ pub(crate) fn build_where(
         external_service_ids,
     }) = &query.selection
     {
-        let c = resource_condition(&mut sql, project_ids, external_service_ids);
+        let c = resource_condition(&mut sql, project_ids, external_service_ids, d)?;
         sql.conditions.push(c);
+    }
+    // Chunks the instance has forgotten (compacted away, purged, or missing)
+    // are masked here where they cannot be deleted, so no aggregation counts
+    // a line the reader can no longer fetch.
+    if let Some(tombstones) = d.tombstones {
+        sql.conditions.push(format!(
+            "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones})"
+        ));
     }
     if !query.levels.is_empty() {
         let v = sql.bind(Param::StrList(
@@ -446,7 +635,7 @@ pub(crate) fn build_where(
 
     for p in attrs {
         let cond = match p.op {
-            AttrOp::Exists => attr_exists_expr(&p.key)?,
+            AttrOp::Exists => attr_exists_expr(&p.key, d)?,
             AttrOp::Eq | AttrOp::Neq | AttrOp::Prefix => {
                 let value = p
                     .value
@@ -456,14 +645,12 @@ pub(crate) fn build_where(
                     })?;
                 let v = sql.bind(Param::Str(value));
                 match p.op {
-                    // Equality compares the raw (possibly `Dynamic`) column:
-                    // an absent key is NULL, which is simply not equal, and
-                    // skipping the `toString(ifNull(…))` wrapper reads 2.4×
-                    // faster at 50M lines. `!=` keeps the wrapper so lines
-                    // without the key count as "not that value".
-                    AttrOp::Eq => format!("{} = {v}", attr_raw_expr(&p.key)?),
-                    AttrOp::Neq => format!("{} != {v}", attr_string_expr(&p.key)?),
-                    _ => format!("startsWith({}, {v})", attr_string_expr(&p.key)?),
+                    // `=` compares the cheapest form the storage allows (see
+                    // `attr_equality_expr`); `!=` always compares the string
+                    // form so lines without the key count as "not that value".
+                    AttrOp::Eq => format!("{} = {v}", attr_equality_expr(&p.key, d)?),
+                    AttrOp::Neq => format!("{} != {v}", attr_string_expr(&p.key, d)?),
+                    _ => format!("startsWith({}, {v})", attr_string_expr(&p.key, d)?),
                 }
             }
             AttrOp::Gt | AttrOp::Lt => {
@@ -477,7 +664,7 @@ pub(crate) fn build_where(
                                 p.key
                             ),
                         })?;
-                let expr = attr_number_expr(&p.key)?;
+                let expr = attr_number_expr(&p.key, d)?;
                 let v = sql.bind(Param::F64(value));
                 if p.op == AttrOp::Gt {
                     format!("{expr} > {v}")
@@ -493,19 +680,19 @@ pub(crate) fn build_where(
 }
 
 /// Metric expression and the attribute it needs (if any).
-pub(crate) fn metric_expr(metric: &Metric) -> Result<String, LogAggregatorError> {
+pub(crate) fn metric_expr(metric: &Metric, d: &Dialect) -> Result<String, LogAggregatorError> {
     // Numeric attributes are `Nullable` (non-numeric rows → NULL) and the
     // aggregates over them are therefore `Nullable(Float64)`; a group with
     // no numeric value reports 0 rather than failing to deserialise.
     Ok(match metric {
         Metric::Count => "toFloat64(count())".into(),
-        Metric::CountDistinct(k) => format!("toFloat64(uniq({}))", attr_string_expr(k)?),
-        Metric::Avg(k) => format!("ifNull(avg({}), 0)", attr_number_expr(k)?),
-        Metric::P50(k) => format!("ifNull(quantile(0.5)({}), 0)", attr_number_expr(k)?),
-        Metric::P95(k) => format!("ifNull(quantile(0.95)({}), 0)", attr_number_expr(k)?),
-        Metric::P99(k) => format!("ifNull(quantile(0.99)({}), 0)", attr_number_expr(k)?),
-        Metric::Max(k) => format!("ifNull(max({}), 0)", attr_number_expr(k)?),
-        Metric::Sum(k) => format!("ifNull(sum({}), 0)", attr_number_expr(k)?),
+        Metric::CountDistinct(k) => format!("toFloat64(uniq({}))", attr_string_expr(k, d)?),
+        Metric::Avg(k) => format!("ifNull(avg({}), 0)", attr_number_expr(k, d)?),
+        Metric::P50(k) => format!("ifNull(quantile(0.5)({}), 0)", attr_number_expr(k, d)?),
+        Metric::P95(k) => format!("ifNull(quantile(0.95)({}), 0)", attr_number_expr(k, d)?),
+        Metric::P99(k) => format!("ifNull(quantile(0.99)({}), 0)", attr_number_expr(k, d)?),
+        Metric::Max(k) => format!("ifNull(max({}), 0)", attr_number_expr(k, d)?),
+        Metric::Sum(k) => format!("ifNull(sum({}), 0)", attr_number_expr(k, d)?),
     })
 }
 
@@ -544,9 +731,41 @@ pub(crate) struct PointerRow {
     pub ts_ms: i64,
 }
 
+/// An enrolled, telemetry-enabled [`CloudLink`](temps_cloud_client::CloudLink)
+/// for dialect tests, shared with `clickhouse.rs`.
+///
+/// No network and no enrollment round trip: the state file is the only thing
+/// the link reads to consider itself linked, and the scoping keys are derived
+/// from the token in it. The caller keeps the `TempDir` alive.
+#[cfg(test)]
+pub(crate) fn test_cloud_link(dir: &std::path::Path) -> Arc<temps_cloud_client::CloudLink> {
+    let mut state = temps_cloud_client::state::EnrollmentState::new("https://cloud.example.test");
+    state.token = Some("inst_test_token".into());
+    state
+        .save(&dir.join("cloud-link").join("state.json"))
+        .expect("persist link state");
+    let link = Arc::new(temps_cloud_client::CloudLink::load(
+        dir.to_path_buf(),
+        "0.1.0-test",
+    ));
+    link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches {
+        telemetry: true,
+        backups: false,
+        notifications: false,
+    })
+    .expect("apply feature switches");
+    link
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dialect every pre-Cloud expectation in this file is written
+    /// against; its SQL must not move.
+    fn local() -> Dialect {
+        Dialect::local()
+    }
 
     fn q(scope: LogAccessScope) -> LogQuery {
         let mut q = LogQuery::for_scope(scope);
@@ -563,6 +782,7 @@ mod tests {
                 external_service_ids: vec![],
             }),
             &[],
+            &local(),
         )
         .unwrap();
         assert!(sql.where_clause().contains(" AND 0"));
@@ -572,6 +792,7 @@ mod tests {
                 external_service_ids: vec![9],
             }),
             &[],
+            &local(),
         )
         .unwrap();
         assert!(sql.where_clause().contains("project_id IN ?"));
@@ -588,7 +809,7 @@ mod tests {
             op: AttrOp::Eq,
             value: Some("1".into()),
         };
-        assert!(build_where(&query, &[bad]).is_err());
+        assert!(build_where(&query, &[bad], &local()).is_err());
         assert!(validate_key("http.status").is_ok());
         assert!(validate_key("1abc").is_err());
         assert!(validate_key(&"k".repeat(65)).is_err());
@@ -597,16 +818,19 @@ mod tests {
     #[test]
     fn canonical_keys_use_fixed_columns_and_dynamic_keys_use_json() {
         assert_eq!(
-            attr_string_expr("status_code").unwrap(),
+            attr_string_expr("status_code", &local()).unwrap(),
             "toString(status_code)"
         );
         assert_eq!(
-            attr_string_expr("worker").unwrap(),
+            attr_string_expr("worker", &local()).unwrap(),
             "toString(ifNull(attrs.`worker`, ''))"
         );
-        assert_eq!(attr_exists_expr("duration_ms").unwrap(), "duration_ms != 0");
         assert_eq!(
-            attr_exists_expr("worker").unwrap(),
+            attr_exists_expr("duration_ms", &local()).unwrap(),
+            "duration_ms != 0"
+        );
+        assert_eq!(
+            attr_exists_expr("worker", &local()).unwrap(),
             "attrs.`worker` IS NOT NULL"
         );
     }
@@ -628,6 +852,7 @@ mod tests {
                     value: Some("hi'".into()),
                 },
             ],
+            &local(),
         )
         .unwrap();
         let w = sql.where_clause();
@@ -682,11 +907,142 @@ mod tests {
 
     #[test]
     fn metric_expressions() {
-        assert_eq!(metric_expr(&Metric::Count).unwrap(), "toFloat64(count())");
         assert_eq!(
-            metric_expr(&Metric::P95("duration_ms".into())).unwrap(),
+            metric_expr(&Metric::Count, &local()).unwrap(),
+            "toFloat64(count())"
+        );
+        assert_eq!(
+            metric_expr(&Metric::P95("duration_ms".into()), &local()).unwrap(),
             "ifNull(quantile(0.95)(toFloat64(duration_ms)), 0)"
         );
-        assert!(metric_expr(&Metric::Avg("bad key".into())).is_err());
+        assert!(metric_expr(&Metric::Avg("bad key".into()), &local()).is_err());
+    }
+
+    // ── Cloud dialect ────────────────────────────────────────────────────
+
+    fn cloud(dir: &tempfile::TempDir) -> Dialect {
+        Dialect::cloud(test_cloud_link(dir.path()))
+    }
+
+    #[test]
+    fn cloud_attributes_are_read_with_the_json_string_functions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let d = cloud(&dir);
+        // Canonical keys are real columns on both sides — unchanged.
+        assert_eq!(
+            attr_string_expr("status_code", &d).unwrap(),
+            "toString(status_code)"
+        );
+        // A dynamic key is JSON text: strings are unescaped, numbers keep
+        // their digits (the index compares values on their string form).
+        assert_eq!(
+            attr_string_expr("worker", &d).unwrap(),
+            "if(JSONType(attrs, 'worker') = 'String', JSONExtractString(attrs, 'worker'), \
+             trim(BOTH '\"' FROM JSONExtractRaw(attrs, 'worker')))"
+        );
+        assert_eq!(
+            attr_number_expr("worker", &d).unwrap(),
+            "toFloat64OrNull(if(JSONType(attrs, 'worker') = 'String', \
+             JSONExtractString(attrs, 'worker'), JSONExtractRaw(attrs, 'worker')))"
+        );
+        assert_eq!(
+            attr_exists_expr("worker", &d).unwrap(),
+            "(JSONHas(attrs, 'worker') AND JSONType(attrs, 'worker') != 'Null')"
+        );
+        // Equality cannot compare the raw form there: it still carries the
+        // JSON quotes.
+        assert_eq!(
+            attr_equality_expr("worker", &d).unwrap(),
+            attr_string_expr("worker", &d).unwrap()
+        );
+        assert!(attr_string_expr("x'; DROP TABLE", &d).is_err());
+    }
+
+    #[test]
+    fn cloud_scoping_binds_refs_and_groups_by_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let d = cloud(&dir);
+        let sql = build_where(
+            &q(LogAccessScope::Allowed {
+                project_ids: vec![1, 2],
+                external_service_ids: vec![9],
+            }),
+            &[],
+            &d,
+        )
+        .unwrap();
+        let w = sql.where_clause();
+        assert!(
+            w.contains("external_service_ref = '' AND project_ref IN ?"),
+            "{w}"
+        );
+        assert!(
+            w.contains("external_service_ref != '' AND external_service_ref IN ?"),
+            "{w}"
+        );
+        assert!(
+            !w.contains("project_id"),
+            "Cloud never sees a local id: {w}"
+        );
+        // The refs are opaque and bound, never the ids themselves.
+        let refs: Vec<&Vec<String>> = sql
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                Param::StrList(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].len(), 2);
+        assert!(refs[0].iter().all(|r| r != "1" && r != "2"));
+        assert_eq!(
+            key_expr(&GroupKey::Label(FacetField::Project), &d).unwrap(),
+            "project_ref"
+        );
+        assert_eq!(
+            key_expr(&GroupKey::Label(FacetField::ExternalService), &d).unwrap(),
+            "external_service_ref"
+        );
+    }
+
+    #[test]
+    fn every_cloud_read_excludes_forgotten_chunks_and_no_local_read_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tombstones = "chunk_seq NOT IN (SELECT chunk_seq FROM telemetry_log_forgotten_chunks)";
+        // Cloud cannot DELETE through the proxies, so the mask is the only
+        // thing keeping a compacted chunk out of every aggregation.
+        for scope in [
+            LogAccessScope::All,
+            LogAccessScope::Allowed {
+                project_ids: vec![7],
+                external_service_ids: vec![],
+            },
+        ] {
+            let sql = build_where(&q(scope), &[], &cloud(&dir)).unwrap();
+            assert!(sql.where_clause().contains(tombstones));
+        }
+        let sql = build_where(&q(LogAccessScope::All), &[], &local()).unwrap();
+        assert!(!sql
+            .where_clause()
+            .contains("telemetry_log_forgotten_chunks"));
+    }
+
+    #[test]
+    fn the_external_service_none_sentinel_differs_per_dialect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut query = q(LogAccessScope::All);
+        query.source = LogSourceKind::Application;
+        assert!(build_where(&query, &[], &local())
+            .unwrap()
+            .where_clause()
+            .contains("external_service_id = 0"));
+        assert!(build_where(&query, &[], &cloud(&dir))
+            .unwrap()
+            .where_clause()
+            .contains("external_service_ref = ''"));
+        // `0` is "no external service", not the pseudonym of the id 0.
+        assert_eq!(cloud(&dir).external_service_ref(0).unwrap(), "");
+        assert!(!cloud(&dir).external_service_ref(9).unwrap().is_empty());
     }
 }

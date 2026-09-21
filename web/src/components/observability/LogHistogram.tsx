@@ -4,7 +4,8 @@
 /**
  * Line-count histogram above the global log list (ADR-047 §5).
  *
- * Needs the ClickHouse line index: when it is not configured this still
+ * Needs the line index (ClickHouse, Temps Cloud or the TimescaleDB
+ * fallback): when none is available this still
  * renders — the onboarding state names exactly what's missing, shows the
  * example, and links to Settings → Metrics & monitoring (CLAUDE.md:
  * unconfigured features onboard instead of disappearing). `text` search has

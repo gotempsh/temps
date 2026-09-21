@@ -18,6 +18,7 @@
 
 pub mod analytics;
 pub mod clickhouse;
+pub mod timescale;
 
 use std::sync::Arc;
 
@@ -77,6 +78,38 @@ pub trait LineIndexSink: Send + Sync {
     /// endpoint (`None` when indexing is active).
     fn unavailable_reason(&self) -> Option<String> {
         None
+    }
+
+    /// Which store holds the index rows. Persisted by the plugin so a change
+    /// of backend (say, ClickHouse configured after weeks on TimescaleDB)
+    /// invalidates `indexed_at` and the reindexer rebuilds the index where
+    /// queries now look. `None` when nothing is indexing.
+    fn backend(&self) -> Option<LineIndexBackend> {
+        None
+    }
+}
+
+/// The stores a line index can live in, in the order the plugin prefers
+/// them: the instance's own ClickHouse, then Temps Cloud's, then the
+/// control-plane TimescaleDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub enum LineIndexBackend {
+    #[serde(rename = "clickhouse")]
+    ClickHouse,
+    #[serde(rename = "temps_cloud")]
+    TempsCloud,
+    #[serde(rename = "timescaledb")]
+    TimescaleDb,
+}
+
+impl LineIndexBackend {
+    /// Stable identifier stored in `log_line_index_state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClickHouse => "clickhouse",
+            Self::TempsCloud => "temps_cloud",
+            Self::TimescaleDb => "timescaledb",
+        }
     }
 }
 

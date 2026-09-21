@@ -1150,6 +1150,7 @@ export type AllocEntry = {
 };
 
 export type AnalyticsCapability = {
+    backend?: null | LineIndexBackend;
     /**
      * `true` when the line index is active and receiving sealed chunks.
      */
@@ -12385,6 +12386,13 @@ export type LineContext = {
      */
     before: Array<ContextLine>;
 };
+
+/**
+ * The stores a line index can live in, in the order the plugin prefers
+ * them: the instance's own ClickHouse, then Temps Cloud's, then the
+ * control-plane TimescaleDB.
+ */
+export type LineIndexBackend = 'clickhouse' | 'temps_cloud' | 'timescaledb';
 
 export type LinkApplicationProjectRequest = {
     project_id: number;

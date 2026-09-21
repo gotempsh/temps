@@ -214,6 +214,7 @@ struct CountRow {
 
 async fn row_count(idx: &ClickHouseLineIndex, where_clause: &str) -> u64 {
     idx.client()
+        .expect("a local target owns its client")
         .query(&format!(
             "SELECT count() AS n FROM log_lines_index WHERE {where_clause}"
         ))
@@ -235,14 +236,17 @@ async fn connect_applies_migration_and_is_idempotent() {
     let idx = ClickHouseLineIndex::connect(cfg)
         .await
         .expect("first connect should apply migration 0001 and version-gate the server");
+    let version = idx
+        .version()
+        .expect("a local target probes the server version");
     assert!(
-        idx.version().at_least(25, 3),
-        "container reports {}, expected >= 25.3",
-        idx.version()
+        version.at_least(25, 3),
+        "container reports {version}, expected >= 25.3"
     );
 
     let tracked_after_first = idx
         .client()
+        .expect("a local target owns its client")
         .query(
             "SELECT count() AS n FROM _temps_ch_log_index_migrations \
              WHERE name = '0001_log_lines_index'",
@@ -265,6 +269,7 @@ async fn connect_applies_migration_and_is_idempotent() {
 
     let tracked_after_second = idx2
         .client()
+        .expect("a local target owns its client")
         .query(
             "SELECT count() AS n FROM _temps_ch_log_index_migrations \
              WHERE name = '0001_log_lines_index'",
@@ -379,6 +384,7 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
     assert_eq!(out, IndexOutcome::Indexed);
 
     idx.client()
+        .expect("a local target owns its client")
         .query("OPTIMIZE TABLE log_lines_index FINAL")
         .execute()
         .await
@@ -595,6 +601,7 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
     }
     let engine = idx
         .client()
+        .expect("a local target owns its client")
         .query(
             "SELECT engine_full FROM system.tables \
              WHERE database = 'temps_test' AND name = 'log_lines_index'",

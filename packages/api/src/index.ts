@@ -4130,6 +4130,7 @@ export type {
   LemonSqueezyConfig,
   LetsEncryptSettings,
   LineContext,
+  LineIndexBackend,
   LinkApplicationProjectData,
   LinkApplicationProjectErrors,
   LinkApplicationProjectRequest,

@@ -6,7 +6,7 @@
  * seen in the current scope, expandable into its top values, each of which
  * becomes an `attr` predicate (`key=value`, `key!=value` or `key?`).
  *
- * Renders even when the ClickHouse line index is not configured: the
+ * Renders even when the line index is not configured: the
  * onboarding state names exactly what's missing and links to setup
  * (CLAUDE.md — unconfigured features must onboard, never disappear).
  */

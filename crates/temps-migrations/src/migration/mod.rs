@@ -280,6 +280,8 @@ pub mod m20260919_000001_add_failover_at_to_nodes;
 pub mod m20260919_000001_log_chunks_v2;
 pub mod m20260920_000001_log_chunks_indexed_at;
 pub mod m20260920_000002_log_collector_positions;
+pub mod m20260921_000001_log_lines_index;
+pub mod m20260921_000002_log_line_index_state;
 
 mod m20260920_000001_compose_security_policies;
 
@@ -620,6 +622,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_log_chunks_v2::Migration),
             Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
             Box::new(m20260920_000002_log_collector_positions::Migration),
+            Box::new(m20260921_000001_log_lines_index::Migration),
+            Box::new(m20260921_000002_log_line_index_state::Migration),
         ]
     }
 }

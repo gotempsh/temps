@@ -46,6 +46,7 @@ crc32fast = "1.4"
 arc-swap = "1.7"
 clickhouse = { workspace = true }
 temps-clickhouse = { path = "../temps-clickhouse" }
+temps-cloud-client = { path = "../temps-cloud-client" }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }

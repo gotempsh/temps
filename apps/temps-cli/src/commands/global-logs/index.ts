@@ -255,8 +255,18 @@ interface AggregateResponse {
   rows: AggregateRow[]
 }
 
+type LineIndexBackend = 'clickhouse' | 'temps_cloud' | 'timescaledb'
+
+const BACKEND_LABELS: Record<LineIndexBackend, string> = {
+  clickhouse: 'ClickHouse (this instance)',
+  temps_cloud: 'Temps Cloud ClickHouse',
+  timescaledb: 'TimescaleDB (control-plane database)',
+}
+
 interface AnalyticsCapability {
   configured: boolean
+  /** Where the index lives when configured. */
+  backend?: LineIndexBackend | null
   reason?: string | null
   setup_path: string
   example: string
@@ -993,6 +1003,9 @@ async function capabilitiesAction(options: { json?: boolean }): Promise<void> {
   newline()
   header(`${icons.info} Log analytics capabilities`)
   keyValue('Configured', analytics.configured ? 'yes' : 'no')
+  if (analytics.backend) {
+    keyValue('Index store', BACKEND_LABELS[analytics.backend] ?? analytics.backend)
+  }
   keyValue('Live chunks', analytics.live_chunks.toLocaleString())
   keyValue('Indexed chunks', analytics.indexed_chunks.toLocaleString())
   newline()
@@ -1001,7 +1014,7 @@ async function capabilitiesAction(options: { json?: boolean }): Promise<void> {
   } else {
     // Onboards rather than hides: state exactly what's missing, what it
     // would do once configured, and where to fix it (CLAUDE.md).
-    warning(analytics.reason ?? 'The ClickHouse line index is not configured.')
+    warning(analytics.reason ?? 'The log line index is not available.')
     info(`Example once configured: ${analytics.example}`)
     info(`Configure it at ${analytics.setup_path}`)
   }

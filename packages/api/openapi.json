@@ -2663,6 +2663,17 @@
       },
       "AnalyticsCapability": {
         "properties": {
+          "backend": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LineIndexBackend",
+                "description": "Where the index lives (`clickhouse`, `temps_cloud` or `timescaledb`)\nwhen configured. The TimescaleDB fallback answers the same endpoints\nbut scales with line count on the control-plane database; the\nonboarding copy points at ClickHouse or Temps Cloud for volume."
+              }
+            ]
+          },
           "configured": {
             "description": "`true` when the line index is active and receiving sealed chunks.",
             "type": "boolean"
@@ -26694,6 +26705,15 @@
           "after"
         ],
         "type": "object"
+      },
+      "LineIndexBackend": {
+        "description": "The stores a line index can live in, in the order the plugin prefers\nthem: the instance's own ClickHouse, then Temps Cloud's, then the\ncontrol-plane TimescaleDB.",
+        "enum": [
+          "clickhouse",
+          "temps_cloud",
+          "timescaledb"
+        ],
+        "type": "string"
       },
       "LinkApplicationProjectRequest": {
         "properties": {

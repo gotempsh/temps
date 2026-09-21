@@ -228,6 +228,12 @@ pub struct GlobalLogCapabilities {
 pub struct AnalyticsCapability {
     /// `true` when the line index is active and receiving sealed chunks.
     pub configured: bool,
+    /// Where the index lives (`clickhouse`, `temps_cloud` or `timescaledb`)
+    /// when configured. The TimescaleDB fallback answers the same endpoints
+    /// but scales with line count on the control-plane database; the
+    /// onboarding copy points at ClickHouse or Temps Cloud for volume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<crate::index::LineIndexBackend>,
     /// Exactly what is missing, when `configured` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -260,6 +266,7 @@ pub async fn global_log_capabilities(
     Ok(Json(GlobalLogCapabilities {
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
+            backend: state.line_index.backend(),
             reason,
             setup_path: ANALYTICS_SETUP_PATH.to_string(),
             example: "Group ERROR lines by http_route for the last hour, chart requests slower \

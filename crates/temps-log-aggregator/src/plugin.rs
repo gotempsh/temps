@@ -18,8 +18,9 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::chunk::cache::ChunkCache;
 use crate::handlers::{self, create_log_aggregator_app_state, LogAggregatorAppState};
-use crate::index::clickhouse::{ClickHouseLineIndex, IndexUnavailable};
-use crate::index::{LineIndex, NoLineIndex};
+use crate::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
+use crate::index::timescale::TimescaleLineIndex;
+use crate::index::LineIndex;
 use crate::services::{
     ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
     RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
@@ -79,8 +80,9 @@ pub struct LogAggregatorPlugin {
     /// ClickHouse connection for the ADR-047 line index, resolved once by
     /// the composition root from `ServerConfig` (the single home of the
     /// instance's ClickHouse connection, shared with analytics, OTel, proxy
-    /// logs and metrics — ADR-012). `None` = index disabled; the explorer
-    /// then shows the onboarding state.
+    /// logs and metrics — ADR-012). `None` = no local ClickHouse; the index
+    /// then goes to Temps Cloud's ClickHouse when the instance is linked,
+    /// else to the control-plane TimescaleDB (ADR-047 §8).
     line_index_config: Option<ClickHouseConfig>,
 }
 
@@ -162,28 +164,38 @@ impl TempsPlugin for LogAggregatorPlugin {
             // without WAL protection rather than failing to start.
             let wal_dir = data_dir.map(|dir| dir.join("logs").join("wal"));
 
-            // ADR-047: per-line index in ClickHouse when configured and new
-            // enough. Any reason it is unavailable is kept verbatim so the
-            // explorer can tell the operator what to fix (never a silent
-            // downgrade).
-            let line_index: Arc<dyn LineIndex> = match self.line_index_config.as_ref() {
-                None => {
-                    tracing::info!(
-                        "log line index disabled: ClickHouse not configured (attribute \
-                         analytics unavailable)"
-                    );
-                    Arc::new(NoLineIndex::new(
-                        IndexUnavailable::NotConfigured.to_string(),
-                    ))
+            // ADR-047 §8: the per-line index lives in the first store that
+            // is available — the instance's ClickHouse, then Temps Cloud's
+            // ClickHouse (through the telemetry proxies), then the
+            // control-plane TimescaleDB. Any reason a preferred store is
+            // skipped is logged; the chosen store is reported by the
+            // capabilities endpoint so the operator always knows where the
+            // index is (never a silent downgrade).
+            let line_index = select_line_index(
+                self.line_index_config.as_ref(),
+                context.get_service::<temps_cloud_client::CloudLink>(),
+                db.clone(),
+            )
+            .await;
+
+            // A different store than last start means the existing
+            // `indexed_at` marks describe rows queries will never read
+            // again: clear them so the reindexer rebuilds the index here.
+            if let Some(backend) = line_index.backend() {
+                let manifests = ManifestRepo::new(db.clone());
+                match manifests.activate_index_backend(backend.as_str()).await {
+                    Ok(true) => tracing::info!(
+                        backend = backend.as_str(),
+                        "log line index store changed; every live chunk queued for reindex"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not record the log line index store; a store change \
+                         will not trigger a reindex until this succeeds"
+                    ),
                 }
-                Some(config) => match ClickHouseLineIndex::connect(config).await {
-                    Ok(index) => index,
-                    Err(reason) => {
-                        tracing::warn!(%reason, "log line index disabled");
-                        Arc::new(NoLineIndex::new(reason.to_string()))
-                    }
-                },
-            };
+            }
 
             let chunk_writer = ChunkWriterService::open_with_index(
                 storage.clone(),
@@ -532,9 +544,11 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Drains `indexed_at IS NULL` chunks into the line index: the
             // backlog from before ClickHouse was configured, chunks sealed
             // while it was down, and compactor output. Runs in short bursts
-            // while there is work, then idles on the interval. A no-op when
-            // the index is unavailable.
-            if line_index.unavailable_reason().is_none() {
+            // while there is work, then idles on the interval. Scheduled
+            // whenever a store is selected — not on `unavailable_reason()`,
+            // which is dynamic for Temps Cloud (telemetry export is switched
+            // on after startup) and would leave the backlog undrained.
+            if line_index.backend().is_some() {
                 let reindexer = ReindexService::new(
                     Arc::new(ManifestRepo::new(db.clone())),
                     context.require_service::<dyn LogStorage>(),
@@ -870,6 +884,40 @@ fn spawn_local_container_discovery(
         }
     });
     tracing::info!("Container discovery started (events listener + startup scan)");
+}
+
+/// Pick the line index store in preference order (ADR-047 §8).
+async fn select_line_index(
+    local: Option<&ClickHouseConfig>,
+    cloud: Option<Arc<temps_cloud_client::CloudLink>>,
+    db: Arc<sea_orm::DatabaseConnection>,
+) -> Arc<dyn LineIndex> {
+    if let Some(config) = local {
+        match ClickHouseLineIndex::connect(LineIndexTarget::Local(config.clone())).await {
+            Ok(index) => return index,
+            Err(reason) => tracing::warn!(
+                %reason,
+                "local ClickHouse cannot host the log line index; trying the next store"
+            ),
+        }
+    }
+    if let Some(link) = cloud.filter(|link| link.is_linked()) {
+        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud(link)).await {
+            Ok(index) => {
+                tracing::info!("log line index ready (Temps Cloud ClickHouse)");
+                return index;
+            }
+            Err(reason) => tracing::warn!(
+                %reason,
+                "Temps Cloud cannot host the log line index; falling back to TimescaleDB"
+            ),
+        }
+    }
+    tracing::info!(
+        "log line index ready (TimescaleDB) — configure ClickHouse or link Temps Cloud for \
+         volume beyond a few million lines a day"
+    );
+    TimescaleLineIndex::new(db)
 }
 
 #[cfg(test)]
