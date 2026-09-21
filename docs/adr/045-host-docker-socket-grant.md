@@ -206,6 +206,79 @@ Protecting it is unchanged and unchangeable by this ADR.
 Compose deployments are unchanged: the deny-list stays as it is. The grant
 applies only to the image deployment path.
 
+### Deploying and exec'ing into a granted project are also admin-only
+
+A project writer who cannot claim the slug can still, without this guard,
+deploy or exec into a project someone else already granted -- the deploy
+gate and the exec gate close that. Both reuse one predicate,
+`deploy_requires_instance_admin(grant, slug, caller)`, so they cannot
+disagree about which projects are gated or who may act on them.
+`DeployCaller` distinguishes a human-attributable actor (`ProjectWriter`,
+fail-closed default, or `InstanceAdmin`) from `Platform` -- Temps' own
+failover/drain-reschedule code, which carries no attacker-chosen image or
+command and is deliberately exempt.
+
+The predicate is enforced at the two chokepoints every deployment-creation
+and exec path is structurally required to pass through --
+`WorkflowPlanner::create_deployment_jobs` (before any job row is written)
+and `DeployImageJobBuilder::build` (as its first statement) for deploys,
+`verify_container_exec_access` for both the HTTP exec route and the
+WebSocket terminal -- rather than at each handler, which an earlier draft of
+this guard did and which a security review then found three separate
+handlers could bypass by not calling it. A required constructor argument
+cannot be forgotten the way a per-handler call can.
+
+Mounting the socket itself carries the same check from the other side:
+`docker_socket_bind_for` requires both the executing host's own grant *and*
+a `control_plane_grants_socket` flag the control plane computes from its
+**own** `process_grant().declares(slug)` and puts on the `DeployRequest`
+(`#[serde(default)]`, fail-closed). A worker is never trusted to assert its
+own authorization to mount the socket -- only the control plane's
+declaration counts, closing a gap where a stale or leftover worker-side
+grant could mount the socket with no cross-check against the control plane
+that actually decided placement.
+
+### Nothing else can plant the payload a granted deploy will run as root
+
+Admin-only deploy and exec are necessary but not sufficient: a project
+writer doesn't need to deploy anything if they can instead change the input
+the *next* deploy -- run by an admin, or by the platform's own
+failover/reschedule path -- executes as host root. Every field capable of
+supplying that input is therefore behind the same
+`DockerSocketWriteRequiresAdmin` guard the deploy and exec gates use,
+enumerated exhaustively rather than gated one reported case at a time:
+
+- **Runtime config** -- the persisted `command` and image configuration
+  (`ProjectService::update_service_template_runtime`).
+- **Source definition** -- `main_branch`, `repo_owner`, `repo_name`,
+  `directory`, `preset`, `preset_config` and `git_provider_connection_id`
+  (`update_project_settings_as`). The connection id was missing from the
+  first version of this list -- repointing *which* git connection a project
+  trusts is the same attack as repointing `repo_owner`/`repo_name`, since
+  either determines what code the next deploy pulls.
+- **Git settings** -- `git_url` (`update_git_settings`).
+- **Environment variables and secrets** -- `create_environment_variable`,
+  `update_environment_variable`, `create_project_secret` and
+  `update_project_secret` (`temps-environments`). This is a separate crate
+  and request shape from the three above, and had no ADR-045 check of any
+  kind until it was found by review: an environment variable is delivered
+  into the container verbatim, and a secret is materialised as a file under
+  `/run/secrets/<KEY>` -- either is enough to get arbitrary code execution
+  in most runtimes once a shell reads it (`NODE_OPTIONS`, `PYTHONSTARTUP`,
+  `BASH_ENV`, ...), and `Role::User` holds `EnvironmentsCreate`/
+  `EnvironmentsWrite` against any project since OSS never registers a
+  `ProjectAccessChecker`.
+
+Each of these follows the same shape as the deploy/exec gates: a pure
+function taking the grant explicitly (`guard_granted_project_write_against`,
+`require_granted_project_write_authority_against`) so it is unit-testable
+without mutating the process-wide `OnceLock`, plus a thin wrapper that reads
+`process_grant()` in production. The repeated discovery of a new channel in
+this family across several review rounds is the reason this section
+enumerates every one found rather than describing the mechanism once and
+trusting it generalizes -- the next channel that writes something a granted
+project's container later executes belongs on this list too.
+
 ## Consequences
 
 - A granted project is host-root-equivalent on the hosts that grant it, and
