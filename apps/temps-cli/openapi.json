@@ -16332,6 +16332,45 @@
         ],
         "type": "object"
       },
+      "DockerSocketCapability": {
+        "description": "Where a project is granted host Docker access, published on the project\nresponse so the console can render a badge (granted) or an onboarding state\n(not granted) instead of the feature being invisible.\n\nDeliberately read-only. The grant is host policy; there is no write path,\nand an API that could set it would be one step from host root.",
+        "properties": {
+          "granted": {
+            "description": "Whether any host grants this project `/var/run/docker.sock`.",
+            "type": "boolean"
+          },
+          "nodes": {
+            "description": "Hosts that grant it: worker node names, plus `control-plane` when this\ncontrol plane's own environment names the project. Empty when not\ngranted.",
+            "example": [
+              "control-plane",
+              "worker-1"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why it is not granted, when `granted` is false. Names the exact\nvariable, value and processes, because the operator is debugging alone.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that shows the hosts this could be set on.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "granted",
+          "nodes"
+        ],
+        "type": "object"
+      },
       "DockerfilePresetConfig": {
         "description": "Configuration for Dockerfile preset\nAllows customizing the Dockerfile path and build context for Docker-based deployments",
         "properties": {
@@ -35002,6 +35041,17 @@
           },
           "directory": {
             "type": "string"
+          },
+          "docker_socket": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DockerSocketCapability",
+                "description": "Where this project is granted host Docker access (ADR 045), and what to\nset when it is granted nowhere.\n\nPopulated only on the single-project detail responses — computing it\ncosts a `nodes` query, and the list endpoints must stay cheap. `None`\ntherefore means \"not computed on this response\", never \"not granted\";\nclients read `granted` from the object, not from its presence."
+              }
+            ]
           },
           "enable_preview_environments": {
             "description": "Enable automatic preview environment creation for each branch",

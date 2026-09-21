@@ -7594,6 +7594,36 @@ export type DockerRegistrySettingsMasked = {
 };
 
 /**
+ * Where a project is granted host Docker access, published on the project
+ * response so the console can render a badge (granted) or an onboarding state
+ * (not granted) instead of the feature being invisible.
+ *
+ * Deliberately read-only. The grant is host policy; there is no write path,
+ * and an API that could set it would be one step from host root.
+ */
+export type DockerSocketCapability = {
+    /**
+     * Whether any host grants this project `/var/run/docker.sock`.
+     */
+    granted: boolean;
+    /**
+     * Hosts that grant it: worker node names, plus `control-plane` when this
+     * control plane's own environment names the project. Empty when not
+     * granted.
+     */
+    nodes: Array<string>;
+    /**
+     * Why it is not granted, when `granted` is false. Names the exact
+     * variable, value and processes, because the operator is debugging alone.
+     */
+    reason?: string | null;
+    /**
+     * Console path that shows the hosts this could be set on.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
  */
@@ -15977,6 +16007,7 @@ export type ProjectResponse = {
      */
     deployment_config: DeploymentConfig;
     directory: string;
+    docker_socket?: null | DockerSocketCapability;
     /**
      * Enable automatic preview environment creation for each branch
      */

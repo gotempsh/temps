@@ -7594,6 +7594,36 @@ export type DockerRegistrySettingsMasked = {
 };
 
 /**
+ * Where a project is granted host Docker access, published on the project
+ * response so the console can render a badge (granted) or an onboarding state
+ * (not granted) instead of the feature being invisible.
+ *
+ * Deliberately read-only. The grant is host policy; there is no write path,
+ * and an API that could set it would be one step from host root.
+ */
+export type DockerSocketCapability = {
+    /**
+     * Whether any host grants this project `/var/run/docker.sock`.
+     */
+    granted: boolean;
+    /**
+     * Hosts that grant it: worker node names, plus `control-plane` when this
+     * control plane's own environment names the project. Empty when not
+     * granted.
+     */
+    nodes: Array<string>;
+    /**
+     * Why it is not granted, when `granted` is false. Names the exact
+     * variable, value and processes, because the operator is debugging alone.
+     */
+    reason?: string | null;
+    /**
+     * Console path that shows the hosts this could be set on.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
  */
@@ -11058,6 +11088,17 @@ export type HeartbeatApiRequest = {
      */
     containers?: Array<ContainerInventoryItem> | null;
     dns_resolver?: null | DnsResolverHeartbeat;
+    /**
+     * Project slugs this node grants host Docker access to (ADR 045), read
+     * by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+     *
+     * Advisory only: it tells the scheduler where a granted project *may* be
+     * placed. It can never cause a socket to be mounted — that decision is
+     * made by the executing process against its own environment. `None` from
+     * a pre-ADR-045 agent leaves the stored value untouched; an empty array
+     * clears it.
+     */
+    docker_socket_projects?: Array<string> | null;
     /**
      * Updated node labels for scheduling (allows runtime label changes).
      */
@@ -16225,6 +16266,7 @@ export type ProjectResponse = {
      */
     deployment_config: DeploymentConfig;
     directory: string;
+    docker_socket?: null | DockerSocketCapability;
     /**
      * Enable automatic preview environment creation for each branch
      */
