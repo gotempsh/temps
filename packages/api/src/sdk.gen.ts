@@ -358,6 +358,9 @@ import type {
   CreateGlobalWorkspacePreviewLinkData,
   CreateGlobalWorkspacePreviewLinkErrors,
   CreateGlobalWorkspacePreviewLinkResponses,
+  CreateHttpCheckData,
+  CreateHttpCheckErrors,
+  CreateHttpCheckResponses,
   CreateIncidentData,
   CreateIncidentErrors,
   CreateIncidentResponses,
@@ -528,6 +531,9 @@ import type {
   DeleteGlobalSkillData,
   DeleteGlobalSkillErrors,
   DeleteGlobalSkillResponses,
+  DeleteHttpCheckData,
+  DeleteHttpCheckErrors,
+  DeleteHttpCheckResponses,
   DeleteIpAccessControlData,
   DeleteIpAccessControlErrors,
   DeleteIpAccessControlResponses,
@@ -640,6 +646,9 @@ import type {
   DetachScheduleServiceData,
   DetachScheduleServiceErrors,
   DetachScheduleServiceResponses,
+  DetectEnvCredentialData,
+  DetectEnvCredentialErrors,
+  DetectEnvCredentialResponses,
   DetectPublicEnvExampleData,
   DetectPublicEnvExampleErrors,
   DetectPublicEnvExampleResponses,
@@ -1181,6 +1190,9 @@ import type {
   GetHttpChallengeDebugData,
   GetHttpChallengeDebugErrors,
   GetHttpChallengeDebugResponses,
+  GetHttpChecksCapabilitiesData,
+  GetHttpChecksCapabilitiesErrors,
+  GetHttpChecksCapabilitiesResponses,
   GetImportStatusData,
   GetImportStatusErrors,
   GetImportStatusResponses,
@@ -1927,6 +1939,12 @@ import type {
   ListGlobalSkillsData,
   ListGlobalSkillsErrors,
   ListGlobalSkillsResponses,
+  ListHttpCheckPresetsData,
+  ListHttpCheckPresetsErrors,
+  ListHttpCheckPresetsResponses,
+  ListHttpChecksData,
+  ListHttpChecksErrors,
+  ListHttpChecksResponses,
   ListIncidentsData,
   ListIncidentsErrors,
   ListIncidentsResponses,
@@ -2131,6 +2149,9 @@ import type {
   ListUsersData,
   ListUsersErrors,
   ListUsersResponses,
+  ListVariableHistoryData,
+  ListVariableHistoryErrors,
+  ListVariableHistoryResponses,
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
@@ -2507,6 +2528,9 @@ import type {
   RunExternalServiceBackupData,
   RunExternalServiceBackupErrors,
   RunExternalServiceBackupResponses,
+  RunHttpCheckData,
+  RunHttpCheckErrors,
+  RunHttpCheckResponses,
   RunScheduleNowData,
   RunScheduleNowErrors,
   RunScheduleNowResponses,
@@ -2557,6 +2581,9 @@ import type {
   SetFlagEnvironmentData,
   SetFlagEnvironmentErrors,
   SetFlagEnvironmentResponses,
+  SetHttpCheckEnabledData,
+  SetHttpCheckEnabledErrors,
+  SetHttpCheckEnabledResponses,
   SetPreviewPasswordData,
   SetPreviewPasswordErrors,
   SetPreviewPasswordResponses,
@@ -2801,6 +2828,9 @@ import type {
   UpdateGlobalSkillData,
   UpdateGlobalSkillErrors,
   UpdateGlobalSkillResponses,
+  UpdateHttpCheckData,
+  UpdateHttpCheckErrors,
+  UpdateHttpCheckResponses,
   UpdateIncidentStatusData,
   UpdateIncidentStatusErrors,
   UpdateIncidentStatusResponses,
@@ -16887,6 +16917,40 @@ export const getResolvedEnvironmentVariableValue = <
     ...options,
   });
 
+export const detectEnvCredential = <ThrowOnError extends boolean = false>(
+  options: Options<DetectEnvCredentialData, ThrowOnError>,
+): RequestResult<
+  DetectEnvCredentialResponses,
+  DetectEnvCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    DetectEnvCredentialResponses,
+    DetectEnvCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/env-vars/{env_var_id}/detect",
+    ...options,
+  });
+
+export const listVariableHistory = <ThrowOnError extends boolean = false>(
+  options: Options<ListVariableHistoryData, ThrowOnError>,
+): RequestResult<
+  ListVariableHistoryResponses,
+  ListVariableHistoryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListVariableHistoryResponses,
+    ListVariableHistoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/env-vars/{env_var_id}/history",
+    ...options,
+  });
+
 /**
  * Get a regular environment variable value by key. Marked secrets return 403.
  */
@@ -18362,6 +18426,146 @@ export const getHourlyVisits = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/hourly-visits",
+    ...options,
+  });
+
+export const listHttpChecks = <ThrowOnError extends boolean = false>(
+  options: Options<ListHttpChecksData, ThrowOnError>,
+): RequestResult<ListHttpChecksResponses, ListHttpChecksErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    ListHttpChecksResponses,
+    ListHttpChecksErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks",
+    ...options,
+  });
+
+export const createHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<CreateHttpCheckData, ThrowOnError>,
+): RequestResult<
+  CreateHttpCheckResponses,
+  CreateHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateHttpCheckResponses,
+    CreateHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getHttpChecksCapabilities = <ThrowOnError extends boolean = false>(
+  options: Options<GetHttpChecksCapabilitiesData, ThrowOnError>,
+): RequestResult<
+  GetHttpChecksCapabilitiesResponses,
+  GetHttpChecksCapabilitiesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetHttpChecksCapabilitiesResponses,
+    GetHttpChecksCapabilitiesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/capabilities",
+    ...options,
+  });
+
+export const listHttpCheckPresets = <ThrowOnError extends boolean = false>(
+  options: Options<ListHttpCheckPresetsData, ThrowOnError>,
+): RequestResult<
+  ListHttpCheckPresetsResponses,
+  ListHttpCheckPresetsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListHttpCheckPresetsResponses,
+    ListHttpCheckPresetsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/presets",
+    ...options,
+  });
+
+export const deleteHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteHttpCheckData, ThrowOnError>,
+): RequestResult<
+  DeleteHttpCheckResponses,
+  DeleteHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteHttpCheckResponses,
+    DeleteHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+  });
+
+export const setHttpCheckEnabled = <ThrowOnError extends boolean = false>(
+  options: Options<SetHttpCheckEnabledData, ThrowOnError>,
+): RequestResult<
+  SetHttpCheckEnabledResponses,
+  SetHttpCheckEnabledErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    SetHttpCheckEnabledResponses,
+    SetHttpCheckEnabledErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateHttpCheckData, ThrowOnError>,
+): RequestResult<
+  UpdateHttpCheckResponses,
+  UpdateHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateHttpCheckResponses,
+    UpdateHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const runHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<RunHttpCheckData, ThrowOnError>,
+): RequestResult<RunHttpCheckResponses, RunHttpCheckErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    RunHttpCheckResponses,
+    RunHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}/run",
     ...options,
   });
 
