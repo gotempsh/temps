@@ -422,6 +422,17 @@ pub async fn add_environment_domain(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: attaching a public hostname to a granted project's environment
+    // is one of the two controls (with `password`/`security`, gated on
+    // update_environment_settings) on whether the platform proxy serves this
+    // host-root-equivalent container publicly at all.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "public domains",
+    )
+    .await?;
 
     let domain = state
         .environment_service
@@ -956,6 +967,20 @@ pub async fn delete_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    // ADR 045: deleting a variable is not itself a way to plant one, but it
+    // can silently break or degrade a granted project's infrastructure
+    // service on its next deploy (e.g. removing the credential it
+    // authenticates with), and can re-expose a lower-precedence,
+    // scope-shadowed variable -- a value change this guard exists to own.
+    // Kept symmetric with create/update rather than gating 2 of 4 verbs on
+    // the same resource.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     state
         .env_var_service
@@ -1256,6 +1281,39 @@ pub async fn update_environment_settings(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    // ADR 045: `branch` is the environment-scoped twin of the project-level
+    // `main_branch` field `update_project_settings_as` already gates, and
+    // `automatic_deploy`/`protected` together arm the same push-deploy
+    // trigger the project-level guard closes -- `protected` is the
+    // query-level filter that stops a push reaching this environment at
+    // all, so flipping it off re-opens the trigger even if
+    // `automatic_deploy` is never touched. `target_nodes`/`target_labels`
+    // can only narrow placement (the scheduler gate keeps only nodes that
+    // advertise the grant regardless), but they're gated too rather than
+    // arguing a narrowing-only field can never matter. `exposed_port` takes
+    // priority over the project-level `exposed_port` this same guard family
+    // closes at the project level -- an ungated environment override would
+    // make that guard pointless. `password`/`security` are the only control
+    // on whether the platform proxy serves this granted project's container
+    // publicly on its subdomain (the private-address bind only protects the
+    // *published host port*, not the proxy route).
+    if settings.branch.is_some()
+        || settings.automatic_deploy.is_some()
+        || settings.protected.is_some()
+        || settings.target_nodes.is_some()
+        || settings.target_labels.is_some()
+        || settings.exposed_port.is_some()
+        || settings.password.is_some()
+        || settings.security.is_some()
+    {
+        require_granted_project_write_authority(
+            &state.environment_service,
+            &auth,
+            project_id,
+            "the tracked branch, exposed port, public access or deployment triggers",
+        )
+        .await?;
+    }
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
@@ -1426,6 +1484,14 @@ pub async fn update_environment_subdomain(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: the same public-reachability control as add_environment_domain.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "public domains",
+    )
+    .await?;
 
     let project = state.environment_service.get_project(project_id).await?;
     let environment = state
@@ -1967,6 +2033,19 @@ pub async fn create_environment(
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: a new environment is a new push-deploy target bound to
+    // whatever branch the request names, and inherits the project's
+    // `automatic_deploy` -- the same class of attack `update_environment_settings`
+    // gates for an *existing* environment. Gated unconditionally: this
+    // endpoint always sets a tracked branch, so there is no "unrelated field"
+    // case to carve out.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environments and the branches they track",
+    )
+    .await?;
 
     let environment = state
         .environment_service
@@ -2262,6 +2341,18 @@ pub async fn delete_project_secret(
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: kept symmetric with create/update for the same reason as
+    // `delete_environment_variable` -- a non-admin silently degrading a
+    // granted project's infrastructure service by deleting the secret it
+    // depends on is exactly the failure this guard family exists to prevent,
+    // even though it can't be used to plant a new value.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     state.secret_service.delete(project_id, secret_id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
