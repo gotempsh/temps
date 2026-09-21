@@ -2176,6 +2176,14 @@ impl DeployImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
 
+        // Store both the ID and its owning deployer before status checks,
+        // startup log streaming, health checks, or ANY other fallible work —
+        // including the ADR-045 audit and logging below. A container that
+        // exists but is not tracked cannot be cleaned up, and the socket-
+        // mounted case is the worst one to leak: a transient log-write error
+        // would otherwise strand a running, root-equivalent container.
+        self.track_container(deploy_result.container_id.clone(), deployer.clone());
+
         // ADR 045: the executing host reports back whether it actually mounted
         // `/var/run/docker.sock`. Audited here rather than inferred from the
         // control plane's view, because only that host knows its own grant —
@@ -2196,10 +2204,6 @@ impl DeployImageJob {
             .await?;
         }
 
-        // Store both the ID and its owning deployer before status checks,
-        // startup log streaming, health checks, or any other fallible work.
-        self.track_container(deploy_result.container_id.clone(), deployer.clone());
-
         // ADR 045: the scheduler placed this replica here *because* the
         // project requires the socket, and the host started it without one.
         // Either that host's own `TEMPS_DOCKER_SOCKET_PROJECTS` disagrees with
@@ -2208,9 +2212,9 @@ impl DeployImageJob {
         // it would leave the workload running with none of the access it
         // exists for, reported as healthy.
         //
-        // Checked after `track_container` so the container this rejects is
-        // torn down with the rest of the failed deployment rather than left
-        // running untracked.
+        // Checked after `track_container` (above) so the container this
+        // rejects is torn down with the rest of the failed deployment rather
+        // than left running untracked.
         if docker_socket_required && !deploy_result.docker_socket_mounted {
             let error = WorkflowError::DockerSocketNotMounted {
                 node: audited_node_name.clone(),
