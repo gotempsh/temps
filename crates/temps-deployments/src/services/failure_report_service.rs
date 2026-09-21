@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use temps_core::EncryptionService;
 use temps_entities::deployment_jobs;
 use thiserror::Error;
@@ -160,6 +160,13 @@ struct FailureReportPayload<'a> {
     deployment_id: i32,
     failed_job_id: &'a str,
     failed_job_type: &'a str,
+}
+
+/// Error body of the central endpoint (`{"error": "..."}`, see
+/// `telemetry-api/src/routes/failure-reports.ts`).
+#[derive(Deserialize)]
+struct CentralEndpointError {
+    error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -394,12 +401,7 @@ impl FailureReportService {
         let jobs = self.jobs_up_to(project_id, deployment_id, job_id).await?;
         let failed_job = jobs.last().expect("jobs_up_to always returns >= 1 job");
         let secrets = self.known_secret_values(&jobs);
-        let safe_text = fit_report_text(&redact_known_secrets(report_text, &secrets));
-        // The central endpoint rejects a blank report with a 422; say so
-        // here rather than making the user decode a bare status code.
-        if safe_text.trim().is_empty() {
-            return Err(FailureReportError::EmptyReport);
-        }
+        let safe_text = prepare_report_text(report_text, &secrets)?;
 
         let payload = FailureReportPayload {
             report_text: &safe_text,
@@ -412,6 +414,24 @@ impl FailureReportService {
 
         post_report(&self.client, &self.endpoint, deployment_id, &payload).await
     }
+}
+
+/// Redact known secrets from user-submitted text, refuse a blank report and
+/// bound the result to the endpoint's size limit.
+///
+/// The blank check has to run before truncation: `fit_report_text` prepends a
+/// non-whitespace marker, which would make an oversized run of whitespace look
+/// like content. The endpoint rejects a blank report with a 422, so it is
+/// refused here with a message the user can act on.
+fn prepare_report_text(
+    report_text: &str,
+    secrets: &[String],
+) -> Result<String, FailureReportError> {
+    let redacted = redact_known_secrets(report_text, secrets);
+    if redacted.trim().is_empty() {
+        return Err(FailureReportError::EmptyReport);
+    }
+    Ok(fit_report_text(&redacted))
 }
 
 /// POST `payload` to the central endpoint. On a non-2xx answer the reason the
@@ -440,9 +460,9 @@ async fn post_report(
     }
 
     let body = response.text().await.unwrap_or_default();
-    let detail = serde_json::from_str::<serde_json::Value>(&body)
+    let detail = serde_json::from_str::<CentralEndpointError>(&body)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .and_then(|e| e.error)
         .filter(|e| !e.is_empty());
     let reason = match detail {
         Some(detail) => format!("central endpoint returned {status}: {detail}"),
@@ -552,6 +572,34 @@ mod tests {
 
         let fitted = fit_report_text(&text);
         assert!(utf16_len(&fitted) <= MAX_REPORT_TEXT_UTF16_UNITS);
+    }
+
+    #[test]
+    fn prepare_report_text_refuses_blank_reports() {
+        assert!(matches!(
+            prepare_report_text("  \n\t ", &[]),
+            Err(FailureReportError::EmptyReport)
+        ));
+    }
+
+    /// Truncation prepends a marker, so checking for blankness afterwards
+    /// would let an oversized all-whitespace report through as "content".
+    #[test]
+    fn prepare_report_text_refuses_oversized_whitespace() {
+        let blank = " \n".repeat(MAX_REPORT_TEXT_UTF16_UNITS);
+        assert!(matches!(
+            prepare_report_text(&blank, &[]),
+            Err(FailureReportError::EmptyReport)
+        ));
+    }
+
+    #[test]
+    fn prepare_report_text_redacts_then_bounds() {
+        let secret = "s3cr3t-value-123".to_string();
+        let text = format!("{}\nleaked {secret}", "line\n".repeat(60_000));
+        let prepared = prepare_report_text(&text, std::slice::from_ref(&secret)).unwrap();
+        assert!(!prepared.contains(&secret));
+        assert!(utf16_len(&prepared) <= MAX_REPORT_TEXT_UTF16_UNITS);
     }
 
     async fn serve_once(status: axum::http::StatusCode, body: &'static str) -> String {
