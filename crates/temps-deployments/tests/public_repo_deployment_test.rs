@@ -424,20 +424,23 @@ mod public_repo_tests {
         env_vars.insert("HOST".to_string(), "0.0.0.0".to_string());
         env_vars.insert("HOSTNAME".to_string(), "0.0.0.0".to_string());
 
-        let deploy_job = DeployImageJobBuilder::new("public-repo-test")
-            .job_id("deploy_public_repo".to_string())
-            .build_job_id("build_public_repo".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name(service_name.clone())
-            .namespace("default".to_string())
-            .port(test_case.port as u32)
-            .replicas(1)
-            .environment_variables(env_vars)
-            .build(container_deployer)
-            .map_err(|e| format!("Failed to create deploy job: {}", e))?;
+        let deploy_job = DeployImageJobBuilder::new(
+            "public-repo-test",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy_public_repo".to_string())
+        .build_job_id("build_public_repo".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name(service_name.clone())
+        .namespace("default".to_string())
+        .port(test_case.port as u32)
+        .replicas(1)
+        .environment_variables(env_vars)
+        .build(container_deployer)
+        .map_err(|e| format!("Failed to create deploy job: {}", e))?;
 
         println!("\n✅ All jobs created successfully");
         println!("   - Download job: {}", download_job.job_id());

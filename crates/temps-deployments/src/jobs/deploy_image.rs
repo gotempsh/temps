@@ -2965,6 +2965,41 @@ pub struct DeployImageJobBuilder {
     failed_container_db: Option<Arc<DbConnection>>,
     deployment_id: Option<i32>,
     audit_logger: Option<Arc<dyn temps_core::AuditLogger>>,
+    caller: temps_core::docker_socket_grant::DeployCaller,
+}
+
+/// The ADR-045 deploy rule, with the grant injected.
+///
+/// Split out of [`DeployImageJobBuilder::build`] and pure, mirroring
+/// `ProjectService::guard_reserved_slug_against`: the process grant is a
+/// `OnceLock` frozen at first use, so the rule would otherwise be untestable
+/// without mutating process-global environment state from parallel tests.
+///
+/// `project_slug` is `Option` only because [`DeploymentJobConfig`] stores it
+/// that way; the builder's constructor always sets it. `None` is nothing to
+/// match against, and a slug no host declares is unaffected — which is every
+/// project on every install that never set the variable.
+fn refuse_granted_project_deploy(
+    grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+    project_slug: Option<&str>,
+    caller: temps_core::docker_socket_grant::DeployCaller,
+) -> Result<(), WorkflowError> {
+    let Some(project_slug) = project_slug else {
+        return Ok(());
+    };
+    if !temps_core::docker_socket_grant::deploy_requires_instance_admin(grant, project_slug, caller)
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        project_slug = %project_slug,
+        caller = ?caller,
+        env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+        "Refused to build a deploy job for a project that holds host Docker access (ADR 045)"
+    );
+    Err(WorkflowError::DockerSocketDeployRequiresAdmin {
+        project_slug: project_slug.to_string(),
+    })
 }
 
 impl DeployImageJobBuilder {
@@ -2978,8 +3013,21 @@ impl DeployImageJobBuilder {
     /// was a setter, which meant a granted project redeployed by either path
     /// would be placed anywhere and started without its socket. A required
     /// argument makes that omission impossible to reintroduce.
-    pub fn new(project_slug: impl Into<String>) -> Self {
+    ///
+    /// `caller` is required for the same reason, and is the actual enforcement
+    /// point for the ADR-045 deploy rule. Gating the *service* methods was not
+    /// enough: three remote-deployment handlers build the deployment row and
+    /// its jobs themselves and never call any of them. This builder is the one
+    /// place every image deployment — present and future — is structurally
+    /// forced through, so the check lives here, and a new deploy route cannot
+    /// reach a container without having said, in a required argument, on whose
+    /// authority it is running.
+    pub fn new(
+        project_slug: impl Into<String>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Self {
         Self {
+            caller,
             job_id: None,
             build_job_id: None,
             target: None,
@@ -3229,6 +3277,16 @@ impl DeployImageJobBuilder {
         self,
         container_deployer: Arc<dyn ContainerDeployer>,
     ) -> Result<DeployImageJob, WorkflowError> {
+        // ADR 045, before anything else is validated: a project this control
+        // plane declares runs its image and command as host root, so the
+        // deployment is admin-only however it was started. Pure and sync — the
+        // process grant is already in memory and the slug is already here — so
+        // it costs nothing to make it the first thing the builder does.
+        refuse_granted_project_deploy(
+            temps_core::docker_socket_grant::process_grant(),
+            self.config.project_slug.as_deref(),
+            self.caller,
+        )?;
         let job_id = self.job_id.unwrap_or_else(|| "deploy_image".to_string());
         let build_job_id = self.build_job_id.ok_or_else(|| {
             WorkflowError::JobValidationFailed("build_job_id is required".to_string())
@@ -3616,18 +3674,21 @@ mod tests {
     fn job_with_image_builder(builder: PlatformOnlyImageBuilder) -> DeployImageJob {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
-        DeployImageJobBuilder::new("test-project")
-            .job_id("deploy".to_string())
-            .build_job_id("build".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .namespace("default".to_string())
-            .image_builder(Arc::new(builder))
-            .build(container_deployer)
-            .unwrap()
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .namespace("default".to_string())
+        .image_builder(Arc::new(builder))
+        .build(container_deployer)
+        .unwrap()
     }
 
     fn job_with_local_platform(platform: &str) -> DeployImageJob {
@@ -4028,17 +4089,20 @@ mod tests {
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
         );
 
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("test_deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(target)
-            .service_name("myapp".to_string())
-            .namespace("production".to_string())
-            .replicas(3)
-            .environment_variables(env_vars)
-            .failed_container_retention(db, 42)
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(target)
+        .service_name("myapp".to_string())
+        .namespace("production".to_string())
+        .replicas(3)
+        .environment_variables(env_vars)
+        .failed_container_retention(db, 42)
+        .build(container_deployer)
+        .unwrap();
 
         assert_eq!(job.job_id(), "test_deploy");
         assert_eq!(job.build_job_id, "build_image");
@@ -4061,17 +4125,20 @@ mod tests {
                 .into_connection(),
         );
         let deployer = Arc::new(TrackingMockContainerDeployer::new());
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("deploy".to_string())
-            .build_job_id("build".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("checkout".to_string())
-            .failed_container_retention(db.clone(), 42)
-            .build(deployer.clone())
-            .expect("valid deploy job");
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("checkout".to_string())
+        .failed_container_retention(db.clone(), 42)
+        .build(deployer.clone())
+        .expect("valid deploy job");
         job.failed_candidates
             .lock()
             .expect("candidate lock")
@@ -4131,15 +4198,18 @@ mod tests {
     #[tokio::test]
     async fn a_gated_replica_whose_host_did_not_mount_the_socket_fails_the_deployment() {
         let deployer: Arc<dyn ContainerDeployer> = Arc::new(TrackingMockContainerDeployer::new());
-        let job = DeployImageJobBuilder::new("node-daemon")
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("node-daemon".to_string())
-            .build(deployer.clone())
-            .expect("valid deploy job");
+        let job = DeployImageJobBuilder::new(
+            "node-daemon",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("node-daemon".to_string())
+        .build(deployer.clone())
+        .expect("valid deploy job");
         let context = WorkflowContext::new("run-45".to_string(), 45, 2, 3, Arc::new(TestLogWriter));
 
         // The mock reports `docker_socket_mounted: false`, which is exactly
@@ -4185,20 +4255,86 @@ mod tests {
         }
     }
 
+    /// ADR 045, the structural half of the deploy rule: this builder is the
+    /// one point every image deployment is forced through, so a route that
+    /// never learned the rule — the three remote-deployment handlers that
+    /// originally bypassed the gated service methods, or any future fourth —
+    /// still cannot produce a job that would start a host-root container.
+    #[test]
+    fn a_project_writer_cannot_build_a_deploy_job_for_a_declared_project() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon"));
+        let error = refuse_granted_project_deploy(
+            &grant,
+            Some("node-daemon"),
+            temps_core::docker_socket_grant::DeployCaller::ProjectWriter,
+        )
+        .expect_err("a project writer must not be able to build this job");
+        match error {
+            WorkflowError::DockerSocketDeployRequiresAdmin { ref project_slug } => {
+                assert_eq!(project_slug, "node-daemon");
+                let rendered = error.to_string();
+                assert!(rendered.contains("ADR 045"), "{rendered}");
+                assert!(
+                    rendered.contains(temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV),
+                    "{rendered}"
+                );
+            }
+            other => panic!("expected DockerSocketDeployRequiresAdmin, got {other:?}"),
+        }
+    }
+
+    /// The three callers that are allowed, and the one project shape that is
+    /// never affected. `Platform` covers node drain and failover, which
+    /// redeploy the workload that is already there and would otherwise leave a
+    /// granted infrastructure service down after its host died.
+    #[test]
+    fn admins_the_platform_and_undeclared_projects_build_normally() {
+        use temps_core::docker_socket_grant::{DeployCaller, DockerSocketGrant};
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        for caller in [DeployCaller::InstanceAdmin, DeployCaller::Platform] {
+            assert!(
+                refuse_granted_project_deploy(&grant, Some("node-daemon"), caller).is_ok(),
+                "{caller:?} may deploy a declared project"
+            );
+        }
+        for caller in [
+            DeployCaller::ProjectWriter,
+            DeployCaller::InstanceAdmin,
+            DeployCaller::Platform,
+        ] {
+            assert!(
+                refuse_granted_project_deploy(&grant, Some("my-app"), caller).is_ok(),
+                "{caller:?} deploying an undeclared project is untouched by ADR 045"
+            );
+            assert!(
+                refuse_granted_project_deploy(
+                    &DockerSocketGrant::default(),
+                    Some("my-app"),
+                    caller
+                )
+                .is_ok(),
+                "an install that never set the variable is untouched by ADR 045"
+            );
+        }
+    }
+
     #[test]
     fn test_health_check_path_override_default_is_none() {
         // By default there is no deploy-time override; only the standard
         // health_check_path ("/") is set.
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("d".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .build(Arc::new(TrackingMockContainerDeployer::new()))
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("d".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap();
 
         assert_eq!(job.config.health_check_path_override, None);
         assert_eq!(job.config.health_check_path, Some("/".to_string()));
@@ -4208,17 +4344,20 @@ mod tests {
     fn test_health_check_path_override_flows_to_config() {
         // An explicit deploy-time override is captured separately so it can win
         // over .temps.yaml at execution time.
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("d".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .health_check_path_override(Some("/api/healthz".to_string()))
-            .build(Arc::new(TrackingMockContainerDeployer::new()))
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("d".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .health_check_path_override(Some("/api/healthz".to_string()))
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap();
 
         assert_eq!(
             job.config.health_check_path_override,
@@ -4236,18 +4375,21 @@ mod tests {
     /// must be returned without ever needing a successful inspection.
     #[tokio::test]
     async fn test_resolve_container_port_prefers_explicit_override_over_image_detection() {
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .port(3000)
-            .configured_port(Some(9090))
-            .build(Arc::new(TrackingMockContainerDeployer::new()))
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(3000)
+        .configured_port(Some(9090))
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap();
 
         let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
 
@@ -4264,17 +4406,20 @@ mod tests {
     /// configured/default port.
     #[tokio::test]
     async fn test_resolve_container_port_falls_back_to_default_without_override() {
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .port(4000)
-            .build(Arc::new(TrackingMockContainerDeployer::new()))
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(4000)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap();
 
         assert_eq!(job.config.configured_port, None);
 
@@ -4304,16 +4449,19 @@ mod tests {
         };
 
         // Create job with 2 replicas
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("test_deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(target)
-            .service_name("myapp".to_string())
-            .namespace("production".to_string())
-            .replicas(2) // Deploy 2 replicas
-            .port(3000)
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(target)
+        .service_name("myapp".to_string())
+        .namespace("production".to_string())
+        .replicas(2) // Deploy 2 replicas
+        .port(3000)
+        .build(container_deployer)
+        .unwrap();
 
         // Verify job configuration
         assert_eq!(
@@ -4395,20 +4543,23 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("test_deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("myapp".to_string())
-            .namespace("default".to_string())
-            .replicas(2)
-            .node_scheduler(scheduler)
-            .target_nodes(vec![1, 3])
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("myapp".to_string())
+        .namespace("default".to_string())
+        .replicas(2)
+        .node_scheduler(scheduler)
+        .target_nodes(vec![1, 3])
+        .build(container_deployer)
+        .unwrap();
 
         assert!(job.node_scheduler.is_some(), "Node scheduler should be set");
         assert_eq!(
@@ -4424,18 +4575,21 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("test_deploy".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("myapp".to_string())
-            .namespace("default".to_string())
-            .replicas(3)
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("myapp".to_string())
+        .namespace("default".to_string())
+        .replicas(3)
+        .build(container_deployer)
+        .unwrap();
 
         assert!(
             job.node_scheduler.is_none(),
@@ -4483,18 +4637,21 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("test".to_string())
-            .build_job_id("build".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("myapp".to_string())
-            .namespace("default".to_string())
-            .replicas(3)
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("myapp".to_string())
+        .namespace("default".to_string())
+        .replicas(3)
+        .build(container_deployer)
+        .unwrap();
 
         // Verify no scheduler is set
         assert!(job.node_scheduler.is_none());
@@ -4749,20 +4906,23 @@ mod tests {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
 
-        let job = DeployImageJobBuilder::new("test-project")
-            .job_id("deploy".to_string())
-            .build_job_id("build".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "local".to_string(),
-                network: None,
-            })
-            .service_name("app".to_string())
-            .namespace("default".to_string())
-            .replicas(2)
-            .node_scheduler(scheduler)
-            .target_nodes(vec![5, 10])
-            .build(container_deployer)
-            .unwrap();
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .namespace("default".to_string())
+        .replicas(2)
+        .node_scheduler(scheduler)
+        .target_nodes(vec![5, 10])
+        .build(container_deployer)
+        .unwrap();
 
         // Verify the config was set correctly
         assert_eq!(job.config.target_nodes, Some(vec![5, 10]));

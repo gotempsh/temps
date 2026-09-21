@@ -316,7 +316,13 @@ async fn test_workflow_execution_service_with_real_jobs() {
         encryption_service.clone(),
     );
 
-    let jobs_created = match workflow_planner.create_deployment_jobs(deployment.id).await {
+    let jobs_created = match workflow_planner
+        .create_deployment_jobs(
+            deployment.id,
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .await
+    {
         Ok(jobs) => {
             println!(
                 "✅ Created {} jobs for deployment {}",

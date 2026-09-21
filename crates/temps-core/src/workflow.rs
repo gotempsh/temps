@@ -115,6 +115,21 @@ pub enum WorkflowError {
         /// the one the deployer actually reads.
         env: &'static str,
     },
+
+    /// A deploy job for a project that holds host Docker access was built by a
+    /// caller without instance-admin authority (ADR 045).
+    ///
+    /// Raised by `DeployImageJobBuilder::build`, the one point every image
+    /// deployment is structurally forced through, so a deployment route that
+    /// never learned about this rule cannot start the container anyway.
+    #[error(
+        "{}",
+        crate::docker_socket_grant::granted_project_deploy_reason(project_slug)
+    )]
+    DockerSocketDeployRequiresAdmin {
+        /// Project whose deployment was refused.
+        project_slug: String,
+    },
 }
 
 /// Trait for writing logs in real-time during workflow execution

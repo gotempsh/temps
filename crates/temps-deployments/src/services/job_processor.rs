@@ -961,7 +961,19 @@ impl JobProcessorService {
             }));
             Self::send_post_commit_events(&queue, post_commit_events).await;
 
-            match workflow_planner.create_deployment_jobs(deployment.id).await {
+            // ADR 045: the authority that was checked when this job was
+            // queued (`trigger_image_deployment_as`), carried on the job
+            // itself. Absent on a job queued by an older build, which plans as
+            // an ordinary writer and is refused for a declared project.
+            let deploy_caller = if job.docker_socket_authorized {
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin
+            } else {
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter
+            };
+            match workflow_planner
+                .create_deployment_jobs(deployment.id, deploy_caller)
+                .await
+            {
                 Ok(created_jobs) => {
                     info!(
                         "Created {} jobs for deployment {} from DeployImageRequested",
@@ -2113,7 +2125,20 @@ async fn process_git_push_event(
         }));
         JobProcessorService::send_post_commit_events(&queue, post_commit_events).await;
 
-        let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
+        // ADR 045: a git push has no authenticated principal — it arrives from
+        // a provider webhook — so it deploys as the platform. What makes that
+        // safe is that the inputs it builds from are admin-controlled: on a
+        // project whose slug this control plane declares, the source
+        // repository fields and the runtime command are themselves
+        // instance-admin-only to change (see `ProjectService`). Without those
+        // guards a non-admin could repoint a granted project at their own
+        // repository and push, and this is where it would run as host root.
+        let create_jobs_result = workflow_planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await;
         let deployment_id = deployment.id;
 
         match create_jobs_result {
@@ -3589,7 +3614,10 @@ mod tests {
 
         // Test workflow planner creates jobs
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify jobs were created (nextjs project should create 10 jobs including
@@ -3706,7 +3734,10 @@ mod tests {
 
         // Create jobs - should skip download_repo
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Should create 4 jobs (no download_repo): build_image, deploy_container, persist_static_assets, mark_deployment_complete
@@ -3780,7 +3811,10 @@ mod tests {
 
         // Create jobs
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify all jobs start as Pending

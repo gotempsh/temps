@@ -3890,6 +3890,11 @@ pub async fn create_project_from_template(
                 health_check_path: runtime.health_check_path,
                 command: runtime.command,
                 recovery_of_deployment_id: None,
+                // ADR 045: the slug was just claimed, and claiming a declared
+                // slug is already instance-admin-only with step-up — so this
+                // is an admin, and the first deploy of the project they just
+                // created must not be refused by the planner.
+                docker_socket_authorized: auth.is_instance_admin(),
             });
         if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
             error!(

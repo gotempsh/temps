@@ -80,6 +80,16 @@ pub struct DeployImageRequestedJob {
     /// See [`GitPushEventJob::recovery_of_deployment_id`].
     #[serde(default)]
     pub recovery_of_deployment_id: Option<i32>,
+    /// Whether the principal that asked for this deployment was allowed to
+    /// deploy a project holding host Docker access (ADR 045).
+    ///
+    /// The consumer plans the deployment long after the request is gone, so
+    /// it cannot re-derive the answer. `#[serde(default)]` is `false`: a job
+    /// queued before this field existed, or one that lost it in transit, is
+    /// planned as an ordinary project writer and refused for a declared
+    /// project rather than allowed by omission.
+    #[serde(default)]
+    pub docker_socket_authorized: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
