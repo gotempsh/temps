@@ -127,6 +127,11 @@ impl From<AgentError> for Problem {
                     .with_title("MCP Server Already Exists")
                     .with_detail(error.to_string())
             }
+            AgentError::DockerSocketWriteRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Write Requires An Admin")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

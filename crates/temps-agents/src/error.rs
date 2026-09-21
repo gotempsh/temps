@@ -116,6 +116,19 @@ pub enum AgentError {
         project_id: Option<i32>,
         slug: String,
     },
+
+    /// ADR 045: refused a push+PR the agent executor would otherwise make to
+    /// a project this host declares (`TEMPS_DOCKER_SOCKET_PROJECTS`). Any
+    /// commit landing on the tracked branch is what a later deploy — an
+    /// admin's, or the platform's own failover reschedule — runs as host
+    /// root, and nothing on this path can prove instance-admin authority the
+    /// way an interactive session can, so it fails closed unconditionally
+    /// rather than trusting whoever triggered the run.
+    #[error(
+        "Autopilot cannot push changes to project {slug}: it is granted host Docker access \
+         (ADR 045) and this action is admin-only"
+    )]
+    DockerSocketWriteRequiresAdmin { slug: String },
 }
 
 fn scope_label(project_id: Option<i32>) -> String {
