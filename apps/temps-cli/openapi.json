@@ -89872,6 +89872,9 @@
           "409": {
             "description": "Expected project slug is already in use"
           },
+          "428": {
+            "description": "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -90009,6 +90012,9 @@
           },
           "404": {
             "description": "Template not found"
+          },
+          "428": {
+            "description": "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"
           },
           "500": {
             "description": "Internal server error"
@@ -104690,6 +104696,9 @@
           },
           "404": {
             "description": "Project not found"
+          },
+          "428": {
+            "description": "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"
           },
           "500": {
             "description": "Internal server error"

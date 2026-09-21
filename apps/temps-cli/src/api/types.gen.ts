@@ -45831,6 +45831,10 @@ export type CreateProjectErrors = {
      */
     409: unknown;
     /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -45933,6 +45937,10 @@ export type CreateProjectFromTemplateErrors = {
      * Template not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -55355,6 +55363,10 @@ export type UpdateProjectSettingsErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
