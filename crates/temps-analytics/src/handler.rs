@@ -1083,7 +1083,7 @@ pub async fn get_session_logs(
     put,
     path = "/analytics/visitors/{visitor_id}/enrich",
     params(
-        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)"),
+        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project."),
         ("project_id" = i32, Query, description = "Project ID or slug"),
     ),
     request_body = EnrichVisitorRequest,
@@ -1091,6 +1091,7 @@ pub async fn get_session_logs(
         (status = 200, description = "Successfully enriched visitor data", body = EnrichVisitorResponse),
         (status = 404, description = "Visitor not found"),
         (status = 400, description = "Invalid parameters or project not found"),
+        (status = 403, description = "Deployment token used with a non-encrypted visitor ID"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -1104,7 +1105,25 @@ pub async fn enrich_visitor(
     Json(request): Json<EnrichVisitorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsWrite);
-    deny_deployment_token!(auth);
+
+    // Deployment tokens (the `TEMPS_API_TOKEN` injected into deployed apps) hold
+    // `visitors:enrich` and may enrich visitors, but only their own project's,
+    // and only when addressed by the sealed `enc_` id from the proxy's visitor
+    // cookie. Numeric ids and raw GUIDs would let a token pick arbitrary
+    // visitors, so they stay limited to user/API-key auth.
+    let scope_project_id = auth.project_id();
+    if auth.is_deployment_token() && !visitor_id.starts_with("enc_") {
+        return Err(temps_core::error_builder::ErrorBuilder::new(
+            axum::http::StatusCode::FORBIDDEN,
+        )
+        .type_("https://temps.sh/probs/deployment-token-not-allowed")
+        .title("Encrypted Visitor ID Required")
+        .detail(
+            "Deployment tokens can only enrich a visitor identified by its \
+             encrypted visitor ID (enc_...) from the _temps_visitor_id cookie",
+        )
+        .build());
+    }
 
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
     if let Ok(numeric_id) = visitor_id.parse::<i32>() {
@@ -1121,7 +1140,7 @@ pub async fn enrich_visitor(
         // GUID or encrypted GUID (enc_xxx) - use enrich_visitor_by_guid
         match app_state
             .analytics_service
-            .enrich_visitor_by_guid(&visitor_id, request.custom_data)
+            .enrich_visitor_by_guid(&visitor_id, scope_project_id, request.custom_data)
             .await
         {
             Ok(response) => Ok(Json(response)),

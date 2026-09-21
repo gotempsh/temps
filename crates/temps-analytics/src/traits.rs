@@ -144,10 +144,15 @@ pub trait Analytics: Send + Sync {
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 
-    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix).
+    ///
+    /// When `project_id` is `Some`, only a visitor belonging to that project can
+    /// be enriched; any other visitor is reported as "not found". Project-scoped
+    /// callers (deployment tokens) must always pass it.
     async fn enrich_visitor_by_guid(
         &self,
         visitor_guid: &str,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 

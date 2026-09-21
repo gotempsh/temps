@@ -2049,6 +2049,7 @@ impl Analytics for AnalyticsService {
     async fn enrich_visitor_by_guid(
         &self,
         visitor_guid: &str,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -2066,9 +2067,15 @@ impl Analytics for AnalyticsService {
             visitor_guid.to_string()
         };
 
-        // Find the visitor by visitor_id (guid)
-        let visitor = visitor::Entity::find()
-            .filter(visitor::Column::VisitorId.eq(&actual_visitor_id))
+        // Find the visitor by visitor_id (guid), confined to the caller's project
+        // when one is given so a project-scoped credential cannot reach another
+        // tenant's visitors.
+        let mut query =
+            visitor::Entity::find().filter(visitor::Column::VisitorId.eq(&actual_visitor_id));
+        if let Some(project_id) = project_id {
+            query = query.filter(visitor::Column::ProjectId.eq(project_id));
+        }
+        let visitor = query
             .one(self.db.as_ref())
             .await
             .map_err(AnalyticsError::from)?;
@@ -4934,6 +4941,51 @@ mod tests {
 
         // Test that the service was created successfully
         assert!(std::ptr::addr_of!(service) as usize != 0);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_visitor_by_guid_is_confined_to_project() -> anyhow::Result<()> {
+        use sea_orm::EntityTrait;
+        let (service, db, _container) =
+            create_test_analytics_service!("test_enrich_visitor_by_guid_is_confined_to_project");
+        let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+        let visitor = temps_entities::visitor::Entity::find()
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        let data = serde_json::json!({ "user_id": "u1" });
+
+        // A token bound to another project must not reach this visitor.
+        let other = service
+            .enrich_visitor_by_guid(&sealed, Some(visitor.project_id + 1), data.clone())
+            .await?;
+        assert!(!other.success, "cross-project enrichment must be refused");
+        let unchanged = temps_entities::visitor::Entity::find_by_id(visitor.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert!(unchanged.custom_data.is_none());
+
+        // The owning project can enrich it.
+        let own = service
+            .enrich_visitor_by_guid(&sealed, Some(visitor.project_id), data.clone())
+            .await?;
+        assert!(own.success);
+        let updated = temps_entities::visitor::Entity::find_by_id(visitor.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated.custom_data, Some(data.clone()));
+
+        // Unscoped callers (user / API key auth) keep working.
+        let unscoped = service
+            .enrich_visitor_by_guid(&sealed, None, serde_json::json!({ "name": "n" }))
+            .await?;
+        assert!(unscoped.success);
+
+        cleanup_test_analytics!(db);
+        Ok(())
     }
 
     #[tokio::test]
