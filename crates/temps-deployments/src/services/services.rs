@@ -381,6 +381,16 @@ pub struct DeploymentService {
     /// individual `deployer.remove_container` calls never touch -- when a
     /// project/environment that deployed via Docker Compose is deleted.
     compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// The rollback and promotion paths build their own `DeployImageJob`
+    /// rather than going through `WorkflowExecutionService`, so without this
+    /// they would always take the "no audit sink" branch and the ADR-045
+    /// `DEPLOYMENT_DOCKER_SOCKET_MOUNTED` record would silently never exist
+    /// for a rolled-back or promoted granted project. Late-bound like
+    /// `telemetry`: a missing sink degrades to a log line, never a failed
+    /// deployment.
+    audit_logger: std::sync::OnceLock<Arc<dyn temps_core::AuditLogger>>,
 }
 
 fn deployment_url_from_settings(
@@ -1034,6 +1044,7 @@ impl DeploymentService {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -1056,6 +1067,13 @@ impl DeploymentService {
     /// (currently `rollback_triggered`).
     pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
         let _ = self.telemetry.set(reporter);
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045), so
+    /// the rollback and promotion paths record a host-Docker-socket mount the
+    /// same way an ordinary deployment does.
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// The telemetry reporter, or a no-op when none has been wired.
@@ -2612,6 +2630,10 @@ impl DeploymentService {
             // one. A rollback or promotion of a granted project that omitted
             // it would be placed anywhere and started without its socket.
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new(project.slug.clone())
+                // ADR 045: the same audit sink an ordinary deploy uses, so a
+                // rollback/promotion that mounts the socket is recorded rather
+                // than only logged.
+                .audit_logger(self.audit_logger.get().cloned())
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
                 .target(crate::jobs::DeploymentTarget::Docker {
@@ -3307,6 +3329,10 @@ impl DeploymentService {
             // one. A rollback or promotion of a granted project that omitted
             // it would be placed anywhere and started without its socket.
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new(project.slug.clone())
+                // ADR 045: the same audit sink an ordinary deploy uses, so a
+                // rollback/promotion that mounts the socket is recorded rather
+                // than only logged.
+                .audit_logger(self.audit_logger.get().cloned())
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
                 .target(crate::jobs::DeploymentTarget::Docker {
@@ -6006,6 +6032,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -6087,6 +6114,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -7035,6 +7063,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -8903,6 +8932,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         };
 
         service

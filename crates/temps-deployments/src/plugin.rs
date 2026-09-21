@@ -537,20 +537,30 @@ impl TempsPlugin for DeploymentsPlugin {
             // ADR-045 record that a deployment received the host Docker
             // socket. Optional: an install with no audit sink still deploys,
             // it just logs the event instead of persisting it.
-            if let Some(workflow_execution_service) =
-                context.get_service::<WorkflowExecutionService>()
-            {
-                match context.get_service::<dyn temps_core::AuditLogger>() {
-                    Some(audit_logger) => {
-                        workflow_execution_service.set_audit_logger(audit_logger);
+            // Both services build deploy jobs: the workflow execution service
+            // for ordinary deploys, and DeploymentService for the inline
+            // rollback/promotion paths. Wiring only the first left rollback
+            // and promotion permanently on the "no audit sink" branch.
+            match context.get_service::<dyn temps_core::AuditLogger>() {
+                Some(audit_logger) => {
+                    if let Some(workflow_execution_service) =
+                        context.get_service::<WorkflowExecutionService>()
+                    {
+                        workflow_execution_service.set_audit_logger(audit_logger.clone());
                         tracing::debug!("Audit logger wired into workflow execution service");
                     }
-                    None => tracing::warn!(
-                        "No audit logger is registered; a deployment that receives the host \
-                         Docker socket (ADR 045) will be logged but not recorded in the audit \
-                         trail"
-                    ),
+                    if let Some(deployment_service) = context.get_service::<DeploymentService>() {
+                        deployment_service.set_audit_logger(audit_logger);
+                        tracing::debug!(
+                            "Audit logger wired into deployment service (rollback/promotion)"
+                        );
+                    }
                 }
+                None => tracing::warn!(
+                    "No audit logger is registered; a deployment that receives the host \
+                     Docker socket (ADR 045) will be logged but not recorded in the audit \
+                     trail"
+                ),
             }
 
             Ok(())
