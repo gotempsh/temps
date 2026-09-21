@@ -94,6 +94,16 @@ pub struct Model {
     /// durably queued and cleared by the next heartbeat, so failover completes
     /// once per outage and survives a control-plane restart.
     pub failover_at: Option<DBDateTime>,
+    /// Operator-controlled opt-in for serving public HTTP/HTTPS on this worker.
+    pub public_ingress_enabled: bool,
+    /// Last runtime state reported by an ingress-capable agent. `None` means
+    /// the worker has not reported support yet.
+    pub public_ingress_running: Option<bool>,
+    pub public_ingress_last_error: Option<String>,
+    pub public_ingress_certificate_count: Option<i32>,
+    pub public_ingress_route_count: Option<i32>,
+    pub public_ingress_unsupported_route_count: Option<i32>,
+    pub public_ingress_unsupported_reasons: Json,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

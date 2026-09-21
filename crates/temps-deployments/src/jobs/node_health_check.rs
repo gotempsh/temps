@@ -803,6 +803,13 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

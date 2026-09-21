@@ -19,6 +19,11 @@ pub const PERMISSION_DENIED_PRUNE_BATCH_SIZE: u64 = 2_048;
 pub const PERMISSION_DENIED_PRUNE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 const PERMISSION_DENIED_OPERATION: &str = "PERMISSION_DENIED";
+/// Written by `temps-analytics` when a visitor enrichment changes a visitor.
+/// A deployment token can trigger these from any address if it leaks, so like
+/// permission denials they keep the IP in the audit JSON without creating a
+/// durable geolocation row per caller address.
+const VISITOR_ENRICHED_OPERATION: &str = "VISITOR_ENRICHED";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditMaintenanceError {
@@ -69,7 +74,7 @@ impl AuditService {
         // geolocation row for each rotating denial IP would outlive the 90-day
         // audit row and turn the security signal into an unbounded side table.
         let ip_address_id_val = match (operation_type.as_str(), ip_address) {
-            (PERMISSION_DENIED_OPERATION, _) => None,
+            (PERMISSION_DENIED_OPERATION | VISITOR_ENRICHED_OPERATION, _) => None,
             (_, Some(ip_address)) => match self.ip_service.get_or_create_ip(&ip_address).await {
                 Ok(ip_address) => Some(ip_address.id),
                 Err(err) => {
@@ -445,6 +450,38 @@ mod tests {
         assert!(AuditOperation::serialize(&operation)
             .expect("test audit should serialize")
             .contains("203.0.113.91"));
+    }
+
+    #[tokio::test]
+    async fn visitor_enrichment_keeps_ip_in_json_without_geolocation_row() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![log_row(None)]])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+        let operation = TestAuditOperation {
+            user_id: None,
+            operation_type: VISITOR_ENRICHED_OPERATION,
+            ip_address: Some("203.0.113.93".to_string()),
+        };
+
+        service
+            .create_audit_log_typed(&operation)
+            .await
+            .expect("visitor enrichment audit should persist");
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release database")
+            .into_transaction_log();
+        let statements: Vec<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert_eq!(statements.len(), 1, "must only insert the audit row");
+        assert!(!statements[0].sql.contains("ip_geolocations"));
     }
 
     #[tokio::test]

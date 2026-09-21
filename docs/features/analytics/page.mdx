@@ -15,7 +15,7 @@ export const sections = [
   { title: 'Performance Monitoring', id: 'performance-monitoring' },
   { title: 'Funnel Analysis', id: 'funnel-analysis' },
   { title: 'Sending Analytics from React', id: 'react-sdk' },
-  { title: 'Enriching Visitors with Node SDK', id: 'enrich-visitors' },
+  { title: 'Enriching Visitors', id: 'enrich-visitors' },
   { title: 'Privacy & Compliance', id: 'privacy' },
 ]
 
@@ -762,9 +762,9 @@ Track events using data attributes (no JavaScript required):
 
 ---
 
-## Enriching Visitors with Node SDK {{ anchor: true, id: 'enrich-visitors' }}
+## Enriching Visitors {{ anchor: true, id: 'enrich-visitors' }}
 
-Enrich visitor data with custom metadata from your backend using the Node SDK. This allows you to add user information, subscription details, or any custom data to visitor records.
+Attach custom metadata to a visitor record — from your backend, from a deployed app, or from the CLI. This is how an anonymous visitor becomes a known user in your analytics.
 
 ### Why Enrich Visitors?
 
@@ -773,6 +773,25 @@ Visitor enrichment lets you:
 - Add business context (subscription tier, customer segment)
 - Store custom metadata for segmentation
 - Improve analytics insights with user data
+
+### How Enrichment Works
+
+`PUT /api/analytics/visitors/{visitor_id}/enrich` takes a `custom_data` object and merges it into whatever the visitor already has stored.
+
+<Properties>
+  <Property name="Merge, not replace">
+    The top-level keys you send are merged into the visitor's existing `custom_data`. Keys you don't send are left untouched, so you can enrich the same visitor repeatedly from different parts of your system without one call erasing another's work. Nested objects are replaced wholesale, not deep-merged — send the whole object for a key you want to change.
+  </Property>
+  <Property name="null removes a key">
+    A top-level key whose value is JSON `null` is deleted from the stored `custom_data`. That is the only way to remove a key: sending the key with an empty string stores an empty string.
+  </Property>
+  <Property name="success: false means not found">
+    A visitor that doesn't exist (or that your credential can't see) returns HTTP 200 with `{ "success": false, "message": "Visitor not found" }` — no exception is thrown. Check `success` before treating the call as a write. A visitor row only exists once that visitor has sent at least one event.
+  </Property>
+  <Property name="No project_id">
+    The endpoint takes no `project_id` parameter. The project is derived from the visitor and from the credential you authenticate with.
+  </Property>
+</Properties>
 
 ### Enrich Visitor Example
 
@@ -787,16 +806,12 @@ const client = new TempsClient({
 // After user logs in, enrich their visitor record
 async function enrichVisitorAfterLogin(
   visitorId: string | number, // Can be GUID, numeric ID, or encrypted GUID (enc_xxx)
-  projectId: number,
   userId: string,
   userEmail: string
 ) {
   try {
     const result = await client.analytics.enrichVisitor({
-      path: {
-        visitor_id: typeof visitorId === 'number' ? visitorId : visitorId
-      },
-      query: { project_id: projectId },
+      path: { visitor_id: visitorId },
       body: {
         custom_data: {
           userId: userId,
@@ -809,11 +824,30 @@ async function enrichVisitorAfterLogin(
       }
     });
 
-    console.log('Visitor enriched:', result);
     // Response: { success: true, visitor_id: string, message: string }
+    // success: false means no such visitor — nothing was stored.
+    if (!result.success) {
+      console.warn('Visitor not found, nothing enriched:', result.message);
+      return;
+    }
+
+    console.log('Visitor enriched:', result.message);
   } catch (error) {
     console.error('Failed to enrich visitor:', error);
   }
+}
+
+// Remove a key you previously stored: send null for it.
+async function clearTrialData(visitorId: string) {
+  await client.analytics.enrichVisitor({
+    path: { visitor_id: visitorId },
+    body: {
+      custom_data: {
+        trialEndsAt: null,   // removed from the stored custom_data
+        subscriptionTier: 'pro' // other keys are merged as usual
+      }
+    }
+  });
 }
 ```
 
@@ -822,7 +856,7 @@ async function enrichVisitorAfterLogin(
 To enrich a visitor, you need their visitor ID from the frontend. The visitor ID can be:
 - A GUID (e.g., `"550e8400-e29b-41d4-a716-446655440000"`)
 - A numeric ID (e.g., `123`)
-- An encrypted GUID (e.g., `"enc_xxx"`)
+- A sealed, encrypted ID (e.g., `"enc_..."`) — the value Temps sets in the `_temps_visitor_id` cookie on every request it proxies
 
 ```typescript {{ title: 'React - Get Visitor ID' }}
 import { useAnalytics } from '@temps-sdk/react-analytics';
@@ -851,6 +885,70 @@ function UserProfile() {
   return <div>Profile</div>;
 }
 ```
+
+### Enriching from a Deployed App
+
+An app that Temps deploys doesn't need an API key to enrich its own visitors. Temps injects `TEMPS_API_TOKEN` into the container; if that deployment token carries the `visitors:enrich` permission, the app can call the endpoint directly.
+
+```typescript {{ title: 'Deployed app — enrich with the injected token' }}
+// Server-side handler inside your deployed app.
+// `_temps_visitor_id` is set by the Temps proxy on every request it serves.
+export async function POST(request: Request) {
+  const cookie = request.headers.get('cookie') ?? '';
+  const sealedVisitorId = cookie.match(/_temps_visitor_id=([^;]+)/)?.[1];
+
+  if (!sealedVisitorId) {
+    return Response.json({ error: 'no visitor cookie' }, { status: 400 });
+  }
+
+  // TEMPS_API_URL is injected by Temps and already ends in /api
+  const response = await fetch(
+    `${process.env.TEMPS_API_URL}/analytics/visitors/${sealedVisitorId}/enrich`,
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.TEMPS_API_TOKEN}`
+      },
+      body: JSON.stringify({
+        custom_data: {
+          user_id: 'user_123',
+          email: 'ada@example.com',
+          plan: 'pro'
+        }
+      })
+    }
+  );
+
+  const result = await response.json();
+  // success: false means the visitor wasn't found — nothing was stored.
+  return Response.json({ enriched: result.success, message: result.message });
+}
+```
+
+Deployment tokens are deliberately more restricted than an API key:
+
+<Properties>
+  <Property name="Sealed IDs only">
+    A deployment token may only address a visitor by the sealed `enc_...` ID from the `_temps_visitor_id` cookie. Numeric IDs and raw GUIDs are rejected with `403`, so a token baked into a container can't walk through other people's visitors by guessing IDs.
+  </Property>
+  <Property name="Own project only">
+    The token is confined to its own project. A sealed ID belonging to another project reads as "visitor not found", not as an error that confirms the visitor exists.
+  </Property>
+  <Property name="Bounded payloads">
+    The stored `custom_data` may end up with at most 32 top-level keys and 8 KB of JSON. The cap is applied to the merged document, so repeated calls with fresh keys can't grow a visitor row without limit. Callers that aren't a deployment token (console, API keys, the CLI) have a higher ceiling of 128 keys and 64 KB, and `custom_data` must always be a JSON object.
+  </Property>
+  <Property name="Values stay private">
+    Every enrichment that changes a visitor is written to the audit log with the key names only — never the values. Keys you set and keys you remove are recorded separately.
+  </Property>
+  <Property name="Rate limit">
+    A token can make up to 300 visitor-changing enrichments per minute (per server process). Once that is used up, every enrichment from that token is refused with `429 Too Many Requests` until the minute rolls over, so the number of audit entries one token can create stays bounded. Calls that change nothing, such as re-sending the same identity on every page load, don't use up the budget, but they are refused while it is spent.
+  </Property>
+</Properties>
+
+<Note>
+  Enriching on every page load is cheap: a call that would store exactly what is already stored is detected and skipped, so it costs a read rather than a write.
+</Note>
 
 ### Backend Integration
 
@@ -883,12 +981,7 @@ export default async function handler(
     // Enrich visitor with user data
     // visitorId can be string (GUID) or number (numeric ID)
     const result = await tempsClient.analytics.enrichVisitor({
-      path: {
-        visitor_id: typeof visitorId === 'string' ? visitorId : parseInt(visitorId)
-      },
-      query: {
-        project_id: parseInt(process.env.TEMPS_PROJECT_ID!)
-      },
+      path: { visitor_id: visitorId },
       body: {
         custom_data: {
           userId: user.id,
@@ -901,6 +994,11 @@ export default async function handler(
         }
       }
     });
+
+    // HTTP 200 with success: false means the visitor does not exist.
+    if (!result.success) {
+      return res.status(404).json({ error: result.message });
+    }
 
     res.json({
       success: true,
@@ -924,10 +1022,7 @@ export default async function handler(
 
     ```typescript
     const result = await client.analytics.enrichVisitor({
-      path: {
-        visitor_id: visitorId // string GUID or number
-      },
-      query: { project_id: 1 },
+      path: { visitor_id: visitorId }, // GUID, numeric ID, or enc_... ID
       body: {
         custom_data: {
           userId: user.id,
@@ -946,7 +1041,6 @@ export default async function handler(
     ```typescript
     await client.analytics.enrichVisitor({
       path: { visitor_id: visitorId },
-      query: { project_id: 1 },
       body: {
         custom_data: {
           subscriptionTier: 'enterprise',
@@ -965,7 +1059,6 @@ export default async function handler(
     ```typescript
     await client.analytics.enrichVisitor({
       path: { visitor_id: visitorId },
-      query: { project_id: 1 },
       body: {
         custom_data: {
           segment: 'high-value',
@@ -978,6 +1071,47 @@ export default async function handler(
     ```
   </Property>
 </Properties>
+
+### Enriching from the CLI
+
+The CLI exposes the same endpoint, which is handy for backfills, one-off fixes, and scripts:
+
+```bash {{ title: 'Enrich a visitor from the CLI' }}
+# Merge identity onto a visitor (sealed ID from the _temps_visitor_id cookie)
+bunx @temps-sdk/cli analytics enrich enc_AbC123 \
+  --data '{"user_id":"user_123","email":"ada@example.com"}'
+
+# String values without hand-writing JSON (repeatable)
+bunx @temps-sdk/cli analytics enrich 4821 --set plan=pro --set segment=enterprise
+
+# Read the object from a file
+bunx @temps-sdk/cli analytics enrich 550e8400-e29b-41d4-a716-446655440000 \
+  --file ./visitor.json
+
+# Remove a stored key (sends null for it)
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --unset trial_ends_at
+
+# Machine-readable output for scripts
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --set plan=pro --json
+```
+
+```json {{ title: '--json output' }}
+{
+  "requested_visitor_id": "enc_AbC123",
+  "visitor_id": "550e8400-e29b-41d4-a716-446655440000",
+  "success": true,
+  "message": "Visitor enriched successfully",
+  "set_keys": ["plan"],
+  "unset_keys": []
+}
+```
+
+Worth knowing:
+
+- At least one of `--data`, `--file`, `--set`, or `--unset` is required, and the payload must be a JSON object — arrays and bare values are refused before any request is sent.
+- Sources merge lowest to highest: `--file`, then `--data`, then `--set`, then `--unset`. Repeating a flag lets the later value win, and a key given to both `--set` and `--unset` is rejected rather than guessed at.
+- `--set` always sends a string. Use `--data` or `--file` for numbers, booleans, arrays, and nested objects.
+- A visitor that doesn't exist (`success: false`) is reported as a failure with a non-zero exit code, so a script never mistakes it for a write that happened.
 
 ### Querying Enriched Visitors
 

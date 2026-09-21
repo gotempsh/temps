@@ -102,6 +102,17 @@ impl RequestPolicyGateSlot {
     pub fn finish_registration(&self) {
         self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
+
+    /// Whether worker ingress can preserve the configured request policy.
+    ///
+    /// Worker snapshots currently support only the built-in open policy. A
+    /// claimed provider may make path- or method-dependent decisions that
+    /// cannot safely be reconstructed on another node, so route export must
+    /// fail closed whenever one is registered (or discovery is incomplete).
+    pub fn supports_worker_ingress(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+            && !self.claimed.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Default for RequestPolicyGateSlot {
@@ -207,7 +218,9 @@ mod tests {
     #[test]
     fn completed_registration_without_provider_delegates_to_legacy_gate() {
         let slot = RequestPolicyGateSlot::new_default();
+        assert!(!slot.supports_worker_ingress());
         slot.finish_registration();
+        assert!(slot.supports_worker_ingress());
         let context = RequestPolicyContext {
             path: "/",
             method: "GET",
@@ -217,5 +230,12 @@ mod tests {
             client_ip: None,
         };
         assert_eq!(slot.evaluate(&context), RequestPolicyDecision::Continue);
+    }
+
+    #[test]
+    fn claimed_provider_disables_worker_ingress_export() {
+        let slot = RequestPolicyGateSlot::new_default();
+        assert!(slot.set(Arc::new(DenyAll)));
+        assert!(!slot.supports_worker_ingress());
     }
 }

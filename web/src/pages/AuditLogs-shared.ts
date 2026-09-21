@@ -287,6 +287,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     ],
   },
   {
+    label: 'Analytics & Visitors',
+    operations: [{ value: 'VISITOR_ENRICHED', label: 'Visitor Enriched' }],
+  },
+  {
     label: 'Storage (Blob / KV)',
     operations: [
       { value: 'BLOB_SERVICE_ENABLED', label: 'Blob Service Enabled' },

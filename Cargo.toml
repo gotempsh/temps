@@ -115,6 +115,7 @@ repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 # ============================================================================
 # Async Runtime & Concurrency
 # ============================================================================

@@ -20,6 +20,10 @@ describe('permission-denial audit presentation', () => {
     expect(categorize('OIDC_PROVIDER_CREATED')).toBe('auth')
   })
 
+  test('categorizes visitor enrichment as analytics, not "other"', () => {
+    expect(categorize('VISITOR_ENRICHED')).toBe('analytics')
+  })
+
   test('renders only normalized, redacted denial metadata', () => {
     expect(
       describePermissionDenial({

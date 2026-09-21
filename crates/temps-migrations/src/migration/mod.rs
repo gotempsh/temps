@@ -4,6 +4,7 @@
 mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
 mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
+mod m20260921_000001_add_worker_public_ingress;
 
 pub mod m20260921_000001_http_checks;
 pub mod m20260921_000002_env_check_history;
@@ -642,6 +643,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260921_000002_env_check_history::Migration),
             Box::new(m20260921_000003_detection_retry::Migration),
             Box::new(m20260921_000004_credential_catalog::Migration),
+            Box::new(m20260921_000001_add_worker_public_ingress::Migration),
         ]
     }
 }

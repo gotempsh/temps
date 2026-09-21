@@ -10096,6 +10096,7 @@ dependencies = [
 name = "temps-agent"
 version = "0.1.0-beta.56"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "bollard",
@@ -10132,6 +10133,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -10724,6 +10726,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "axum",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -10829,6 +10832,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "x25519-dalek",
  "x509-parser",
 ]
 
@@ -12772,6 +12776,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "parking_lot",
+ "rustls-pemfile",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -12782,8 +12787,10 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

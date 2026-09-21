@@ -15,6 +15,8 @@ pub enum AnalyticsError {
     ProjectNotFound(i32),
     #[error("Invalid visitor ID: {0}")]
     InvalidVisitorId(String),
+    #[error("Invalid enrichment data: {0}")]
+    InvalidEnrichmentData(String),
     #[error("Other error: {0}")]
     Other(String),
     #[error("AI summary request is rate limited: {reason}")]

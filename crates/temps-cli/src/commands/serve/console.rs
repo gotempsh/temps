@@ -4300,6 +4300,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let route_sync_state = Arc::new(temps_routes::route_sync::RouteSyncAppState {
         db: db.clone(),
         peer_table: route_table.clone(),
+        encryption_service: encryption_service.clone(),
+        request_policy_gate: request_policy_gate_slot.clone(),
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);

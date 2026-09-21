@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Badge } from '@/components/ui/badge'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -11,6 +12,7 @@ import {
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
+import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import {
   useInvalidateNodeCapability,
   useNodeCapability,
@@ -52,7 +54,6 @@ import {
   Box,
   ChevronDown,
   ChevronRight,
-  Copy,
   Cpu,
   ExternalLink,
   Globe,
@@ -124,24 +125,6 @@ function formatRelativeTime(dateStr: string | null | undefined): string {
   if (diffHours < 24) return `${diffHours}h ago`
   const diffDays = Math.floor(diffHours / 24)
   return `${diffDays}d ago`
-}
-
-function CopyButton({ text }: { text: string }) {
-  const handleCopy = () => {
-    navigator.clipboard.writeText(text)
-    toast.success('Copied to clipboard')
-  }
-
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      className="h-6 w-6 shrink-0"
-      onClick={handleCopy}
-    >
-      <Copy className="h-3 w-3" />
-    </Button>
-  )
 }
 
 function formatBytes(bytes: number): string {
@@ -499,14 +482,22 @@ function JoinInstructions({ joinCommand }: { joinCommand: string }) {
               <span className="flex-1 overflow-x-auto">
                 curl -fsSL https://temps.sh/install.sh | bash
               </span>
-              <CopyButton text="curl -fsSL https://temps.sh/install.sh | bash" />
+              <CopyButton
+                minimal
+                className="h-6 w-6 shrink-0"
+                value="curl -fsSL https://temps.sh/install.sh | bash"
+              />
             </div>
           </div>
           <div>
             <p className="font-medium text-foreground">2. Join the cluster</p>
             <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
               <span className="flex-1 overflow-x-auto">{joinCommand}</span>
-              <CopyButton text={joinCommand} />
+              <CopyButton
+                minimal
+                className="h-6 w-6 shrink-0"
+                value={joinCommand}
+              />
             </div>
             <p className="mt-1 text-xs">
               Replace <code>&lt;worker-ip&gt;</code> with the worker machine’s
@@ -517,7 +508,11 @@ function JoinInstructions({ joinCommand }: { joinCommand: string }) {
             <p className="font-medium text-foreground">3. Start the agent</p>
             <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
               <span className="flex-1 overflow-x-auto">temps agent</span>
-              <CopyButton text="temps agent" />
+              <CopyButton
+                minimal
+                className="h-6 w-6 shrink-0"
+                value="temps agent"
+              />
             </div>
             <p className="mt-1 text-xs">
               Reads config saved by <code>temps join</code> and starts the
@@ -1247,6 +1242,8 @@ function NodeDetail({
 
       {/* Labels */}
       <NodeDetailLabels labels={node.labels} />
+
+      {node.role === 'worker' && <WorkerIngressCard node={node} />}
 
       {/* Metrics */}
       {metrics && (

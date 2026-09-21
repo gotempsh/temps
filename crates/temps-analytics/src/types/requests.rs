@@ -265,6 +265,9 @@ pub struct UpdateSpeedMetricsPayload {
 
 #[derive(Deserialize, ToSchema)]
 pub struct EnrichVisitorRequest {
+    /// Attributes to attach to the visitor. Top-level keys are merged into the
+    /// visitor's stored `custom_data`; a key whose value is `null` removes that
+    /// key. Deployment tokens may send at most 32 keys and 8 KB.
     #[schema(value_type = Object)]
     pub custom_data: serde_json::Value,
 }
