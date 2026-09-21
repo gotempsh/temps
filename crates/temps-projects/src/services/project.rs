@@ -8967,6 +8967,124 @@ mod tests {
         assert_eq!(updated.project.slug, "still-ordinary");
     }
 
+    /// [`ProjectService::preflight_guard_reserved_slug`] exists so a caller
+    /// with an irreversible side effect (a template fork's upstream repo
+    /// creation) between planning a slug and creating the project can fail
+    /// fast, before that side effect runs. It must therefore apply the exact
+    /// same authority check as the creation-time guard it stands in front
+    /// of: a project writer preflighting a granted slug is refused outright,
+    /// with no MFA prompt, identically to `create_project_as`.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_refuses_a_non_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        let error = project_service
+            .preflight_guard_reserved_slug("node-daemon", &writer.caller())
+            .await
+            .expect_err("a project writer must not pass the preflight for a granted slug");
+        assert!(
+            matches!(
+                error,
+                ProjectError::DockerSocketSlugReserved {
+                    change: ReservedSlugChange::Claim,
+                    ..
+                }
+            ),
+            "a non-admin must be refused outright, not challenged: {error:?}"
+        );
+    }
+
+    /// The preflight is a sensitive action too: an admin whose MFA is
+    /// enrolled but stale gets the same 428 step-up challenge the
+    /// creation-time guard would give, so the console can prompt for
+    /// re-verification before the caller does anything irreversible.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_challenges_stale_mfa() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = project_service
+            .preflight_guard_reserved_slug("node-daemon", &stale.caller())
+            .await
+            .expect_err("stale MFA must be challenged before an irreversible side effect");
+        assert_step_up_challenge(&error, "claim_docker_socket_slug");
+    }
+
+    /// The success path: a recently-verified admin passes the preflight for
+    /// the exact slug they plan to create, clearing the way for the
+    /// irreversible side effect (e.g. the template fork's repository push)
+    /// to run before the authoritative creation-time guard is reached.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_allows_a_verified_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+
+        project_service
+            .preflight_guard_reserved_slug("node-daemon", &verified.caller())
+            .await
+            .expect("a recently-verified admin may preflight a granted slug");
+    }
+
+    /// The preflight is scoped to reserved slugs, exactly like the
+    /// creation-time guard: an ordinary slug never challenges anyone, so a
+    /// template fork onto a non-granted name sees no MFA friction.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_ignores_an_unreserved_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        project_service
+            .preflight_guard_reserved_slug("ordinary-app", &writer.caller())
+            .await
+            .expect("an unreserved slug is not a sensitive action for anyone");
+    }
+
     fn create_request(name: &str) -> CreateProjectRequest {
         CreateProjectRequest {
             name: name.to_string(),

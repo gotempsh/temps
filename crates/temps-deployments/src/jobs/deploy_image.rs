@@ -4313,6 +4313,86 @@ mod tests {
         }
     }
 
+    /// ADR 045: once a deployment's container has ever mounted the host
+    /// Docker socket, that fact must land on the `deployments` row so exec
+    /// authorization can check *this deployment's* history instead of the
+    /// project's current slug -- a project renamed away from a granted slug
+    /// keeps its already-running containers, and only the persisted flag
+    /// keeps exec on them admin-only.
+    #[tokio::test]
+    async fn persist_docker_socket_mounted_updates_the_deployment_row() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let job = DeployImageJobBuilder::new(
+            "node-daemon",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("node-daemon".to_string())
+        .failed_container_retention(db.clone(), 77)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .expect("valid deploy job");
+        let context = WorkflowContext::new("run-77".to_string(), 77, 3, 4, Arc::new(TestLogWriter));
+
+        job.persist_docker_socket_mounted(&context).await;
+
+        drop(job);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let transaction_log = db.into_transaction_log();
+        let rendered = transaction_log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.contains("UPDATE \"deployments\""))
+            .map(|statement| format!("{statement:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("docker_socket_mounted"),
+            "expected an UPDATE on docker_socket_mounted, got: {rendered}"
+        );
+        assert!(
+            rendered.contains('7'),
+            "expected deployment id 77: {rendered}"
+        );
+    }
+
+    /// A job built with no database handle (never happens in production,
+    /// since `failed_container_retention` is called unconditionally on every
+    /// builder chain that reaches a real deploy) must not panic -- the mount
+    /// is still logged and audited, just not persisted, per the doc comment
+    /// on `persist_docker_socket_mounted`.
+    #[tokio::test]
+    async fn persist_docker_socket_mounted_is_a_no_op_without_a_wired_database() {
+        let job = DeployImageJobBuilder::new(
+            "node-daemon",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("node-daemon".to_string())
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .expect("valid deploy job");
+        let context = WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(TestLogWriter));
+
+        job.persist_docker_socket_mounted(&context).await;
+    }
+
     /// ADR 045, the structural half of the deploy rule: this builder is the
     /// one point every image deployment is forced through, so a route that
     /// never learned the rule — the three remote-deployment handlers that
