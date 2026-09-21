@@ -2733,6 +2733,16 @@ export const getVisitorDetailsOptions = (options: Options<GetVisitorDetailsData>
     queryKey: getVisitorDetailsQueryKey(options)
 });
 
+/**
+ * Attach attributes (for example the signed-in user's id, name and email) to a
+ * visitor.
+ *
+ * The top-level keys of `custom_data` are merged into what is already stored;
+ * a key set to `null` is removed. A deployed app can call this with its
+ * injected deployment token (permission `visitors:enrich`), using the sealed
+ * `enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own
+ * project only.
+ */
 export const enrichVisitorMutation = (options?: Partial<Options<EnrichVisitorData>>): UseMutationOptions<EnrichVisitorResponse2, DefaultError, Options<EnrichVisitorData>> => {
     const mutationOptions: UseMutationOptions<EnrichVisitorResponse2, DefaultError, Options<EnrichVisitorData>> = {
         mutationFn: async (fnOptions) => {

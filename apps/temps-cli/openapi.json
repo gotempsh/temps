@@ -17692,6 +17692,7 @@
       "EnrichVisitorRequest": {
         "properties": {
           "custom_data": {
+            "description": "Attributes to attach to the visitor. Top-level keys are merged into the\nvisitor's stored `custom_data`; a key whose value is `null` removes that\nkey. Deployment tokens may send at most 32 keys and 8 KB.",
             "type": "object"
           }
         },
@@ -63019,6 +63020,7 @@
     },
     "/analytics/visitors/{visitor_id}/enrich": {
       "put": {
+        "description": "The top-level keys of `custom_data` are merged into what is already stored;\na key set to `null` is removed. A deployed app can call this with its\ninjected deployment token (permission `visitors:enrich`), using the sealed\n`enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own\nproject only.",
         "operationId": "enrich_visitor",
         "parameters": [
           {
@@ -63050,16 +63052,13 @@
                 }
               }
             },
-            "description": "Successfully enriched visitor data"
+            "description": "Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed."
           },
           "400": {
             "description": "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"
           },
           "403": {
             "description": "Deployment token used with a non-encrypted visitor ID"
-          },
-          "404": {
-            "description": "Visitor not found"
           },
           "500": {
             "description": "Internal server error"
@@ -63070,6 +63069,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Attach attributes (for example the signed-in user's id, name and email) to a\nvisitor.",
         "tags": [
           "Analytics"
         ],

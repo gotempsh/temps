@@ -8143,6 +8143,11 @@ export type EnqueuedJob = {
 };
 
 export type EnrichVisitorRequest = {
+    /**
+     * Attributes to attach to the visitor. Top-level keys are merged into the
+     * visitor's stored `custom_data`; a key whose value is `null` removes that
+     * key. Deployment tokens may send at most 32 keys and 8 KB.
+     */
     custom_data: {
         [key: string]: unknown;
     };
@@ -29426,10 +29431,6 @@ export type EnrichVisitorErrors = {
      */
     403: unknown;
     /**
-     * Visitor not found
-     */
-    404: unknown;
-    /**
      * Internal server error
      */
     500: unknown;
@@ -29437,7 +29438,7 @@ export type EnrichVisitorErrors = {
 
 export type EnrichVisitorResponses = {
     /**
-     * Successfully enriched visitor data
+     * Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed.
      */
     200: EnrichVisitorResponse;
 };
