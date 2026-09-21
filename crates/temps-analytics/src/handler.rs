@@ -1166,19 +1166,38 @@ pub async fn enrich_visitor(
 
     // `Some` only for deployment tokens, which are confined to their project.
     let scope_project_id = auth.project_id();
-    if let Some(token) = auth.deployment_token_info() {
-        deployment_token_enrich_guard(&visitor_id, &request.custom_data)?;
-        // Every change is audited, so the change rate is what bounds the audit
-        // trail. Refuse instead of writing an unaudited change.
-        if !app_state.enrich_budget.has_budget(token.token_id) {
-            return Err(too_many_requests()
-                .detail(
-                    "This deployment token made too many visitor-changing enrichments in \
-                     the last minute; retry shortly",
-                )
-                .build());
+    // For a deployment token: extra rules, then reserve a slot in its write
+    // budget before writing. Every change is audited, so the change rate is what
+    // bounds the audit trail, and reserving up front (rather than checking, then
+    // counting later) keeps concurrent requests from all slipping past the limit.
+    // The slot is kept only if this request changes a visitor.
+    let reservation = match auth.deployment_token_info() {
+        Some(token) => {
+            deployment_token_enrich_guard(&visitor_id, &request.custom_data)?;
+            match app_state.enrich_budget.try_reserve(token.token_id) {
+                Ok(reservation) => Some(reservation),
+                Err(refused) => {
+                    if refused.first_in_window {
+                        // Once per window, so an abused or over-busy token is
+                        // visible to the operator without a flood of log lines.
+                        tracing::warn!(
+                            deployment_token_id = token.token_id,
+                            project_id = ?auth.project_id(),
+                            "Deployment token exceeded its visitor enrichment budget; \
+                             further enrichments are refused until the window resets"
+                        );
+                    }
+                    return Err(too_many_requests()
+                        .detail(
+                            "This deployment token made too many visitor-changing enrichments in \
+                             the last minute; retry shortly",
+                        )
+                        .build());
+                }
+            }
         }
-    }
+        None => None,
+    };
 
     // Names only, bounded: values are routinely personal data and stay out of the
     // audit trail, and key names are caller-chosen so they are truncated. A key
@@ -1215,8 +1234,8 @@ pub async fn enrich_visitor(
     let response = result.map_err(handle_analytics_error)?;
 
     if response.updated {
-        if let Some(token) = auth.deployment_token_info() {
-            app_state.enrich_budget.record(token.token_id);
+        if let Some(reservation) = reservation {
+            reservation.commit();
         }
         let token = auth.deployment_token_info();
         let audit = crate::visitor_audit::VisitorEnrichedAudit {

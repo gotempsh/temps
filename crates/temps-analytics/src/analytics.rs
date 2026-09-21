@@ -324,6 +324,12 @@ fn validate_merge(
             let (merged_keys, merged_bytes) = custom_data_footprint(Some(merged));
             if merged_keys <= existing_keys && merged_bytes <= existing_bytes {
                 Ok(())
+            } else if existing_keys > max_keys || existing_bytes > max_bytes {
+                Err(AnalyticsError::InvalidEnrichmentData(format!(
+                    "this visitor's custom_data is already over the limit ({existing_keys} keys, \
+                     {existing_bytes} bytes; at most {max_keys} keys / {max_bytes} bytes) and can \
+                     only be reduced, not grown"
+                )))
             } else {
                 Err(error)
             }
@@ -386,9 +392,10 @@ impl AnalyticsService {
         let visitor_row_id = visitor_model.id;
         // Nothing to store: an identical document, or removing keys from a row
         // that has no data. The response text is the same for both outcomes, so
-        // the body does not say which happened. (Timing and the size-limit
-        // errors below can still hint at stored state to a write-only caller;
-        // that residual is accepted, not eliminated.)
+        // the body does not say which happened. (Timing, the size-limit errors
+        // below and the token's write budget still let a write-only caller
+        // infer a little about stored state; that residual is narrowed, not
+        // eliminated.)
         let unchanged = visitor_model.custom_data.as_ref() == Some(&merged)
             || (visitor_model.custom_data.is_none()
                 && merged.as_object().is_some_and(|map| map.is_empty()));

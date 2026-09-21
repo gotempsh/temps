@@ -942,7 +942,7 @@ Deployment tokens are deliberately more restricted than an API key:
     Every enrichment that changes a visitor is written to the audit log with the key names only — never the values. Keys you set and keys you remove are recorded separately.
   </Property>
   <Property name="Rate limit">
-    A token can make up to 300 visitor-changing enrichments per minute. Beyond that the API answers `429 Too Many Requests` and writes nothing, so no change is ever left unaudited. Calls that change nothing, such as re-sending the same identity on every page load, don't count.
+    A token can make up to 300 visitor-changing enrichments per minute (per server process). Once that is used up, every enrichment from that token is refused with `429 Too Many Requests` until the minute rolls over, so the number of audit entries one token can create stays bounded. Calls that change nothing, such as re-sending the same identity on every page load, don't use up the budget, but they are refused while it is spent.
   </Property>
 </Properties>
 

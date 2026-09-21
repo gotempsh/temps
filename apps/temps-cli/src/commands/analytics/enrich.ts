@@ -278,6 +278,11 @@ export async function enrichVisitorAction(
 
   let fileContents: string | undefined
   if (options.file !== undefined) {
+    if (typeof Bun === 'undefined') {
+      throw new Error(
+        '--file needs the Bun runtime. Run this command with bunx @temps-sdk/cli, or pass the JSON inline with --data.',
+      )
+    }
     try {
       fileContents = await Bun.file(options.file).text()
     } catch (e) {

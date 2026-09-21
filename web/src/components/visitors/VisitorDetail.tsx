@@ -289,7 +289,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
     onError: (error: Error) => {
       if (isPayloadTooLargeError(error)) {
         const description =
-          'Custom data is limited to 16 KB per visitor. Remove some keys or shorten their values and try again.'
+          'A single save is limited to 16 KB. Remove some keys or shorten their values and try again.'
         setEnrichJsonError(description)
         toast.error('Custom data is too large', { description })
         return
@@ -1012,7 +1012,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               Edit the custom data for this visitor as a JSON object. Saving
               merges the keys below into the visitor&rsquo;s existing custom
               data, and any key you remove from the JSON is removed from the
-              visitor. Custom data is limited to 16 KB per visitor.
+              visitor. A single save is limited to 16 KB, and a visitor can hold
+              up to 128 keys / 64 KB.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
