@@ -107,6 +107,19 @@ impl DockerSocketGrant {
         self.slugs.contains(slug)
     }
 
+    /// Whether the control plane **declares** that `slug` requires the socket.
+    ///
+    /// The same variable answers two questions on the control plane: which
+    /// projects this host would mount the socket for, and — because it is the
+    /// only process an operator with a shell on the control plane configures —
+    /// which projects the cluster as a whole treats as socket-requiring. A
+    /// worker's heartbeat can narrow *where* a declared project runs; it can
+    /// never make this answer true, or one compromised worker would decide
+    /// which projects are root-equivalent (see [`slug_is_reserved`]).
+    pub fn declares(&self, slug: &str) -> bool {
+        self.allows(slug)
+    }
+
     /// The granted slugs, sorted, for logging and capability responses.
     pub fn slugs(&self) -> impl Iterator<Item = &str> {
         self.slugs.iter().map(String::as_str)
@@ -159,6 +172,55 @@ pub fn process_grant() -> &'static DockerSocketGrant {
     PROCESS_GRANT.get_or_init(DockerSocketGrant::from_env)
 }
 
+/// Whether `slug` is reserved by a host's grant, and may therefore only be
+/// **claimed** — created, or renamed to — by an instance admin.
+///
+/// Pure, with the grant injected, so the rule is testable against an explicit
+/// grant instead of the process-wide `OnceLock` (mirrors
+/// `temps_deployer::docker::docker_socket_bind_for`). Callers in the control
+/// plane pass [`process_grant`].
+///
+/// The rule exists because `projects.slug` is writable by any project writer:
+/// without it, renaming a project onto a granted slug would hand its next
+/// deployment host root on every machine that grants that slug. Only the claim
+/// is reserved — an existing project whose slug already matches keeps working,
+/// including through updates that do not change the slug.
+pub fn slug_is_reserved(grant: &DockerSocketGrant, slug: &str) -> bool {
+    grant.allows(slug)
+}
+
+/// The sentence shown to whoever tried to claim a reserved slug.
+///
+/// Names the ADR and the variable rather than only refusing: the person who
+/// hits this is usually an operator who *did* set the variable and is now
+/// surprised their own project create is rejected.
+pub fn reserved_slug_reason(slug: &str) -> String {
+    format!(
+        "Project slug '{slug}' is reserved by this host's {DOCKER_SOCKET_PROJECTS_ENV} policy \
+         (ADR 045): a project with that slug is granted `/var/run/docker.sock` and is therefore \
+         root-equivalent on every host that grants it. Only an instance admin may create or \
+         rename a project onto a granted slug. Choose another slug, or ask an admin."
+    )
+}
+
+/// The sentence shown to whoever tried to rename a project *off* a reserved
+/// slug.
+///
+/// The symmetric half of [`reserved_slug_reason`], and needed for the same
+/// reason: the grant is keyed by slug, so a rename away from one both revokes
+/// the project's host Docker access on every host that grants it — silently
+/// breaking an operator-owned infrastructure service — and frees the slug for
+/// whoever creates a project next, who would inherit that access. Both ends of
+/// the move are therefore admin-only.
+pub fn released_slug_reason(slug: &str) -> String {
+    format!(
+        "Project slug '{slug}' is granted `/var/run/docker.sock` by this host's \
+         {DOCKER_SOCKET_PROJECTS_ENV} policy (ADR 045). Renaming this project away from it \
+         would revoke its host Docker access on every host that grants it, and free the slug \
+         for the next project created. Only an instance admin may do that."
+    )
+}
+
 /// Slugs a node advertises in its heartbeat `capacity` JSON.
 ///
 /// Tolerant by construction: a node that has never reported (older agent), or
@@ -199,13 +261,37 @@ pub fn set_capacity_grants(capacity: &mut serde_json::Value, slugs: &[String]) {
 /// The sentence shown to an operator when a project is granted nowhere.
 ///
 /// Names the exact variable, the exact value, and both processes that read it,
-/// because the person reading it is debugging alone on their own host.
+/// because the person reading it is debugging alone on their own host. Both
+/// halves of the rule are spelled out: the control plane's variable *declares*
+/// that a project requires the socket, and each host's own variable decides
+/// whether that host provides it. Setting only one of the two is the failure
+/// an operator cannot otherwise see.
 pub fn not_granted_reason(slug: &str) -> String {
     format!(
         "No host grants project '{slug}' access to the Docker socket. Set \
-         {DOCKER_SOCKET_PROJECTS_ENV}={slug} on the host that should run it and restart \
-         `temps serve` (control plane) or `temps agent` (worker node). A granted project is \
-         root-equivalent on that host."
+         {DOCKER_SOCKET_PROJECTS_ENV}={slug} on the control plane and restart `temps serve` — \
+         that declares the project requires the socket — and set the same variable on each host \
+         that should run it (`temps agent` on a worker node; the control plane itself already \
+         counts) and restart it. A granted project is root-equivalent on every host that \
+         grants it."
+    )
+}
+
+/// The sentence shown when worker nodes advertise the grant but this control
+/// plane never declared the project.
+///
+/// A heartbeat narrows *where* a declared project may run; it never creates
+/// the requirement, or one compromised or misconfigured worker could make
+/// itself the only eligible host for any project it names. The operator has
+/// already done half the work here, so say which half is missing and which
+/// hosts are already configured.
+pub fn not_declared_reason(slug: &str, advertising_nodes: &[String]) -> String {
+    format!(
+        "Node(s) {} grant project '{slug}' host Docker access, but this control plane does not \
+         declare it: a node's advertisement alone never grants the socket. Set \
+         {DOCKER_SOCKET_PROJECTS_ENV}={slug} on the control plane and restart `temps serve`, \
+         then deployments of this project are placed only on hosts that grant it.",
+        advertising_nodes.join(", ")
     )
 }
 
@@ -235,26 +321,47 @@ impl DockerSocketCapability {
     /// Derive the capability from its two inputs. Pure, so the rule lives in
     /// one place and is testable without a database.
     ///
+    /// `control_plane_declares` is this control plane's own process grant. It
+    /// is the *gate*: a project is granted host Docker access only when the
+    /// operator declared it there, because that is the one variable no worker
+    /// heartbeat can write. Nodes advertising a slug the control plane never
+    /// declared are reported as the misconfiguration they are, not as a grant
+    /// — otherwise a single worker could decide, from its own heartbeat, which
+    /// projects are root-equivalent.
+    ///
     /// `granting_node_names` is every worker node advertising the grant, of
     /// any status — a node that is currently offline still *grants* it, and
     /// telling the operator otherwise would send them to change a variable
     /// that is already correct.
     pub fn evaluate(
         slug: &str,
-        control_plane_grants: bool,
+        control_plane_declares: bool,
         granting_node_names: Vec<String>,
     ) -> Self {
-        let mut nodes = Vec::new();
-        if control_plane_grants {
-            nodes.push(CONTROL_PLANE_NODE_NAME.to_string());
+        if !control_plane_declares {
+            return Self {
+                granted: false,
+                // Deliberately empty: `nodes` lists hosts this project is
+                // actually granted on, and without the declaration it is
+                // granted nowhere Temps will place it. The advertising nodes
+                // are named in `reason` instead, where they are the fix.
+                nodes: Vec::new(),
+                reason: Some(if granting_node_names.is_empty() {
+                    not_granted_reason(slug)
+                } else {
+                    not_declared_reason(slug, &granting_node_names)
+                }),
+                setup_path: Some(DOCKER_SOCKET_SETUP_PATH.to_string()),
+            };
         }
+
+        let mut nodes = vec![CONTROL_PLANE_NODE_NAME.to_string()];
         nodes.extend(granting_node_names);
 
-        let granted = !nodes.is_empty();
         Self {
-            granted,
+            granted: true,
             nodes,
-            reason: (!granted).then(|| not_granted_reason(slug)),
+            reason: None,
             setup_path: Some(DOCKER_SOCKET_SETUP_PATH.to_string()),
         }
     }
@@ -290,6 +397,30 @@ mod tests {
                 "worker-1".to_string(),
                 "worker-2".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn a_node_advertisement_alone_never_grants_the_capability() {
+        // The finding this rule exists for: a worker that advertises a slug
+        // the control plane never declared must not read back as "granted",
+        // or the console would promise host Docker access that no operator
+        // asked for.
+        let capability =
+            DockerSocketCapability::evaluate("node-daemon", false, vec!["worker-1".to_string()]);
+        assert!(!capability.granted);
+        assert!(capability.nodes.is_empty());
+        let reason = capability
+            .reason
+            .expect("an ungranted project explains why");
+        assert!(reason.contains("worker-1"), "{reason}");
+        assert!(
+            reason.contains("does not declare it"),
+            "the missing half must be named: {reason}"
+        );
+        assert!(
+            reason.contains("TEMPS_DOCKER_SOCKET_PROJECTS=node-daemon"),
+            "{reason}"
         );
     }
 
@@ -397,5 +528,37 @@ mod tests {
         let reason = not_granted_reason("node-daemon");
         assert!(reason.contains("TEMPS_DOCKER_SOCKET_PROJECTS=node-daemon"));
         assert!(reason.contains("temps agent"));
+        // Both halves of the rule, or an operator sets one and waits.
+        assert!(reason.contains("temps serve"));
+        assert!(reason.contains("control plane"));
+    }
+
+    #[test]
+    fn a_reserved_slug_is_exactly_a_granted_slug() {
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        assert!(slug_is_reserved(&grant, "node-daemon"));
+        // Same exact-match rule as the bind: a near miss is not reserved, and
+        // is also not granted, so the two can never disagree.
+        assert!(!slug_is_reserved(&grant, "node-daemon-2"));
+        assert!(!slug_is_reserved(&grant, "Node-Daemon"));
+        assert!(!slug_is_reserved(
+            &DockerSocketGrant::default(),
+            "node-daemon"
+        ));
+    }
+
+    #[test]
+    fn reserved_slug_reason_names_the_adr_the_variable_and_the_remedy() {
+        let reason = reserved_slug_reason("node-daemon");
+        assert!(reason.contains("ADR 045"), "{reason}");
+        assert!(reason.contains("TEMPS_DOCKER_SOCKET_PROJECTS"), "{reason}");
+        assert!(reason.contains("instance admin"), "{reason}");
+    }
+
+    #[test]
+    fn declares_is_the_same_exact_match_as_allows() {
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        assert!(grant.declares("node-daemon"));
+        assert!(!grant.declares("infra-agent"));
     }
 }

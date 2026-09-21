@@ -1199,6 +1199,14 @@ impl From<ProjectError> for Problem {
             ProjectError::InvalidGitUrl { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
+
+            // 403, not 409: the slug is not taken, the caller is not allowed
+            // to take it. An admin sending the same request succeeds.
+            ProjectError::DockerSocketSlugReserved { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Project Slug Reserved For Host Docker Access")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

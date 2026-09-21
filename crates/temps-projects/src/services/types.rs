@@ -123,6 +123,76 @@ pub struct Project {
     pub image_retention_hours: Option<i32>,
 }
 
+/// What the caller is allowed to *claim*, as opposed to what it is allowed to
+/// write (ADR 045).
+///
+/// One project property is not merely data: a slug named in a host's
+/// `TEMPS_DOCKER_SOCKET_PROJECTS` decides whether that project's containers get
+/// `/var/run/docker.sock`, i.e. host root. `projects.slug` is writable by any
+/// project writer and derivable from the display name at create time, so
+/// without this distinction a non-admin could rename a project onto a granted
+/// slug and have the next deploy run as root on the granting host.
+///
+/// Defaults to [`Self::ProjectWriter`] — the fail-closed answer — so a caller
+/// that never thought about it cannot claim a reserved slug by omission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlugClaimAuthority {
+    /// Anyone holding `ProjectsCreate`/`ProjectsWrite`. May use any slug that
+    /// is not reserved by this host's grant.
+    #[default]
+    ProjectWriter,
+    /// An instance admin (`AuthContext::is_instance_admin`). Whoever can set
+    /// the environment variable on the host is the same person who is allowed
+    /// to point a project at it, so this is the only role that may claim a
+    /// reserved slug.
+    InstanceAdmin,
+}
+
+impl SlugClaimAuthority {
+    /// Derive the authority from an instance-admin check.
+    pub fn from_instance_admin(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::InstanceAdmin
+        } else {
+            Self::ProjectWriter
+        }
+    }
+
+    /// Whether this caller may claim a slug reserved by the host grant.
+    pub fn may_claim_reserved_slug(self) -> bool {
+        matches!(self, Self::InstanceAdmin)
+    }
+}
+
+/// Which way a reserved slug was being moved when the caller was refused
+/// (ADR 045).
+///
+/// Both directions are admin-only, and for different reasons — so the refusal
+/// has to say which one it is, or the operator reading a 403 about a slug they
+/// did not type is left guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedSlugChange {
+    /// Taking a reserved slug: creating a project with it, or renaming one
+    /// onto it. Grants the project host root on every host that grants the
+    /// slug.
+    Claim,
+    /// Giving up a reserved slug the project already holds. Revokes that
+    /// project's host Docker access everywhere and frees the slug for the
+    /// next project created.
+    Release,
+}
+
+impl ReservedSlugChange {
+    /// The full sentence shown for this direction. Kept next to the grant
+    /// itself so the API message, the CLI and the log line cannot drift.
+    pub fn describe(self, slug: &str) -> String {
+        match self {
+            Self::Claim => temps_core::docker_socket_grant::reserved_slug_reason(slug),
+            Self::Release => temps_core::docker_socket_grant::released_slug_reason(slug),
+        }
+    }
+}
+
 /// Sparse set of project settings to change.
 ///
 /// A struct rather than a positional parameter list: the settings endpoint
@@ -367,6 +437,19 @@ pub enum ProjectError {
 
     #[error("Invalid git URL '{url}': {reason}")]
     InvalidGitUrl { url: String, reason: String },
+
+    /// The caller tried to move a slug this host grants `/var/run/docker.sock`
+    /// to (ADR 045) without being an instance admin — either taking it
+    /// (create, or rename onto it) or giving it up (rename away from it).
+    ///
+    /// Carries the slug because the operator who set the variable is often the
+    /// person hitting this, and "which slug?" is their first question, and the
+    /// direction because the two refusals have different remedies.
+    #[error("{}", change.describe(slug))]
+    DockerSocketSlugReserved {
+        slug: String,
+        change: ReservedSlugChange,
+    },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

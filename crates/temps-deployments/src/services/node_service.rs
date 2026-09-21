@@ -45,25 +45,32 @@ pub enum NodeError {
     },
 
     #[error(
-        "{replicas} replicas requested with anti-affinity, but only {available} node(s) \
-         can run this image ({excluded}). Set replicas to {available}, add a compatible \
-         node, or disable anti-affinity to stack replicas on the nodes you have"
+        "{replicas} replicas requested with anti-affinity, but only {available} node(s) are \
+         eligible — {cause} ({excluded}). Set replicas to {available}, add an eligible node, \
+         or disable anti-affinity to stack replicas on the nodes you have"
     )]
     InsufficientCompatibleNodes {
         /// Replicas the deployment asked for.
         replicas: u32,
-        /// Nodes that can actually run the image.
+        /// Nodes that are actually eligible.
         available: usize,
-        /// What was dropped from the pool and why, already formatted.
+        /// What eliminated the rest, as one phrase. Not always the image
+        /// architecture: the ADR-045 Docker socket gate drops nodes from the
+        /// same pool, and a message that blamed the architecture for a socket
+        /// exclusion would send the operator to rebuild an image that is fine.
+        cause: String,
+        /// What was dropped from the pool and why, already formatted per node.
         excluded: String,
     },
 
     #[error(
-        "Placement constraints selected node(s) that cannot run this image ({excluded}); \
+        "Placement constraints selected node(s) that are not eligible ({excluded}); \
          refusing to ignore the requested placement"
     )]
     PlacementConstraintsUnsatisfied {
-        /// Constrained nodes that were dropped from the pool and why.
+        /// Constrained nodes that were dropped from the pool and why. Each
+        /// entry names its own reason, which is not necessarily the image
+        /// architecture — see `InsufficientCompatibleNodes::cause`.
         excluded: String,
     },
 
@@ -81,9 +88,12 @@ pub enum NodeError {
     },
 
     #[error(
-        "Project '{project_slug}' is granted host Docker access (ADR 045), but {reason}. \
-         Deploying it on a host that does not grant it would start the container without \
-         the Docker socket it exists to use, so placement is refused instead"
+        "Project '{project_slug}' is declared as requiring host Docker access on this control \
+         plane (ADR 045), but {reason}. Deploying it on a host that does not grant it would \
+         start the container without the Docker socket it exists to use, so placement is \
+         refused instead. Declare it on the control plane and grant it on at least one node: \
+         set TEMPS_DOCKER_SOCKET_PROJECTS={project_slug} on that host and restart its `temps \
+         agent` (or `temps serve` for the control plane)"
     )]
     DockerSocketNotSchedulable {
         /// Project the deployment is for.
@@ -208,6 +218,28 @@ fn resolve_heartbeat_capacity(
         }
     }
     capacity
+}
+
+/// Slugs a node advertises that this control plane never declared (ADR 045).
+///
+/// Such an advertisement does nothing — the placement gate exists only for
+/// projects named in the *control plane's* `TEMPS_DOCKER_SOCKET_PROJECTS`, so
+/// a node cannot conjure one — but it is never benign: either the operator set
+/// the variable on the worker and forgot the control plane (the common case,
+/// and otherwise invisible: the project simply deploys without the socket), or
+/// the node is reporting slugs nobody configured. Both deserve a line naming
+/// the node.
+///
+/// Pure, so the rule is testable without a database.
+fn undeclared_advertisements(
+    declared: &temps_core::docker_socket_grant::DockerSocketGrant,
+    advertised: &[String],
+) -> Vec<String> {
+    advertised
+        .iter()
+        .filter(|slug| !declared.declares(slug))
+        .cloned()
+        .collect()
 }
 
 /// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
@@ -547,11 +579,37 @@ impl NodeService {
         // replaced on every beat and never written through the API — exactly
         // the lifecycle this list has — so a migration would buy nothing but
         // a column that can disagree with the beat that set it.
-        active.capacity = Set(resolve_heartbeat_capacity(
+        let resolved_capacity = resolve_heartbeat_capacity(
             request.capacity,
             request.docker_socket_projects,
             &node.capacity,
-        ));
+        );
+        // An advertisement narrows where a declared project may run; it never
+        // declares one. Say so when a node advertises something this control
+        // plane does not declare — rate-limited to the beats where the node's
+        // set actually changes, since heartbeats arrive continuously and a
+        // per-beat warning would be noise nobody reads.
+        let advertised = temps_core::docker_socket_grant::capacity_grants(&resolved_capacity);
+        if advertised != temps_core::docker_socket_grant::capacity_grants(&node.capacity) {
+            let undeclared = undeclared_advertisements(
+                temps_core::docker_socket_grant::process_grant(),
+                &advertised,
+            );
+            if !undeclared.is_empty() {
+                tracing::warn!(
+                    node_id,
+                    node_name = %node.name,
+                    slugs = %undeclared.join(", "),
+                    env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                    "Node advertises host Docker access for project(s) this control plane does \
+                     not declare; the advertisement is ignored for scheduling. Set {} on the \
+                     control plane too if this is intended — otherwise the node is \
+                     misconfigured, or reporting slugs nobody configured",
+                    temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+                );
+            }
+        }
+        active.capacity = Set(resolved_capacity);
         // Only transition to "active" if the node was "offline" (reconnecting).
         // Preserve managed states like "draining" and "drained".
         if node.status == "offline" {
@@ -1173,6 +1231,27 @@ mod tests {
             );
             assert_eq!(capacity_grants(&capacity), vec!["node-daemon".to_string()]);
             assert_eq!(capacity["cpu_usage"], serde_json::json!(0.4));
+        }
+
+        #[test]
+        fn advertisements_outside_the_declared_set_are_reported_as_such() {
+            use super::super::undeclared_advertisements;
+            use temps_core::docker_socket_grant::DockerSocketGrant;
+
+            let declared = DockerSocketGrant::parse(Some("node-daemon"));
+            // A node advertising a slug the control plane never declared does
+            // nothing for scheduling, but it is never benign: either half a
+            // config change, or a node naming projects nobody configured.
+            assert_eq!(
+                undeclared_advertisements(
+                    &declared,
+                    &["node-daemon".to_string(), "hostile".to_string()],
+                ),
+                vec!["hostile".to_string()]
+            );
+            // The ordinary case is silent.
+            assert!(undeclared_advertisements(&declared, &["node-daemon".to_string()]).is_empty());
+            assert!(undeclared_advertisements(&declared, &[]).is_empty());
         }
 
         #[test]

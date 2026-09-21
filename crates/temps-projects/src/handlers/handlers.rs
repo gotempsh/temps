@@ -45,6 +45,31 @@ use temps_core::problemdetails::Problem;
 use temps_entities::source_type::SourceType;
 use tokio::io::AsyncWriteExt;
 
+/// Record who tried to claim a slug reserved by the host Docker socket grant
+/// (ADR 045).
+///
+/// The service refuses the write and logs what it knows; this adds the one
+/// thing only the HTTP layer has — the principal. There is no audit event for
+/// a write that did not happen, and inventing a `ProjectCreated` record for a
+/// project that was never created would be worse than a log line: this is the
+/// closest honest equivalent.
+fn log_reserved_slug_refusal(
+    error: &crate::services::types::ProjectError,
+    user_id: i32,
+    project_id: Option<i32>,
+) {
+    if let crate::services::types::ProjectError::DockerSocketSlugReserved { slug, change } = error {
+        warn!(
+            user_id,
+            project_id = ?project_id,
+            slug = %slug,
+            change = ?change,
+            "Rejected a non-admin attempt to move a project slug that is granted host Docker \
+             access on this host (ADR 045)"
+        );
+    }
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     use axum::extract::DefaultBodyLimit;
     let custom_domain_routes = super::custom_domains::configure_routes();
@@ -923,6 +948,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     responses(
         (status = 200, description = "Project created successfully", body = ProjectResponse),
         (status = 400, description = "Invalid input"),
+        (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 409, description = "Expected project slug is already in use"),
         (status = 500, description = "Internal server error")
     ),
@@ -986,8 +1012,16 @@ pub async fn create_project(
 
     let new_project = state
         .project_service
-        .create_project(project_req)
+        // ADR 045: only an instance admin may claim a slug this host grants
+        // host Docker access to — including one derived from the name.
+        .create_project_as(
+            project_req,
+            crate::services::types::SlugClaimAuthority::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
         .map_err(Problem::from)?;
 
     // Create audit event
@@ -1559,7 +1593,7 @@ pub async fn delete_project(
     responses(
         (status = 200, description = "Project settings updated successfully", body = ProjectResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)"),
         (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1612,8 +1646,17 @@ pub async fn update_project_settings(
 
     let update = state
         .project_service
-        .update_project_settings(project_id, settings.clone().into())
+        .update_project_settings_as(
+            project_id,
+            settings.clone().into(),
+            // ADR 045: renaming onto a granted slug is admin-only. Every other
+            // settings change, including on an already-granted project, is not.
+            crate::services::types::SlugClaimAuthority::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), Some(project_id)))
         .map_err(Problem::from)?;
 
     // Create audit event
@@ -3458,7 +3501,7 @@ async fn canonical_template_app_url(
         (status = 201, description = "Project created successfully", body = super::templates::CreateProjectFromTemplateResponse),
         (status = 400, description = "Invalid input"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 404, description = "Template not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3798,14 +3841,22 @@ pub async fn create_project_from_template(
         (create_request, repository_url, deploy_mode, None)
     };
 
+    // ADR 045: same claim rule as plain project creation — a template deploy
+    // is another way to name a slug.
+    let authority =
+        crate::services::types::SlugClaimAuthority::from_instance_admin(auth.is_instance_admin());
     let project = if let Some(service_template) = service_template_instance {
         state
             .project_service
-            .create_service_project(create_request, service_template)
+            .create_service_project_as(create_request, service_template, authority)
             .await
     } else {
-        state.project_service.create_project(create_request).await
+        state
+            .project_service
+            .create_project_as(create_request, authority)
+            .await
     }
+    .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
     .map_err(Problem::from)?;
 
     // 4. Image mode: docker_image projects don't auto-deploy on create (no Git
