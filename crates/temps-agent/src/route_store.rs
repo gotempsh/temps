@@ -466,15 +466,21 @@ fn decrypt_certified_key(
         temps_core::ecies::decrypt_bundle(private_key_b64, ephemeral_public_key, encrypted)
             .map_err(|error| error.to_string())?;
     let payload = std::str::from_utf8(&plaintext).map_err(|error| error.to_string())?;
-    let key_marker = payload
-        .find("-----BEGIN ")
-        .and_then(|first| {
-            payload[first + 11..]
-                .find("-----BEGIN ")
-                .map(|second| first + 11 + second)
-        })
-        .ok_or_else(|| "certificate payload contains no private key".to_string())?;
-    let certificate_pem = payload[..key_marker].trim();
+    let key_marker = [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+    ]
+    .iter()
+    .filter_map(|marker| payload.find(marker))
+    .min()
+    .ok_or_else(|| "certificate payload contains no private key".to_string())?;
+    // The control plane builds the encrypted payload as
+    // `{certificate}\n{private_key}` and fingerprints the certificate string
+    // exactly as stored. Remove only that one separator newline. Trimming the
+    // slice also removed meaningful trailing PEM whitespace and made the
+    // worker compute a different fingerprint from the control plane.
+    let certificate_pem = certificate_pem_from_payload(payload, key_marker)?;
     if temps_core::ecies::cert_fingerprint(certificate_pem) != bundle.fingerprint {
         return Err("certificate fingerprint does not match snapshot".to_string());
     }
@@ -492,6 +498,12 @@ fn decrypt_certified_key(
     let certified = CertifiedKey::new(certificates, signing_key);
     certified.keys_match().map_err(|error| error.to_string())?;
     Ok(certified)
+}
+
+fn certificate_pem_from_payload(payload: &str, key_marker: usize) -> Result<&str, String> {
+    payload[..key_marker]
+        .strip_suffix('\n')
+        .ok_or_else(|| "certificate payload separator is missing".to_string())
 }
 
 fn parse_public_certificate_pem(
@@ -643,5 +655,76 @@ mod tests {
 
         assert!(store.lookup_public("example.com").is_some());
         assert!(store.lookup_public_tls_key("example.com").is_none());
+    }
+
+    #[test]
+    fn certificate_bundle_preserves_stored_pem_trailing_newline_for_fingerprint() {
+        const PRIVATE_KEY_B64: &str = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=";
+        const PUBLIC_KEY_B64: &str = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
+
+        let ca = temps_core::node_pki::generate_cluster_ca().expect("generate test CA");
+        let leaf = temps_core::node_pki::generate_node_keypair_csr(
+            "app.example.test",
+            &["app.example.test".to_string()],
+        )
+        .expect("generate test leaf CSR");
+        let signed = temps_core::node_pki::sign_node_csr(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &leaf.csr_pem,
+            &["app.example.test".to_string()],
+        )
+        .expect("sign test leaf certificate");
+        let certificate = format!("{}{}", signed.cert_pem, ca.cert_pem);
+        let payload = format!("{certificate}\n{}", leaf.key_pem);
+        let session = temps_core::ecies::EncryptionSession::new(PUBLIC_KEY_B64)
+            .expect("create encryption session");
+        let encrypted = session.encrypt(payload.as_bytes()).expect("encrypt bundle");
+        let bundle = PublicIngressCertBundle {
+            domain: "app.example.test".to_string(),
+            ciphertext: encrypted.ciphertext.clone(),
+            nonce: encrypted.nonce.clone(),
+            fingerprint: temps_core::ecies::cert_fingerprint(&certificate),
+        };
+
+        let certified_key = decrypt_certified_key(
+            PRIVATE_KEY_B64,
+            session.ephemeral_public_key(),
+            &bundle,
+            &encrypted,
+        );
+
+        assert!(
+            certified_key.is_ok(),
+            "leaf and CA chain must decrypt and parse"
+        );
+    }
+
+    #[test]
+    fn certificate_bundle_rejects_missing_payload_separator() {
+        const PRIVATE_KEY_B64: &str = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=";
+        const PUBLIC_KEY_B64: &str = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
+
+        let ca = temps_core::node_pki::generate_cluster_ca().expect("generate test CA");
+        let payload = format!("{}{}", ca.cert_pem.trim_end(), ca.key_pem);
+        let session = temps_core::ecies::EncryptionSession::new(PUBLIC_KEY_B64)
+            .expect("create encryption session");
+        let encrypted = session.encrypt(payload.as_bytes()).expect("encrypt bundle");
+        let bundle = PublicIngressCertBundle {
+            domain: "app.example.test".to_string(),
+            ciphertext: encrypted.ciphertext.clone(),
+            nonce: encrypted.nonce.clone(),
+            fingerprint: temps_core::ecies::cert_fingerprint(ca.cert_pem.trim_end()),
+        };
+
+        let error = decrypt_certified_key(
+            PRIVATE_KEY_B64,
+            session.ephemeral_public_key(),
+            &bundle,
+            &encrypted,
+        )
+        .expect_err("payload without framing separator must fail");
+
+        assert_eq!(error, "certificate payload separator is missing");
     }
 }

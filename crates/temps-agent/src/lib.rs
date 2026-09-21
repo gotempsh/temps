@@ -557,6 +557,9 @@ mod tests {
 
         let parsed: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.private_address, None);
+        assert_eq!(parsed.public_ingress_address, None);
+        assert_eq!(parsed.public_ingress_http_port, 80);
+        assert_eq!(parsed.public_ingress_https_port, 443);
     }
 
     #[test]
