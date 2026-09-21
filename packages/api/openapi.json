@@ -8447,6 +8447,153 @@
         ],
         "type": "object"
       },
+      "ComposeSecurityCheck": {
+        "enum": [
+          "extends",
+          "include",
+          "interpolation",
+          "inline_services",
+          "inline_sections",
+          "inline_fields",
+          "privileged",
+          "docker_socket",
+          "capabilities",
+          "drop_capabilities",
+          "security_options",
+          "no_new_privileges",
+          "devices",
+          "device_rules",
+          "gpu",
+          "sysctls",
+          "groups",
+          "cgroup_parent",
+          "runtime",
+          "lifecycle_hooks",
+          "provider",
+          "container_name",
+          "init",
+          "host_network",
+          "host_pid",
+          "host_ipc",
+          "host_uts",
+          "host_cgroup",
+          "host_user",
+          "container_namespace",
+          "network_mode",
+          "external_networks",
+          "network_names",
+          "network_drivers",
+          "network_options",
+          "network_ipam",
+          "external_links",
+          "published_ports",
+          "bind_mounts",
+          "volume_drivers",
+          "volume_network_filesystems",
+          "volume_host_paths",
+          "volume_options",
+          "external_volumes",
+          "volume_names",
+          "volumes_from",
+          "config_paths",
+          "secret_paths",
+          "external_configs",
+          "external_secrets",
+          "env_files",
+          "label_files",
+          "storage_options",
+          "oom_killer",
+          "service_shm",
+          "aggregate_shm",
+          "tmpfs",
+          "ulimits",
+          "pids",
+          "memory",
+          "logging",
+          "blkio",
+          "swap",
+          "replicas",
+          "remote_build",
+          "build_context",
+          "dockerfile",
+          "build_privileged",
+          "build_entitlements",
+          "build_network",
+          "build_ssh",
+          "build_shm",
+          "build_ulimits",
+          "build_additional_contexts",
+          "build_cache_from",
+          "build_cache_to",
+          "build_tags",
+          "image_references",
+          "build_image",
+          "pull_policy"
+        ],
+        "type": "string"
+      },
+      "ComposeSecurityCheckDefinition": {
+        "properties": {
+          "consequence": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/ComposeSecurityCheck"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group",
+          "label",
+          "consequence"
+        ],
+        "type": "object"
+      },
+      "ComposeSecurityPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "disabled_checks": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeSecurityCheck"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "type": "object"
+      },
+      "ComposeSecurityResponse": {
+        "properties": {
+          "can_edit": {
+            "type": "boolean"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeSecurityCheckDefinition"
+            },
+            "type": "array"
+          },
+          "legacy_migration_pending": {
+            "type": "boolean"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "checks",
+          "can_edit",
+          "legacy_migration_pending"
+        ],
+        "type": "object"
+      },
       "ComposeServiceFamily": {
         "description": "The specific well-known service family a compose service's image matches,\nwhen it matches one Temps can deploy as a managed `external_services` row\ninstead. Drives the \"deploy this as a Temps-managed service\" recommendation\nin `GitSettings.tsx` and the deploy-log message — kept separate from\n`ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)\nbecause that field only gates the unrelated \"may need elevated Linux\ncapabilities\" warning, and S3/MinIO images need this classification\nwithout tripping that warning.",
         "enum": [
@@ -50061,6 +50208,29 @@
         ],
         "type": "object"
       },
+      "UpdateComposeSecurityRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledge_legacy_migration": {
+            "type": "boolean"
+          },
+          "acknowledge_risks": {
+            "type": "boolean"
+          },
+          "expected_policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Policy read by the editor; compared while holding the project lock."
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "expected_policy"
+        ],
+        "type": "object"
+      },
       "UpdateConfigBody": {
         "properties": {
           "config": {
@@ -91553,6 +91723,96 @@
           }
         ],
         "summary": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.",
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/compose-security": {
+      "get": {
+        "operationId": "get_compose_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSecurityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "tags": [
+          "Projects"
+        ]
+      },
+      "put": {
+        "operationId": "update_compose_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateComposeSecurityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSecurityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid settings or missing acknowledgement"
+          },
+          "403": {
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "Policy changed; refresh before retrying"
+          }
+        },
         "tags": [
           "Projects"
         ]

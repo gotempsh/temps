@@ -919,6 +919,9 @@ import type {
   GetCmdData,
   GetCmdErrors,
   GetCmdResponses,
+  GetComposeSecurityData,
+  GetComposeSecurityErrors,
+  GetComposeSecurityResponses,
   GetContainerDetailData,
   GetContainerDetailErrors,
   GetContainerDetailResponses,
@@ -2750,6 +2753,9 @@ import type {
   UpdateCloudflareProviderData,
   UpdateCloudflareProviderErrors,
   UpdateCloudflareProviderResponses,
+  UpdateComposeSecurityData,
+  UpdateComposeSecurityErrors,
+  UpdateComposeSecurityResponses,
   UpdateConnectionTokenData,
   UpdateConnectionTokenErrors,
   UpdateConnectionTokenResponses,
@@ -14643,6 +14649,39 @@ export const setAlternateSources = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{id}/alternate-sources",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getComposeSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<GetComposeSecurityData, ThrowOnError>,
+): RequestResult<
+  GetComposeSecurityResponses,
+  GetComposeSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetComposeSecurityResponses,
+    GetComposeSecurityErrors,
+    ThrowOnError
+  >({ url: "/projects/{id}/compose-security", ...options });
+
+export const updateComposeSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateComposeSecurityData, ThrowOnError>,
+): RequestResult<
+  UpdateComposeSecurityResponses,
+  UpdateComposeSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateComposeSecurityResponses,
+    UpdateComposeSecurityErrors,
+    ThrowOnError
+  >({
+    url: "/projects/{id}/compose-security",
     ...options,
     headers: {
       "Content-Type": "application/json",
