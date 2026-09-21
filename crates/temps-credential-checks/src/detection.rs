@@ -117,6 +117,19 @@ impl CredentialDetector for CatalogDetector {
             let Some(secret) = captures.get(group) else {
                 continue;
             };
+            // Never let a name or a token embedded in another secret authorize
+            // automatic transmission of the whole environment-variable value.
+            if matches!(
+                entry.rule.id.as_str(),
+                "github-pat"
+                    | "github-fine-grained-pat"
+                    | "github-oauth"
+                    | "openai-api-key"
+                    | "anthropic-api-key"
+            ) && (secret.as_bytes() != value.as_bytes() || secret.start() != name.len() + 2)
+            {
+                continue;
+            }
             if entropy(std::str::from_utf8(secret.as_bytes()).unwrap_or("")) < entry.rule.entropy {
                 continue;
             }
@@ -176,6 +189,21 @@ fn entropy(input: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_candidates_must_match_the_entire_value_not_the_name() {
+        let detector = CatalogDetector::bundled().unwrap();
+        let token = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123456789");
+        for (name, value) in [
+            (token.as_str(), "unrelated-secret".to_string()),
+            ("GITHUB_TOKEN", format!("other-secret;{token}")),
+            ("GITHUB_TOKEN", format!("{token};other-secret")),
+        ] {
+            assert!(crate::automatic_preset(&detector.detect(name, &value), &value).is_none());
+        }
+        assert!(
+            crate::automatic_preset(&detector.detect("GITHUB_TOKEN", &token), &token).is_some()
+        );
+    }
     #[test]
     fn compiles_entire_catalog_and_finds_named_credentials() {
         let detector = CatalogDetector::bundled().unwrap_or_else(|e| panic!("{e}"));
