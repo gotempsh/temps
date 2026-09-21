@@ -32,6 +32,26 @@ async fn verify_container_exec_access(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // ADR 045, before the caller-supplied container id touches any Docker
+    // daemon: a running container of a project this control plane declares
+    // already has `/var/run/docker.sock` bound, so a shell inside it can drive
+    // the engine. That is the same host root a malicious deployment would have
+    // obtained, reached without deploying anything, so `ContainersExec` on its
+    // own is not sufficient here.
+    //
+    // This helper — not the two handlers that call it — is the enforcement
+    // point: `exec_command` and `container_terminal` both funnel through it,
+    // and unlike the deploy path there is no builder or planner downstream to
+    // catch an omission.
+    super::docker_socket::guard_exec(
+        &state
+            .deployment_service
+            .project_slug(project_id)
+            .await
+            .map_err(Problem::from)?,
+        auth,
+    )?;
+
     // Verify the container belongs to this project/environment before using
     // the caller-supplied Docker ID against any Docker daemon.
     let (container_record, _env) = state

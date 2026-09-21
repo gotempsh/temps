@@ -22,8 +22,8 @@
 use axum::http::StatusCode;
 use temps_auth::AuthContext;
 use temps_core::docker_socket_grant::{
-    deploy_requires_instance_admin, granted_project_deploy_reason, process_grant, DeployCaller,
-    DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV,
+    deploy_requires_instance_admin, granted_project_deploy_reason, granted_project_exec_reason,
+    process_grant, DeployCaller, DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV,
 };
 use temps_core::problemdetails::{self, Problem};
 use tracing::warn;
@@ -71,6 +71,49 @@ fn guard_deploy_against(
     Err(problemdetails::new(StatusCode::FORBIDDEN)
         .with_title("Host Docker Access Deployment Requires An Admin")
         .with_detail(granted_project_deploy_reason(project_slug)))
+}
+
+/// Refuse a shell inside a granted project's container unless the caller is an
+/// instance admin.
+///
+/// A running granted container already has `/var/run/docker.sock` bound, so a
+/// shell in it can drive the engine: the same host root a malicious deploy
+/// would have obtained, reached without deploying anything. `ContainersExec`
+/// on its own is therefore not sufficient for a declared project.
+///
+/// Unlike [`guard_deploy`] this **is** the enforcement point — there is no
+/// builder or planner downstream to catch an omission — so it lives in the one
+/// helper both exec routes already funnel through
+/// (`container_exec::verify_container_exec_access`), not in each handler.
+pub(crate) fn guard_exec(project_slug: &str, auth: &AuthContext) -> Result<(), Problem> {
+    guard_exec_against(process_grant(), project_slug, auth)
+}
+
+/// [`guard_exec`] with the grant injected, for the same reason as
+/// [`guard_deploy_against`].
+///
+/// Reuses `deploy_requires_instance_admin` deliberately: entering a container
+/// that already holds the socket and deploying one that will are the same
+/// privilege, so they must never be able to disagree about who may do it.
+/// `DeployCaller::Platform` cannot occur here — an exec always has a request
+/// behind it — so the shared predicate does not widen this check.
+fn guard_exec_against(
+    grant: &DockerSocketGrant,
+    project_slug: &str,
+    auth: &AuthContext,
+) -> Result<(), Problem> {
+    if !deploy_requires_instance_admin(grant, project_slug, deploy_caller(auth)) {
+        return Ok(());
+    }
+    warn!(
+        slug = %project_slug,
+        user_id = auth.user_id(),
+        env = DOCKER_SOCKET_PROJECTS_ENV,
+        "Refused a non-admin exec into a project that holds host Docker access (ADR 045)"
+    );
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Host Docker Access Exec Requires An Admin")
+        .with_detail(granted_project_exec_reason(project_slug)))
 }
 
 #[cfg(test)]
@@ -161,5 +204,60 @@ mod tests {
         assert!(detail.contains("ADR 045"), "{detail}");
         assert!(detail.contains(DOCKER_SOCKET_PROJECTS_ENV), "{detail}");
         assert!(detail.contains("node-daemon"), "{detail}");
+    }
+
+    /// A running granted container already has the socket bound, so a shell in
+    /// it reaches the same host root a malicious deploy would have — without
+    /// deploying anything. `ContainersExec` alone must not be enough.
+    #[test]
+    fn exec_into_a_declared_project_is_admin_only() {
+        let problem = guard_exec_against(&granted(), "node-daemon", &auth(Role::User))
+            .expect_err("a non-admin must not get a shell in a host-root container");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        for role in [Role::Admin, Role::PlatformAdmin] {
+            assert!(
+                guard_exec_against(&granted(), "node-daemon", &auth(role.clone())).is_ok(),
+                "{role:?} is an instance admin and may exec into a granted project"
+            );
+        }
+        for grant in [granted(), DockerSocketGrant::default()] {
+            for role in [Role::User, Role::Admin] {
+                assert!(
+                    guard_exec_against(&grant, "my-app", &auth(role.clone())).is_ok(),
+                    "{role:?} exec'ing into an undeclared project must be untouched by ADR 045"
+                );
+            }
+        }
+    }
+
+    /// The two refusals must not read alike. Nothing is being deployed here,
+    /// so "ask an admin to deploy it" would be the wrong instruction — and the
+    /// operator reading it has nobody to ask what it meant.
+    #[test]
+    fn the_exec_refusal_explains_something_different_from_the_deploy_refusal() {
+        let detail = |problem: Problem| {
+            problem
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let exec = guard_exec_against(&granted(), "node-daemon", &auth(Role::User))
+            .expect_err("expected an exec refusal");
+        let deploy = guard_deploy_against(&granted(), "node-daemon", &auth(Role::User))
+            .expect_err("expected a deploy refusal");
+        assert_ne!(exec.body.get("title"), deploy.body.get("title"));
+        let exec_detail = detail(exec);
+        assert_ne!(exec_detail, detail(deploy));
+        assert!(exec_detail.contains("ADR 045"), "{exec_detail}");
+        assert!(
+            exec_detail.contains(DOCKER_SOCKET_PROJECTS_ENV),
+            "{exec_detail}"
+        );
+        assert!(
+            exec_detail.contains("Ask an admin to run the command"),
+            "{exec_detail}"
+        );
     }
 }

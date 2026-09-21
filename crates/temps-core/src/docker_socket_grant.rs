@@ -276,6 +276,24 @@ pub fn granted_project_deploy_reason(slug: &str) -> String {
     )
 }
 
+/// The sentence shown to whoever tried to exec into a granted project's
+/// container without instance-admin authority.
+///
+/// Separate from [`granted_project_deploy_reason`] because the remedy differs:
+/// nothing is being deployed, and telling the operator to "ask an admin to
+/// deploy it" would be the wrong instruction entirely.
+pub fn granted_project_exec_reason(slug: &str) -> String {
+    format!(
+        "Project '{slug}' is declared in {DOCKER_SOCKET_PROJECTS_ENV} on this control plane \
+         (ADR 045), so its running containers already have `/var/run/docker.sock` bound. A shell \
+         inside one of them can talk to the engine and is therefore equivalent to host root on \
+         the machine running it, which is why exec is restricted to instance admins here even \
+         though the container permission would otherwise allow it. Ask an admin to run the \
+         command, or remove the slug from {DOCKER_SOCKET_PROJECTS_ENV} and restart the control \
+         plane if it should no longer hold host Docker access."
+    )
+}
+
 /// The sentence shown to whoever tried to change a project setting that
 /// decides what a granted project *runs*, without instance-admin authority.
 ///

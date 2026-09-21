@@ -4879,6 +4879,23 @@ impl DeploymentService {
         Ok(container)
     }
 
+    /// The routing/identity slug of a project.
+    ///
+    /// Exists because the ADR-045 guards answer from the slug, not the id —
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS` names slugs — and handlers must not
+    /// query `projects` themselves. One indexed primary-key lookup, on
+    /// human-initiated paths only (exec, terminal); it is deliberately not
+    /// used anywhere per-request.
+    pub async fn project_slug(&self, project_id: i32) -> Result<String, DeploymentError> {
+        projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(projects::Column::Slug)
+            .into_tuple::<String>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("Project {project_id} not found")))
+    }
+
     /// Check whether container exec/terminal access is enabled for an
     /// environment after applying project-level defaults and environment-level
     /// overrides.
