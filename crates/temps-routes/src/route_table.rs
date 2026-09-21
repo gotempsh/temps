@@ -2184,6 +2184,48 @@ impl CachedPeerTable {
             .map(|(h, r)| (h.clone(), r.clone()))
             .collect()
     }
+
+    /// Snapshot public container routes which can be served without bypassing
+    /// control-plane request policy. Routes requiring redirect, wake-up,
+    /// attack-mode, or per-project security processing stay on the control
+    /// plane until those policies have a worker-side representation.
+    pub fn snapshot_worker_public_routes(&self) -> Vec<(String, RouteInfo)> {
+        let routes = self.routes.read();
+        routes
+            .iter()
+            .filter(|(host, route)| {
+                !host.ends_with(".temps.local")
+                    && route.redirect_to.is_none()
+                    && matches!(route.backend, BackendType::Upstream { .. })
+                    && route.environment.as_ref().is_some_and(|environment| {
+                        !environment.sleeping
+                            && environment.attack_mode != Some(true)
+                            && environment
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|config| config.security.as_ref())
+                                .is_none()
+                    })
+                    && route.project.as_ref().is_some_and(|project| {
+                        !project.attack_mode
+                            && project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|config| config.security.as_ref())
+                                .is_none()
+                    })
+            })
+            .map(|(host, route)| (host.clone(), route.clone()))
+            .collect()
+    }
+
+    pub fn worker_public_route_count(&self) -> usize {
+        self.routes
+            .read()
+            .keys()
+            .filter(|host| !host.ends_with(".temps.local"))
+            .count()
+    }
 }
 
 #[temps_core::async_trait::async_trait]

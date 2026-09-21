@@ -12,11 +12,10 @@
 //!
 //! ## Atomic snapshots
 //!
-//! Replace-the-whole-map semantics. Each apply allocates a new
-//! `HashMap`, populates it, then swaps it into the `Arc<RwLock<…>>`.
-//! Lookups take a tiny read lock and clone the matched entry; they
-//! never block writers in practice (apply happens once per CP
-//! generation bump, lookups happen per request).
+//! Replace-the-whole-map semantics. Internal routes retain a brief read lock;
+//! public ingress routes and prepared TLS keys use immutable `ArcSwap` maps so
+//! request and handshake lookups never lock or observe a partially built map.
+//! Applies build each replacement off-path and publish it atomically.
 //!
 //! ## Disk snapshot
 //!
@@ -28,10 +27,15 @@
 //! round finishes.
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -57,6 +61,32 @@ pub struct RouteEntry {
     pub environment_id: Option<i32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PublicIngressSnapshot {
+    pub enabled: bool,
+    pub routes: Vec<RouteEntry>,
+    #[serde(default)]
+    pub certificates: Option<PublicIngressCertificates>,
+    #[serde(default)]
+    pub unsupported_route_count: usize,
+    #[serde(default)]
+    pub unsupported_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicIngressCertificates {
+    pub ephemeral_public_key: String,
+    pub bundles: Vec<PublicIngressCertBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicIngressCertBundle {
+    pub domain: String,
+    pub ciphertext: String,
+    pub nonce: String,
+    pub fingerprint: String,
+}
+
 /// On-disk snapshot. Versioned via the wrapping struct so a future
 /// schema change (e.g. adding affinity hints) can use `serde`'s
 /// `default` rather than a breaking parse failure.
@@ -64,12 +94,23 @@ pub struct RouteEntry {
 struct DiskSnapshot {
     pub generation: u64,
     pub routes: Vec<RouteEntry>,
+    #[serde(default)]
+    pub public_ingress: PublicIngressSnapshot,
+    #[serde(default)]
+    pub public_ingress_expires_at: i64,
 }
 
 pub struct RouteStore {
     inner: RwLock<HashMap<String, RouteEntry>>,
     container_projects: RwLock<HashMap<String, HashSet<i32>>>,
     generation: RwLock<u64>,
+    public_ingress: RwLock<PublicIngressSnapshot>,
+    public_enabled: AtomicBool,
+    public_routes: ArcSwap<HashMap<String, RouteEntry>>,
+    public_certificates: RwLock<Option<(String, HashMap<String, PublicIngressCertBundle>)>>,
+    public_tls_private_key: RwLock<Option<String>>,
+    public_tls_keys: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
+    public_ingress_expires_at: AtomicI64,
     snapshot_path: PathBuf,
 }
 
@@ -79,6 +120,13 @@ impl RouteStore {
             inner: RwLock::new(HashMap::new()),
             container_projects: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
+            public_ingress: RwLock::new(PublicIngressSnapshot::default()),
+            public_enabled: AtomicBool::new(false),
+            public_routes: ArcSwap::from_pointee(HashMap::new()),
+            public_certificates: RwLock::new(None),
+            public_tls_private_key: RwLock::new(None),
+            public_tls_keys: ArcSwap::from_pointee(HashMap::new()),
+            public_ingress_expires_at: AtomicI64::new(0),
             snapshot_path,
         }
     }
@@ -98,7 +146,12 @@ impl RouteStore {
         // Best-effort disk persistence. We tolerate any error here —
         // the in-memory store is already updated and the proxy serves
         // from there.
-        let snap = DiskSnapshot { generation, routes };
+        let snap = DiskSnapshot {
+            generation,
+            routes,
+            public_ingress: self.public_ingress.read().clone(),
+            public_ingress_expires_at: self.public_ingress_expires_at.load(Ordering::Acquire),
+        };
         if let Err(e) = self.persist(&snap) {
             warn!(
                 error = %e,
@@ -113,6 +166,102 @@ impl RouteStore {
             "applied route snapshot"
         );
         generation
+    }
+
+    /// Apply the authenticated public-ingress portion of the control-plane
+    /// snapshot. The encrypted certificate bundles are safe to cache on disk;
+    /// decrypted private keys are never stored here.
+    pub fn apply_public_snapshot(&self, snapshot: PublicIngressSnapshot) {
+        if !snapshot.enabled {
+            self.public_enabled.store(false, Ordering::Release);
+        }
+        self.rebuild_public_indexes(&snapshot);
+        self.rebuild_public_tls_keys(&snapshot);
+        self.public_enabled
+            .store(snapshot.enabled, Ordering::Release);
+        *self.public_ingress.write() = snapshot;
+        self.public_ingress_expires_at.store(
+            chrono::Utc::now().timestamp().saturating_add(300),
+            Ordering::Release,
+        );
+        self.persist_current();
+    }
+
+    pub fn public_ingress_snapshot(&self) -> PublicIngressSnapshot {
+        let mut snapshot = self.public_ingress.read().clone();
+        if !self.public_ingress_authorized() {
+            snapshot.enabled = false;
+        }
+        snapshot
+    }
+
+    pub(crate) fn public_ingress_runtime_status(&self) -> (bool, bool, usize) {
+        (
+            self.public_enabled.load(Ordering::Acquire),
+            self.public_ingress_authorized(),
+            self.public_tls_keys.load().len(),
+        )
+    }
+
+    pub fn lookup_public(&self, host: &str) -> Option<RouteEntry> {
+        if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
+            return None;
+        }
+        self.public_routes
+            .load()
+            .get(&host.to_ascii_lowercase())
+            .cloned()
+    }
+
+    pub fn lookup_public_certificate(
+        &self,
+        host: &str,
+    ) -> Option<(String, PublicIngressCertBundle)> {
+        if !self.public_ingress_authorized() || !self.public_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let certificates = self.public_certificates.read();
+        let (ephemeral_key, bundles) = certificates.as_ref()?;
+        let bundle = bundles.get(&host).or_else(|| {
+            host.find('.')
+                .and_then(|dot| bundles.get(&format!("*.{}", &host[dot + 1..])))
+        })?;
+        Some((ephemeral_key.clone(), bundle.clone()))
+    }
+
+    /// Install the enrollment key used to decrypt certificate bundles and
+    /// eagerly prepare the current snapshot. TLS handshakes only clone an
+    /// already validated signing key and never decrypt or parse PEM data.
+    pub fn configure_public_tls(&self, private_key_b64: String) {
+        *self.public_tls_private_key.write() = Some(private_key_b64);
+        self.rebuild_public_tls_keys(&self.public_ingress.read());
+    }
+
+    pub fn lookup_public_tls_key(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        if !self.public_ingress_authorized() || !self.public_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let keys = self.public_tls_keys.load();
+        keys.get(&host)
+            .or_else(|| {
+                host.find('.')
+                    .and_then(|dot| keys.get(&format!("*.{}", &host[dot + 1..])))
+            })
+            .cloned()
+    }
+
+    fn persist_current(&self) {
+        let snapshot = DiskSnapshot {
+            generation: *self.generation.read(),
+            routes: self.inner.read().values().cloned().collect(),
+            public_ingress: self.public_ingress.read().clone(),
+            public_ingress_expires_at: self.public_ingress_expires_at.load(Ordering::Acquire),
+        };
+        if let Err(error) = self.persist(&snapshot) {
+            warn!(error = %error, path = %self.snapshot_path.display(), "failed to persist route snapshot");
+        }
     }
 
     /// Look up a host. Returns the cloned entry on hit. Case-insensitive.
@@ -179,6 +328,25 @@ impl RouteStore {
         *self.inner.write() = map;
         *self.container_projects.write() = container_projects;
         *self.generation.write() = snap.generation;
+        let now = chrono::Utc::now().timestamp();
+        let valid_expiry = snap.public_ingress_expires_at > now
+            && snap.public_ingress_expires_at <= now.saturating_add(300);
+        *self.public_ingress.write() = PublicIngressSnapshot {
+            enabled: snap.public_ingress.enabled && valid_expiry,
+            ..snap.public_ingress
+        };
+        self.public_enabled
+            .store(self.public_ingress.read().enabled, Ordering::Release);
+        self.rebuild_public_indexes(&self.public_ingress.read());
+        self.rebuild_public_tls_keys(&self.public_ingress.read());
+        self.public_ingress_expires_at.store(
+            if valid_expiry {
+                snap.public_ingress_expires_at
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
         debug!(
             generation = snap.generation,
             entries = self.inner.read().len(),
@@ -197,10 +365,167 @@ impl RouteStore {
         let tmp = self.snapshot_path.with_extension("json.tmp");
         let json = serde_json::to_string(snap)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &self.snapshot_path)?;
         Ok(())
     }
+
+    fn public_ingress_authorized(&self) -> bool {
+        let expiry = self.public_ingress_expires_at.load(Ordering::Acquire);
+        expiry > 0 && chrono::Utc::now().timestamp() <= expiry
+    }
+
+    fn rebuild_public_indexes(&self, snapshot: &PublicIngressSnapshot) {
+        self.public_routes.store(Arc::new(
+            snapshot
+                .routes
+                .iter()
+                .map(|route| {
+                    (
+                        route.host.trim_end_matches('.').to_ascii_lowercase(),
+                        route.clone(),
+                    )
+                })
+                .collect(),
+        ));
+        *self.public_certificates.write() = snapshot.certificates.as_ref().map(|certificates| {
+            (
+                certificates.ephemeral_public_key.clone(),
+                certificates
+                    .bundles
+                    .iter()
+                    .map(|bundle| {
+                        (
+                            bundle.domain.trim_end_matches('.').to_ascii_lowercase(),
+                            bundle.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        });
+    }
+
+    fn rebuild_public_tls_keys(&self, snapshot: &PublicIngressSnapshot) {
+        let Some(private_key_b64) = self.public_tls_private_key.read().clone() else {
+            self.public_tls_keys.store(Arc::new(HashMap::new()));
+            return;
+        };
+        let Some(certificates) = snapshot.certificates.as_ref() else {
+            self.public_tls_keys.store(Arc::new(HashMap::new()));
+            return;
+        };
+        let mut prepared = HashMap::with_capacity(certificates.bundles.len());
+        for bundle in &certificates.bundles {
+            let encrypted = temps_core::ecies::EncryptedBundle {
+                ciphertext: bundle.ciphertext.clone(),
+                nonce: bundle.nonce.clone(),
+            };
+            let key = decrypt_certified_key(
+                &private_key_b64,
+                &certificates.ephemeral_public_key,
+                bundle,
+                &encrypted,
+            );
+            match key {
+                Ok(key) => {
+                    prepared.insert(
+                        bundle.domain.trim_end_matches('.').to_ascii_lowercase(),
+                        Arc::new(key),
+                    );
+                }
+                Err(error) => {
+                    warn!(domain = %bundle.domain, %error, "rejected public ingress certificate bundle")
+                }
+            }
+        }
+        self.public_tls_keys.store(Arc::new(prepared));
+    }
+}
+
+fn decrypt_certified_key(
+    private_key_b64: &str,
+    ephemeral_public_key: &str,
+    bundle: &PublicIngressCertBundle,
+    encrypted: &temps_core::ecies::EncryptedBundle,
+) -> Result<CertifiedKey, String> {
+    let plaintext =
+        temps_core::ecies::decrypt_bundle(private_key_b64, ephemeral_public_key, encrypted)
+            .map_err(|error| error.to_string())?;
+    let payload = std::str::from_utf8(&plaintext).map_err(|error| error.to_string())?;
+    let key_marker = payload
+        .find("-----BEGIN ")
+        .and_then(|first| {
+            payload[first + 11..]
+                .find("-----BEGIN ")
+                .map(|second| first + 11 + second)
+        })
+        .ok_or_else(|| "certificate payload contains no private key".to_string())?;
+    let certificate_pem = payload[..key_marker].trim();
+    if temps_core::ecies::cert_fingerprint(certificate_pem) != bundle.fingerprint {
+        return Err("certificate fingerprint does not match snapshot".to_string());
+    }
+    let (certificates, private_key) = parse_public_certificate_pem(&plaintext)?;
+    if !certificate_covers_domain(
+        certificates
+            .first()
+            .ok_or_else(|| "certificate chain is empty".to_string())?,
+        &bundle.domain,
+    ) {
+        return Err("certificate SAN does not cover snapshot domain".to_string());
+    }
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
+        .map_err(|error| error.to_string())?;
+    let certified = CertifiedKey::new(certificates, signing_key);
+    certified.keys_match().map_err(|error| error.to_string())?;
+    Ok(certified)
+}
+
+fn parse_public_certificate_pem(
+    payload: &[u8],
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let mut reader = BufReader::new(payload);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(payload);
+    let private_key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "certificate payload contains no private key".to_string())?;
+    if certificates.is_empty() {
+        return Err("certificate payload contains no certificate".to_string());
+    }
+    Ok((certificates, private_key))
+}
+
+fn certificate_covers_domain(certificate: &CertificateDer<'_>, expected: &str) -> bool {
+    use x509_parser::extensions::GeneralName;
+    let Ok((_, parsed)) = x509_parser::parse_x509_certificate(certificate.as_ref()) else {
+        return false;
+    };
+    let Ok(Some(san)) = parsed.subject_alternative_name() else {
+        return false;
+    };
+    san.value.general_names.len() == 1
+        && san.value.general_names.iter().all(|name| match name {
+            GeneralName::DNSName(name) => {
+                !name.starts_with("*.") && name.eq_ignore_ascii_case(expected)
+            }
+            _ => false,
+        })
 }
 
 fn container_project_index(routes: &[RouteEntry]) -> HashMap<String, HashSet<i32>> {
@@ -293,5 +618,30 @@ mod tests {
         store.load_from_disk();
         assert_eq!(store.current_generation(), 0);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn public_indexes_normalize_hosts_and_reject_unprepared_certificates() {
+        let dir = TempDir::new().unwrap();
+        let store = RouteStore::new(dir.path().join("routes.json"));
+        store.configure_public_tls("invalid enrollment key".to_string());
+        store.apply_public_snapshot(PublicIngressSnapshot {
+            enabled: true,
+            routes: vec![entry("Example.COM.", "10.0.0.1:80")],
+            certificates: Some(PublicIngressCertificates {
+                ephemeral_public_key: "invalid ephemeral key".to_string(),
+                bundles: vec![PublicIngressCertBundle {
+                    domain: "EXAMPLE.COM.".to_string(),
+                    ciphertext: "invalid ciphertext".to_string(),
+                    nonce: "invalid nonce".to_string(),
+                    fingerprint: "invalid fingerprint".to_string(),
+                }],
+            }),
+            unsupported_route_count: 0,
+            unsupported_reasons: Vec::new(),
+        });
+
+        assert!(store.lookup_public("example.com").is_some());
+        assert!(store.lookup_public_tls_key("example.com").is_none());
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Internal edge proxy bound to the worker's overlay bridge gateway.
+//! Worker HTTP proxy shared by private overlay and opt-in public ingress.
 //!
 //! Containers on this worker resolve `<env>.<project>.temps.local` to
 //! the bridge gateway IP via the per-node Hickory resolver. They open a
@@ -41,9 +41,10 @@
 //!
 //! ## Listen scope
 //!
-//! Always binds to `<bridge_ip>:80`. Never `0.0.0.0`. Never published
-//! via Docker. The only callers are processes inside the overlay
-//! network, which is precisely the trust boundary we want.
+//! The private listener binds only to `<bridge_ip>:80`. Public ingress reuses
+//! the routing and streaming code through [`public_router`], but its caller
+//! identity, host/SNI checks, connection limits, ACME budget, and forwarding
+//! metadata come from the explicitly configured public listeners.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -55,13 +56,36 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::route_store::{RouteEntry, SharedRouteStore};
+
+#[derive(Clone, Debug)]
+pub(crate) struct PublicTlsSni(pub String);
+
+#[derive(Clone)]
+pub(crate) struct PublicAcmeConfig {
+    pub control_plane_url: String,
+    pub node_id: i32,
+    pub node_token: String,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PublicPeer(pub SocketAddr);
+
+#[derive(Clone)]
+pub(crate) struct PublicConnectionPermit(pub Arc<tokio::sync::OwnedSemaphorePermit>);
+
+const PUBLIC_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const PUBLIC_TUNNEL_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const ACME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const ACME_CACHE_CAPACITY: usize = 256;
+const ACME_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+const ACME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
 
 /// Hop-by-hop headers per RFC 7230 §6.1. Lowercased so comparison is
 /// trivial (axum normalises, but be explicit).
@@ -75,12 +99,19 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
     "host",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "x-temps-deployment-id",
 ];
 
 /// Per-attempt upstream timeout. Internal-zone calls are between
 /// containers on the same overlay; if 30s isn't enough something is
 /// already wrong elsewhere.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLIC_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum upstream retry attempts (across distinct backends) on
 /// connect failure before returning 502.
@@ -135,10 +166,43 @@ impl InspectionQuota {
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
-    docker: bollard::Docker,
+    docker: Option<bollard::Docker>,
     inspection_quotas: Arc<RwLock<HashMap<i32, Arc<InspectionQuota>>>>,
     inspection_concurrency: Arc<Semaphore>,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
+    public_mode: bool,
+    forwarded_proto: &'static str,
+    acme: Option<PublicAcmeConfig>,
+    acme_relay: Arc<AcmeRelayState>,
+}
+
+struct AcmeCacheEntry {
+    value: Option<String>,
+    expires_at: Instant,
+}
+
+struct AcmeRateBudget {
+    tokens: f64,
+    updated_at: Instant,
+    cache: HashMap<String, AcmeCacheEntry>,
+}
+
+struct AcmeRelayState {
+    budget: Mutex<AcmeRateBudget>,
+    concurrency: Semaphore,
+}
+
+impl AcmeRelayState {
+    fn new() -> Self {
+        Self {
+            budget: Mutex::new(AcmeRateBudget {
+                tokens: 4.0,
+                updated_at: Instant::now(),
+                cache: HashMap::new(),
+            }),
+            concurrency: Semaphore::new(2),
+        }
+    }
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -175,10 +239,14 @@ pub async fn spawn(
     let state = Arc::new(ProxyState {
         client,
         store,
-        docker: docker.clone(),
+        docker: Some(docker.clone()),
         inspection_quotas: Arc::clone(&inspection_quotas),
         inspection_concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_GLOBAL_CONCURRENCY)),
         caller_identities: Arc::clone(&caller_identities),
+        public_mode: false,
+        forwarded_proto: "http",
+        acme: None,
+        acme_relay: Arc::new(AcmeRelayState::new()),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
@@ -272,6 +340,37 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
+    if state.public_mode {
+        if state.forwarded_proto == "https"
+            && req
+                .extensions()
+                .get::<PublicTlsSni>()
+                .map(|sni| sni.0.as_str())
+                != Some(host.as_str())
+        {
+            return error_body(
+                StatusCode::MISDIRECTED_REQUEST,
+                "TLS server name does not match Host",
+            );
+        }
+        if state.forwarded_proto == "http"
+            && req.uri().path().starts_with("/.well-known/acme-challenge/")
+        {
+            return proxy_acme_challenge(&state, &host, req).await;
+        }
+        let entry = match state.store.lookup_public(&host) {
+            Some(entry) => entry,
+            None => return error_body(StatusCode::NOT_FOUND, "no public route for this host"),
+        };
+        if entry.backends.is_empty() {
+            return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
+        }
+        if is_upgrade_request(req.headers()) {
+            return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+        }
+        return proxy_with_retries(&state, &entry, req).await;
+    }
+
     // Reject non-temps.local up front. The proxy is not a generic
     // forwarder; matching only our internal zone makes accidental
     // misconfiguration (e.g. someone CNAME'd a public name to our
@@ -315,10 +414,195 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     // RFC 7230 Upgrade target (HTTP/2 prior knowledge isn't supported
     // here — internal traffic is plain HTTP/1.1).
     if is_upgrade_request(req.headers()) {
-        return proxy_upgrade(&entry, req).await;
+        return proxy_upgrade(&entry, req, state.forwarded_proto).await;
     }
 
     proxy_with_retries(&state, &entry, req).await
+}
+
+/// Bind the public HTTP listener, accepting port zero for integration tests.
+/// Only exact hosts present in the authenticated public snapshot are served.
+pub async fn spawn_public_http(
+    address: SocketAddr,
+    store: SharedRouteStore,
+    shutdown: Arc<Notify>,
+) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(address).await?;
+    let bound = listener.local_addr()?;
+    let app = public_router(store, "http", None)?;
+    tokio::spawn(async move {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown.notified().await;
+        });
+        if let Err(error) = server.await {
+            error!(%error, "public worker HTTP ingress exited");
+        }
+    });
+    Ok(bound)
+}
+
+pub(crate) fn public_router(
+    store: SharedRouteStore,
+    forwarded_proto: &'static str,
+    acme: Option<PublicAcmeConfig>,
+) -> std::io::Result<axum::Router> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_TIMEOUT)
+        // Reqwest applies this between successful reads, rather than to the
+        // whole response. Active uploads, SSE responses, and streamed bodies
+        // may therefore live indefinitely while stalled upstreams are bounded.
+        .read_timeout(PUBLIC_UPSTREAM_IDLE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let state = Arc::new(ProxyState {
+        client,
+        store,
+        docker: None,
+        inspection_quotas: Arc::new(RwLock::new(HashMap::new())),
+        inspection_concurrency: Arc::new(Semaphore::new(1)),
+        caller_identities: Arc::new(RwLock::new(CallerIdentitySnapshot::new(HashMap::new()))),
+        public_mode: true,
+        forwarded_proto,
+        acme,
+        acme_relay: Arc::new(AcmeRelayState::new()),
+    });
+    Ok(axum::Router::new().fallback(handle).with_state(state))
+}
+
+async fn proxy_acme_challenge(state: &ProxyState, host: &str, req: Request) -> Response {
+    if !matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) || {
+        let (enabled, authorized, _) = state.store.public_ingress_runtime_status();
+        !enabled || !authorized
+    } {
+        return error_body(StatusCode::NOT_FOUND, "ACME challenge not available");
+    }
+    let token = req
+        .uri()
+        .path()
+        .trim_start_matches("/.well-known/acme-challenge/");
+    if token.is_empty()
+        || token.len() > 512
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return error_body(StatusCode::BAD_REQUEST, "invalid ACME challenge token");
+    }
+    let Some(acme) = state.acme.as_ref() else {
+        return error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ACME challenge origin unavailable",
+        );
+    };
+    let cache_key = format!("{host}\0{token}");
+    {
+        let mut budget = state.acme_relay.budget.lock();
+        let now = Instant::now();
+        budget.cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = budget.cache.get(&cache_key) {
+            return match &entry.value {
+                Some(value) => Response::new(Body::from(value.clone())),
+                None => error_body(StatusCode::NOT_FOUND, "ACME challenge not available"),
+            };
+        }
+        let elapsed = now.duration_since(budget.updated_at).as_secs_f64();
+        budget.tokens = (budget.tokens + elapsed * 2.0).min(4.0);
+        budget.updated_at = now;
+        if budget.tokens < 1.0 {
+            return acme_rate_limited();
+        }
+        budget.tokens -= 1.0;
+    }
+    let Ok(_lookup_permit) = state.acme_relay.concurrency.try_acquire() else {
+        return acme_rate_limited();
+    };
+    let url = format!(
+        "{}/api/internal/nodes/{}/acme-challenge",
+        acme.control_plane_url.trim_end_matches('/'),
+        acme.node_id,
+    );
+    let lookup = async {
+        let upstream = state
+            .client
+            .get(url)
+            .bearer_auth(&acme.node_token)
+            .query(&[("host", host), ("token", token)])
+            .send()
+            .await
+            .map_err(|_| ())?;
+        let status = upstream.status();
+        let mut stream = upstream.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ())?;
+            if body.len().saturating_add(chunk.len()) > 16 * 1024 {
+                return Err(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<_, ()>((status, body))
+    };
+    let Ok(Ok((upstream_status, body))) = tokio::time::timeout(ACME_LOOKUP_TIMEOUT, lookup).await
+    else {
+        return error_body(StatusCode::BAD_GATEWAY, "ACME challenge origin unavailable");
+    };
+    if upstream_status != reqwest::StatusCode::OK {
+        cache_acme_result(state, cache_key, None, ACME_NEGATIVE_CACHE_TTL);
+        return error_body(StatusCode::NOT_FOUND, "ACME challenge not available");
+    }
+    #[derive(serde::Deserialize)]
+    struct ChallengeResponse {
+        key_authorization: String,
+    }
+    match serde_json::from_slice::<ChallengeResponse>(&body) {
+        Ok(challenge) if challenge.key_authorization.len() <= 4096 => {
+            cache_acme_result(
+                state,
+                cache_key,
+                Some(challenge.key_authorization.clone()),
+                ACME_POSITIVE_CACHE_TTL,
+            );
+            Response::new(Body::from(challenge.key_authorization))
+        }
+        _ => error_body(StatusCode::BAD_GATEWAY, "ACME challenge origin unavailable"),
+    }
+}
+
+fn acme_rate_limited() -> Response {
+    let mut response = error_body(StatusCode::TOO_MANY_REQUESTS, "ACME lookup rate limited");
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
+    response
+}
+
+fn cache_acme_result(state: &ProxyState, key: String, value: Option<String>, ttl: Duration) {
+    let mut budget = state.acme_relay.budget.lock();
+    if budget.cache.len() >= ACME_CACHE_CAPACITY {
+        if let Some(oldest) = budget
+            .cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone())
+        {
+            budget.cache.remove(&oldest);
+        }
+    }
+    budget.cache.insert(
+        key,
+        AcmeCacheEntry {
+            value,
+            expires_at: Instant::now() + ttl,
+        },
+    );
 }
 
 async fn caller_may_access_route(
@@ -383,11 +667,12 @@ async fn source_container_is_current(
         return false;
     };
 
+    let Some(docker) = state.docker.as_ref() else {
+        return false;
+    };
     let inspected = tokio::time::timeout(
         IDENTITY_INSPECTION_TIMEOUT,
-        state
-            .docker
-            .inspect_container(container_id, None::<InspectContainerOptions>),
+        docker.inspect_container(container_id, None::<InspectContainerOptions>),
     )
     .await;
     let Ok(Ok(inspected)) = inspected else {
@@ -533,7 +818,11 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 /// real downstream host), reads the backend's status line + headers
 /// up to the empty line, and pipes bytes bidirectionally until either
 /// side closes.
-async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
+async fn proxy_upgrade(
+    entry: &RouteEntry,
+    req: Request,
+    forwarded_proto: &'static str,
+) -> Response {
     use rand::prelude::IndexedRandom;
     let backend = {
         let mut rng = rand::rng();
@@ -551,6 +840,15 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
         .unwrap_or("/")
         .to_string();
     let headers = req.headers().clone();
+    let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| PublicPeer(peer.0))
+    });
+    let connection_permit = req
+        .extensions()
+        .get::<PublicConnectionPermit>()
+        .map(|permit| Arc::clone(&permit.0));
     let original_host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -559,21 +857,28 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
     // Dial backend up front. If this fails the client sees a 502
     // before its own upgrade attempt is committed, which is the
     // friendly outcome.
-    let mut backend_sock = match tokio::net::TcpStream::connect(&backend.address).await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut backend_sock = match tokio::time::timeout(
+        UPSTREAM_TIMEOUT,
+        tokio::net::TcpStream::connect(&backend.address),
+    )
+    .await
+    {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(e)) => {
             warn!(backend = %backend.address, error = %e, "ws upgrade backend connect failed");
+            return error_body(StatusCode::BAD_GATEWAY, "application backend unavailable");
+        }
+        Err(_) => {
             return error_body(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream {}: {}", backend.address, e),
-            );
+                StatusCode::GATEWAY_TIMEOUT,
+                "application backend unavailable",
+            )
         }
     };
 
     // Build the request as raw bytes. Manually so we don't have to
     // wrestle with hyper's typed encoder for this narrow path.
     let mut wire = format!("{} {} HTTP/1.1\r\n", method.as_str(), path_and_query).into_bytes();
-    let mut sent_host = false;
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
         // Drop hop-by-hop except `connection` and `upgrade`, which the
@@ -592,21 +897,20 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
         if name_str == "forwarded"
             || name_str.starts_with("x-forwarded-")
             || name_str.starts_with("x-temps-")
+            || name_str == "x-real-ip"
         {
             continue;
         }
         if name_str == "host" {
-            sent_host = true;
+            continue;
         }
         wire.extend_from_slice(name_str.as_bytes());
         wire.extend_from_slice(b": ");
         wire.extend_from_slice(value.as_bytes());
         wire.extend_from_slice(b"\r\n");
     }
-    if !sent_host {
-        if let Some(h) = &original_host {
-            wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
-        }
+    if let Some(h) = &original_host {
+        wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
     }
     if let Some(deployment_id) = entry.deployment_id {
         wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
@@ -614,12 +918,30 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
     if let Some(h) = &original_host {
         wire.extend_from_slice(format!("x-forwarded-host: {}\r\n", h).as_bytes());
     }
-    wire.extend_from_slice(b"x-forwarded-proto: http\r\n\r\n");
+    wire.extend_from_slice(format!("x-forwarded-proto: {forwarded_proto}\r\n\r\n").as_bytes());
+    if let Some(peer) = public_peer {
+        let forwarding = format!(
+            "x-forwarded-for: {}\r\nx-real-ip: {}\r\n",
+            peer.0.ip(),
+            peer.0.ip()
+        );
+        let insert_at = wire.len().saturating_sub(2);
+        wire.splice(insert_at..insert_at, forwarding.bytes());
+    }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    if let Err(e) = backend_sock.write_all(&wire).await {
-        warn!(backend = %backend.address, error = %e, "ws backend write request failed");
-        return error_body(StatusCode::BAD_GATEWAY, "upstream write failed");
+    match tokio::time::timeout(UPSTREAM_TIMEOUT, backend_sock.write_all(&wire)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(backend = %backend.address, error = %e, "ws backend write request failed");
+            return error_body(StatusCode::BAD_GATEWAY, "upstream write failed");
+        }
+        Err(_) => {
+            return error_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                "application backend unavailable",
+            )
+        }
     }
 
     // Read the backend's response headers. We only need to peek at
@@ -630,12 +952,12 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
     let header_end = loop {
-        match backend_sock.read(&mut tmp).await {
-            Ok(0) => {
+        match tokio::time::timeout(UPSTREAM_TIMEOUT, backend_sock.read(&mut tmp)).await {
+            Ok(Ok(0)) => {
                 warn!(backend = %backend.address, "backend closed before headers");
                 return error_body(StatusCode::BAD_GATEWAY, "upstream closed early");
             }
-            Ok(n) => {
+            Ok(Ok(n)) => {
                 buf.extend_from_slice(&tmp[..n]);
                 if let Some(idx) = find_header_end(&buf) {
                     break idx;
@@ -645,9 +967,15 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
                     return error_body(StatusCode::BAD_GATEWAY, "upstream header too large");
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(backend = %backend.address, error = %e, "ws backend read failed");
                 return error_body(StatusCode::BAD_GATEWAY, "upstream read failed");
+            }
+            Err(_) => {
+                return error_body(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "application backend unavailable",
+                )
             }
         }
     };
@@ -699,10 +1027,17 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
     // need to detach the futures since axum returns the response
     // before the tunnel starts.
     tokio::spawn(async move {
-        let upgraded = match on_upgrade.await {
-            Ok(u) => u,
-            Err(e) => {
+        // Keep the listener's bounded connection slot owned until the
+        // detached upgraded tunnel actually exits.
+        let _connection_permit = connection_permit;
+        let upgraded = match tokio::time::timeout(UPSTREAM_TIMEOUT, on_upgrade).await {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
                 warn!(error = %e, "ws client upgrade failed");
+                return;
+            }
+            Err(_) => {
+                warn!("ws client upgrade timed out");
                 return;
             }
         };
@@ -714,12 +1049,23 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
         // header terminator (ws frames often arrive in the same
         // packet as the 101 from the upstream).
         if !leftover.is_empty() {
-            if let Err(e) = client_sock.write_all(&leftover).await {
+            if let Err(e) = tokio::time::timeout(
+                PUBLIC_TUNNEL_WRITE_TIMEOUT,
+                client_sock.write_all(&leftover),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "leftover write timed out")
+            })
+            .and_then(|result| result)
+            {
                 warn!(error = %e, "ws leftover write to client failed");
                 return;
             }
         }
-        match tokio::io::copy_bidirectional(&mut client_sock, &mut backend_sock).await {
+        let result =
+            copy_tunnel_with_idle(client_sock, backend_sock, PUBLIC_TUNNEL_IDLE_TIMEOUT).await;
+        match result {
             Ok((up, down)) => {
                 debug!(up_bytes = up, down_bytes = down, "ws tunnel closed");
             }
@@ -730,6 +1076,75 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
     });
 
     client_resp
+}
+
+async fn copy_tunnel_with_idle<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Duration,
+) -> std::io::Result<(u64, u64)>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (client_read, client_write) = tokio::io::split(client);
+    let (backend_read, backend_write) = tokio::io::split(backend);
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let tunnel = async {
+        tokio::try_join!(
+            copy_tunnel_direction(client_read, backend_write, Arc::clone(&last_activity)),
+            copy_tunnel_direction(backend_read, client_write, Arc::clone(&last_activity))
+        )
+    };
+    tokio::pin!(tunnel);
+    let result = loop {
+        let deadline = *last_activity.lock() + idle_timeout;
+        tokio::select! {
+            result = &mut tunnel => break result,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                if last_activity.lock().elapsed() >= idle_timeout {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "tunnel idle timeout",
+                    ));
+                }
+            }
+        }
+    };
+    result
+}
+
+async fn copy_tunnel_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    last_activity: Arc<Mutex<Instant>>,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            tokio::time::timeout(PUBLIC_TUNNEL_WRITE_TIMEOUT, writer.shutdown())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "tunnel shutdown timeout")
+                })??;
+            return Ok(copied);
+        }
+        tokio::time::timeout(
+            PUBLIC_TUNNEL_WRITE_TIMEOUT,
+            writer.write_all(&buffer[..read]),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tunnel write timeout"))??;
+        *last_activity.lock() = Instant::now();
+        copied = copied.saturating_add(read as u64);
+    }
 }
 
 /// Find the position immediately after the first `\r\n\r\n` in `buf`.
@@ -780,10 +1195,20 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let retryable = matches!(
+    let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| PublicPeer(peer.0))
+    });
+    let metadata = ForwardRequestMetadata {
         method,
-        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
-    );
+        uri,
+        headers,
+        public_peer,
+    };
+    let retryable = metadata.method == axum::http::Method::GET
+        || metadata.method == axum::http::Method::HEAD
+        || metadata.method == axum::http::Method::OPTIONS;
 
     // Pre-shuffle the backend order so attempts hit distinct
     // backends. We don't want an unhealthy first-in-list backend to
@@ -793,7 +1218,15 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
         let mut rng = rand::rng();
         order.shuffle(&mut rng);
     }
-    let attempts = if retryable {
+    let has_body = metadata
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "0")
+        || metadata
+            .headers
+            .contains_key(axum::http::header::TRANSFER_ENCODING);
+    let attempts = if retryable && !has_body {
         MAX_RETRIES.min(order.len())
     } else {
         1
@@ -806,12 +1239,12 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
 
     if attempts <= 1 || !retryable {
         let backend = &entry.backends[order[0]];
-        return forward_once(state, entry, backend, &method, &uri, &headers, body).await;
+        return forward_once(state, entry, backend, &metadata, body).await;
     }
 
     // Buffer the body so we can replay across attempts. For
     // GET/HEAD/OPTIONS the body is normally empty; this is a no-op.
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!(error = %e, "failed to buffer request body");
@@ -823,7 +1256,7 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     for idx in order.iter().take(attempts) {
         let backend = &entry.backends[*idx];
         let body = Body::from(bytes.clone());
-        let resp = forward_once(state, entry, backend, &method, &uri, &headers, body).await;
+        let resp = forward_once(state, entry, backend, &metadata, body).await;
         // Treat 502/504 as retryable transport errors.
         let status = resp.status();
         if status == StatusCode::BAD_GATEWAY || status == StatusCode::GATEWAY_TIMEOUT {
@@ -843,45 +1276,53 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
         last_err = ?last_err,
         "all backends failed",
     );
-    error_body(
-        StatusCode::BAD_GATEWAY,
-        &format!(
+    let message = if state.public_mode {
+        "application backend unavailable".to_string()
+    } else {
+        format!(
             "all {} backend(s) for {} failed: {}",
             attempts,
             entry.host,
             last_err.unwrap_or_default()
-        ),
-    )
+        )
+    };
+    error_body(StatusCode::BAD_GATEWAY, &message)
+}
+
+struct ForwardRequestMetadata {
+    method: axum::http::Method,
+    uri: Uri,
+    headers: HeaderMap,
+    public_peer: Option<PublicPeer>,
 }
 
 async fn forward_once(
     state: &ProxyState,
     entry: &RouteEntry,
     backend: &crate::route_store::RouteBackend,
-    method: &axum::http::Method,
-    uri: &Uri,
-    headers: &HeaderMap,
+    metadata: &ForwardRequestMetadata,
     body: Body,
 ) -> Response {
-    let path_and_query = uri
+    let path_and_query = metadata
+        .uri
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(uri.path());
+        .unwrap_or(metadata.uri.path());
     let upstream_url = format!("http://{}{}", backend.address, path_and_query);
 
     debug!(
         host = %entry.host,
         upstream = %upstream_url,
-        method = %method,
+        method = %metadata.method,
         "forwarding internal request"
     );
 
     // Build the outbound request. We translate axum's Method/HeaderMap
     // into reqwest's; reqwest re-uses the http crate types so this is
     // a parse round-trip rather than reflection.
-    let mut builder = state.client.request(method.clone(), &upstream_url);
+    let mut builder = state.client.request(metadata.method.clone(), &upstream_url);
 
-    for (name, value) in headers.iter() {
+    for (name, value) in metadata.headers.iter() {
         if HOP_BY_HOP.contains(&name.as_str()) {
             continue;
         }
@@ -891,9 +1332,16 @@ async fn forward_once(
     // X-Forwarded-* — give backends visibility into the original
     // request shape. Internal proxy is plain HTTP only, so proto is
     // always "http".
-    builder = builder.header("x-forwarded-proto", "http");
-    if let Some(orig_host) = headers.get("host").and_then(|v| v.to_str().ok()) {
-        builder = builder.header("x-forwarded-host", orig_host);
+    builder = builder.header("x-forwarded-proto", state.forwarded_proto);
+    if let Some(peer) = metadata.public_peer {
+        builder = builder
+            .header("x-forwarded-for", peer.0.ip().to_string())
+            .header("x-real-ip", peer.0.ip().to_string());
+    }
+    if let Some(orig_host) = metadata.headers.get("host").and_then(|v| v.to_str().ok()) {
+        builder = builder
+            .header("host", orig_host)
+            .header("x-forwarded-host", orig_host);
     }
     if let Some(deployment_id) = entry.deployment_id {
         builder = builder.header("x-temps-deployment-id", deployment_id.to_string());
@@ -901,7 +1349,10 @@ async fn forward_once(
 
     // Stream the request body. reqwest accepts a `Body` built from a
     // bytes Stream; we adapt axum's Body via http_body_util.
-    let stream = body_to_stream(body);
+    let stream = body_to_stream(
+        body,
+        state.public_mode.then_some(PUBLIC_UPSTREAM_IDLE_TIMEOUT),
+    );
     builder = builder.body(reqwest::Body::wrap_stream(stream));
 
     let upstream = match builder.send().await {
@@ -921,7 +1372,12 @@ async fn forward_once(
             } else {
                 StatusCode::BAD_GATEWAY
             };
-            return error_body(status, &format!("upstream {}: {}", backend.address, e));
+            let message = if state.public_mode {
+                "application backend unavailable".to_string()
+            } else {
+                format!("upstream {}: {}", backend.address, e)
+            };
+            return error_body(status, &message);
         }
     };
 
@@ -945,25 +1401,70 @@ async fn forward_once(
 /// `reqwest::Body::wrap_stream` accepts. Backpressure preserved.
 fn body_to_stream(
     body: Body,
+    idle_timeout: Option<Duration>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     use futures::StreamExt;
     use http_body_util::BodyStream;
-    BodyStream::new(body).filter_map(|frame| async move {
-        match frame {
-            Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                e.to_string(),
-            ))),
-        }
-    })
+    futures::stream::unfold(
+        (BodyStream::new(body), false),
+        move |(mut stream, finished)| async move {
+            if finished {
+                return None;
+            }
+            let frame = match idle_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "request body idle timeout",
+                            )),
+                            (stream, true),
+                        ));
+                    }
+                },
+                None => stream.next().await,
+            };
+            match frame {
+                Some(Ok(frame)) => frame
+                    .into_data()
+                    .ok()
+                    .map(|data| (Ok(data), (stream, false))),
+                Some(Err(error)) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        error.to_string(),
+                    )),
+                    (stream, true),
+                )),
+                None => None,
+            }
+        },
+    )
 }
 
 fn extract_host(headers: &HeaderMap) -> Option<String> {
-    let h = headers.get("host")?.to_str().ok()?;
-    // Strip port suffix if present (`example.com:8080` → `example.com`).
-    let host = h.split(':').next().unwrap_or(h);
-    Some(host.to_ascii_lowercase())
+    if headers.get_all("host").iter().count() != 1 {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = headers.get("host")?.to_str().ok()?.parse().ok()?;
+    let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 || host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    if !host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return None;
+    }
+    Some(host)
 }
 
 fn error_body(status: StatusCode, message: &str) -> Response {
@@ -1013,6 +1514,25 @@ mod tests {
         store.apply_snapshot(1, vec![attacker, victim.clone()]);
 
         assert!(!store.container_id_has_project("container-attacker", 42));
+    }
+
+    #[tokio::test]
+    async fn public_request_body_stream_fails_after_idle_timeout() {
+        use futures::StreamExt;
+
+        let pending = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let mut stream = Box::pin(body_to_stream(
+            Body::from_stream(pending),
+            Some(Duration::from_millis(10)),
+        ));
+
+        let error = stream
+            .next()
+            .await
+            .expect("timeout emits one terminal error")
+            .expect_err("stalled request body must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(stream.next().await.is_none());
     }
 
     #[test]
@@ -1090,5 +1610,159 @@ mod tests {
         assert!(project_a.concurrency.try_acquire().is_err());
         drop((first, second));
         assert!(project_a.concurrency.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn upgraded_tunnel_permit_stays_saturated_until_detached_task_exits() {
+        use std::convert::Infallible;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test backend");
+        let backend_address = backend_listener.local_addr().expect("backend address");
+        let backend = tokio::spawn(async move {
+            let (mut socket, _) = backend_listener.accept().await.expect("accept proxy");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket
+                        .read_exact(&mut byte)
+                        .await
+                        .expect("read upgrade request");
+                    request.push(byte[0]);
+                }
+            })
+            .await
+            .expect("backend receives upgrade headers");
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+                )
+                .await
+                .expect("write backend 101");
+            let mut drain = [0u8; 32];
+            while socket.read(&mut drain).await.expect("drain tunnel") != 0 {}
+        });
+
+        let capacity = Arc::new(Semaphore::new(1));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        let proxy_capacity = Arc::clone(&capacity);
+        let proxy = tokio::spawn(async move {
+            use hyper_util::rt::{TokioExecutor, TokioIo};
+            let (stream, _) = proxy_listener.accept().await.expect("accept client");
+            let permit = Arc::new(
+                proxy_capacity
+                    .try_acquire_owned()
+                    .expect("test capacity available"),
+            );
+            let entry = RouteEntry {
+                host: "upgrade.example.test".to_string(),
+                backends: vec![RouteBackend {
+                    address: backend_address.to_string(),
+                    container_id: None,
+                    container_name: None,
+                }],
+                deployment_id: Some(1),
+                project_id: Some(1),
+                environment_id: Some(1),
+            };
+            let service = hyper::service::service_fn(move |mut request| {
+                request
+                    .extensions_mut()
+                    .insert(PublicConnectionPermit(Arc::clone(&permit)));
+                let entry = entry.clone();
+                async move {
+                    Ok::<_, Infallible>(proxy_upgrade(&entry, request.map(Body::new), "http").await)
+                }
+            });
+            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+                .expect("serve upgraded connection");
+        });
+
+        let mut client = tokio::net::TcpStream::connect(proxy_address)
+            .await
+            .expect("connect test client");
+        client
+            .write_all(
+                b"GET /socket HTTP/1.1\r\nhost: upgrade.example.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+            )
+            .await
+            .expect("write client upgrade");
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !response.ends_with(b"\r\n\r\n") {
+                client.read_exact(&mut byte).await.expect("read proxy 101");
+                response.push(byte[0]);
+            }
+        })
+        .await
+        .expect("client receives proxy 101");
+        assert!(response.starts_with(b"HTTP/1.1 101"));
+        tokio::time::timeout(Duration::from_secs(1), proxy)
+            .await
+            .expect("HTTP connection task exits after handing off upgrade")
+            .expect("proxy task exits");
+        assert!(capacity.clone().try_acquire_owned().is_err());
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), backend)
+            .await
+            .expect("backend exits after upgraded client closes")
+            .expect("backend task exits");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if capacity.clone().try_acquire_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity releases after upgraded socket closes");
+    }
+
+    #[tokio::test]
+    async fn tunnel_idle_deadline_tracks_activity_across_both_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, tunnel_client) = tokio::io::duplex(256);
+        let (tunnel_backend, mut backend) = tokio::io::duplex(256);
+        let tunnel = tokio::spawn(copy_tunnel_with_idle(
+            tunnel_client,
+            tunnel_backend,
+            Duration::from_millis(80),
+        ));
+
+        for byte in 0u8..6 {
+            client.write_all(&[byte]).await.expect("write test byte");
+            let mut received = [0u8; 1];
+            backend
+                .read_exact(&mut received)
+                .await
+                .expect("read forwarded test byte");
+            assert_eq!(received[0], byte);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !tunnel.is_finished(),
+                "one-way activity must reset shared idle deadline"
+            );
+        }
+
+        let result = tokio::time::timeout(Duration::from_millis(200), tunnel)
+            .await
+            .expect("fully idle tunnel must terminate")
+            .expect("tunnel task joins");
+        assert_eq!(
+            result.expect_err("idle tunnel returns timeout").kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 }

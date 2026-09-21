@@ -4,6 +4,7 @@
 mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
 mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
+mod m20260921_000001_add_worker_public_ingress;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -614,6 +615,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
             Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260921_000001_add_worker_public_ingress::Migration),
         ]
     }
 }

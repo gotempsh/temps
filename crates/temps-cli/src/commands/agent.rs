@@ -80,6 +80,19 @@ pub struct AgentCommand {
     /// proxy dials for this node.
     #[arg(long, env = "TEMPS_AGENT_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
+
+    /// Local interface IP on which this worker accepts public application
+    /// traffic. Behind NAT, use the local interface address; DNS still points
+    /// to the router's public IP. Unspecified addresses are rejected to avoid
+    /// colliding with the overlay-only internal listener on port 80.
+    #[arg(long)]
+    pub public_ingress_address: Option<std::net::IpAddr>,
+
+    #[arg(long, default_value_t = 80)]
+    pub public_ingress_http_port: u16,
+
+    #[arg(long, default_value_t = 443)]
+    pub public_ingress_https_port: u16,
 }
 
 impl AgentCommand {
@@ -237,6 +250,46 @@ impl AgentCommand {
                         "failed to start route sync client; internal proxy will return 503"
                     );
                 }
+            }
+
+            if let (Some(public_ip), Some(private_key_b64)) = (
+                config.public_ingress_address,
+                config.public_ingress_private_key.clone(),
+            ) {
+                let ingress_config = temps_agent::public_ingress::PublicIngressConfig {
+                    http_address: std::net::SocketAddr::new(
+                        public_ip,
+                        config.public_ingress_http_port,
+                    ),
+                    https_address: std::net::SocketAddr::new(
+                        public_ip,
+                        config.public_ingress_https_port,
+                    ),
+                    private_key_b64,
+                    control_plane_url: config.control_plane_url.clone(),
+                    node_id: config.node_id,
+                    node_token: config.token.clone(),
+                };
+                match temps_agent::public_ingress::spawn(
+                    ingress_config,
+                    route_store.clone(),
+                    route_sync_shutdown.clone(),
+                )
+                .await
+                {
+                    Ok(handle) => tracing::info!(
+                        http = %handle.http_address(),
+                        https = %handle.https_address(),
+                        "public worker ingress started"
+                    ),
+                    Err(error) => tracing::error!(%error, "public worker ingress failed to start"),
+                }
+            } else if config.public_ingress_address.is_some() {
+                let message = "public ingress is configured but this worker has no ingress encryption key; rerun the original `temps join` command with the same node name and control-plane target to re-enroll, then restart the agent";
+                temps_agent::public_ingress::record_failure(message);
+                tracing::error!("{message}");
+            } else {
+                tracing::info!("public worker ingress listener not configured on this node");
             }
 
             // Internal edge proxy bound to the overlay bridge gateway.
@@ -433,6 +486,17 @@ impl AgentCommand {
                 })?
                 .to_string();
 
+        let public_ingress_address = self.public_ingress_address.or_else(|| {
+            saved
+                .as_ref()
+                .and_then(|config| config.public_ingress_address)
+        });
+        if public_ingress_address.is_some_and(|address| address.is_unspecified()) {
+            anyhow::bail!(
+                "public_ingress_address must name one local interface; 0.0.0.0 and :: are not allowed"
+            );
+        }
+
         Ok(temps_agent::AgentConfig {
             listen_address,
             token,
@@ -451,6 +515,26 @@ impl AgentCommand {
             underlay_dev,
             underlay_mtu,
             private_address: Some(private_address),
+            public_ingress_address,
+            public_ingress_http_port: if self.public_ingress_http_port != 80 {
+                self.public_ingress_http_port
+            } else {
+                saved
+                    .as_ref()
+                    .map(|config| config.public_ingress_http_port)
+                    .unwrap_or(80)
+            },
+            public_ingress_https_port: if self.public_ingress_https_port != 443 {
+                self.public_ingress_https_port
+            } else {
+                saved
+                    .as_ref()
+                    .map(|config| config.public_ingress_https_port)
+                    .unwrap_or(443)
+            },
+            public_ingress_private_key: saved
+                .as_ref()
+                .and_then(|config| config.public_ingress_private_key.clone()),
         })
     }
 

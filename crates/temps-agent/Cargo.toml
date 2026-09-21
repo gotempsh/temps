@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -48,6 +49,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-a
 # mTLS: the agent serves rustls TLS with client-cert verification (WS-2.1).
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+x509-parser = "0.18"
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]

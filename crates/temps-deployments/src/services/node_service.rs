@@ -139,6 +139,100 @@ pub struct HeartbeatRequest {
     /// columns are left untouched rather than cleared, same treatment as
     /// `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+    pub public_ingress: Option<PublicIngressHeartbeatUpdate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicIngressHeartbeatUpdate {
+    pub running: bool,
+    pub last_error: Option<String>,
+    pub certificate_count: i32,
+    pub route_count: i32,
+    pub unsupported_route_count: i32,
+    pub unsupported_reasons: Vec<String>,
+}
+
+impl PublicIngressHeartbeatUpdate {
+    pub const MAX_UNSUPPORTED_REASONS: usize = 100;
+    pub const MAX_UNSUPPORTED_REASON_CHARS: usize = 512;
+
+    pub fn validated(
+        running: bool,
+        last_error: Option<String>,
+        certificate_count: i64,
+        route_count: i64,
+        unsupported_route_count: i64,
+        unsupported_reasons: Vec<String>,
+    ) -> Result<Self, NodeError> {
+        let certificate_count = validate_ingress_count("certificate_count", certificate_count)?;
+        let route_count = validate_ingress_count("route_count", route_count)?;
+        let unsupported_route_count =
+            validate_ingress_count("unsupported_route_count", unsupported_route_count)?;
+        let heartbeat = Self {
+            running,
+            last_error,
+            certificate_count,
+            route_count,
+            unsupported_route_count,
+            unsupported_reasons,
+        };
+        heartbeat.validate()?;
+        Ok(heartbeat)
+    }
+
+    fn validate(&self) -> Result<(), NodeError> {
+        for (field, value) in [
+            ("certificate_count", self.certificate_count),
+            ("route_count", self.route_count),
+            ("unsupported_route_count", self.unsupported_route_count),
+        ] {
+            if value < 0 {
+                return Err(NodeError::Validation {
+                    message: format!(
+                        "public ingress {field} must not be negative (received {value})"
+                    ),
+                });
+            }
+        }
+        if self.unsupported_reasons.len() > Self::MAX_UNSUPPORTED_REASONS {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "public ingress unsupported_reasons has {} entries; maximum is {}",
+                    self.unsupported_reasons.len(),
+                    Self::MAX_UNSUPPORTED_REASONS
+                ),
+            });
+        }
+        if let Some((index, reason)) = self
+            .unsupported_reasons
+            .iter()
+            .enumerate()
+            .find(|(_, reason)| reason.chars().count() > Self::MAX_UNSUPPORTED_REASON_CHARS)
+        {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "public ingress unsupported_reasons[{index}] has {} characters; maximum is {}",
+                    reason.chars().count(),
+                    Self::MAX_UNSUPPORTED_REASON_CHARS
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_ingress_count(field: &str, value: i64) -> Result<i32, NodeError> {
+    if value < 0 {
+        return Err(NodeError::Validation {
+            message: format!("public ingress {field} must not be negative (received {value})"),
+        });
+    }
+    i32::try_from(value).map_err(|_| NodeError::Validation {
+        message: format!(
+            "public ingress {field} exceeds the supported maximum {} (received {value})",
+            i32::MAX
+        ),
+    })
 }
 
 /// Service-layer view of the agent-reported DNS resolver health, decoupled
@@ -484,6 +578,9 @@ impl NodeService {
         node_id: i32,
         request: HeartbeatRequest,
     ) -> Result<Option<ArchitectureChange>, NodeError> {
+        if let Some(ingress) = request.public_ingress.as_ref() {
+            ingress.validate()?;
+        }
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await?
@@ -553,6 +650,18 @@ impl NodeService {
                 Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
             active.dns_resolver_record_count = Set(Some(dns.record_count));
         }
+        if let Some(ingress) = request.public_ingress {
+            active.public_ingress_running = Set(Some(ingress.running));
+            active.public_ingress_last_error = Set(ingress
+                .last_error
+                .map(|error| error.chars().take(1000).collect()));
+            active.public_ingress_certificate_count = Set(Some(ingress.certificate_count));
+            active.public_ingress_route_count = Set(Some(ingress.route_count));
+            active.public_ingress_unsupported_route_count =
+                Set(Some(ingress.unsupported_route_count));
+            active.public_ingress_unsupported_reasons =
+                Set(serde_json::json!(ingress.unsupported_reasons));
+        }
         active.update(self.db.as_ref()).await?;
 
         Ok(architecture_change)
@@ -564,6 +673,39 @@ impl NodeService {
             .one(self.db.as_ref())
             .await?
             .ok_or(NodeError::NotFoundById { node_id })
+    }
+
+    pub async fn set_public_ingress_enabled(
+        &self,
+        node_id: i32,
+        enabled: bool,
+    ) -> Result<nodes::Model, NodeError> {
+        let node = self.get_by_id(node_id).await?;
+        if node.role != "worker" {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "Node {} has role '{}'; public ingress is supported only on worker nodes",
+                    node_id, node.role
+                ),
+            });
+        }
+        let mut active: nodes::ActiveModel = node.into();
+        active.public_ingress_enabled = Set(enabled);
+        if !enabled {
+            active.public_ingress_running = Set(Some(false));
+            active.public_ingress_last_error = Set(None);
+            active.public_ingress_certificate_count = Set(Some(0));
+            active.public_ingress_route_count = Set(Some(0));
+            active.public_ingress_unsupported_route_count = Set(Some(0));
+            active.public_ingress_unsupported_reasons = Set(serde_json::json!([]));
+        }
+        let updated = active.update(self.db.as_ref()).await?;
+        sea_orm::ConnectionTrait::execute_unprepared(
+            self.db.as_ref(),
+            "SELECT pg_notify('route_table_changes', '')",
+        )
+        .await?;
+        Ok(updated)
     }
 
     /// Authorization check for `get_s3_credentials` (ADR-020 WS-4.1 / analyst-1).
@@ -1213,6 +1355,13 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1677,6 +1826,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1705,6 +1855,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1742,6 +1893,7 @@ mod tests {
                         last_sync_error: Some("resolver crashed: too many open files".into()),
                         record_count: 37,
                     }),
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1798,6 +1950,7 @@ mod tests {
                         capacity: serde_json::json!({}),
                         labels: None,
                         dns_resolver: None,
+                        public_ingress: None,
                     },
                 )
                 .await;
@@ -1854,6 +2007,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1926,6 +2080,7 @@ mod tests {
                         last_sync_error: None,
                         record_count: 0,
                     }),
+                    public_ingress: None,
                 },
             )
             .await;
@@ -2182,6 +2337,184 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             NodeError::NotFoundById { node_id: 999 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_updates_worker() {
+        let node = sample_node();
+        let mut updated = node.clone();
+        updated.public_ingress_enabled = true;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node], vec![updated.clone()]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let result = service.set_public_ingress_enabled(1, true).await;
+
+        let returned = result.expect("worker ingress enable should succeed");
+        assert!(returned.public_ingress_enabled);
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_rejects_missing_node() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(99, true).await,
+            Err(NodeError::NotFoundById { node_id: 99 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_rejects_non_worker() {
+        let mut node = sample_node();
+        node.role = "control-plane".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(1, true).await,
+            Err(NodeError::Validation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_reports_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "node lookup unavailable".to_string(),
+            )])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(1, true).await,
+            Err(NodeError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_public_ingress_clears_reported_readiness() {
+        let mut node = sample_node();
+        node.public_ingress_enabled = true;
+        node.public_ingress_running = Some(true);
+        node.public_ingress_certificate_count = Some(2);
+        node.public_ingress_route_count = Some(3);
+        node.public_ingress_unsupported_route_count = Some(1);
+        node.public_ingress_unsupported_reasons = serde_json::json!(["unsupported test route"]);
+        let mut updated = node.clone();
+        updated.public_ingress_enabled = false;
+        updated.public_ingress_running = Some(false);
+        updated.public_ingress_certificate_count = Some(0);
+        updated.public_ingress_route_count = Some(0);
+        updated.public_ingress_unsupported_route_count = Some(0);
+        updated.public_ingress_unsupported_reasons = serde_json::json!([]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node], vec![updated]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let returned = service
+            .set_public_ingress_enabled(1, false)
+            .await
+            .expect("worker ingress disable should succeed");
+        assert!(!returned.public_ingress_enabled);
+        assert_eq!(returned.public_ingress_running, Some(false));
+        assert_eq!(returned.public_ingress_route_count, Some(0));
+        assert_eq!(
+            returned.public_ingress_unsupported_reasons,
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_rejects_negative_and_overflow_counts() {
+        for counts in [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (i64::from(i32::MAX) + 1, 0, 0),
+        ] {
+            assert!(matches!(
+                PublicIngressHeartbeatUpdate::validated(
+                    true,
+                    None,
+                    counts.0,
+                    counts.1,
+                    counts.2,
+                    Vec::new(),
+                ),
+                Err(NodeError::Validation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_bounds_unsupported_reasons() {
+        let too_many = vec![
+            "unsupported".to_string();
+            PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASONS + 1
+        ];
+        assert!(matches!(
+            PublicIngressHeartbeatUpdate::validated(true, None, 0, 0, 0, too_many),
+            Err(NodeError::Validation { .. })
+        ));
+
+        let too_long =
+            vec!["x".repeat(PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASON_CHARS + 1)];
+        assert!(matches!(
+            PublicIngressHeartbeatUpdate::validated(true, None, 0, 0, 0, too_long),
+            Err(NodeError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_accepts_boundary_values() {
+        let reasons = vec![
+            "x".repeat(PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASON_CHARS);
+            PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASONS
+        ];
+        let update =
+            PublicIngressHeartbeatUpdate::validated(true, None, i64::from(i32::MAX), 0, 0, reasons);
+        assert!(update.is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_validates_public_ingress_before_database_access() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NodeService::new(Arc::new(db));
+        let request = HeartbeatRequest {
+            capacity: serde_json::json!({}),
+            labels: None,
+            architecture: None,
+            dns_resolver: None,
+            public_ingress: Some(PublicIngressHeartbeatUpdate {
+                running: true,
+                last_error: None,
+                certificate_count: -1,
+                route_count: 0,
+                unsupported_route_count: 0,
+                unsupported_reasons: Vec::new(),
+            }),
+        };
+
+        assert!(matches!(
+            service.heartbeat(42, request).await,
+            Err(NodeError::Validation { .. })
         ));
     }
 

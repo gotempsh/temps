@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod internal_proxy;
 pub mod network_sync;
 mod output_buffer;
+pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
 pub mod server;
@@ -158,6 +159,24 @@ pub struct AgentConfig {
     /// always rejects a `None` config before `build_router` is called.
     #[serde(default)]
     pub private_address: Option<String>,
+    /// Explicit public interface address for HTTP/HTTPS ingress. `None` keeps
+    /// public listeners disabled even if the control-plane toggle is on.
+    #[serde(default)]
+    pub public_ingress_address: Option<std::net::IpAddr>,
+    #[serde(default = "default_public_http_port")]
+    pub public_ingress_http_port: u16,
+    #[serde(default = "default_public_https_port")]
+    pub public_ingress_https_port: u16,
+    /// X25519 private key used only to decrypt this node's certificate bundles.
+    #[serde(default)]
+    pub public_ingress_private_key: Option<String>,
+}
+
+fn default_public_http_port() -> u16 {
+    80
+}
+fn default_public_https_port() -> u16 {
+    443
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -512,6 +531,10 @@ mod tests {
             underlay_dev: None,
             underlay_mtu: None,
             private_address: Some("10.100.0.2".to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
