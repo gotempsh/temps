@@ -1659,23 +1659,41 @@ impl ProjectService {
     ///
     /// Only ever computed for a single project's detail view, never per row of
     /// a list: it is one extra query, and the list endpoints must stay cheap.
+    ///
+    /// The match is done by Postgres, not by Rust: this runs on every
+    /// project-detail request, and loading every `nodes` row (each carrying a
+    /// full heartbeat `capacity` blob and a labels blob) to then discard
+    /// almost all of them costs memory proportional to the fleet for an answer
+    /// that is usually one name or none. JSONB containment on the array the
+    /// agent advertises does the same test in the index-able place, and only
+    /// the node *name* is selected, since that is all the capability carries.
     pub async fn docker_socket_capability(
         &self,
         slug: &str,
     ) -> Result<DockerSocketCapability, ProjectError> {
-        let nodes = temps_entities::nodes::Entity::find()
+        // `capacity->'docker_socket_projects' @> '["<slug>"]'` is true only for
+        // an exact element match, which is the same exact-match rule the
+        // deployer's bind and the reservation guard use — a near miss must
+        // fail closed rather than widen the grant. The slug is bound as a
+        // parameter (never interpolated), and a node whose capacity has no
+        // such key, or a non-array there, simply does not match — the tolerant
+        // behaviour `capacity_grants` already has for an older agent.
+        let granting_node_names: Vec<String> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Name)
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!(
+                    "\"capacity\" -> '{}' @> $1::jsonb",
+                    temps_core::docker_socket_grant::NODE_CAPACITY_KEY
+                ),
+                [sea_orm::Value::from(
+                    serde_json::Value::from(vec![slug.to_string()]).to_string(),
+                )],
+            ))
+            .order_by_asc(temps_entities::nodes::Column::Name)
+            .into_tuple::<String>()
             .all(self.db.as_ref())
             .await?;
-
-        let granting_node_names = nodes
-            .into_iter()
-            .filter(|node| {
-                temps_core::docker_socket_grant::capacity_grants(&node.capacity)
-                    .iter()
-                    .any(|granted| granted == slug)
-            })
-            .map(|node| node.name)
-            .collect();
 
         Ok(DockerSocketCapability::evaluate(
             slug,
@@ -7678,6 +7696,93 @@ mod tests {
             .await
             .expect("re-sending the existing slug is not a claim");
         assert_eq!(updated.project.slug, "node-daemon");
+    }
+
+    /// The capability query asks Postgres which nodes advertise the slug,
+    /// rather than loading the fleet and filtering in Rust. Exercised against
+    /// a real database because the whole point of the change is the SQL — a
+    /// mock would assert the shape of a query nobody ran.
+    #[tokio::test]
+    async fn docker_socket_capability_matches_advertised_slugs_in_the_database() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let insert_node = |name: &'static str, capacity: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                temps_entities::nodes::ActiveModel {
+                    name: Set(name.to_string()),
+                    token_hash: Set(format!("hash-{name}")),
+                    address: Set(format!("https://{name}.invalid:3100")),
+                    private_address: Set("10.100.0.2".to_string()),
+                    role: Set("worker".to_string()),
+                    status: Set("active".to_string()),
+                    labels: Set(serde_json::json!({})),
+                    capacity: Set(capacity),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("the node is inserted");
+            }
+        };
+
+        insert_node(
+            "worker-b",
+            serde_json::json!({ "docker_socket_projects": ["node-daemon"] }),
+        )
+        .await;
+        insert_node(
+            "worker-a",
+            serde_json::json!({ "docker_socket_projects": ["other-thing", "node-daemon"] }),
+        )
+        .await;
+        // Near miss, wrong key, malformed value and no capacity at all: every
+        // one of these must fail closed rather than widen the grant.
+        insert_node(
+            "worker-c",
+            serde_json::json!({ "docker_socket_projects": ["node-daemon-2"] }),
+        )
+        .await;
+        insert_node(
+            "worker-d",
+            serde_json::json!({ "docker_socket_projects": "node-daemon" }),
+        )
+        .await;
+        insert_node("worker-e", serde_json::json!({ "cpu_cores": 4 })).await;
+
+        let capability = project_service
+            .docker_socket_capability("node-daemon")
+            .await
+            .expect("the capability is computed");
+        assert!(capability.granted, "the control plane declares this slug");
+        assert_eq!(
+            capability.nodes,
+            vec![
+                // This control plane grants it too, by declaring it.
+                "control-plane".to_string(),
+                "worker-a".to_string(),
+                "worker-b".to_string()
+            ],
+            "only exact advertisements count, ordered by name"
+        );
+
+        // A slug this control plane never declared is not granted, whatever
+        // any node advertises — the declare/provide split of ADR 045.
+        let undeclared = project_service
+            .docker_socket_capability("other-thing")
+            .await
+            .expect("the capability is computed");
+        assert!(!undeclared.granted);
     }
 
     fn create_request(name: &str) -> CreateProjectRequest {
