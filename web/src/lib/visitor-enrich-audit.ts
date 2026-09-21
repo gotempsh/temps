@@ -79,7 +79,28 @@ export function deploymentTokenAuditActor(
 }
 
 /**
- * A one-line description of an enrichment: which visitor, and which keys.
+ * "email, name, +2 more", or "4 keys" when the payload only carried a count.
+ * `null` when there is nothing to list.
+ */
+function listKeys(names: unknown, reportedTotal: unknown): string | null {
+  const keys = readKeyNames(names)
+  const reported = readNumber(reportedTotal)
+  const total =
+    reported != null && reported > keys.length ? reported : keys.length
+  if (total === 0) return null
+
+  const listed = keys
+    .slice(0, MAX_LISTED_KEYS)
+    .map((k) => truncate(k, MAX_KEY_LENGTH))
+  if (listed.length === 0) return `${total} key${total === 1 ? '' : 's'}`
+
+  const remaining = total - listed.length
+  return (remaining > 0 ? [...listed, `+${remaining} more`] : listed).join(', ')
+}
+
+/**
+ * A one-line description of an enrichment: which visitor, which keys were set
+ * and which were removed.
  *
  * Only key *names* are ever shown — enrichment routinely carries personal data
  * and the audit console must not become a second place to read it.
@@ -89,21 +110,13 @@ export function describeVisitorEnrichment(data: unknown): string {
   const visitorRowId = readNumber(record?.visitor_row_id)
   const subject = visitorRowId != null ? `visitor ${visitorRowId}` : 'a visitor'
 
-  const keys = readKeyNames(record?.custom_data_keys)
-  const reported = readNumber(record?.custom_data_key_count)
-  const total =
-    reported != null && reported > keys.length ? reported : keys.length
+  const set = listKeys(record?.custom_data_keys, record?.custom_data_key_count)
+  const removed = listKeys(record?.removed_keys, record?.removed_key_count)
 
-  if (total === 0) return `Enriched ${subject}`
-
-  const listed = keys
-    .slice(0, MAX_LISTED_KEYS)
-    .map((k) => truncate(k, MAX_KEY_LENGTH))
-  if (listed.length === 0) {
-    return `Enriched ${subject} (${total} key${total === 1 ? '' : 's'})`
+  if (set && removed) {
+    return `Enriched ${subject} (${set}; removed: ${removed})`
   }
-
-  const remaining = total - listed.length
-  const parts = remaining > 0 ? [...listed, `+${remaining} more`] : listed
-  return `Enriched ${subject} (${parts.join(', ')})`
+  if (set) return `Enriched ${subject} (${set})`
+  if (removed) return `Removed data from ${subject} (${removed})`
+  return `Enriched ${subject}`
 }

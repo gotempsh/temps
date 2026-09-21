@@ -102,11 +102,15 @@ pub struct VisitorEnrichedAudit {
     /// The token's project; `None` for callers that are not project-scoped.
     pub project_id: Option<i32>,
     pub visitor_row_id: Option<i32>,
-    /// Names of the top-level `custom_data` keys that were written or removed,
-    /// bounded by [`bounded_key_names`].
+    /// Names of the top-level `custom_data` keys the request set, bounded by
+    /// [`bounded_key_names`].
     pub custom_data_keys: Vec<String>,
-    /// How many keys the request touched in total.
+    /// How many keys the request set in total.
     pub custom_data_key_count: usize,
+    /// Names of the keys the request removed (sent as `null`), bounded the same way.
+    pub removed_keys: Vec<String>,
+    /// How many keys the request removed in total.
+    pub removed_key_count: usize,
 }
 
 impl AuditOperation for VisitorEnrichedAudit {
@@ -152,6 +156,8 @@ mod tests {
             visitor_row_id: Some(11),
             custom_data_keys: vec!["email".to_string()],
             custom_data_key_count: 1,
+            removed_keys: Vec::new(),
+            removed_key_count: 0,
         }
     }
 

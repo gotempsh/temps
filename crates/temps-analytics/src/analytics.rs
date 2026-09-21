@@ -245,31 +245,49 @@ pub const MAX_SCOPED_ENRICHMENT_BYTES: usize = 8 * 1024;
 /// Most top-level keys a project-scoped caller may leave on a visitor row.
 pub const MAX_SCOPED_ENRICHMENT_KEYS: usize = 32;
 
-/// Bound what a machine credential baked into a container can store on a
-/// visitor row: a JSON object of limited size and key count. Applied to the
-/// merged document, so repeated calls with fresh keys cannot grow a row
-/// without limit.
-pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(), AnalyticsError> {
+/// Absolute ceiling on a visitor's `custom_data` for callers that are not
+/// project-scoped (session, API key, CLI). Now that enrichment merges, repeated
+/// writes accumulate, so even trusted callers get a bound.
+pub const MAX_ENRICHMENT_BYTES: usize = 64 * 1024;
+/// See [`MAX_ENRICHMENT_BYTES`].
+pub const MAX_ENRICHMENT_KEYS: usize = 128;
+
+/// A JSON object of at most `max_keys` top-level keys and `max_bytes` bytes.
+fn validate_document(
+    custom_data: &serde_json::Value,
+    max_keys: usize,
+    max_bytes: usize,
+) -> Result<(), AnalyticsError> {
     let Some(map) = custom_data.as_object() else {
         return Err(AnalyticsError::InvalidEnrichmentData(
             "custom_data must be a JSON object".to_string(),
         ));
     };
-    if map.len() > MAX_SCOPED_ENRICHMENT_KEYS {
+    if map.len() > max_keys {
         return Err(AnalyticsError::InvalidEnrichmentData(format!(
             "custom_data would have {} keys after this change; at most {} are allowed",
             map.len(),
-            MAX_SCOPED_ENRICHMENT_KEYS
+            max_keys
         )));
     }
     let size = custom_data.to_string().len();
-    if size > MAX_SCOPED_ENRICHMENT_BYTES {
+    if size > max_bytes {
         return Err(AnalyticsError::InvalidEnrichmentData(format!(
             "custom_data would be {} bytes after this change; at most {} are allowed",
-            size, MAX_SCOPED_ENRICHMENT_BYTES
+            size, max_bytes
         )));
     }
     Ok(())
+}
+
+/// Bound what a machine credential baked into a container can store on a
+/// visitor row: a JSON object of limited size and key count.
+pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(), AnalyticsError> {
+    validate_document(
+        custom_data,
+        MAX_SCOPED_ENRICHMENT_KEYS,
+        MAX_SCOPED_ENRICHMENT_BYTES,
+    )
 }
 
 /// `(top-level key count, serialized bytes)` of a `custom_data` document.
@@ -282,16 +300,24 @@ fn custom_data_footprint(custom_data: Option<&serde_json::Value>) -> (usize, usi
     })
 }
 
-/// Validate the document a project-scoped write would leave behind.
+/// Validate the document a write would leave behind, against the limits for
+/// the caller (`project_scoped` = deployment token, the tighter ones).
 ///
-/// A row that an unscoped caller already pushed past the cap stays editable by
-/// a scoped caller as long as the write does not make it larger, so identity
-/// enrichment does not stop working for that visitor; it just can't grow it.
-fn validate_scoped_merge(
+/// A row that is already over the limit (for example written before the limit
+/// existed) stays editable as long as the write does not make it larger, so
+/// identity enrichment does not stop working for that visitor; it just can't
+/// grow it.
+fn validate_merge(
     existing: Option<&serde_json::Value>,
     merged: &serde_json::Value,
+    project_scoped: bool,
 ) -> Result<(), AnalyticsError> {
-    match validate_scoped_enrichment(merged) {
+    let (max_keys, max_bytes) = if project_scoped {
+        (MAX_SCOPED_ENRICHMENT_KEYS, MAX_SCOPED_ENRICHMENT_BYTES)
+    } else {
+        (MAX_ENRICHMENT_KEYS, MAX_ENRICHMENT_BYTES)
+    };
+    match validate_document(merged, max_keys, max_bytes) {
         Ok(()) => Ok(()),
         Err(error) if merged.is_object() => {
             let (existing_keys, existing_bytes) = custom_data_footprint(existing);
@@ -359,8 +385,10 @@ impl AnalyticsService {
         let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
         let visitor_row_id = visitor_model.id;
         // Nothing to store: an identical document, or removing keys from a row
-        // that has no data. Identical text for both outcomes, so a caller that
-        // may only write cannot tell "already had this value" from "just set it".
+        // that has no data. The response text is the same for both outcomes, so
+        // the body does not say which happened. (Timing and the size-limit
+        // errors below can still hint at stored state to a write-only caller;
+        // that residual is accepted, not eliminated.)
         let unchanged = visitor_model.custom_data.as_ref() == Some(&merged)
             || (visitor_model.custom_data.is_none()
                 && merged.as_object().is_some_and(|map| map.is_empty()));
@@ -373,9 +401,7 @@ impl AnalyticsService {
                 visitor_row_id: Some(visitor_row_id),
             });
         }
-        if project_scoped {
-            validate_scoped_merge(visitor_model.custom_data.as_ref(), &merged)?;
-        }
+        validate_merge(visitor_model.custom_data.as_ref(), &merged, project_scoped)?;
 
         let mut active_model: visitor::ActiveModel = visitor_model.into();
         active_model.custom_data = Set(Some(merged));
@@ -5160,20 +5186,34 @@ mod tests {
             .collect();
         let existing = serde_json::Value::Object(big.clone());
         // Same size: allowed. One fewer key: allowed. One more key: rejected.
-        assert!(validate_scoped_merge(Some(&existing), &existing).is_ok());
+        assert!(validate_merge(Some(&existing), &existing, true).is_ok());
         let mut smaller = big.clone();
         smaller.remove("k0");
-        assert!(
-            validate_scoped_merge(Some(&existing), &serde_json::Value::Object(smaller)).is_ok()
-        );
+        assert!(validate_merge(Some(&existing), &serde_json::Value::Object(smaller), true).is_ok());
         let mut larger = big;
         larger.insert("extra".to_string(), serde_json::json!(1));
         assert!(matches!(
-            validate_scoped_merge(Some(&existing), &serde_json::Value::Object(larger)),
+            validate_merge(Some(&existing), &serde_json::Value::Object(larger), true),
             Err(AnalyticsError::InvalidEnrichmentData(_))
         ));
         // A fresh document over the cap is rejected outright.
-        assert!(validate_scoped_merge(None, &existing).is_err());
+        assert!(validate_merge(None, &existing, true).is_err());
+    }
+
+    #[test]
+    fn unscoped_callers_have_a_higher_absolute_ceiling() {
+        let keys = |n: usize| {
+            serde_json::Value::Object(
+                (0..n)
+                    .map(|i| (format!("k{i}"), serde_json::json!(1)))
+                    .collect(),
+            )
+        };
+        // Over the scoped limit but under the ceiling: fine for user/API-key auth.
+        assert!(validate_merge(None, &keys(MAX_SCOPED_ENRICHMENT_KEYS + 1), false).is_ok());
+        assert!(validate_merge(None, &keys(MAX_SCOPED_ENRICHMENT_KEYS + 1), true).is_err());
+        // Over the ceiling: refused for everyone.
+        assert!(validate_merge(None, &keys(MAX_ENRICHMENT_KEYS + 1), false).is_err());
     }
 
     #[tokio::test]

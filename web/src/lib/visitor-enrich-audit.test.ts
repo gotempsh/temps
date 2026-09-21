@@ -74,6 +74,27 @@ describe('deploymentTokenAuditActor', () => {
 })
 
 describe('describeVisitorEnrichment', () => {
+  test('says what was removed, separately from what was set', () => {
+    expect(
+      describeVisitorEnrichment({
+        visitor_row_id: 11,
+        custom_data_keys: ['email'],
+        custom_data_key_count: 1,
+        removed_keys: ['plan', 'segment'],
+        removed_key_count: 2,
+      })
+    ).toBe('Enriched visitor 11 (email; removed: plan, segment)')
+    expect(
+      describeVisitorEnrichment({
+        visitor_row_id: 11,
+        custom_data_keys: [],
+        custom_data_key_count: 0,
+        removed_keys: ['plan'],
+        removed_key_count: 1,
+      })
+    ).toBe('Removed data from visitor 11 (plan)')
+  })
+
   test('names the visitor and the keys, collapsing the tail', () => {
     expect(
       describeVisitorEnrichment({

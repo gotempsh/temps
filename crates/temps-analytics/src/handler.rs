@@ -1155,6 +1155,15 @@ pub async fn enrich_visitor(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsWrite);
 
+    // Enrichment merges top-level keys, so anything but an object is a mistake
+    // (and used to be stored verbatim, replacing the visitor's data).
+    if !request.custom_data.is_object() {
+        return Err(bad_request()
+            .title("Invalid Enrichment Data")
+            .detail("custom_data must be a JSON object")
+            .build());
+    }
+
     // `Some` only for deployment tokens, which are confined to their project.
     let scope_project_id = auth.project_id();
     if let Some(token) = auth.deployment_token_info() {
@@ -1172,12 +1181,24 @@ pub async fn enrich_visitor(
     }
 
     // Names only, bounded: values are routinely personal data and stay out of the
-    // audit trail, and key names are caller-chosen so they are truncated.
-    let (custom_data_keys, custom_data_key_count) = request
-        .custom_data
-        .as_object()
-        .map(|map| crate::visitor_audit::bounded_key_names(map.keys()))
-        .unwrap_or_default();
+    // audit trail, and key names are caller-chosen so they are truncated. A key
+    // sent as `null` is a removal and is recorded as one.
+    let (set_keys, removed_keys): (Vec<&String>, Vec<&String>) = {
+        let mut set = Vec::new();
+        let mut removed = Vec::new();
+        for (key, value) in request.custom_data.as_object().into_iter().flatten() {
+            if value.is_null() {
+                removed.push(key);
+            } else {
+                set.push(key);
+            }
+        }
+        (set, removed)
+    };
+    let (custom_data_keys, custom_data_key_count) =
+        crate::visitor_audit::bounded_key_names(set_keys.into_iter());
+    let (removed_keys, removed_key_count) =
+        crate::visitor_audit::bounded_key_names(removed_keys.into_iter());
 
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
     let result = if let Ok(numeric_id) = visitor_id.parse::<i32>() {
@@ -1215,6 +1236,8 @@ pub async fn enrich_visitor(
             visitor_row_id: response.visitor_row_id,
             custom_data_keys,
             custom_data_key_count,
+            removed_keys,
+            removed_key_count,
         };
         // A failed audit write must not fail the enrichment that already happened.
         if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -2452,8 +2475,9 @@ mod enrich_handler_tests {
         {
             let log = audit.0.lock().unwrap();
             assert_eq!(log.len(), 3);
-            assert!(log[2].2.contains("\"custom_data_keys\":[\"name\"]"));
-            assert!(log[2].2.contains("\"custom_data_key_count\":1"));
+            assert!(log[2].2.contains("\"custom_data_keys\":[]"));
+            assert!(log[2].2.contains("\"removed_keys\":[\"name\"]"));
+            assert!(log[2].2.contains("\"removed_key_count\":1"));
         }
 
         // The token has now made its 3 visitor-changing writes for the window:

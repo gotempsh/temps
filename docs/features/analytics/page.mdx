@@ -936,10 +936,10 @@ Deployment tokens are deliberately more restricted than an API key:
     The token is confined to its own project. A sealed ID belonging to another project reads as "visitor not found", not as an error that confirms the visitor exists.
   </Property>
   <Property name="Bounded payloads">
-    The stored `custom_data` may end up with at most 32 top-level keys and 8 KB of JSON. The cap is applied to the merged document, so repeated calls with fresh keys can't grow a visitor row without limit.
+    The stored `custom_data` may end up with at most 32 top-level keys and 8 KB of JSON. The cap is applied to the merged document, so repeated calls with fresh keys can't grow a visitor row without limit. Callers that aren't a deployment token (console, API keys, the CLI) have a higher ceiling of 128 keys and 64 KB, and `custom_data` must always be a JSON object.
   </Property>
   <Property name="Values stay private">
-    Every enrichment that changes a visitor is written to the audit log with the key names only — never the values.
+    Every enrichment that changes a visitor is written to the audit log with the key names only — never the values. Keys you set and keys you remove are recorded separately.
   </Property>
   <Property name="Rate limit">
     A token can make up to 300 visitor-changing enrichments per minute. Beyond that the API answers `429 Too Many Requests` and writes nothing, so no change is ever left unaudited. Calls that change nothing, such as re-sending the same identity on every page load, don't count.
