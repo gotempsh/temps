@@ -1207,6 +1207,15 @@ impl From<ProjectError> for Problem {
                     .with_title("Project Slug Reserved For Host Docker Access")
                     .with_detail(error.to_string())
             }
+
+            // Also 403 and also admin-only, but a different refusal: the
+            // caller may write this project, just not run code as host root
+            // on its behalf.
+            ProjectError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -1410,5 +1419,34 @@ mod tests {
         assert_eq!(omitted.image_retention_hours, None);
         assert_eq!(cleared.image_retention_hours, Some(None));
         assert_eq!(set.image_retention_hours, Some(Some(72)));
+    }
+
+    /// ADR 045 refusals are 403, not 400: an admin sending the identical
+    /// request succeeds, so the request itself is not malformed.
+    #[test]
+    fn docker_socket_refusals_map_to_forbidden_and_explain_themselves() {
+        let reserved: Problem = ProjectError::DockerSocketSlugReserved {
+            slug: "node-daemon".to_string(),
+            change: crate::services::types::ReservedSlugChange::Claim,
+        }
+        .into();
+        assert_eq!(reserved.status_code, StatusCode::FORBIDDEN);
+        let detail = reserved
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("ADR 045"), "{detail}");
+        assert!(detail.contains("TEMPS_DOCKER_SOCKET_PROJECTS"), "{detail}");
+
+        let deploy: Problem = ProjectError::DockerSocketDeployRequiresAdmin {
+            slug: "node-daemon".to_string(),
+        }
+        .into();
+        assert_eq!(deploy.status_code, StatusCode::FORBIDDEN);
+        // The two must not read alike — one is about naming the project, the
+        // other about running code inside it.
+        assert_ne!(reserved.body.get("title"), deploy.body.get("title"));
     }
 }

@@ -450,6 +450,18 @@ pub enum ProjectError {
         slug: String,
         change: ReservedSlugChange,
     },
+
+    /// The caller tried to deploy a project that holds host Docker access
+    /// (ADR 045) without being an instance admin.
+    ///
+    /// Distinct from the slug variants: nothing about the *project* is being
+    /// changed here, so "reserved slug" would be the wrong thing to tell the
+    /// caller. What is refused is running code as host root.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_deploy_reason(slug)
+    )]
+    DockerSocketDeployRequiresAdmin { slug: String },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

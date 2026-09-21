@@ -203,6 +203,79 @@ pub fn reserved_slug_reason(slug: &str) -> String {
     )
 }
 
+/// Who is asking for a deployment, for the ADR-045 rule that a project holding
+/// host Docker access may only be deployed by an instance admin.
+///
+/// Restricting the *slug* is not enough on its own: a granted project created
+/// by an admin has no restrictive access grants of its own, so any principal
+/// with `DeploymentsCreate` on it could otherwise deploy an image and command
+/// of their choosing into a container that gets `/var/run/docker.sock` — host
+/// root by a route that never touches the slug.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeployCaller {
+    /// An ordinary principal holding `DeploymentsCreate`. The fail-closed
+    /// default, so a deploy path that never considered this cannot be the one
+    /// that hands out the socket.
+    #[default]
+    ProjectWriter,
+    /// An instance admin (`AuthContext::is_instance_admin`) — the same bar
+    /// that may claim the slug in the first place.
+    InstanceAdmin,
+    /// Temps itself, with no user behind the request: failover and node-drain
+    /// rescheduling, cron, the deployment processor.
+    ///
+    /// Allowed, deliberately. These paths redeploy *the workload that is
+    /// already there* — they carry no attacker-chosen image or command — and
+    /// refusing them would mean a granted infrastructure service silently
+    /// stays down after its node dies, which is the failure mode this whole
+    /// feature exists to avoid.
+    Platform,
+}
+
+impl DeployCaller {
+    /// Derive the caller from an instance-admin check.
+    pub fn from_instance_admin(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::InstanceAdmin
+        } else {
+            Self::ProjectWriter
+        }
+    }
+
+    /// Whether this caller may deploy a project that holds host Docker access.
+    pub fn may_deploy_granted_project(self) -> bool {
+        matches!(self, Self::InstanceAdmin | Self::Platform)
+    }
+}
+
+/// Whether deploying `project_slug` requires instance-admin authority, and the
+/// caller does not have it (ADR 045).
+///
+/// Pure, with the grant injected, for the same reason as [`slug_is_reserved`].
+/// A project no host declares is unaffected — which is every project on every
+/// install that never set the variable.
+pub fn deploy_requires_instance_admin(
+    grant: &DockerSocketGrant,
+    project_slug: &str,
+    caller: DeployCaller,
+) -> bool {
+    grant.declares(project_slug) && !caller.may_deploy_granted_project()
+}
+
+/// The sentence shown to whoever tried to deploy a granted project without
+/// instance-admin authority.
+pub fn granted_project_deploy_reason(slug: &str) -> String {
+    format!(
+        "Project '{slug}' is declared in {DOCKER_SOCKET_PROJECTS_ENV} on this control plane \
+         (ADR 045), so its containers receive `/var/run/docker.sock` and are root-equivalent on \
+         the host that runs them. Deploying it is therefore restricted to instance admins — \
+         holding deploy permission on the project is not enough, because the deployed image and \
+         command would run as host root. Ask an admin to deploy it, or remove the slug from \
+         {DOCKER_SOCKET_PROJECTS_ENV} and restart the control plane if it should no longer hold \
+         host Docker access."
+    )
+}
+
 /// The sentence shown to whoever tried to rename a project *off* a reserved
 /// slug.
 ///
@@ -560,5 +633,81 @@ mod tests {
         let grant = DockerSocketGrant::parse(Some("node-daemon"));
         assert!(grant.declares("node-daemon"));
         assert!(!grant.declares("infra-agent"));
+    }
+
+    #[test]
+    fn deploying_a_granted_project_is_admin_only() {
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        // Holding deploy permission on the project is not enough: the image
+        // and command the caller chooses would run as host root.
+        assert!(deploy_requires_instance_admin(
+            &grant,
+            "node-daemon",
+            DeployCaller::ProjectWriter
+        ));
+        assert!(!deploy_requires_instance_admin(
+            &grant,
+            "node-daemon",
+            DeployCaller::InstanceAdmin
+        ));
+    }
+
+    #[test]
+    fn temps_itself_may_redeploy_a_granted_project() {
+        // Failover, node drain and the deployment processor redeploy the
+        // workload that is already there. Refusing them would leave a granted
+        // infrastructure service down after its node dies — the exact failure
+        // this feature exists to avoid.
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        assert!(!deploy_requires_instance_admin(
+            &grant,
+            "node-daemon",
+            DeployCaller::Platform
+        ));
+    }
+
+    #[test]
+    fn an_ungranted_project_is_deployable_by_anyone_who_may_deploy_it() {
+        // The state of every project on every install, including the other
+        // projects on a host that grants one. Nothing about ordinary
+        // deployment permissions changes.
+        let grant = DockerSocketGrant::parse(Some("node-daemon"));
+        assert!(!deploy_requires_instance_admin(
+            &grant,
+            "my-app",
+            DeployCaller::ProjectWriter
+        ));
+        // Exact match, same as the bind — a near miss is not declared.
+        assert!(!deploy_requires_instance_admin(
+            &grant,
+            "node-daemon-2",
+            DeployCaller::ProjectWriter
+        ));
+        assert!(!deploy_requires_instance_admin(
+            &DockerSocketGrant::default(),
+            "node-daemon",
+            DeployCaller::ProjectWriter
+        ));
+    }
+
+    #[test]
+    fn the_deploy_caller_defaults_to_the_fail_closed_answer() {
+        // A deploy path that never considered ADR 045 must not be the one
+        // that hands out the socket.
+        assert_eq!(DeployCaller::default(), DeployCaller::ProjectWriter);
+        assert!(!DeployCaller::default().may_deploy_granted_project());
+        assert!(DeployCaller::from_instance_admin(true).may_deploy_granted_project());
+        assert!(!DeployCaller::from_instance_admin(false).may_deploy_granted_project());
+    }
+
+    #[test]
+    fn granted_project_deploy_reason_says_why_permission_was_not_enough() {
+        let reason = granted_project_deploy_reason("node-daemon");
+        assert!(reason.contains("ADR 045"), "{reason}");
+        assert!(reason.contains("TEMPS_DOCKER_SOCKET_PROJECTS"), "{reason}");
+        assert!(reason.contains("instance admins"), "{reason}");
+        // The operator reading this has nobody to ask: it must name both ways
+        // out, not just the refusal.
+        assert!(reason.contains("Ask an admin"), "{reason}");
     }
 }

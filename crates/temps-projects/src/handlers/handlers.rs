@@ -2566,12 +2566,18 @@ pub async fn trigger_project_pipeline(
     // Trigger the pipeline
     let (project_id, triggered_env_id, branch, tag, commit) = state
         .project_service
-        .trigger_pipeline(
+        // ADR 045: deploying a project that holds host Docker access runs the
+        // built image as host root, so it is admin-only regardless of who may
+        // otherwise deploy this project.
+        .trigger_pipeline_as(
             id,
             environment_id,
             payload.branch,
             payload.tag,
             payload.commit,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
         )
         .await
         .map_err(|e| {

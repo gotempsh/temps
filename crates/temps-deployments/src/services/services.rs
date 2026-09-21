@@ -132,6 +132,15 @@ pub enum DeploymentError {
     #[error("Queue error: {0}")]
     QueueError(String),
 
+    /// The caller asked to deploy a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045) without instance-admin
+    /// authority.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_deploy_reason(slug)
+    )]
+    DockerSocketDeployRequiresAdmin { slug: String },
+
     /// Bundle path (read from DB and joined to data_dir) resolved outside the
     /// data directory.  `path` is the offending resolved path; `reason`
     /// explains how the check failed.
@@ -1750,6 +1759,30 @@ impl DeploymentService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_pipeline_as(
+            project_id,
+            environment_id,
+            branch,
+            tag,
+            commit,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_pipeline`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn trigger_pipeline_as(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
         self.trigger_pipeline_inner(
             project_id,
             environment_id,
@@ -1860,6 +1893,34 @@ impl DeploymentService {
         health_check_path: Option<String>,
         command: Option<Vec<String>>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_image_deployment_as(
+            project_id,
+            target_environment_id,
+            image_ref,
+            health_check_path,
+            command,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_image_deployment`] for a caller whose authority is
+    /// known (ADR 045).
+    ///
+    /// This is the path that matters most for a granted project: the caller
+    /// supplies the image reference and the command that will run as host
+    /// root.
+    pub async fn trigger_image_deployment_as(
+        &self,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+        image_ref: String,
+        health_check_path: Option<String>,
+        command: Option<Vec<String>>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
         self.trigger_image_deployment_inner(
             project_id,
             target_environment_id,
@@ -2013,12 +2074,77 @@ impl DeploymentService {
         .await
     }
 
+    /// Refuse a deployment of a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045), unless the caller is an
+    /// instance admin (or Temps itself).
+    ///
+    /// Every user-initiated path that can start a container for a project goes
+    /// through one of the methods that calls this. The check is here rather
+    /// than in the handlers because a granted project's container runs the
+    /// caller's image and command as host root, and a new deploy route added
+    /// later must not be able to miss it by forgetting a macro.
+    async fn guard_granted_project_deploy(
+        &self,
+        project_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        // Cheap and skipped entirely on every install that never set the
+        // variable: with nothing declared, no slug can require the check, so
+        // the project row is never even read.
+        if temps_core::docker_socket_grant::process_grant().is_empty()
+            || caller.may_deploy_granted_project()
+        {
+            return Ok(());
+        }
+        let slug = projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(projects::Column::Slug)
+            .into_tuple::<String>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+        if temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            temps_core::docker_socket_grant::process_grant(),
+            &slug,
+            caller,
+        ) {
+            tracing::warn!(
+                project_id,
+                slug = %slug,
+                env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                "Refused a non-admin deployment of a project that holds host Docker access \
+                 (ADR 045)"
+            );
+            return Err(DeploymentError::DockerSocketDeployRequiresAdmin { slug });
+        }
+        Ok(())
+    }
+
     pub async fn rollback_to_deployment(
         &self,
         project_id: i32,
         deployment_id: i32,
     ) -> Result<Deployment, DeploymentError> {
+        self.rollback_to_deployment_as(
+            project_id,
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::rollback_to_deployment`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn rollback_to_deployment_as(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<Deployment, DeploymentError> {
         use temps_entities::deployments::DeploymentMetadata;
+
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
 
         // Fetch the target deployment (the one we're rolling back TO)
         let target_deployment = deployments::Entity::find_by_id(deployment_id)
@@ -2830,7 +2956,28 @@ impl DeploymentService {
         source_deployment_id: i32,
         target_environment_id: i32,
     ) -> Result<Deployment, DeploymentError> {
+        self.promote_deployment_as(
+            project_id,
+            source_deployment_id,
+            target_environment_id,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_deployment`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn promote_deployment_as(
+        &self,
+        project_id: i32,
+        source_deployment_id: i32,
+        target_environment_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<Deployment, DeploymentError> {
         use temps_entities::deployments::DeploymentMetadata;
+
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
 
         // Fetch the source deployment
         let source = deployments::Entity::find_by_id(source_deployment_id)

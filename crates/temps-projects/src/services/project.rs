@@ -30,6 +30,7 @@ use super::types::{
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
+use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
 
 /// A project row plus the provider type of the Git connection it is linked to.
@@ -1601,6 +1602,48 @@ impl ProjectService {
         Err(ProjectError::DockerSocketSlugReserved {
             slug: slug.to_string(),
             change,
+        })
+    }
+
+    /// Refuse a deployment of a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045), unless the caller is an
+    /// instance admin (or Temps itself).
+    ///
+    /// The slug guard decides who may *point a project at* host root; this one
+    /// decides who may *run code as* host root, and they are different
+    /// principals: a granted project created by an admin carries no
+    /// restrictive access grants, so without this any holder of
+    /// `ProjectsWrite`/`DeploymentsCreate` on it could deploy their own image
+    /// and command into a container that receives `/var/run/docker.sock`.
+    fn guard_granted_project_deploy(
+        &self,
+        project_slug: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        Self::guard_granted_project_deploy_against(&self.docker_socket_grant, project_slug, caller)
+    }
+
+    /// [`Self::guard_granted_project_deploy`] with the grant injected, so the
+    /// rule is testable without the process-wide `OnceLock`.
+    fn guard_granted_project_deploy_against(
+        grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+        project_slug: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            grant,
+            project_slug,
+            caller,
+        ) {
+            return Ok(());
+        }
+        warn!(
+            slug = %project_slug,
+            env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            "Refused a non-admin deployment of a project that holds host Docker access (ADR 045)"
+        );
+        Err(ProjectError::DockerSocketDeployRequiresAdmin {
+            slug: project_slug.to_string(),
         })
     }
 
@@ -5033,12 +5076,39 @@ impl ProjectService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(i32, i32, Option<String>, Option<String>, Option<String>), ProjectError> {
+        self.trigger_pipeline_as(
+            project_id,
+            environment_id,
+            branch,
+            tag,
+            commit,
+            DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_pipeline`] for a caller whose authority is known.
+    ///
+    /// ADR 045: deploying a project that holds host Docker access runs the
+    /// deployed image and command as host root, so it is admin-only — deploy
+    /// permission on the project is not sufficient. Every other project is
+    /// unaffected.
+    pub async fn trigger_pipeline_as(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+        caller: DeployCaller,
+    ) -> Result<(i32, i32, Option<String>, Option<String>, Option<String>), ProjectError> {
         // Get the project to validate it exists and get repository information
         let project = temps_entities::projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?
             .ok_or_else(|| ProjectError::NotFound("Project not found".to_string()))?;
+        self.guard_granted_project_deploy(&project.slug, caller)?;
 
         // Validate environment belongs to this project and is not soft-deleted
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
