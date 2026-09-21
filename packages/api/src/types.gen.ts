@@ -1167,6 +1167,13 @@ export type AnalyticsCapability = {
    */
   live_chunks: number;
   /**
+   * Widest window one analytics query answers on this store, in days.
+   * The TimescaleDB store clamps `start_time` to this many days before
+   * `end_time` so a query can never scan the whole control-plane
+   * database; ClickHouse stores are unbounded (`None`).
+   */
+  max_window_days?: number | null;
+  /**
    * Exactly what is missing, when `configured` is false.
    */
   reason?: string | null;

@@ -772,6 +772,10 @@ impl LineIndexSink for TimescaleLineIndex {
     fn backend(&self) -> Option<LineIndexBackend> {
         Some(LineIndexBackend::TimescaleDb)
     }
+
+    fn max_window_days(&self) -> Option<u32> {
+        Some(MAX_WINDOW_DAYS as u32)
+    }
 }
 
 // ── Read side (ADR-047 §5) ──────────────────────────────────────────────

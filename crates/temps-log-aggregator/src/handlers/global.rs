@@ -234,6 +234,12 @@ pub struct AnalyticsCapability {
     /// onboarding copy points at ClickHouse or Temps Cloud for volume.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<crate::index::LineIndexBackend>,
+    /// Widest window one analytics query answers on this store, in days.
+    /// The TimescaleDB store clamps `start_time` to this many days before
+    /// `end_time` so a query can never scan the whole control-plane
+    /// database; ClickHouse stores are unbounded (`None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_window_days: Option<u32>,
     /// Exactly what is missing, when `configured` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -267,6 +273,7 @@ pub async fn global_log_capabilities(
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
             backend: state.line_index.backend(),
+            max_window_days: state.line_index.max_window_days(),
             reason,
             setup_path: ANALYTICS_SETUP_PATH.to_string(),
             example: "Group ERROR lines by http_route for the last hour, chart requests slower \

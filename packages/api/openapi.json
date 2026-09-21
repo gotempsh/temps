@@ -2693,6 +2693,15 @@
             "minimum": 0,
             "type": "integer"
           },
+          "max_window_days": {
+            "description": "Widest window one analytics query answers on this store, in days.\nThe TimescaleDB store clamps `start_time` to this many days before\n`end_time` so a query can never scan the whole control-plane\ndatabase; ClickHouse stores are unbounded (`None`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "reason": {
             "description": "Exactly what is missing, when `configured` is false.",
             "type": [

@@ -565,11 +565,18 @@ fn cloud_index_row<'a>(
     row.deploy_id = labels.deploy_id.unwrap_or(0);
     row.container_id = &labels.container_id;
     row.node_id = labels.node_id.unwrap_or(0);
-    // Correlation ids are identifiers this instance minted, not content, and
-    // a pseudonymised one would join to nothing the user owns.
+    // Trace and span ids ship as spans ship them at this tier (real, so the
+    // line joins to its trace in Cloud). They come from the application's
+    // own log line, not from this instance, but the parser only accepts them
+    // under the trace/span keys and a project at `queryable` has already
+    // consented to its trace ids leaving. `request_id` is different: it is
+    // routinely copied from a caller-supplied header and can be anything, so
+    // it is content and needs listing like every other key.
     row.trace_id = wk.trace_id.unwrap_or("");
     row.span_id = wk.span_id.unwrap_or("");
-    row.request_id = wk.request_id.unwrap_or("");
+    if policy.allows("request_id") {
+        row.request_id = wk.request_id.unwrap_or("");
+    }
     // Everything below is content, and content is allowlisted by key.
     if policy.allows("http_method") {
         row.http_method = wk.http_method.unwrap_or("");
@@ -1363,14 +1370,15 @@ mod tests {
         };
         let (row, labels) = projected(&policy);
 
-        // Labels and correlation ids become real at this tier.
+        // Labels and trace ids become real at this tier; `request_id` is
+        // caller-controlled content and was not listed.
         assert_eq!(row.env, labels.env);
         assert_eq!(row.service, labels.service);
         assert_eq!(row.container_id, labels.container_id);
         assert_eq!(row.deploy_id, 42);
         assert_eq!(row.node_id, 3);
         assert_eq!(row.trace_id, "t-1");
-        assert_eq!(row.request_id, "r-1");
+        assert_eq!(row.request_id, "", "request_id is content; not listed");
 
         // Content is default-deny: only `worker` was listed.
         assert_eq!(row.attrs, r#"{"worker":"3"}"#);
@@ -1407,12 +1415,14 @@ mod tests {
                 "status_code".to_string(),
                 "duration_ms".to_string(),
                 "http_method".to_string(),
+                "request_id".to_string(),
             ])),
         });
         assert_eq!(row.http_route, "/orders/{id}");
         assert_eq!(row.http_method, "POST");
         assert_eq!(row.status_code, 503);
         assert_eq!(row.duration_ms, 12.5);
+        assert_eq!(row.request_id, "r-1");
         // Canonical keys never double as residual attributes.
         assert_eq!(row.attrs, "{}");
     }

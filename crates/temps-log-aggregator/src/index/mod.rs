@@ -87,6 +87,14 @@ pub trait LineIndexSink: Send + Sync {
     fn backend(&self) -> Option<LineIndexBackend> {
         None
     }
+
+    /// Widest analytics window this store answers, in days, when it bounds
+    /// one (the TimescaleDB store does; ClickHouse stores do not). Reported
+    /// by the capabilities endpoint so a clamped answer is never presented
+    /// as an answer to the wider question.
+    fn max_window_days(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The stores a line index can live in, in the order the plugin prefers

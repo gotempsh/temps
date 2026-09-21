@@ -267,6 +267,8 @@ interface AnalyticsCapability {
   configured: boolean
   /** Where the index lives when configured. */
   backend?: LineIndexBackend | null
+  /** Widest analytics window (days) this store answers; unset = unbounded. */
+  max_window_days?: number | null
   reason?: string | null
   setup_path: string
   example: string
@@ -1005,6 +1007,12 @@ async function capabilitiesAction(options: { json?: boolean }): Promise<void> {
   keyValue('Configured', analytics.configured ? 'yes' : 'no')
   if (analytics.backend) {
     keyValue('Index store', BACKEND_LABELS[analytics.backend] ?? analytics.backend)
+  }
+  if (analytics.max_window_days) {
+    keyValue(
+      'Max analytics window',
+      `${analytics.max_window_days} days (configure ClickHouse for wider windows)`,
+    )
   }
   keyValue('Live chunks', analytics.live_chunks.toLocaleString())
   keyValue('Indexed chunks', analytics.indexed_chunks.toLocaleString())
