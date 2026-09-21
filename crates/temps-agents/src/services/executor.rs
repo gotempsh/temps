@@ -49,7 +49,12 @@ use crate::services::run_service::{AgentRunService, UpdateRunFields};
 /// trigger. Fails closed unconditionally rather than trusting whoever (or
 /// whatever) triggered the run — an admin who wants this deploys through a
 /// path that can actually establish who they are.
-fn refuse_granted_project_push(
+///
+/// `pub(crate)`: called from [`AgentExecutor::prepare_sandbox_workspace`]
+/// (the required chokepoint every run path goes through to get a container
+/// at all) and, as defense in depth, directly from `autofixer::create_pr` —
+/// the sibling push+PR call site in this crate.
+pub(crate) fn refuse_granted_project_push(
     grant: &temps_core::docker_socket_grant::DockerSocketGrant,
     project_slug: &str,
 ) -> Result<(), AgentError> {
@@ -428,6 +433,23 @@ impl AgentExecutor {
             host_work_dir,
             ephemeral_yaml,
         } = params;
+
+        // ADR 045: refuse *before* the sandbox is ever built, not only before
+        // the executor's own push step. This sandbox is about to be seeded
+        // with a push-capable git credential for `project`'s repository
+        // (`inject_config_repos_and_secrets` writes `.git-credentials` /
+        // `gh`/`glab` config below) on a full-network sandbox by default --
+        // an AI process holding that credential can `git push` directly,
+        // which is strictly stronger than the PR-branch push
+        // `refuse_granted_project_push`'s other call site blocks, and would
+        // otherwise reach it ungated. This is the one call every run path
+        // (the executor and the autofixer) makes to get a container at all,
+        // so refusing here is a required chokepoint rather than one more
+        // call site to remember.
+        refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
 
         // Load settings row once: used for both sandbox config and external_url.
         let settings_row = settings::Entity::find_by_id(1)
