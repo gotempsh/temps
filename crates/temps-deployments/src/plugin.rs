@@ -36,6 +36,17 @@ pub struct DeploymentsPlugin {
     /// resolver is written in `initialize_plugin_services` once every plugin
     /// has registered.  Remains `None` on OSS-only builds — a strict no-op.
     secrets_resolver_slot: tokio::sync::OnceCell<SecretsResolverSlot>,
+    /// The deployment job processor, built in `register_services` and parked
+    /// here until `initialize_plugin_services` has finished wiring the audit
+    /// logger, the deployment gate and the secrets resolver.
+    ///
+    /// It used to be spawned straight from `register_services`, which runs in
+    /// plugin-registration order — i.e. before any later plugin exists. A
+    /// deployment already queued at boot could then be processed in that
+    /// window, and one that mounted the host Docker socket would skip the
+    /// ADR-045 audit write without anything failing. Parking it turns that
+    /// race into a bounded startup delay.
+    pending_job_processor: tokio::sync::Mutex<Option<JobProcessorService>>,
 }
 
 impl DeploymentsPlugin {
@@ -43,6 +54,7 @@ impl DeploymentsPlugin {
         Self {
             deployment_gate_slot: tokio::sync::OnceCell::new(),
             secrets_resolver_slot: tokio::sync::OnceCell::new(),
+            pending_job_processor: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -429,7 +441,7 @@ impl TempsPlugin for DeploymentsPlugin {
             // (the job processor takes ownership, but we need to register it too)
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
 
-            let mut job_processor = JobProcessorService::with_external_service_manager(
+            let job_processor = JobProcessorService::with_external_service_manager(
                 db.clone(),
                 job_receiver,
                 queue_service.clone(),
@@ -439,11 +451,11 @@ impl TempsPlugin for DeploymentsPlugin {
             );
 
             // Capture a handle to the job processor's gate slot before it's
-            // moved into the spawned task below. Any plugin that registers
-            // after this one would still be unregistered at this point, so
-            // looking the gate up here with get_service would always find
-            // nothing — initialize_plugin_services (below) does the actual
-            // lookup once every plugin has registered.
+            // parked for phase 2 below. Any plugin that registers after this
+            // one would still be unregistered at this point, so looking the
+            // gate up here with get_service would always find nothing —
+            // initialize_plugin_services (below) does the actual lookup once
+            // every plugin has registered.
             if self
                 .deployment_gate_slot
                 .set(job_processor.deployment_gate_handle())
@@ -478,15 +490,27 @@ impl TempsPlugin for DeploymentsPlugin {
                 source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;
             context.register_service(source_drop_deployer);
 
-            // Start the job processor in a background task
-            tokio::spawn(async move {
-                tracing::debug!("Starting deployment job processor");
-                if let Err(e) = job_processor.run().await {
-                    tracing::error!("Deployment job processor error: {}", e);
-                }
-            });
-
-            tracing::debug!("Deployment job processor started successfully");
+            // Hand the processor to phase 2 rather than spawning it here.
+            // `register_services` runs in plugin-registration order, before
+            // any later plugin has registered anything, so a processor started
+            // at this point is already draining the queue while the audit
+            // logger, the deployment gate and the secrets resolver are all
+            // still unwired. A deployment queued at boot could therefore be
+            // processed in that window and, if it mounted the host Docker
+            // socket, skip the ADR-045 `DEPLOYMENT_DOCKER_SOCKET_MOUNTED`
+            // audit write entirely — silently, since the deployment itself
+            // succeeds. `initialize_plugin_services` spawns it once wiring is
+            // complete; `PluginManager::initialize_plugins` always runs both
+            // phases, so this is a delay, never a skipped start.
+            if self
+                .pending_job_processor
+                .lock()
+                .await
+                .replace(job_processor)
+                .is_some()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
 
             // Get the db connection for RemoteDeploymentService
             let db_for_remote = context.require_service::<sea_orm::DatabaseConnection>();
@@ -561,6 +585,37 @@ impl TempsPlugin for DeploymentsPlugin {
                      Docker socket (ADR 045) will be logged but not recorded in the audit \
                      trail"
                 ),
+            }
+
+            // Last, and deliberately so: every wire-up above must be in place
+            // before the first queued deployment can be picked up. Starting
+            // the processor in `register_services` meant a deployment queued
+            // at boot could be planned with no deployment gate, no secrets
+            // resolver and no audit sink — and a deployment that received the
+            // host Docker socket in that window produced no ADR-045 audit
+            // record, while succeeding normally.
+            match self.pending_job_processor.lock().await.take() {
+                Some(mut job_processor) => {
+                    tokio::spawn(async move {
+                        tracing::debug!("Starting deployment job processor");
+                        if let Err(e) = job_processor.run().await {
+                            tracing::error!("Deployment job processor error: {}", e);
+                        }
+                    });
+                    tracing::debug!("Deployment job processor started successfully");
+                }
+                // `register_services` always parks one, and this phase runs
+                // once. Reaching this means the processor was never built, so
+                // nothing would drain the deployment queue — an operator
+                // would otherwise see deployments queue forever with no
+                // explanation anywhere.
+                None => {
+                    return Err(PluginError::InitializationFailed(
+                        "the deployment job processor was not handed over by register_services; \
+                         no deployment would ever be processed"
+                            .to_string(),
+                    ))
+                }
             }
 
             Ok(())
