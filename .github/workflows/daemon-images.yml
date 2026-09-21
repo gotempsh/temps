@@ -53,7 +53,7 @@ jobs:
           python3 tools/sandbox-runtime/test_build_inputs.py
           python3 tools/sandbox-runtime/image_metadata.py >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           cache-image: false
 

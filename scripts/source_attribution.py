@@ -75,6 +75,10 @@ def comment_prefix(path: Path) -> str | None:
 
 
 def is_source_file(path: Path) -> bool:
+    # Pinned third-party data retains its upstream MIT license and attribution.
+    # Never relabel it as first-party Temps source.
+    if path.resolve() == repository_root() / "crates/temps-credential-checks/catalog/gitleaks.toml":
+        return False
     return comment_prefix(path) is not None
 
 

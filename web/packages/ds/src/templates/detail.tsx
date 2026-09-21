@@ -51,12 +51,19 @@ export function Detail({
 }: DetailProps) {
   const Container = embedded ? 'div' : PageContainer
   return (
-    <Container className={cn(embedded && 'w-full min-w-0 space-y-6', className)}>
-      <PageHeader title={title} description={description} verdict={verdict} actions={actions} />
+    <Container
+      className={cn(embedded && 'w-full min-w-0 space-y-6', className)}
+    >
+      <PageHeader
+        title={title}
+        description={description}
+        verdict={verdict}
+        actions={actions}
+      />
       {facts.length > 0 ? (
         <dl
           className={cn(
-            'grid grid-cols-2 gap-x-6 gap-y-3 rounded-md border bg-muted/20 p-4 text-sm sm:grid-cols-3 lg:grid-cols-6',
+            'grid grid-cols-2 gap-x-6 gap-y-3 rounded-md border bg-muted/20 p-4 text-sm sm:grid-cols-3 lg:grid-cols-6'
           )}
         >
           {facts.map((fact, i) => (
@@ -67,8 +74,10 @@ export function Detail({
           ))}
         </dl>
       ) : null}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="min-w-0 space-y-6 lg:col-span-2">{main}</div>
+      <div className={cn('grid grid-cols-1 gap-6', aside && 'lg:grid-cols-3')}>
+        <div className={cn('min-w-0 space-y-6', aside && 'lg:col-span-2')}>
+          {main}
+        </div>
         {aside ? <div className="min-w-0 space-y-6">{aside}</div> : null}
       </div>
     </Container>

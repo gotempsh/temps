@@ -542,7 +542,7 @@ jobs:
         id: nextest-seed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v1
+        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v2
 
       - name: Download inherited nextest target seed
         id: nextest-seed-download
@@ -598,7 +598,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: temps-nextest-target-seed-v1
+          name: temps-nextest-target-seed-v2
           path: nextest-target-seed.tar.zst
           compression-level: 0
           retention-days: 7

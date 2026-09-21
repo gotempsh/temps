@@ -8,6 +8,8 @@ repos:
       - id: check-yaml
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # Preserve the pinned upstream catalog byte-for-byte.
+        exclude: ^crates/temps-credential-checks/catalog/gitleaks\.toml$
   - repo: https://github.com/crate-ci/typos
     rev: v1.38.1
     hooks:
