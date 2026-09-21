@@ -513,6 +513,24 @@ pub enum ProjectError {
     )]
     DockerSocketDeployRequiresAdmin { slug: String },
 
+    /// The caller tried to change a setting that decides what a project
+    /// holding host Docker access (ADR 045) *runs* — its runtime image and
+    /// command, or its source repository — without being an instance admin.
+    ///
+    /// Distinct from [`Self::DockerSocketDeployRequiresAdmin`]: no deployment
+    /// was requested. The write plants the input that a later deployment —
+    /// quite possibly an admin's, or an automatic one from a git push —
+    /// executes as host root, which is why gating only the deploy request
+    /// leaves the same outcome reachable in two steps.
+    ///
+    /// `field` is the caller-facing name of the setting, because a settings
+    /// patch carries many fields and the refusal has to say which one.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_write_reason(slug, field)
+    )]
+    DockerSocketWriteRequiresAdmin { slug: String, field: String },
+
     /// An admin cleared the reserved-slug authority check but has not
     /// verified recently enough (ADR 045 + the shared sensitive-action
     /// policy).

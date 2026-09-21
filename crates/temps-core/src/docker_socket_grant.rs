@@ -276,6 +276,30 @@ pub fn granted_project_deploy_reason(slug: &str) -> String {
     )
 }
 
+/// The sentence shown to whoever tried to change a project setting that
+/// decides what a granted project *runs*, without instance-admin authority.
+///
+/// Distinct from [`granted_project_deploy_reason`] because the caller is not
+/// deploying anything — they are planting the input a later deployment, quite
+/// possibly somebody else's, will execute as host root. Telling them "ask an
+/// admin to deploy it" would describe an operation they never attempted.
+///
+/// `field` names the setting in the caller's own vocabulary (for example
+/// `"the runtime image and command"` or `"the source repository"`), because
+/// the refusal has to say which part of the request was the problem — an
+/// operator who sent a settings patch with six fields cannot otherwise tell.
+pub fn granted_project_write_reason(slug: &str, field: &str) -> String {
+    format!(
+        "Changing {field} of project '{slug}' is restricted to instance admins. The project is \
+         declared in {DOCKER_SOCKET_PROJECTS_ENV} on this control plane (ADR 045), so its \
+         containers receive `/var/run/docker.sock` and run as host root — and this setting \
+         decides what they execute, so writing it is equivalent to deploying to the project even \
+         though the deployment itself would be started by somebody else. Ask an admin to make \
+         the change, or remove the slug from {DOCKER_SOCKET_PROJECTS_ENV} and restart the \
+         control plane if it should no longer hold host Docker access."
+    )
+}
+
 /// The sentence shown to whoever tried to rename a project *off* a reserved
 /// slug.
 ///

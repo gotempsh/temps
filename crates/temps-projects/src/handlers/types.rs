@@ -1228,6 +1228,14 @@ impl From<ProjectError> for Problem {
                     .with_title("Host Docker Access Deployment Requires An Admin")
                     .with_detail(error.to_string())
             }
+
+            // 403 again, and a third distinct refusal: the caller is not
+            // deploying, they are changing what a later deployment will run.
+            ProjectError::DockerSocketWriteRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Project Settings Require An Admin")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -1460,6 +1468,31 @@ mod tests {
         // The two must not read alike — one is about naming the project, the
         // other about running code inside it.
         assert_ne!(reserved.body.get("title"), deploy.body.get("title"));
+
+        // And the third: changing what a declared project runs, without
+        // deploying anything. Telling this caller to "ask an admin to deploy
+        // it" would describe an operation they never attempted, and the
+        // refusal has to name the field so an operator who sent a settings
+        // patch with six of them can tell which one was the problem.
+        let write: Problem = ProjectError::DockerSocketWriteRequiresAdmin {
+            slug: "node-daemon".to_string(),
+            field: "the source repository".to_string(),
+        }
+        .into();
+        assert_eq!(write.status_code, StatusCode::FORBIDDEN);
+        assert_ne!(write.body.get("title"), deploy.body.get("title"));
+        assert_ne!(write.body.get("title"), reserved.body.get("title"));
+        let write_detail = write
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(write_detail.contains("ADR 045"), "{write_detail}");
+        assert!(
+            write_detail.contains("the source repository"),
+            "{write_detail}"
+        );
     }
 
     /// The step-up challenge is passed through byte for byte. Rebuilding it

@@ -2346,6 +2346,11 @@ pub async fn upgrade_project_service_template(
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
+            // ADR 045: see `update_service_template_runtime` — this is the
+            // other write that changes what a declared project runs.
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
         )
         .await
         .map_err(Problem::from)?;
@@ -2444,6 +2449,13 @@ pub async fn update_service_template_runtime(
             runtime,
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+            // ADR 045: the persisted command this writes becomes the default
+            // for every deploy that does not override it, so on a project this
+            // control plane declares it decides what runs as host root — and
+            // the deployment executing it may well be somebody else's.
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
             ),
         )
         .await

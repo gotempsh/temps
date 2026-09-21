@@ -1716,6 +1716,64 @@ impl ProjectService {
         })
     }
 
+    /// Refuse a write that decides what a project holding host Docker access
+    /// (ADR 045) *runs*, unless the caller is an instance admin.
+    ///
+    /// The third of the three ADR-045 guards, and the one that closes the
+    /// two-step version of the attack the other two refuse in one step.
+    /// `guard_reserved_slug` decides who may point a project at host root;
+    /// `guard_granted_project_deploy` decides who may run code as host root
+    /// right now. Neither covers a project writer who *plants* the input and
+    /// lets somebody else's deployment execute it: the persisted runtime
+    /// command becomes the default for every deploy that does not override it
+    /// (including an admin's), and the source-repository fields decide what a
+    /// git push builds and runs — and a git push carries no authenticated
+    /// principal to gate at deploy time at all.
+    ///
+    /// `field` is the caller-facing name of what they tried to change; it
+    /// reaches the API message, so it must read as a noun phrase.
+    fn guard_granted_project_write(
+        &self,
+        project_slug: &str,
+        field: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        Self::guard_granted_project_write_against(
+            &self.docker_socket_grant,
+            project_slug,
+            field,
+            caller,
+        )
+    }
+
+    /// [`Self::guard_granted_project_write`] with the grant injected, so the
+    /// rule is testable without the process-wide `OnceLock`.
+    fn guard_granted_project_write_against(
+        grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+        project_slug: &str,
+        field: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            grant,
+            project_slug,
+            caller,
+        ) {
+            return Ok(());
+        }
+        warn!(
+            slug = %project_slug,
+            field = %field,
+            env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            "Refused a non-admin write to a setting that decides what a project holding host \
+             Docker access runs (ADR 045)"
+        );
+        Err(ProjectError::DockerSocketWriteRequiresAdmin {
+            slug: project_slug.to_string(),
+            field: field.to_string(),
+        })
+    }
+
     /// Where this project is granted host Docker access (ADR 045).
     ///
     /// Answers from two sources, both authoritative for the host they describe:
@@ -4217,11 +4275,19 @@ impl ProjectService {
     /// Both JSON columns live on `projects`, so one row update is enough. A
     /// rejected image, command, health path, resource profile, or tenant
     /// ceiling leaves every previous value intact.
+    ///
+    /// `caller` is required (ADR 045): this is where a project's *persisted*
+    /// runtime image and command are written, and on a project this control
+    /// plane declares, that command is what the next deployment runs as host
+    /// root — including a deployment started by an admin, who would be
+    /// executing a payload they did not write. Ordinary `ProjectsWrite` is
+    /// therefore not sufficient here for a declared project.
     pub async fn update_service_template_runtime(
         &self,
         project_id: i32,
         runtime: UpdateServiceTemplateRuntimeRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
         let project = projects::Entity::find_by_id(project_id)
@@ -4232,6 +4298,7 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+        self.guard_granted_project_write(&project.slug, "the runtime image and command", caller)?;
 
         if project.source_type != temps_entities::source_type::SourceType::DockerImage
             || project.project_type != ProjectType::Service
@@ -4318,6 +4385,7 @@ impl ProjectService {
         target: temps_core::templates::ServiceTemplateInstance,
         new_environment_variables: Vec<CreateProjectEnvVar>,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
         let project = projects::Entity::find_by_id(project_id)
@@ -4328,6 +4396,18 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+        // ADR 045: the sibling of `update_service_template_runtime`, and the
+        // other way the persisted image and command of a service project
+        // change. The target comes from the operator-installed catalog rather
+        // than from the request body, so this is the weaker of the two — but
+        // it still decides what a declared project runs as host root, and
+        // leaving it open would make "downgrade to a release with a different
+        // entrypoint" the way around the guard next to it.
+        self.guard_granted_project_write(
+            &project.slug,
+            "the applied service template release",
+            caller,
+        )?;
 
         if project.project_type != ProjectType::Service {
             return Err(ProjectError::InvalidInput(
@@ -6998,6 +7078,7 @@ mod tests {
                     exposed_port: None,
                 },
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await
             .unwrap();
@@ -7035,6 +7116,7 @@ mod tests {
                     exposed_port: Some(9090),
                 },
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await;
         assert!(matches!(invalid, Err(ProjectError::InvalidInput(_))));
@@ -7255,6 +7337,7 @@ mod tests {
                 target.clone(),
                 Vec::new(),
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await;
         assert!(matches!(missing_value, Err(ProjectError::InvalidInput(_))));
@@ -7269,6 +7352,7 @@ mod tests {
                     is_secret: false,
                 }],
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await
             .expect("same-family template upgrade");
@@ -7487,6 +7571,86 @@ mod tests {
             assert!(!SlugClaimAuthority::default().may_claim_reserved_slug());
             assert!(SlugClaimAuthority::from_instance_admin(true).may_claim_reserved_slug());
             assert!(!SlugClaimAuthority::from_instance_admin(false).may_claim_reserved_slug());
+        }
+    }
+
+    // ── ADR 045: writes that decide what a granted project runs ──────────
+    //
+    // The two-step version of the deploy attack: a project writer does not
+    // deploy anything, they change the input a later deployment executes as
+    // host root. Same injected-grant treatment as `reserved_slug` above, for
+    // the same reason.
+    mod granted_project_write {
+        use super::*;
+        use temps_core::docker_socket_grant::DockerSocketGrant;
+
+        fn guard(granted: &str, slug: &str, caller: DeployCaller) -> Result<(), ProjectError> {
+            ProjectService::guard_granted_project_write_against(
+                &DockerSocketGrant::parse(Some(granted)),
+                slug,
+                "the runtime image and command",
+                caller,
+            )
+        }
+
+        /// The planted-payload path: `Role::User` holds `ProjectsWrite`, and
+        /// the command it persists becomes the default for the *next*
+        /// deployment — including one an admin starts.
+        #[test]
+        fn a_project_writer_cannot_change_what_a_granted_project_runs() {
+            let error = guard("node-daemon", "node-daemon", DeployCaller::ProjectWriter)
+                .expect_err("a non-admin must not decide what runs as host root");
+            match error {
+                ProjectError::DockerSocketWriteRequiresAdmin {
+                    ref slug,
+                    ref field,
+                } => {
+                    assert_eq!(slug, "node-daemon");
+                    assert_eq!(field, "the runtime image and command");
+                    // The operator reading the 403 is alone: it has to name
+                    // the ADR, the variable, and which field was refused.
+                    let rendered = error.to_string();
+                    assert!(rendered.contains("ADR 045"), "{rendered}");
+                    assert!(
+                        rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS"),
+                        "{rendered}"
+                    );
+                    assert!(
+                        rendered.contains("the runtime image and command"),
+                        "{rendered}"
+                    );
+                }
+                other => panic!("expected DockerSocketWriteRequiresAdmin, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_instance_admin_may_change_it() {
+            guard("node-daemon", "node-daemon", DeployCaller::InstanceAdmin)
+                .expect("an admin may change what a granted project runs");
+        }
+
+        #[test]
+        fn every_other_project_is_untouched() {
+            for caller in [
+                DeployCaller::ProjectWriter,
+                DeployCaller::InstanceAdmin,
+                DeployCaller::Platform,
+            ] {
+                guard("node-daemon", "my-app", caller)
+                    .expect("an undeclared project is untouched by ADR 045");
+                // Exact match, same as the bind: a near miss is neither
+                // declared nor granted, so the two cannot disagree.
+                guard("node-daemon", "node-daemon-2", caller)
+                    .expect("a near miss is not the declared slug");
+                ProjectService::guard_granted_project_write_against(
+                    &DockerSocketGrant::default(),
+                    "node-daemon",
+                    "the source repository",
+                    caller,
+                )
+                .expect("an install that never set the variable declares nothing");
+            }
         }
     }
 
