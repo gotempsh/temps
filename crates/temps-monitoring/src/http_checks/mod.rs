@@ -230,7 +230,7 @@ impl HttpChecksService {
         &self,
         project_id: i32,
         id: i32,
-    ) -> Result<(String, String), HttpChecksError> {
+    ) -> Result<(String, String, bool), HttpChecksError> {
         let env = env_vars::Entity::find_by_id(id)
             .filter(env_vars::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
@@ -246,14 +246,39 @@ impl HttpChecksService {
         } else {
             env.value
         };
-        Ok((env.key, value))
+        Ok((env.key, value, env.is_secret))
+    }
+    // Write-only variables may only go to their value-verified public issuer.
+    // Validate again at execution so rotation or legacy saved checks cannot bypass this.
+    fn validate_credential_destination(
+        &self,
+        key: &str,
+        value: &str,
+        restricted: bool,
+        spec: &HttpCheckSpec,
+    ) -> Result<(), HttpChecksError> {
+        if !restricted {
+            return Ok(());
+        }
+        let preset =
+            temps_credential_checks::automatic_preset(&self.detector.detect(key, value), value);
+        if preset.is_some_and(|p| {
+            p.spec.url == spec.url
+                && p.spec.method == spec.method
+                && p.spec.credential_header == spec.credential_header
+                && p.spec.credential_prefix == spec.credential_prefix
+                && p.spec.headers == spec.headers
+        }) {
+            return Ok(());
+        }
+        Err(HttpChecksError::Invalid { reason: "Write-only secrets can only be verified using their value-recognized provider's reviewed endpoint and authentication headers. Supply an explicit credential for custom endpoints.".into() })
     }
     pub async fn detect(
         &self,
         project_id: i32,
         env_var_id: i32,
     ) -> Result<DetectionView, HttpChecksError> {
-        let (key, value) = self.env_credential(project_id, env_var_id).await?;
+        let (key, value, _) = self.env_credential(project_id, env_var_id).await?;
         Ok(DetectionView {
             env_var_id,
             candidates: self.detector.detect(&key, &value),
@@ -292,7 +317,8 @@ impl HttpChecksService {
             });
         }
         if let Some(env_id) = input.env_var_id {
-            self.env_credential(project_id, env_id).await?;
+            let (key, value, is_secret) = self.env_credential(project_id, env_id).await?;
+            self.validate_credential_destination(&key, &value, is_secret, &input.spec)?;
         }
         let existing = match id {
             Some(id) => Some(self.row(project_id, id).await?),
@@ -534,7 +560,14 @@ impl HttpChecksService {
         let spec: HttpCheckSpec = serde_json::from_str(&serialized)
             .map_err(|_| HttpChecksError::Stored { id: row.id })?;
         let credential = if let Some(id) = row.env_var_id {
-            Some(self.env_credential(row.project_id, id).await?.1)
+            let (key, value, is_secret) = self.env_credential(row.project_id, id).await?;
+            self.validate_credential_destination(
+                &key,
+                &value,
+                is_secret || row.automatic_provider.is_some(),
+                &spec,
+            )?;
+            Some(value)
         } else {
             row.encrypted_credential
                 .as_ref()
@@ -624,6 +657,63 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn write_only_secrets_reject_custom_destinations_on_save_and_execution() {
+        let env = env_vars::Model {
+            id: 7,
+            project_id: 10,
+            environment_id: None,
+            key: "GITHUB_TOKEN".into(),
+            value: "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            include_in_preview: false,
+            is_encrypted: false,
+            is_secret: true,
+        };
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![env.clone()], vec![env.clone()]]),
+        );
+        let mut spec = temps_credential_checks::provider_presets().remove(0).spec;
+        assert!(s
+            .validate_credential_destination(&env.key, &env.value, true, &spec)
+            .is_ok());
+        assert!(s
+            .validate_credential_destination(&env.key, "unrelated-secret", true, &spec)
+            .is_err());
+        spec.url = "https://example.com/collect".into();
+        assert!(s
+            .validate_credential_destination(&env.key, &env.value, false, &spec)
+            .is_ok());
+        assert!(matches!(
+            s.save(
+                10,
+                None,
+                SaveHttpCheck {
+                    name: "Custom".into(),
+                    env_var_id: Some(7),
+                    credential: None,
+                    enabled: true,
+                    interval_seconds: 86400,
+                    spec: spec.clone()
+                }
+            )
+            .await,
+            Err(HttpChecksError::Invalid { .. })
+        ));
+        let mut record = row();
+        record.env_var_id = Some(7);
+        record.encrypted_spec = s
+            .encryption
+            .encrypt_string(&serde_json::to_string(&spec).unwrap())
+            .unwrap();
+        assert!(matches!(
+            s.verify_row(&record, Utc::now()).await,
+            Err(HttpChecksError::Invalid { .. })
+        ));
+    }
+
     fn row() -> http_checks::Model {
         let now = Utc::now();
         http_checks::Model {

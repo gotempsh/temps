@@ -78,6 +78,12 @@ pub fn automatic_preset(candidates: &[crate::Candidate], value: &str) -> Option<
     }
     let mut issuers = std::collections::BTreeSet::new();
     for candidate in candidates {
+        if !matches!(
+            candidate.evidence,
+            crate::detection::DetectionEvidence::ValuePattern
+        ) {
+            continue;
+        }
         let provider = match candidate.id.as_str() {
             "github" | "github-pat" | "github-fine-grained-pat" | "github-oauth" => "github",
             "openai" | "openai-api-key" => "openai",
@@ -101,8 +107,17 @@ mod tests {
         let candidate = |id: &str| crate::Candidate {
             id: id.into(),
             description: String::new(),
-            evidence: crate::detection::DetectionEvidence::VariableName,
+            evidence: crate::detection::DetectionEvidence::ValuePattern,
         };
+        assert!(automatic_preset(
+            &[crate::Candidate {
+                id: "github".into(),
+                description: String::new(),
+                evidence: crate::detection::DetectionEvidence::VariableName
+            }],
+            "unrelated-secret"
+        )
+        .is_none());
         assert_eq!(
             automatic_preset(&[candidate("github")], "synthetic")
                 .unwrap()

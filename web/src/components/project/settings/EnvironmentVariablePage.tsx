@@ -4,6 +4,7 @@ import { Link, useParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import type { ProjectResponse } from '@/api/client'
 import { getEnvironmentVariablesOptions } from '@/api/client/@tanstack/react-query.gen'
+import { CheckLoading } from './CheckLoading'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableDetails } from './EnvironmentVariableDetails'
 import { HttpChecksSettings } from './HttpChecksSettings'
@@ -29,7 +30,7 @@ export function EnvironmentVariablePage({
   return (
     <div className="w-full min-w-0 space-y-5">
       {valid && variables.isPending ? (
-        <p role="status">Loading variable…</p>
+        <CheckLoading label="Loading variable…" />
       ) : variables.isError ? (
         <div role="alert" className="space-y-3">
           <p>Could not load this variable.</p>

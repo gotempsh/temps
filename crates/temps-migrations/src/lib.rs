@@ -23,3 +23,5 @@ pub use migration::Migrator;
 pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
 
 pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;
+
+pub use migration::m20260921_000003_detection_retry::Migration as DetectionRetryMigration;

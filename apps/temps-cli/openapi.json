@@ -6432,6 +6432,26 @@
         ],
         "type": "object"
       },
+      "Candidate": {
+        "description": "Detection output deliberately contains neither the secret nor matching substrings.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/DetectionEvidence"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "description",
+          "evidence"
+        ],
+        "type": "object"
+      },
       "CertStatusResponse": {
         "description": "Current on-demand cert status for a single hostname (ADR-018 §5). Backs\n`GET /domains/by-host/{hostname}/cert-status`.",
         "properties": {
@@ -6916,6 +6936,15 @@
           "ai_configured"
         ],
         "type": "object"
+      },
+      "CheckStatus": {
+        "enum": [
+          "healthy",
+          "warning",
+          "error",
+          "unknown"
+        ],
+        "type": "string"
       },
       "ChildBackupEntryResponse": {
         "description": "A single child backup entry in the `GET /backups/{id}/children` response.\n\nEach entry corresponds to one `external_service_backups` row joined with\n`external_services`, providing service metadata without a second request.",
@@ -8158,6 +8187,13 @@
           "gte",
           "lt",
           "lte"
+        ],
+        "type": "string"
+      },
+      "Comparison": {
+        "enum": [
+          "below",
+          "above"
         ],
         "type": "string"
       },
@@ -14786,6 +14822,37 @@
           }
         ]
       },
+      "DetectionEvidence": {
+        "enum": [
+          "value_pattern",
+          "variable_name"
+        ],
+        "type": "string"
+      },
+      "DetectionView": {
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/Candidate"
+            },
+            "type": "array"
+          },
+          "detection_rule_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "env_var_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "env_var_id",
+          "candidates",
+          "detection_rule_count"
+        ],
+        "type": "object"
+      },
       "DeviceCount": {
         "properties": {
           "count": {
@@ -20035,6 +20102,26 @@
         ],
         "type": "object"
       },
+      "ExpirationRule": {
+        "properties": {
+          "field": {
+            "$ref": "#/components/schemas/ResponseField"
+          },
+          "warning_days": {
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "field",
+          "warning_days"
+        ],
+        "type": "object"
+      },
       "ExpireRequest": {
         "description": "Request to set expiration on a key",
         "properties": {
@@ -20691,6 +20778,25 @@
           "name",
           "field_type",
           "nullable"
+        ],
+        "type": "object"
+      },
+      "Finding": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          }
+        },
+        "required": [
+          "code",
+          "status",
+          "message"
         ],
         "type": "object"
       },
@@ -24660,6 +24766,190 @@
           "challenge_exists",
           "dns_a_records",
           "dns_aaaa_records"
+        ],
+        "type": "object"
+      },
+      "HttpCheckList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HttpCheckView"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "HttpCheckMethod": {
+        "enum": [
+          "get",
+          "head"
+        ],
+        "type": "string"
+      },
+      "HttpCheckSpec": {
+        "description": "This is a declarative HTTP recipe, never executable code.\nHeaders may contain secrets: hosts must encrypt this specification at rest.",
+        "properties": {
+          "accepted_statuses": {
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "credential_header": {
+            "description": "Credential injection is separate from detection and always explicitly selected.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "credential_prefix": {
+            "type": "string"
+          },
+          "expiration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExpirationRule"
+              }
+            ]
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpCheckMethod"
+          },
+          "numeric_rules": {
+            "items": {
+              "$ref": "#/components/schemas/NumericRule"
+            },
+            "type": "array"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "method",
+          "accepted_statuses"
+        ],
+        "type": "object"
+      },
+      "HttpCheckView": {
+        "properties": {
+          "automatic_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "env_var_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "interval_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_check_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VerificationResult"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "enabled",
+          "interval_seconds",
+          "next_check_at"
+        ],
+        "type": "object"
+      },
+      "HttpChecksCapabilities": {
+        "properties": {
+          "alerts_configured": {
+            "type": "boolean"
+          },
+          "alerts_setup_path": {
+            "type": "string"
+          },
+          "detection_rule_count": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "detection_rule_count",
+          "alerts_configured",
+          "alerts_setup_path"
         ],
         "type": "object"
       },
@@ -30390,6 +30680,37 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NumericRule": {
+        "properties": {
+          "comparison": {
+            "$ref": "#/components/schemas/Comparison"
+          },
+          "critical": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "field": {
+            "$ref": "#/components/schemas/ResponseField"
+          },
+          "name": {
+            "type": "string"
+          },
+          "warning": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "field",
+          "comparison",
+          "warning"
         ],
         "type": "object"
       },
@@ -36380,6 +36701,29 @@
         ],
         "type": "object"
       },
+      "ProviderPreset": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/HttpCheckSpec"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "spec"
+        ],
+        "type": "object"
+      },
       "ProviderResponse": {
         "properties": {
           "auth_method": {
@@ -39139,6 +39483,46 @@
         },
         "type": "object"
       },
+      "ResponseField": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "header"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "json_pointer"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "RestoreCapabilities": {
         "description": "Capabilities a service exposes for the generic restore framework.\n\nEach engine overrides `ExternalService::restore_capabilities` to declare\nwhat it supports. The handler layer uses this to validate requests and\nthe UI uses it to conditionally show options (e.g., PITR picker).",
         "properties": {
@@ -40455,6 +40839,42 @@
           "provider_id",
           "auth_type",
           "provider"
+        ],
+        "type": "object"
+      },
+      "SaveHttpCheck": {
+        "description": "Credentials and recipe headers are write-only and encrypted at rest.",
+        "properties": {
+          "credential": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "env_var_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "interval_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/HttpCheckSpec"
+          }
+        },
+        "required": [
+          "name",
+          "spec"
         ],
         "type": "object"
       },
@@ -43738,6 +44158,17 @@
             "description": "Tri-state: absent leaves the override, `null` clears it (inherit the\nflag default), anything else sets it. Must match `value_type`."
           }
         },
+        "type": "object"
+      },
+      "SetHttpCheckEnabled": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
         "type": "object"
       },
       "SetPreviewPasswordBody": {
@@ -52534,6 +52965,84 @@
           "warning_count",
           "error_count",
           "critical_count"
+        ],
+        "type": "object"
+      },
+      "VariableHistoryEntry": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "details": {},
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "details",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "VariableHistoryList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VariableHistoryEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "VerificationResult": {
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          }
+        },
+        "required": [
+          "status",
+          "findings",
+          "checked_at"
         ],
         "type": "object"
       },
@@ -96961,6 +97470,151 @@
         ]
       }
     },
+    "/projects/{project_id}/env-vars/{env_var_id}/detect": {
+      "post": {
+        "operationId": "detectEnvCredential",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment variable ID",
+            "in": "path",
+            "name": "env_var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetectionView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/env-vars/{env_var_id}/history": {
+      "get": {
+        "operationId": "listVariableHistory",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "env_var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VariableHistoryList"
+                }
+              }
+            },
+            "description": "Variable activity and verification history"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
     "/projects/{project_id}/env-vars/{key}/value": {
       "get": {
         "operationId": "get_environment_variable_value",
@@ -102131,6 +102785,511 @@
         "summary": "Get hourly visits",
         "tags": [
           "Events"
+        ]
+      }
+    },
+    "/projects/{project_id}/http-checks": {
+      "get": {
+        "operationId": "listHttpChecks",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      },
+      "post": {
+        "operationId": "createHttpCheck",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveHttpCheck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/http-checks/capabilities": {
+      "get": {
+        "operationId": "getHttpChecksCapabilities",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpChecksCapabilities"
+                }
+              }
+            },
+            "description": "Capabilities"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/http-checks/presets": {
+      "get": {
+        "operationId": "listHttpCheckPresets",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderPreset"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/http-checks/{check_id}": {
+      "delete": {
+        "operationId": "deleteHttpCheck",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Check ID",
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      },
+      "patch": {
+        "operationId": "setHttpCheckEnabled",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHttpCheckEnabled"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckView"
+                }
+              }
+            },
+            "description": "Updated check"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      },
+      "put": {
+        "operationId": "updateHttpCheck",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Check ID",
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveHttpCheck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/http-checks/{check_id}/run": {
+      "post": {
+        "operationId": "runHttpCheck",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Check ID",
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
         ]
       }
     },
@@ -117127,6 +118286,10 @@
     {
       "description": "Unified alarm history — list, summarise, acknowledge, resolve",
       "name": "Alarms"
+    },
+    {
+      "description": "Provider-independent HTTP credential checks",
+      "name": "HTTP Checks"
     },
     {
       "description": "Authentication and authorization endpoints",

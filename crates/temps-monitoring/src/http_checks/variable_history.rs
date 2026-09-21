@@ -24,6 +24,7 @@ impl HttpChecksService {
         project_id: i32,
         env_var_id: i32,
         page: u64,
+        page_size: u64,
     ) -> Result<VariableHistoryList, HttpChecksError> {
         let exists = env_vars::Entity::find_by_id(env_var_id)
             .filter(env_vars::Column::ProjectId.eq(project_id))
@@ -37,11 +38,12 @@ impl HttpChecksService {
             });
         }
         let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
         let query = env_var_history::Entity::find()
             .filter(env_var_history::Column::ProjectId.eq(project_id))
             .filter(env_var_history::Column::EnvVarId.eq(env_var_id))
             .order_by_desc(env_var_history::Column::Id)
-            .paginate(self.db.as_ref(), 50);
+            .paginate(self.db.as_ref(), page_size);
         let total = query
             .num_items()
             .await
@@ -62,7 +64,7 @@ impl HttpChecksService {
             items,
             total,
             page,
-            page_size: 50,
+            page_size,
         })
     }
     /// Lock a bounded batch of variables so replicas cannot duplicate automatic checks.
@@ -74,7 +76,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(0, "begin automatic detection", e))?;
         let variables=env_vars::Entity::find().from_raw_sql(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL ORDER BY e.id LIMIT 20 FOR UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
+            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after, '-infinity'::timestamptz), e.id LIMIT 20 FOR UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
         for variable in variables {
             let project_id = variable.project_id;
             let value = if variable.is_encrypted {
@@ -83,7 +85,7 @@ impl HttpChecksService {
                     Err(_) => {
                         // A corrupt credential must not block detection for other variables.
                         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_var_history(project_id,env_var_id,kind) VALUES($1,$2,'detection_unavailable')",[project_id.into(),variable.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection",e))?;
-                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO NOTHING",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection marker",e))?;
+                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at,retry_after) VALUES($1,$2,NOW()+INTERVAL '5 minutes') ON CONFLICT(env_var_id) DO UPDATE SET retry_after=EXCLUDED.retry_after",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection marker",e))?;
                         tracing::warn!(
                             project_id,
                             env_var_id = variable.id,
@@ -114,7 +116,7 @@ impl HttpChecksService {
                 // A renamed/replaced credential must never keep being sent to its former issuer.
                 tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL",[variable.id.into()])).await.map_err(|e|db_error(project_id,"remove obsolete automatic check",e))?;
             }
-            tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO UPDATE SET observed_updated_at=EXCLUDED.observed_updated_at",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record automatic detection",e))?;
+            tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO UPDATE SET observed_updated_at=EXCLUDED.observed_updated_at,retry_after=NULL",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record automatic detection",e))?;
         }
         tx.commit()
             .await

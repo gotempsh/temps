@@ -1,3 +1,4 @@
+import { CheckLoading } from './CheckLoading'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -187,9 +188,14 @@ export function HttpChecksSettings({
         <h2 className="text-2xl font-semibold break-all">{`Checks for ${variable.key}`}</h2>
         <p className="text-sm text-muted-foreground">
           Verify API access, expiration, and numeric thresholds with a read-only
-          HTTPS request.
+          HTTPS request. Write-only secrets can only use their recognized
+          provider’s reviewed endpoint and authentication headers. Custom
+          destinations require an explicit credential.
         </p>
       </header>
+      {(checks.isPending || presets.isPending || capabilities.isPending) && (
+        <CheckLoading label="Loading check configuration…" />
+      )}
       {capabilities.data && !capabilities.data.alerts_configured && (
         <p className="text-sm text-muted-foreground">
           Checks run without alerts until you{' '}

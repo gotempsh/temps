@@ -7,6 +7,7 @@ mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
 
 pub mod m20260921_000001_http_checks;
 pub mod m20260921_000002_env_check_history;
+pub mod m20260921_000003_detection_retry;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -619,6 +620,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260920_000001_compose_security_policies::Migration),
             Box::new(m20260921_000001_http_checks::Migration),
             Box::new(m20260921_000002_env_check_history::Migration),
+            Box::new(m20260921_000003_detection_retry::Migration),
         ]
     }
 }

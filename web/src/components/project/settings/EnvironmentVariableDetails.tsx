@@ -30,6 +30,7 @@ import {
   TableHead,
   TableCell,
 } from '@/components/ui/table'
+import { CheckLoading } from './CheckLoading'
 import { useHttpChecks } from './http-checks'
 
 const eventNames: Record<string, string> = {
@@ -309,9 +310,7 @@ export function EnvironmentVariableDetails({
                 </Button>
               </div>
             ) : checks.isPending ? (
-              <p role="status" className="p-6 text-sm text-muted-foreground">
-                Loading checks…
-              </p>
+              <CheckLoading />
             ) : !scoped.length ? (
               <EmptyState
                 size="compact"
@@ -408,9 +407,7 @@ export function EnvironmentVariableDetails({
           </div>
           <div className="overflow-hidden rounded-lg border bg-card">
             {history.isPending ? (
-              <p role="status" className="p-6 text-sm text-muted-foreground">
-                Loading history…
-              </p>
+              <CheckLoading label="Loading history…" />
             ) : history.isError ? (
               <div role="alert" className="p-6 text-sm">
                 Could not load history.{' '}

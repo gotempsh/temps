@@ -283,7 +283,7 @@ pub async fn set_enabled(
     Extension(metadata): Extension<RequestMetadata>,
     Json(body): Json<SetHttpCheckEnabled>,
 ) -> Result<Json<HttpCheckView>, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
+    authorize_check_toggle(&auth, body.enabled)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     let result = state
@@ -315,7 +315,12 @@ pub async fn history(
     Ok(Json(
         state
             .service
-            .variable_history(project_id, env_var_id, query.page.unwrap_or(1))
+            .variable_history(
+                project_id,
+                env_var_id,
+                query.page.unwrap_or(1),
+                query.page_size.unwrap_or(15),
+            )
             .await?,
     ))
 }
@@ -347,3 +352,50 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
 #[derive(OpenApi)]
 #[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history),components(schemas(VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Provider-independent HTTP credential checks")))]
 pub struct HttpChecksApiDoc;
+
+fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+    if enabled {
+        permission_guard!(auth, SecretsRead);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    #[test]
+    fn resuming_requires_secret_permission_but_pausing_does_not() {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test".into(),
+            email: "test@example.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let auth = temps_auth::AuthContext::new_session(user.clone(), temps_auth::Role::User);
+        assert!(authorize_check_toggle(&auth, false).is_ok());
+        assert_eq!(
+            authorize_check_toggle(&auth, true)
+                .unwrap_err()
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let admin = temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin);
+        assert!(authorize_check_toggle(&admin, true).is_ok());
+    }
+}

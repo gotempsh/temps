@@ -4,7 +4,8 @@
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{
-    EnvCheckHistoryMigration, HttpChecksMigration, MigrationTrait, SchemaManager,
+    DetectionRetryMigration, EnvCheckHistoryMigration, HttpChecksMigration, MigrationTrait,
+    SchemaManager,
 };
 
 #[tokio::test]
@@ -22,6 +23,7 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
+    DetectionRetryMigration.up(&schema).await.unwrap();
     db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'test','ciphertext')").await.unwrap();
     let claim = |token: &str| {
         Statement::from_sql_and_values(DatabaseBackend::Postgres,
@@ -89,6 +91,7 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
         rows.is_empty(),
         "deleting a credential removes its scheduled checks"
     );
+    DetectionRetryMigration.down(&schema).await.unwrap();
     EnvCheckHistoryMigration.down(&schema).await.unwrap();
     HttpChecksMigration.down(&schema).await.unwrap();
 }
@@ -125,17 +128,29 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
+    DetectionRetryMigration.up(&schema).await.unwrap();
     let service = temps_monitoring::http_checks::HttpChecksService::new(
         database.connection_arc(),
         std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
-            "test-password",
+            "wrong-password",
         )),
         std::sync::Arc::new(Notifications),
     )
     .unwrap();
     db.execute_unprepared(
-        "INSERT INTO env_vars(id,key,value,is_encrypted) VALUES(0,'OPENAI_API_KEY','invalid-ciphertext',TRUE),(1,'GITHUB_TOKEN','synthetic-not-real',FALSE)",
+        "INSERT INTO env_vars(id,key,value,is_encrypted) VALUES(0,'OPENAI_API_KEY','invalid-ciphertext',TRUE),(1,'GITHUB_TOKEN','ghp_abcdefghijklmnopqrstuvwxyz0123456789',FALSE),(2,'GITHUB_TOKEN','unrelated-secret',FALSE)",
     )
+    .await
+    .unwrap();
+    let repaired_key = temps_core::EncryptionService::new_from_password("test-password");
+    let ciphertext = repaired_key
+        .encrypt_string("ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+        .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE env_vars SET value=$1 WHERE id=0",
+        [ciphertext.into()],
+    ))
     .await
     .unwrap();
     service.reconcile_variables().await.unwrap();
@@ -148,17 +163,25 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
     );
     let id = checks.items[0].id;
     service.set_enabled(1, id, false).await.unwrap();
-    db.execute_unprepared("UPDATE env_vars SET value='rotated-synthetic' WHERE id=1")
-        .await
-        .unwrap();
+    db.execute_unprepared(
+        "UPDATE env_vars SET value='ghp_0123456789abcdefghijklmnopqrstuvwxyz' WHERE id=1",
+    )
+    .await
+    .unwrap();
     service.reconcile_variables().await.unwrap();
     assert!(
         !service.list(1, 1, 20).await.unwrap().items[0].enabled,
         "rotation must preserve a user pause"
     );
-    db.execute_unprepared(
-        "UPDATE env_vars SET key='OPENAI_API_KEY',value='another-synthetic' WHERE id=1",
-    )
+    let synthetic_openai = format!(
+        "sk-{}T3BlbkFJ{}",
+        "abcdefghijklmnopqrst", "0123456789abcdefghij"
+    );
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE env_vars SET key='OPENAI_API_KEY',value=$1 WHERE id=1",
+        [synthetic_openai.into()],
+    ))
     .await
     .unwrap();
     service.reconcile_variables().await.unwrap();
@@ -173,7 +196,26 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
         .unwrap();
     service.reconcile_variables().await.unwrap();
     assert_eq!(service.list(1, 1, 20).await.unwrap().total, 0);
-    let history = service.variable_history(1, 1, 1).await.unwrap();
+    // Recover after correcting the key, without changing the variable after failure.
+    let service = temps_monitoring::http_checks::HttpChecksService::new(
+        database.connection_arc(),
+        std::sync::Arc::new(repaired_key),
+        std::sync::Arc::new(Notifications),
+    )
+    .unwrap();
+    db.execute_unprepared(
+        "UPDATE env_check_detection SET retry_after=NOW()-INTERVAL '1 second' WHERE env_var_id=0",
+    )
+    .await
+    .unwrap();
+    service.reconcile_variables().await.unwrap();
+    assert_eq!(service.list(1, 1, 20).await.unwrap().total, 1);
+    let small = service.variable_history(1, 1, 1, 2).await.unwrap();
+    let next = service.variable_history(1, 1, 2, 2).await.unwrap();
+    assert_eq!(small.page_size, 2);
+    assert_eq!(small.items.len(), 2);
+    assert!(small.items[1].id > next.items[0].id);
+    let history = service.variable_history(1, 1, 1, 15).await.unwrap();
     assert!(history.items.iter().any(|entry| entry.kind == "created"));
     assert!(history
         .items
@@ -183,7 +225,7 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
         .unwrap()
         .contains("synthetic"));
     assert!(matches!(
-        service.variable_history(99, 1, 1).await,
+        service.variable_history(99, 1, 1, 15).await,
         Err(temps_monitoring::http_checks::HttpChecksError::NotFound { .. })
     ));
 }
