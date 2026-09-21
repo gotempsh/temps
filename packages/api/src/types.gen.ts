@@ -8401,6 +8401,11 @@ export type EnqueuedJob = {
 };
 
 export type EnrichVisitorRequest = {
+  /**
+   * Attributes to attach to the visitor. Top-level keys are merged into the
+   * visitor's stored `custom_data`; a key whose value is `null` removes that
+   * key. Deployment tokens may send at most 32 keys and 8 KB.
+   */
   custom_data: {
     [key: string]: unknown;
   };
@@ -11474,6 +11479,7 @@ export type HeartbeatApiRequest = {
    * Updated node labels for scheduling (allows runtime label changes).
    */
   labels?: unknown;
+  public_ingress?: null | PublicIngressHeartbeat;
 };
 
 export type HeartbeatResponse = {
@@ -14276,6 +14282,13 @@ export type NodeInfoResponse = {
   last_heartbeat?: string | null;
   name: string;
   private_address: string;
+  public_ingress_certificate_count?: number | null;
+  public_ingress_enabled: boolean;
+  public_ingress_last_error?: string | null;
+  public_ingress_route_count?: number | null;
+  public_ingress_running?: boolean | null;
+  public_ingress_unsupported_reasons: Array<string>;
+  public_ingress_unsupported_route_count?: number | null;
   role: string;
   status: string;
 };
@@ -17502,6 +17515,15 @@ export type PublicEnvExampleResponse = {
  */
 export type PublicHostnameStrategy = "standard" | "flat";
 
+export type PublicIngressHeartbeat = {
+  certificate_count: number;
+  last_error?: string | null;
+  route_count: number;
+  running: boolean;
+  unsupported_reasons?: Array<string>;
+  unsupported_route_count: number;
+};
+
 /**
  * Information about a public IP address lookup
  */
@@ -20642,6 +20664,15 @@ export type SetFlagEnvironmentRequest = {
 
 export type SetHttpCheckEnabled = {
   enabled: boolean;
+};
+
+export type SetNodePublicIngressRequest = {
+  enabled: boolean;
+};
+
+export type SetNodePublicIngressResponse = {
+  enabled: boolean;
+  node_id: number;
 };
 
 export type SetPreviewPasswordBody = {
@@ -30016,28 +30047,27 @@ export type EnrichVisitorData = {
   body: EnrichVisitorRequest;
   path: {
     /**
-     * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
+     * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project.
      */
     visitor_id: string;
   };
-  query: {
-    /**
-     * Project ID or slug
-     */
-    project_id: number;
-  };
+  query?: never;
   url: "/analytics/visitors/{visitor_id}/enrich";
 };
 
 export type EnrichVisitorErrors = {
   /**
-   * Invalid parameters or project not found
+   * Invalid visitor ID, or enrichment data that is not a JSON object within the size limits
    */
   400: unknown;
   /**
-   * Visitor not found
+   * Deployment token used with a non-encrypted visitor ID
    */
-  404: unknown;
+  403: unknown;
+  /**
+   * The deployment token made too many visitor-changing enrichments in the last minute; retry shortly
+   */
+  429: unknown;
   /**
    * Internal server error
    */
@@ -30046,7 +30076,7 @@ export type EnrichVisitorErrors = {
 
 export type EnrichVisitorResponses = {
   /**
-   * Successfully enriched visitor data
+   * Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed.
    */
   200: EnrichVisitorResponse;
 };
@@ -41525,6 +41555,10 @@ export type NodeHeartbeatData = {
 
 export type NodeHeartbeatErrors = {
   /**
+   * Invalid heartbeat payload
+   */
+  400: unknown;
+  /**
    * Unauthorized
    */
   401: unknown;
@@ -41583,6 +41617,33 @@ export type ListPeersResponses = {
 };
 
 export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
+
+export type AdminSetNodePublicIngressData = {
+  body: SetNodePublicIngressRequest;
+  path: {
+    node_id: number;
+  };
+  query?: never;
+  url: "/internal/nodes/{node_id}/public-ingress";
+};
+
+export type AdminSetNodePublicIngressErrors = {
+  /**
+   * Node is not a worker
+   */
+  400: unknown;
+  /**
+   * Node not found
+   */
+  404: unknown;
+};
+
+export type AdminSetNodePublicIngressResponses = {
+  200: SetNodePublicIngressResponse;
+};
+
+export type AdminSetNodePublicIngressResponse =
+  AdminSetNodePublicIngressResponses[keyof AdminSetNodePublicIngressResponses];
 
 export type GetS3CredentialsData = {
   body?: never;

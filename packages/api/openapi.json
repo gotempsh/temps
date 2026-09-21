@@ -17941,6 +17941,7 @@
       "EnrichVisitorRequest": {
         "properties": {
           "custom_data": {
+            "description": "Attributes to attach to the visitor. Top-level keys are merged into the\nvisitor's stored `custom_data`; a key whose value is `null` removes that\nkey. Deployment tokens may send at most 32 keys and 8 KB.",
             "type": "object"
           }
         },
@@ -24820,6 +24821,16 @@
           },
           "labels": {
             "description": "Updated node labels for scheduling (allows runtime label changes)."
+          },
+          "public_ingress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublicIngressHeartbeat"
+              }
+            ]
           }
         },
         "type": "object"
@@ -30968,6 +30979,48 @@
           "private_address": {
             "type": "string"
           },
+          "public_ingress_certificate_count": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "public_ingress_enabled": {
+            "type": "boolean"
+          },
+          "public_ingress_last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_ingress_route_count": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "public_ingress_running": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "public_ingress_unsupported_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "public_ingress_unsupported_route_count": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "role": {
             "type": "string"
           },
@@ -30984,7 +31037,9 @@
           "status",
           "labels",
           "capacity",
-          "created_at"
+          "created_at",
+          "public_ingress_enabled",
+          "public_ingress_unsupported_reasons"
         ],
         "type": "object"
       },
@@ -37904,6 +37959,44 @@
         ],
         "type": "string"
       },
+      "PublicIngressHeartbeat": {
+        "properties": {
+          "certificate_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "route_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "unsupported_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unsupported_route_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "running",
+          "certificate_count",
+          "route_count",
+          "unsupported_route_count"
+        ],
+        "type": "object"
+      },
       "PublicIpInfo": {
         "description": "Information about a public IP address lookup",
         "properties": {
@@ -44719,6 +44812,33 @@
           }
         },
         "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "SetNodePublicIngressRequest": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "SetNodePublicIngressResponse": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node_id",
           "enabled"
         ],
         "type": "object"
@@ -64126,25 +64246,16 @@
     },
     "/analytics/visitors/{visitor_id}/enrich": {
       "put": {
+        "description": "The top-level keys of `custom_data` are merged into what is already stored;\na key set to `null` is removed. A deployed app can call this with its\ninjected deployment token (permission `visitors:enrich`), using the sealed\n`enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own\nproject only.",
         "operationId": "enrich_visitor",
         "parameters": [
           {
-            "description": "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)",
+            "description": "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project.",
             "in": "path",
             "name": "visitor_id",
             "required": true,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Project ID or slug",
-            "in": "query",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
             }
           }
         ],
@@ -64167,13 +64278,16 @@
                 }
               }
             },
-            "description": "Successfully enriched visitor data"
+            "description": "Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed."
           },
           "400": {
-            "description": "Invalid parameters or project not found"
+            "description": "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"
           },
-          "404": {
-            "description": "Visitor not found"
+          "403": {
+            "description": "Deployment token used with a non-encrypted visitor ID"
+          },
+          "429": {
+            "description": "The deployment token made too many visitor-changing enrichments in the last minute; retry shortly"
           },
           "500": {
             "description": "Internal server error"
@@ -64184,6 +64298,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Attach attributes (for example the signed-in user's id, name and email) to a\nvisitor.",
         "tags": [
           "Analytics"
         ],
@@ -80944,6 +81059,9 @@
             },
             "description": "Heartbeat received"
           },
+          "400": {
+            "description": "Invalid heartbeat payload"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -80997,6 +81115,58 @@
           }
         },
         "summary": "`GET /internal/nodes/{node_id}/network/peers`",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/public-ingress": {
+      "patch": {
+        "operationId": "admin_set_node_public_ingress",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetNodePublicIngressRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetNodePublicIngressResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Node is not a worker"
+          },
+          "404": {
+            "description": "Node not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Nodes"
         ]

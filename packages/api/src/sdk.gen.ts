@@ -74,6 +74,9 @@ import type {
   AdminRemoveNodeData,
   AdminRemoveNodeErrors,
   AdminRemoveNodeResponses,
+  AdminSetNodePublicIngressData,
+  AdminSetNodePublicIngressErrors,
+  AdminSetNodePublicIngressResponses,
   AdminUndrainNodeData,
   AdminUndrainNodeErrors,
   AdminUndrainNodeResponses,
@@ -5688,6 +5691,16 @@ export const getVisitorDetails = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Attach attributes (for example the signed-in user's id, name and email) to a
+ * visitor.
+ *
+ * The top-level keys of `custom_data` are merged into what is already stored;
+ * a key set to `null` is removed. A deployed app can call this with its
+ * injected deployment token (permission `visitors:enrich`), using the sealed
+ * `enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own
+ * project only.
+ */
 export const enrichVisitor = <ThrowOnError extends boolean = false>(
   options: Options<EnrichVisitorData, ThrowOnError>,
 ): RequestResult<EnrichVisitorResponses, EnrichVisitorErrors, ThrowOnError> =>
@@ -11661,6 +11674,27 @@ export const listPeers = <ThrowOnError extends boolean = false>(
     ListPeersErrors,
     ThrowOnError
   >({ url: "/internal/nodes/{node_id}/network/peers", ...options });
+
+export const adminSetNodePublicIngress = <ThrowOnError extends boolean = false>(
+  options: Options<AdminSetNodePublicIngressData, ThrowOnError>,
+): RequestResult<
+  AdminSetNodePublicIngressResponses,
+  AdminSetNodePublicIngressErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    AdminSetNodePublicIngressResponses,
+    AdminSetNodePublicIngressErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/internal/nodes/{node_id}/public-ingress",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Get decrypted S3 credentials for a backup/restore operation.
