@@ -123,6 +123,19 @@ actual control on public reachability for most granted projects, not the
 private address -- and, like every other write that changes what a granted
 project exposes, is admin-only (see "Nothing else can plant the payload").
 
+"Keeps only nodes that advertise the grant" above is
+`NodeService::granting_node_ids_and_names`, which runs on every placement of
+a declared project and selects only `id`, `name` and `capacity` -- not the
+full `nodes` row (labels, token, address, timestamps) `list_all()` used to
+load for this same check. The exact-slug match still happens in Rust via
+the existing `capacity_grants()` helper; a
+`capacity->'docker_socket_projects' @> '["<slug>"]'` predicate evaluated by
+Postgres, matching `ProjectService::docker_socket_capability`'s read-only
+capability query, would remove that Rust-side filter entirely but is not
+mockable with the `sea_orm::MockDatabase` this module's placement tests
+build on throughout -- left as follow-up work that also converts those
+tests to a real database.
+
 ### It is visible, and it is audited
 
 The project response carries a capability object -- `granted`, `reason`,
@@ -195,6 +208,22 @@ below instance-admin, or register a `SensitiveActionAuthorizer` that denies
 non-interactive principals for `ClaimDockerSocketSlug` /
 `ReleaseDockerSocketSlug`.
 
+The claim-time check above (`guard_reserved_slug`, called from
+`create_project_as`/`create_service_project_as`) is authoritative but runs
+*after* project creation is already committed to happening. That is a
+problem for callers with an irreversible side effect between planning the
+slug and calling it: creating a project from a template in fork mode calls
+`create_repository_and_push_template` -- an external, irreversible Git
+provider API call -- against the already-planned slug before that check
+ever ran. A `428 STEP_UP_REQUIRED` at creation time then left an orphaned
+external repository with no Temps project behind it, and a retry failed
+with "repository already exists" rather than re-prompting for step-up.
+`ProjectService::preflight_guard_reserved_slug` runs the identical guard
+early, keyed to the same planned slug, for exactly this shape of caller. It
+does not replace the creation-time check -- the planned slug can still
+change between the two calls via a race -- it only moves the irreversible
+side effect to after step-up is satisfied in the common case.
+
 #### What the audit record does and does not prove
 
 The audit event is written on the control plane from the executing host's
@@ -246,6 +275,33 @@ own authorization to mount the socket -- only the control plane's
 declaration counts, closing a gap where a stale or leftover worker-side
 grant could mount the socket with no cross-check against the control plane
 that actually decided placement.
+
+#### Exec authorization survives a rename away from the granted slug
+
+Renaming a project away from a granted slug is itself admin-only (the write
+guard above), but a rename does not stop or recreate that project's
+already-running containers -- it only stops *future* deployments from being
+granted the socket. Before this closure, `verify_container_exec_access`
+re-derived socket status from the project's **current** slug on every exec
+request, so a rename silently downgraded exec authorization on a
+still-socket-mounted container from instance-admin-only to anyone holding
+`ContainersExec`, even though that container is exactly as root-equivalent
+as it was before the rename.
+
+Closed with a persisted `deployments.docker_socket_mounted` column, set
+once from the executing host's own `DeployResult.docker_socket_mounted` at
+the same point the existing audit event below is written, and never
+cleared -- a deployment that was ever root-equivalent stays sensitive for
+as long as any of its containers exist. `guard_exec_against` now refuses
+exec when *either* signal fires: the project's current slug is
+granted-and-refused, or this specific deployment historically mounted the
+socket and the caller isn't authorized for a granted-project deploy. A
+per-container flag (touching all seven `deployment_containers` insert
+sites) or live Docker-mount inspection (touching the `ContainerDeployer`
+trait across local and remote nodes) would also have closed this; the
+per-deployment column was chosen as the smallest change that still answers
+"was *this* container root-equivalent", since exec targets a container that
+belongs to exactly one deployment.
 
 ### Nothing else can plant the payload a granted deploy will run as root
 
