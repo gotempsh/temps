@@ -5643,10 +5643,15 @@ mod tests {
     async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service() {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(error) => {
-                println!("Test database not available, skipping: {error}");
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker unavailable; skipping: {error}");
                 return;
             }
+            Err(error) => panic!("failed to prepare test database: {error}"),
         };
         let db = test_db.connection_arc();
         let (project, environment, deployment) = setup_test_data(&db)
