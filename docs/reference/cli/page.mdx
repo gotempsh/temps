@@ -4148,6 +4148,7 @@ View project analytics from the terminal. Displays key metrics, top pages, event
 
 - `overview` (`o`) - Show analytics dashboard overview
 - `top <dimension>` - Show breakdown by dimension
+- `enrich <visitor-id>` - Attach identity or attributes to a visitor
 
 ### `analytics overview` (alias: `o`)
 
@@ -4192,6 +4193,31 @@ temps analytics top browsers --json
 temps analytics top countries --limit 50
 temps analytics top events -p my-app
 temps analytics top utm_source --period 90d
+```
+
+### `analytics enrich <visitor-id>`
+
+Attach identity or attributes to a visitor. The top-level keys you send are merged into the visitor's stored `custom_data`; a key sent with a `null` value is removed. The visitor ID is a numeric ID, a visitor GUID, or the sealed `enc_...` ID from the `_temps_visitor_id` cookie.
+
+**Options:**
+
+| Flag                | Description                                                                        | Default | Required |
+| ------------------- | ---------------------------------------------------------------------------------- | ------- | -------- |
+| `-d, --data <json>` | JSON object to merge                                                               | -       | No       |
+| `-f, --file <path>` | Read the JSON object to merge from a file                                          | -       | No       |
+| `--set <key=value>` | Set one key to a string value (repeatable)                                         | -       | No       |
+| `--unset <key>`     | Remove one top-level key (repeatable; sends null)                                  | -       | No       |
+| `--json`            | Output in JSON format                                                              | -       | No       |
+
+At least one of `--data`, `--file`, `--set`, or `--unset` is required. Sources merge lowest to highest: `--file`, `--data`, `--set`, `--unset`. A visitor that does not exist is reported as a failure with a non-zero exit code.
+
+**Examples:**
+
+```bash
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
+bunx @temps-sdk/cli analytics enrich 4821 --set plan=pro --set segment=enterprise
+bunx @temps-sdk/cli analytics enrich 4821 --file ./visitor.json
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --unset trial_ends_at --json
 ```
 
 ## `notification-preferences` (alias: `notif-prefs`)

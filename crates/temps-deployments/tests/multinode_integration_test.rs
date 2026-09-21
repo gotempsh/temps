@@ -49,6 +49,13 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         dns_resolver_consecutive_failures: 0,
         dns_resolver_last_error: None,
         dns_resolver_record_count: None,
+        public_ingress_enabled: false,
+        public_ingress_running: None,
+        public_ingress_last_error: None,
+        public_ingress_certificate_count: None,
+        public_ingress_route_count: None,
+        public_ingress_unsupported_route_count: None,
+        public_ingress_unsupported_reasons: serde_json::json!([]),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -419,6 +426,7 @@ async fn test_heartbeat_reactivates_offline_node() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                public_ingress: None,
             },
         )
         .await;
@@ -446,6 +454,7 @@ async fn test_heartbeat_preserves_draining_status() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                public_ingress: None,
             },
         )
         .await;
@@ -529,6 +538,7 @@ async fn test_heartbeat_records_reported_architecture() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                public_ingress: None,
             },
         )
         .await;
@@ -563,6 +573,7 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                public_ingress: None,
             },
         )
         .await;

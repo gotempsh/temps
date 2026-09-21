@@ -25,7 +25,7 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::NodeArchitectureChangedAudit;
+use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
@@ -213,6 +213,18 @@ pub struct HeartbeatApiRequest {
     /// a pre-ADR-045 agent leaves the stored value untouched; an empty array
     /// clears it.
     pub docker_socket_projects: Option<Vec<String>>,
+    pub public_ingress: Option<PublicIngressHeartbeat>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PublicIngressHeartbeat {
+    pub running: bool,
+    pub last_error: Option<String>,
+    pub certificate_count: i64,
+    pub route_count: i64,
+    pub unsupported_route_count: i64,
+    #[serde(default)]
+    pub unsupported_reasons: Vec<String>,
 }
 
 /// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
@@ -275,6 +287,24 @@ pub struct NodeInfoResponse {
     pub architecture: Option<String>,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
+    pub public_ingress_enabled: bool,
+    pub public_ingress_running: Option<bool>,
+    pub public_ingress_last_error: Option<String>,
+    pub public_ingress_certificate_count: Option<i32>,
+    pub public_ingress_route_count: Option<i32>,
+    pub public_ingress_unsupported_route_count: Option<i32>,
+    pub public_ingress_unsupported_reasons: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetNodePublicIngressRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetNodePublicIngressResponse {
+    pub node_id: i32,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -452,6 +482,7 @@ pub struct ClusterDnsStatusResponse {
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
+        admin_set_node_public_ingress,
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
@@ -479,6 +510,8 @@ pub struct ClusterDnsStatusResponse {
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
+        SetNodePublicIngressRequest,
+        SetNodePublicIngressResponse,
     )),
     info(
         title = "Node Registration API",
@@ -517,6 +550,10 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/internal/nodes/{node_id}/containers",
             get(admin_list_node_containers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress",
+            axum::routing::patch(admin_set_node_public_ingress),
         )
         .route(
             "/internal/nodes/{node_id}/drain",
@@ -1304,6 +1341,7 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
     request_body = HeartbeatApiRequest,
     responses(
         (status = 200, description = "Heartbeat received", body = HeartbeatResponse),
+        (status = 400, description = "Invalid heartbeat payload", ),
         (status = 401, description = "Unauthorized", ),
         (status = 404, description = "Node not found", ),
         (status = 500, description = "Internal server error", )
@@ -1348,6 +1386,20 @@ async fn node_heartbeat(
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
         docker_socket_projects: request.docker_socket_projects.clone(),
+        public_ingress: request
+            .public_ingress
+            .map(|ingress| {
+                crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+                    ingress.running,
+                    ingress.last_error,
+                    ingress.certificate_count,
+                    ingress.route_count,
+                    ingress.unsupported_route_count,
+                    ingress.unsupported_reasons,
+                )
+            })
+            .transpose()
+            .map_err(Problem::from)?,
     };
 
     let architecture_change = app_state
@@ -1927,6 +1979,13 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
+        public_ingress_enabled: false,
+        public_ingress_running: None,
+        public_ingress_last_error: None,
+        public_ingress_certificate_count: None,
+        public_ingress_route_count: None,
+        public_ingress_unsupported_route_count: None,
+        public_ingress_unsupported_reasons: Vec::new(),
     }
 }
 
@@ -1967,6 +2026,16 @@ async fn admin_list_nodes(
             architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
+            public_ingress_enabled: n.public_ingress_enabled,
+            public_ingress_running: n.public_ingress_running,
+            public_ingress_last_error: n.public_ingress_last_error,
+            public_ingress_certificate_count: n.public_ingress_certificate_count,
+            public_ingress_route_count: n.public_ingress_route_count,
+            public_ingress_unsupported_route_count: n.public_ingress_unsupported_route_count,
+            public_ingress_unsupported_reasons: serde_json::from_value(
+                n.public_ingress_unsupported_reasons,
+            )
+            .unwrap_or_default(),
         })
         .collect();
 
@@ -2024,6 +2093,59 @@ async fn admin_get_node(
         architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
+        public_ingress_enabled: node.public_ingress_enabled,
+        public_ingress_running: node.public_ingress_running,
+        public_ingress_last_error: node.public_ingress_last_error,
+        public_ingress_certificate_count: node.public_ingress_certificate_count,
+        public_ingress_route_count: node.public_ingress_route_count,
+        public_ingress_unsupported_route_count: node.public_ingress_unsupported_route_count,
+        public_ingress_unsupported_reasons: serde_json::from_value(
+            node.public_ingress_unsupported_reasons,
+        )
+        .unwrap_or_default(),
+    }))
+}
+
+#[utoipa::path(
+    tag = "Nodes",
+    patch,
+    path = "/internal/nodes/{node_id}/public-ingress",
+    operation_id = "admin_set_node_public_ingress",
+    request_body = SetNodePublicIngressRequest,
+    responses(
+        (status = 200, body = SetNodePublicIngressResponse),
+        (status = 400, description = "Node is not a worker"),
+        (status = 404, description = "Node not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn admin_set_node_public_ingress(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+    Json(request): Json<SetNodePublicIngressRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let node = app_state
+        .node_service
+        .set_public_ingress_enabled(node_id, request.enabled)
+        .await
+        .map_err(Problem::from)?;
+    let audit = NodePublicIngressChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: None,
+            user_agent: "temps-api".to_string(),
+        },
+        node_id,
+        enabled: request.enabled,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(node_id, %error, "public ingress changed but audit record failed");
+    }
+    Ok(Json(SetNodePublicIngressResponse {
+        node_id: node.id,
+        enabled: node.public_ingress_enabled,
     }))
 }
 
@@ -3216,6 +3338,13 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3753,6 +3882,21 @@ mod tests {
             message: "bad input".to_string(),
         }
         .into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn invalid_public_ingress_heartbeat_maps_to_bad_request() {
+        let error = crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+            true,
+            None,
+            -1,
+            0,
+            0,
+            Vec::new(),
+        )
+        .expect_err("negative ingress count must be rejected");
+        let problem: Problem = error.into();
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
     }
 

@@ -19,6 +19,18 @@ describe('audit operation filters', () => {
       )?.label
     ).toBe('Plugin Permissions Changed')
   })
+  test('offers visitor enrichment so token writes are filterable', () => {
+    expect(
+      buildOperationOptions().find(
+        (option) => option.value === 'VISITOR_ENRICHED'
+      )
+    ).toEqual({
+      value: 'VISITOR_ENRICHED',
+      label: 'Visitor Enriched',
+      group: 'Analytics & Visitors',
+      keywords: 'VISITOR_ENRICHED',
+    })
+  })
   test('offers permission denials in the authentication group', () => {
     expect(
       buildOperationOptions().find(

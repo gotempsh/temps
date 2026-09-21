@@ -6033,6 +6033,7 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+- `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
 
 ### `analytics keys`
 
@@ -6340,6 +6341,20 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics enrich`
+
+Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --data <json>` | JSON object to merge, e.g. '{"user_id":"user_123"}' | - | No |
+| `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
+| `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
+| `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)

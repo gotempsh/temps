@@ -5,6 +5,7 @@ import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
 import {
   Bell,
   Box,
+  ChartLine,
   Database,
   FileCode,
   FolderKanban,
@@ -56,6 +57,7 @@ export type Category =
   | 'webhook'
   | 'notification'
   | 'storage'
+  | 'analytics'
   | 'platform'
   | 'other'
 
@@ -117,6 +119,8 @@ export function categorize(op: string): Category {
     return 'notification'
   if (op.startsWith('BLOB_SERVICE_') || op.startsWith('KV_SERVICE_'))
     return 'storage'
+  if (op.startsWith('VISITOR_') || op.startsWith('ANALYTICS_'))
+    return 'analytics'
   if (
     op === 'SETTINGS_UPDATED' ||
     op === 'JOIN_TOKEN_GENERATED' ||
@@ -230,6 +234,11 @@ export const CATEGORY_META: Record<
     label: 'Storage',
     icon: Database,
     tone: 'bg-green-500/10 text-green-600 dark:text-green-400',
+  },
+  analytics: {
+    label: 'Analytics',
+    icon: ChartLine,
+    tone: 'bg-gray-500/10 text-gray-600 dark:text-gray-400',
   },
   platform: {
     label: 'Platform',

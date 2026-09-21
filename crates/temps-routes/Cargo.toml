@@ -26,6 +26,9 @@ parking_lot = "0.12"
 # Logging
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+x509-parser = "0.18"
+rustls-pemfile = "2"
 
 # Async
 tokio = { workspace = true }

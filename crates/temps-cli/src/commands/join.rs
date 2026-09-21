@@ -97,15 +97,46 @@ fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
     serde_json::from_str(&data).ok()
 }
 
+fn saved_config_for_reenrollment<'a>(
+    saved: Option<&'a temps_agent::AgentConfig>,
+    node_name: &str,
+    control_plane_url: &str,
+) -> Option<&'a temps_agent::AgentConfig> {
+    let saved = saved?;
+    let same_control_plane =
+        saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/');
+    (saved.node_name == node_name && same_control_plane).then_some(saved)
+}
+
 fn prior_token_for_reenrollment(
     saved: Option<&temps_agent::AgentConfig>,
     node_name: &str,
     control_plane_url: &str,
 ) -> Option<String> {
-    let saved = saved?;
-    let same_control_plane =
-        saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/');
-    (saved.node_name == node_name && same_control_plane).then(|| saved.token.clone())
+    saved_config_for_reenrollment(saved, node_name, control_plane_url)
+        .map(|saved| saved.token.clone())
+}
+
+fn public_ingress_listener_settings(
+    matching_saved: Option<&temps_agent::AgentConfig>,
+) -> (Option<std::net::IpAddr>, u16, u16) {
+    matching_saved.map_or((None, 80, 443), |saved| {
+        (
+            saved.public_ingress_address,
+            saved.public_ingress_http_port,
+            saved.public_ingress_https_port,
+        )
+    })
+}
+
+fn apply_saved_public_ingress_settings(
+    config: &mut temps_agent::AgentConfig,
+    matching_saved: Option<&temps_agent::AgentConfig>,
+) {
+    let (address, http_port, https_port) = public_ingress_listener_settings(matching_saved);
+    config.public_ingress_address = address;
+    config.public_ingress_http_port = http_port;
+    config.public_ingress_https_port = https_port;
 }
 
 /// Extract the port `temps agent` will listen on from `--agent-address`.
@@ -379,7 +410,11 @@ impl JoinCommand {
         // can sign a leaf for us (ADR-020 WS-2.1). The leaf must be valid for
         // the private address the CP connects to.
         let tls_material = generate_node_tls_material(node_name, private_address.trim())?;
+        let (public_ingress_private_key, public_ingress_public_key) =
+            generate_public_ingress_key()?;
         let saved_config = load_saved_agent_config();
+        let matching_saved =
+            saved_config_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
         let prior_token =
             prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
 
@@ -400,6 +435,7 @@ impl JoinCommand {
             "architecture": platform,
             "csr_pem": tls_material.csr_pem.clone(),
             "prior_token": prior_token,
+            "edge_public_key": public_ingress_public_key,
         });
 
         let response = client
@@ -432,7 +468,7 @@ impl JoinCommand {
         let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let config = temps_agent::AgentConfig {
+        let mut config = temps_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: agent_token,
             node_name: node_name.to_string(),
@@ -447,7 +483,12 @@ impl JoinCommand {
             underlay_dev: self.underlay_dev.clone(),
             underlay_mtu: self.underlay_mtu,
             private_address: Some(private_address.trim().to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: Some(public_ingress_private_key),
         };
+        apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
         println!();
@@ -560,7 +601,14 @@ impl JoinCommand {
         // Generate per-node mTLS material and send the CSR (ADR-020 WS-2.1).
         // The leaf must be valid for the WG IP the CP connects to.
         let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip)?;
+        let (public_ingress_private_key, public_ingress_public_key) =
+            generate_public_ingress_key()?;
         let saved_config = load_saved_agent_config();
+        let matching_saved = saved_config_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            relay_response.control_plane_url.as_str(),
+        );
         let prior_token = prior_token_for_reenrollment(
             saved_config.as_ref(),
             node_name,
@@ -579,6 +627,7 @@ impl JoinCommand {
             "architecture": platform,
             "csr_pem": tls_material.csr_pem.clone(),
             "prior_token": prior_token,
+            "edge_public_key": public_ingress_public_key,
         });
 
         let response = register_client
@@ -617,7 +666,7 @@ impl JoinCommand {
         let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let config = temps_agent::AgentConfig {
+        let mut config = temps_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: relay_response.agent_token,
             node_name: node_name.to_string(),
@@ -632,7 +681,12 @@ impl JoinCommand {
             underlay_dev: self.underlay_dev.clone(),
             underlay_mtu: self.underlay_mtu,
             private_address: Some(relay_response.assigned_ip.clone()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: Some(public_ingress_private_key),
         };
+        apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
         println!();
@@ -711,6 +765,16 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
+fn generate_public_ingress_key() -> Result<(String, String), temps_core::ecies::EciesError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let secret = temps_core::ecies::generate_x25519_static_secret()?;
+    let public = x25519_dalek::PublicKey::from(&secret);
+    Ok((
+        STANDARD.encode(secret.as_bytes()),
+        STANDARD.encode(public.as_bytes()),
+    ))
+}
+
 /// Try to detect our public IP and WireGuard port for the endpoint.
 async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
     // Try to get public IP via a simple HTTP service
@@ -733,7 +797,11 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_listen_port, prior_token_for_reenrollment, socket_authority};
+    use super::{
+        agent_listen_port, apply_saved_public_ingress_settings, generate_public_ingress_key,
+        prior_token_for_reenrollment, public_ingress_listener_settings,
+        saved_config_for_reenrollment, socket_authority,
+    };
 
     #[test]
     fn agent_listen_port_reads_ipv4_socket_addr() {
@@ -779,6 +847,10 @@ mod tests {
             underlay_dev: None,
             underlay_mtu: None,
             private_address: Some("10.100.0.7".to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
         }
     }
 
@@ -789,6 +861,98 @@ mod tests {
             prior_token_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
                 .as_deref(),
             Some("existing-agent-token")
+        );
+    }
+
+    #[test]
+    fn matching_reenrollment_preserves_public_ingress_listener_settings() {
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+
+        let matched =
+            saved_config_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
+                .expect("same node identity should match");
+        assert_eq!(matched.public_ingress_address, saved.public_ingress_address);
+        assert_eq!(matched.public_ingress_http_port, 8080);
+        assert_eq!(matched.public_ingress_https_port, 8443);
+        assert_eq!(
+            public_ingress_listener_settings(Some(matched)),
+            (saved.public_ingress_address, 8080, 8443)
+        );
+        let mut produced = saved_config();
+        produced.public_ingress_address = None;
+        produced.public_ingress_http_port = 80;
+        produced.public_ingress_https_port = 443;
+        apply_saved_public_ingress_settings(&mut produced, Some(matched));
+        assert_eq!(
+            produced.public_ingress_address,
+            saved.public_ingress_address
+        );
+        assert_eq!(produced.public_ingress_http_port, 8080);
+        assert_eq!(produced.public_ingress_https_port, 8443);
+    }
+
+    #[test]
+    fn foreign_saved_identity_does_not_supply_public_ingress_settings() {
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+
+        assert!(saved_config_for_reenrollment(
+            Some(&saved),
+            "different-worker",
+            "https://control.example.com",
+        )
+        .is_none());
+        assert_eq!(public_ingress_listener_settings(None), (None, 80, 443));
+        assert!(saved_config_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://different-control.example.com",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reenrollment_rotates_public_ingress_encryption_identity() {
+        let (old_private, _) = generate_public_ingress_key().unwrap();
+        let (new_private, new_public) = generate_public_ingress_key().unwrap();
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+        saved.public_ingress_private_key = Some(old_private.clone());
+        let mut produced = saved.clone();
+        produced.public_ingress_address = None;
+        produced.public_ingress_http_port = 80;
+        produced.public_ingress_https_port = 443;
+        produced.public_ingress_private_key = Some(new_private.clone());
+        apply_saved_public_ingress_settings(&mut produced, Some(&saved));
+        let serialized = serde_json::to_vec(&produced).unwrap();
+        let persisted: temps_agent::AgentConfig = serde_json::from_slice(&serialized).unwrap();
+        let persisted_private = persisted.public_ingress_private_key.as_deref().unwrap();
+        assert_eq!(
+            persisted.public_ingress_address,
+            saved.public_ingress_address
+        );
+        assert_eq!(persisted.public_ingress_http_port, 8080);
+        assert_eq!(persisted.public_ingress_https_port, 8443);
+        assert_ne!(persisted_private, old_private);
+        let plaintext = b"new certificate bundle";
+        let (bundle, ephemeral_public) =
+            temps_core::ecies::encrypt_for_edge(&new_public, plaintext).unwrap();
+
+        assert_eq!(
+            temps_core::ecies::decrypt_bundle(persisted_private, &ephemeral_public, &bundle)
+                .unwrap(),
+            plaintext
+        );
+        assert!(
+            temps_core::ecies::decrypt_bundle(&old_private, &ephemeral_public, &bundle).is_err(),
+            "the prior enrollment key must not decrypt bundles for the rotated identity"
         );
     }
 

@@ -303,6 +303,9 @@ fn spawn_heartbeat_loop(
             if let Some(platform) = reported_platform {
                 body["architecture"] = serde_json::json!(platform);
             }
+            if let Some(ingress) = crate::public_ingress::health() {
+                body["public_ingress"] = serde_json::to_value(ingress).unwrap_or_default();
+            }
 
             // DNS resolver health (ADR-024), published by the network-sync
             // loop on every tick. `None` until that loop has ticked at
@@ -808,6 +811,10 @@ mod tests {
             underlay_dev: None,
             underlay_mtu: None,
             private_address: None,
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
         }
     }
 
