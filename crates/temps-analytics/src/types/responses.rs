@@ -322,6 +322,15 @@ pub struct EnrichVisitorResponse {
     pub success: bool,
     pub visitor_id: String,
     pub message: String,
+    /// Whether the stored visitor row actually changed. Internal: used by the
+    /// handler to audit only real writes, never serialized.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub updated: bool,
+    /// Primary key of the visitor that was enriched. Internal, for auditing.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub visitor_row_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

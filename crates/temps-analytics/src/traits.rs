@@ -137,10 +137,16 @@ pub trait Analytics: Send + Sync {
         sort_order: Option<String>,
     ) -> Result<Option<SessionLogsResponse>, AnalyticsError>;
 
-    /// Enrich visitor by ID
+    /// Enrich visitor by ID.
+    ///
+    /// When `project_id` is `Some`, only a visitor belonging to that project can
+    /// be enriched. Project-scoped callers should not reach this by numeric ID,
+    /// but the scope is enforced here too so the boundary never depends on the
+    /// caller's ID format.
     async fn enrich_visitor_by_id(
         &self,
         visitor_id: i32,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 

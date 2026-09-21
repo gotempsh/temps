@@ -106,6 +106,7 @@ impl TempsPlugin for AnalyticsPlugin {
             analytics_service,
             project_access_checker,
             api_traffic_service,
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
         });
 
         // ADR-040 ingest-key admin CRUD. Its own state so the key service and

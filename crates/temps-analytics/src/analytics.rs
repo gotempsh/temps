@@ -239,6 +239,114 @@ struct FacetScope<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+/// Largest serialized `custom_data` a project-scoped caller (a deployment
+/// token) may leave on a visitor row.
+pub const MAX_SCOPED_ENRICHMENT_BYTES: usize = 8 * 1024;
+/// Most top-level keys a project-scoped caller may leave on a visitor row.
+pub const MAX_SCOPED_ENRICHMENT_KEYS: usize = 32;
+
+/// Bound what a machine credential baked into a container can store on a
+/// visitor row: a JSON object of limited size and key count. Applied to both
+/// the incoming payload and the merged document, so repeated calls with fresh
+/// keys cannot grow a row without limit.
+pub fn validate_scoped_enrichment(custom_data: &serde_json::Value) -> Result<(), AnalyticsError> {
+    let Some(map) = custom_data.as_object() else {
+        return Err(AnalyticsError::InvalidEnrichmentData(
+            "custom_data must be a JSON object".to_string(),
+        ));
+    };
+    if map.len() > MAX_SCOPED_ENRICHMENT_KEYS {
+        return Err(AnalyticsError::InvalidEnrichmentData(format!(
+            "custom_data would have {} keys; at most {} are allowed",
+            map.len(),
+            MAX_SCOPED_ENRICHMENT_KEYS
+        )));
+    }
+    let size = custom_data.to_string().len();
+    if size > MAX_SCOPED_ENRICHMENT_BYTES {
+        return Err(AnalyticsError::InvalidEnrichmentData(format!(
+            "custom_data would be {} bytes; at most {} are allowed",
+            size, MAX_SCOPED_ENRICHMENT_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn visitor_not_found(visitor_id: String) -> EnrichVisitorResponse {
+    EnrichVisitorResponse {
+        success: false,
+        visitor_id,
+        message: "Visitor not found".to_string(),
+        updated: false,
+        visitor_row_id: None,
+    }
+}
+
+/// Merge `incoming` into `existing` at the top level. Anything that is not an
+/// object on both sides is replaced by `incoming`.
+fn merge_custom_data(
+    existing: Option<&serde_json::Value>,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    match (existing.and_then(|v| v.as_object()), incoming.as_object()) {
+        (Some(existing), Some(incoming)) => {
+            let mut merged = existing.clone();
+            for (key, value) in incoming {
+                merged.insert(key.clone(), value.clone());
+            }
+            serde_json::Value::Object(merged)
+        }
+        _ => incoming.clone(),
+    }
+}
+
+impl AnalyticsService {
+    /// Merge `incoming` into the visitor's `custom_data` and persist it.
+    ///
+    /// Skips the write when nothing changes, so a client that re-sends the same
+    /// identity on every page load costs a read, not a row rewrite.
+    async fn apply_visitor_enrichment(
+        &self,
+        visitor_model: temps_entities::visitor::Model,
+        project_scoped: bool,
+        incoming: serde_json::Value,
+        response_visitor_id: String,
+    ) -> Result<EnrichVisitorResponse, AnalyticsError> {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::visitor;
+
+        let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
+        if project_scoped {
+            validate_scoped_enrichment(&merged)?;
+        }
+        let visitor_row_id = visitor_model.id;
+        if visitor_model.custom_data.as_ref() == Some(&merged) {
+            return Ok(EnrichVisitorResponse {
+                success: true,
+                visitor_id: response_visitor_id,
+                message: "Visitor already up to date".to_string(),
+                updated: false,
+                visitor_row_id: Some(visitor_row_id),
+            });
+        }
+
+        let mut active_model: visitor::ActiveModel = visitor_model.into();
+        active_model.custom_data = Set(Some(merged));
+        active_model
+            .update(self.db.as_ref())
+            .await
+            .map_err(AnalyticsError::from)?;
+
+        Ok(EnrichVisitorResponse {
+            success: true,
+            visitor_id: response_visitor_id,
+            message: "Visitor enriched successfully".to_string(),
+            updated: true,
+            visitor_row_id: Some(visitor_row_id),
+        })
+    }
+}
+
 #[async_trait]
 impl Analytics for AnalyticsService {
     /// Get top pages by view count
@@ -1988,61 +2096,31 @@ impl Analytics for AnalyticsService {
     async fn enrich_visitor_by_id(
         &self,
         visitor_id: i32,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
-        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::visitor;
 
-        // Find the visitor by id
-        let visitor = visitor::Entity::find()
-            .filter(visitor::Column::Id.eq(visitor_id))
+        let mut query = visitor::Entity::find().filter(visitor::Column::Id.eq(visitor_id));
+        if let Some(project_id) = project_id {
+            query = query.filter(visitor::Column::ProjectId.eq(project_id));
+        }
+        let Some(visitor_model) = query
             .one(self.db.as_ref())
             .await
-            .map_err(AnalyticsError::from)?;
-
-        // Early return if visitor not found
-        let Some(visitor_model) = visitor else {
-            return Ok(EnrichVisitorResponse {
-                success: false,
-                visitor_id: visitor_id.to_string(),
-                message: "Visitor not found".to_string(),
-            });
+            .map_err(AnalyticsError::from)?
+        else {
+            return Ok(visitor_not_found(visitor_id.to_string()));
         };
 
-        let mut active_model: visitor::ActiveModel = visitor_model.into();
-
-        // Merge enrichment_data with existing custom_data (if any)
-        let merged_custom_data = match &active_model.custom_data {
-            sea_orm::ActiveValue::Set(Some(existing_json)) => {
-                // existing_json is serde_json::Value
-                let mut existing_map = match existing_json.as_object() {
-                    Some(map) => map.clone(),
-                    None => serde_json::Map::new(),
-                };
-                if let Some(new_map) = enrichment_data.as_object() {
-                    for (k, v) in new_map {
-                        existing_map.insert(k.clone(), v.clone());
-                    }
-                }
-                serde_json::Value::Object(existing_map)
-            }
-            _ => enrichment_data.clone(),
-        };
-
-        // Set the merged custom_data as serde_json::Value
-        active_model.custom_data = Set(Some(merged_custom_data));
-
-        // Save the updated visitor
-        active_model
-            .update(self.db.as_ref())
-            .await
-            .map_err(AnalyticsError::from)?;
-
-        Ok(EnrichVisitorResponse {
-            success: true,
-            visitor_id: visitor_id.to_string(),
-            message: "Visitor enriched successfully".to_string(),
-        })
+        self.apply_visitor_enrichment(
+            visitor_model,
+            project_id.is_some(),
+            enrichment_data,
+            visitor_id.to_string(),
+        )
+        .await
     }
 
     /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
@@ -2052,7 +2130,7 @@ impl Analytics for AnalyticsService {
         project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
-        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::visitor;
 
         // Handle encrypted visitor ID (enc_ prefix)
@@ -2060,6 +2138,12 @@ impl Analytics for AnalyticsService {
             match self.cookie_crypto.decrypt(encrypted) {
                 Ok(decrypted) => decrypted,
                 Err(_) => {
+                    // A project-scoped caller must not be able to tell an
+                    // undecryptable value from an unknown visitor: that would
+                    // let it probe the shared cookie key.
+                    if project_id.is_some() {
+                        return Ok(visitor_not_found(visitor_guid.to_string()));
+                    }
                     return Err(AnalyticsError::InvalidVisitorId(visitor_guid.to_string()));
                 }
             }
@@ -2075,56 +2159,24 @@ impl Analytics for AnalyticsService {
         if let Some(project_id) = project_id {
             query = query.filter(visitor::Column::ProjectId.eq(project_id));
         }
-        let visitor = query
+        let Some(visitor_model) = query
             .one(self.db.as_ref())
             .await
-            .map_err(AnalyticsError::from)?;
-
-        // Early return if visitor not found
-        let Some(visitor_model) = visitor else {
-            return Ok(EnrichVisitorResponse {
-                success: false,
-                // Echo the caller's own input, never the decrypted plaintext:
-                // the cookie key is shared with auth cookies, so returning it
-                // would make this endpoint a decryption oracle.
-                visitor_id: visitor_guid.to_string(),
-                message: "Visitor not found".to_string(),
-            });
+            .map_err(AnalyticsError::from)?
+        else {
+            // Echo the caller's own input, never the decrypted plaintext: the
+            // cookie key is shared with auth cookies, so returning it would make
+            // this endpoint a decryption oracle.
+            return Ok(visitor_not_found(visitor_guid.to_string()));
         };
 
-        let mut active_model: visitor::ActiveModel = visitor_model.into();
-
-        // Merge enrichment_data with existing custom_data (if any)
-        let merged_custom_data = match &active_model.custom_data {
-            sea_orm::ActiveValue::Set(Some(existing_json)) => {
-                let mut existing_map = match existing_json.as_object() {
-                    Some(map) => map.clone(),
-                    None => serde_json::Map::new(),
-                };
-                if let Some(new_map) = enrichment_data.as_object() {
-                    for (k, v) in new_map {
-                        existing_map.insert(k.clone(), v.clone());
-                    }
-                }
-                serde_json::Value::Object(existing_map)
-            }
-            _ => enrichment_data.clone(),
-        };
-
-        // Set the merged custom_data as serde_json::Value
-        active_model.custom_data = Set(Some(merged_custom_data));
-
-        // Save the updated visitor
-        active_model
-            .update(self.db.as_ref())
-            .await
-            .map_err(AnalyticsError::from)?;
-
-        Ok(EnrichVisitorResponse {
-            success: true,
-            visitor_id: visitor_guid.to_string(),
-            message: "Visitor enriched successfully".to_string(),
-        })
+        self.apply_visitor_enrichment(
+            visitor_model,
+            project_id.is_some(),
+            enrichment_data,
+            visitor_guid.to_string(),
+        )
+        .await
     }
 
     /// Check if analytics events exist
@@ -4990,6 +5042,50 @@ mod tests {
             .enrich_visitor_by_guid(&sealed, None, serde_json::json!({ "name": "n" }))
             .await?;
         assert!(unscoped.success);
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scoped_enrichment_cannot_grow_a_row_past_the_cap() -> anyhow::Result<()> {
+        let (service, db, _container) =
+            create_test_analytics_service!("test_scoped_enrichment_cannot_grow_a_row_past_the_cap");
+        let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+        let visitor = temps_entities::visitor::Entity::find()
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+
+        // Each call is within the per-call cap; together they exceed it.
+        let mut last = Ok(());
+        for batch in 0..3 {
+            let data: serde_json::Map<String, serde_json::Value> = (0..12)
+                .map(|i| (format!("k{batch}_{i}"), serde_json::json!(1)))
+                .collect();
+            last = service
+                .enrich_visitor_by_guid(
+                    &sealed,
+                    Some(visitor.project_id),
+                    serde_json::Value::Object(data),
+                )
+                .await
+                .map(|_| ());
+        }
+        assert!(
+            matches!(last, Err(AnalyticsError::InvalidEnrichmentData(_))),
+            "the merged document must be capped, not just each request"
+        );
+
+        // The same growth is allowed for unscoped (user / API key) callers.
+        let data: serde_json::Map<String, serde_json::Value> = (0..40)
+            .map(|i| (format!("u{i}"), serde_json::json!(1)))
+            .collect();
+        let unscoped = service
+            .enrich_visitor_by_guid(&sealed, None, serde_json::Value::Object(data))
+            .await?;
+        assert!(unscoped.success && unscoped.updated);
 
         cleanup_test_analytics!(db);
         Ok(())

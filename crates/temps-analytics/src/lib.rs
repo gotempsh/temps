@@ -11,6 +11,7 @@ pub mod ingest_keys;
 pub mod plugin;
 pub mod traits;
 pub mod types;
+pub mod visitor_audit;
 
 #[cfg(test)]
 pub mod testing;

@@ -10,7 +10,7 @@ use axum::{
     extract::{Query, State},
     response::IntoResponse,
     routing::{get, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -31,6 +31,8 @@ pub struct AppState {
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// API traffic analytics service (proxy_logs GROUP BY queries + optional AI summary).
     pub api_traffic_service: Arc<ApiTrafficService>,
+    /// Audit trail for writes made through this module's handlers.
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 #[derive(OpenApi)]
@@ -234,7 +236,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/analytics/visitors/{visitor_id}/enrich",
-            put(enrich_visitor),
+            // A real payload is a few identity fields. Reject anything larger
+            // before it is buffered and parsed.
+            put(enrich_visitor).layer(axum::extract::DefaultBodyLimit::max(ENRICH_MAX_BODY_BYTES)),
         )
         .route(
             "/analytics/visitors/{visitor_id}/sessions",
@@ -1078,78 +1082,22 @@ pub async fn get_session_logs(
     }
 }
 
-/// Largest serialized `custom_data` a deployment token may write per call.
-const MAX_TOKEN_ENRICHMENT_BYTES: usize = 8 * 1024;
-/// Most top-level keys a deployment token may write per call.
-const MAX_TOKEN_ENRICHMENT_KEYS: usize = 32;
+/// Request-body ceiling for the enrich route (see `MAX_SCOPED_ENRICHMENT_BYTES`
+/// for the tighter limit applied to deployment tokens).
+const ENRICH_MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// Bound what a machine credential baked into a container can write into a
-/// visitor row: a flat JSON object of limited size and key count.
-fn validate_token_enrichment_data(custom_data: &serde_json::Value) -> Result<(), Problem> {
-    let Some(map) = custom_data.as_object() else {
-        return Err(bad_request()
-            .title("Invalid Enrichment Data")
-            .detail("custom_data must be a JSON object")
-            .build());
-    };
-    if map.len() > MAX_TOKEN_ENRICHMENT_KEYS {
-        return Err(bad_request()
-            .title("Invalid Enrichment Data")
-            .detail(format!(
-                "custom_data has {} keys; deployment tokens may set at most {}",
-                map.len(),
-                MAX_TOKEN_ENRICHMENT_KEYS
-            ))
-            .build());
-    }
-    let size = custom_data.to_string().len();
-    if size > MAX_TOKEN_ENRICHMENT_BYTES {
-        return Err(bad_request()
-            .title("Invalid Enrichment Data")
-            .detail(format!(
-                "custom_data is {} bytes; deployment tokens may send at most {}",
-                size, MAX_TOKEN_ENRICHMENT_BYTES
-            ))
-            .build());
-    }
-    Ok(())
-}
-
-#[utoipa::path(
-    tag = "Analytics",
-    put,
-    path = "/analytics/visitors/{visitor_id}/enrich",
-    params(
-        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project."),
-        ("project_id" = i32, Query, description = "Project ID or slug"),
-    ),
-    request_body = EnrichVisitorRequest,
-    responses(
-        (status = 200, description = "Successfully enriched visitor data", body = EnrichVisitorResponse),
-        (status = 404, description = "Visitor not found"),
-        (status = 400, description = "Invalid parameters or project not found"),
-        (status = 403, description = "Deployment token used with a non-encrypted visitor ID"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(
-        ("bearer_auth" = [])
-    )
-)]
-pub async fn enrich_visitor(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    axum::extract::Path(visitor_id): axum::extract::Path<String>,
-    Json(request): Json<EnrichVisitorRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsWrite);
-
-    // Deployment tokens (the `TEMPS_API_TOKEN` injected into deployed apps) hold
-    // `visitors:enrich` and may enrich visitors, but only their own project's,
-    // and only when addressed by the sealed `enc_` id from the proxy's visitor
-    // cookie. Numeric ids and raw GUIDs would let a token pick arbitrary
-    // visitors, so they stay limited to user/API-key auth.
-    let scope_project_id = auth.project_id();
-    if auth.is_deployment_token() && !visitor_id.starts_with("enc_") {
+/// Extra rules for a deployment token calling the enrich endpoint.
+///
+/// Tokens (the `TEMPS_API_TOKEN` injected into deployed apps) may enrich, but
+/// only a visitor addressed by the sealed `enc_` id from the proxy's visitor
+/// cookie: numeric ids and raw GUIDs would let a token pick arbitrary
+/// visitors, so they stay limited to user/API-key auth. The payload is bounded
+/// too. The token's project confinement is applied in the service.
+fn deployment_token_enrich_guard(
+    visitor_id: &str,
+    custom_data: &serde_json::Value,
+) -> Result<(), Problem> {
+    if !visitor_id.starts_with("enc_") {
         return Err(temps_core::error_builder::ErrorBuilder::new(
             axum::http::StatusCode::FORBIDDEN,
         )
@@ -1165,32 +1113,90 @@ pub async fn enrich_visitor(
         )
         .build());
     }
+    crate::analytics::validate_scoped_enrichment(custom_data).map_err(handle_analytics_error)
+}
+
+#[utoipa::path(
+    tag = "Analytics",
+    put,
+    path = "/analytics/visitors/{visitor_id}/enrich",
+    params(
+        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project."),
+    ),
+    request_body = EnrichVisitorRequest,
+    responses(
+        (status = 200, description = "Successfully enriched visitor data", body = EnrichVisitorResponse),
+        (status = 404, description = "Visitor not found"),
+        (status = 400, description = "Invalid visitor ID, or enrichment data that is not a JSON object within the size limits"),
+        (status = 403, description = "Deployment token used with a non-encrypted visitor ID"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn enrich_visitor(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    axum::extract::Path(visitor_id): axum::extract::Path<String>,
+    Json(request): Json<EnrichVisitorRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+
+    // `Some` only for deployment tokens, which are confined to their project.
+    let scope_project_id = auth.project_id();
     if auth.is_deployment_token() {
-        validate_token_enrichment_data(&request.custom_data)?;
+        deployment_token_enrich_guard(&visitor_id, &request.custom_data)?;
     }
 
+    // Names only: values are routinely personal data and stay out of the audit trail.
+    let custom_data_keys: Vec<String> = request
+        .custom_data
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
-    if let Ok(numeric_id) = visitor_id.parse::<i32>() {
-        // Numeric ID - use enrich_visitor_by_id
-        match app_state
+    let result = if let Ok(numeric_id) = visitor_id.parse::<i32>() {
+        app_state
             .analytics_service
-            .enrich_visitor_by_id(numeric_id, request.custom_data)
+            .enrich_visitor_by_id(numeric_id, scope_project_id, request.custom_data)
             .await
-        {
-            Ok(response) => Ok(Json(response)),
-            Err(e) => Err(handle_analytics_error(e)),
-        }
     } else {
-        // GUID or encrypted GUID (enc_xxx) - use enrich_visitor_by_guid
-        match app_state
+        app_state
             .analytics_service
             .enrich_visitor_by_guid(&visitor_id, scope_project_id, request.custom_data)
             .await
-        {
-            Ok(response) => Ok(Json(response)),
-            Err(e) => Err(handle_analytics_error(e)),
+    };
+    let response = result.map_err(handle_analytics_error)?;
+
+    if response.updated {
+        let token = auth.deployment_token_info();
+        let audit = crate::visitor_audit::VisitorEnrichedAudit {
+            context: temps_core::AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            actor_kind: if auth.is_deployment_token() {
+                "deployment_token"
+            } else {
+                "user"
+            },
+            deployment_token_id: token.as_ref().map(|t| t.token_id),
+            deployment_token_name: token.map(|t| t.token_name),
+            project_id: scope_project_id,
+            visitor_row_id: response.visitor_row_id,
+            custom_data_keys,
+        };
+        // A failed audit write must not fail the enrichment that already happened.
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create visitor enrichment audit log: {}", e);
         }
     }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1249,8 +1255,13 @@ pub(super) fn handle_analytics_error(error: AnalyticsError) -> Problem {
                 .detail("Failed to fetch analytics data")
                 .build()
         }
+        AnalyticsError::InvalidEnrichmentData(reason) => bad_request()
+            .title("Invalid Enrichment Data")
+            .detail(reason)
+            .build(),
         AnalyticsError::InvalidVisitorId(visitor_id) => {
-            tracing::error!("Invalid visitor ID: {}", visitor_id);
+            // Client input, not a server fault: keep it out of error-level alerting.
+            tracing::debug!("Invalid visitor ID: {}", visitor_id);
             bad_request()
                 .detail(format!("Invalid visitor ID: {}", visitor_id))
                 .build()
@@ -2160,32 +2171,235 @@ mod api_traffic_window_tests {
 }
 
 #[cfg(test)]
-mod enrich_validation_tests {
+mod enrich_handler_tests {
     use super::*;
+    use crate::{cleanup_test_analytics, create_test_analytics_service};
+    use axum::http::StatusCode;
+    use sea_orm::EntityTrait;
     use serde_json::json;
+    use std::sync::Mutex;
+    use temps_ai::{AiRequest, AiService};
+    use temps_auth::context::AuthContext;
+    use temps_core::problemdetails::{PermissionDenialKind, PermissionDenialMarker};
+    use temps_entities::deployment_tokens::DeploymentTokenPermission;
 
-    #[test]
-    fn token_enrichment_accepts_small_object() {
-        assert!(validate_token_enrichment_data(&json!({"user_id": "u1"})).is_ok());
+    struct UnavailableAi;
+
+    #[async_trait::async_trait]
+    impl AiService for UnavailableAi {
+        async fn is_available(&self) -> bool {
+            false
+        }
+
+        async fn complete(
+            &self,
+            _request: AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
     }
 
-    #[test]
-    fn token_enrichment_rejects_non_object() {
-        assert!(validate_token_enrichment_data(&json!(["a"])).is_err());
-        assert!(validate_token_enrichment_data(&json!("s")).is_err());
+    /// Records `(operation_type, user_id, payload)` for every audit write.
+    #[derive(Default)]
+    struct CapturingAudit(Mutex<Vec<(String, Option<i32>, String)>>);
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for CapturingAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push((
+                operation.operation_type(),
+                operation.user_id(),
+                operation.serialize()?,
+            ));
+            Ok(())
+        }
     }
 
-    #[test]
-    fn token_enrichment_rejects_too_many_keys() {
-        let map: serde_json::Map<String, serde_json::Value> = (0..=MAX_TOKEN_ENRICHMENT_KEYS)
-            .map(|i| (format!("k{i}"), json!(1)))
-            .collect();
-        assert!(validate_token_enrichment_data(&serde_json::Value::Object(map)).is_err());
+    fn metadata() -> temps_core::RequestMetadata {
+        temps_core::RequestMetadata {
+            ip_address: "203.0.113.9".to_string(),
+            user_agent: "enrich-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
     }
 
-    #[test]
-    fn token_enrichment_rejects_oversized_payload() {
-        let big = "x".repeat(MAX_TOKEN_ENRICHMENT_BYTES);
-        assert!(validate_token_enrichment_data(&json!({ "blob": big })).is_err());
+    fn token(project_id: i32, permissions: Vec<DeploymentTokenPermission>) -> AuthContext {
+        AuthContext::new_deployment_token(
+            project_id,
+            None,
+            None,
+            9,
+            "app-token".to_string(),
+            permissions,
+        )
+    }
+
+    fn status_of(result: Result<impl IntoResponse, Problem>) -> Option<StatusCode> {
+        result.err().map(|problem| problem.into_response().status())
+    }
+
+    #[tokio::test]
+    async fn deployment_token_enrichment_is_authorized_confined_and_audited() {
+        let (service, db, _container) = create_test_analytics_service!(
+            "deployment_token_enrichment_is_authorized_confined_and_audited"
+        );
+        let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+        let visitor = temps_entities::visitor::Entity::find()
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let project = visitor.project_id;
+
+        let audit = Arc::new(CapturingAudit::default());
+        let state = Arc::new(AppState {
+            analytics_service: Arc::new(service),
+            project_access_checker: None,
+            api_traffic_service: Arc::new(ApiTrafficService::new(
+                db.clone(),
+                Arc::new(UnavailableAi),
+            )),
+            audit_service: audit.clone(),
+        });
+        let call = |auth: AuthContext, id: &str, data: serde_json::Value| {
+            let state = state.clone();
+            let id = id.to_string();
+            async move {
+                enrich_visitor(
+                    RequireAuth(auth),
+                    State(state),
+                    Extension(metadata()),
+                    axum::extract::Path(id),
+                    Json(EnrichVisitorRequest { custom_data: data }),
+                )
+                .await
+                .map(|ok| ok.into_response())
+            }
+        };
+        let stored = || async {
+            temps_entities::visitor::Entity::find_by_id(visitor.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .custom_data
+        };
+        let can_enrich = || token(project, vec![DeploymentTokenPermission::VisitorsEnrich]);
+
+        // 403 with the permission-denial marker for a raw GUID and a numeric id.
+        for id in ["test_visitor_1".to_string(), visitor.id.to_string()] {
+            let denied = call(can_enrich(), &id, json!({"user_id": "u1"}))
+                .await
+                .expect_err("token must not address a visitor by raw id");
+            let response = denied.into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let marker = response.extensions().get::<PermissionDenialMarker>();
+            assert_eq!(
+                marker.map(PermissionDenialMarker::kind),
+                Some(PermissionDenialKind::DeploymentTokenNotAllowed)
+            );
+        }
+        assert!(stored().await.is_none(), "denied calls must not write");
+
+        // A token without visitors:enrich is refused by the permission guard.
+        let no_perm = token(project, vec![DeploymentTokenPermission::FlagsRead]);
+        assert_eq!(
+            status_of(call(no_perm, &sealed, json!({"user_id": "u1"})).await),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // Oversized and non-object payloads are 400s.
+        let big = json!({ "blob": "x".repeat(crate::analytics::MAX_SCOPED_ENRICHMENT_BYTES) });
+        assert_eq!(
+            status_of(call(can_enrich(), &sealed, big).await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status_of(call(can_enrich(), &sealed, json!(["not", "an", "object"])).await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+
+        // A token bound to another project cannot see or change the visitor.
+        let other = token(project + 1, vec![DeploymentTokenPermission::VisitorsEnrich]);
+        let miss = call(other, &sealed, json!({"user_id": "intruder"}))
+            .await
+            .expect("cross-project call answers, it does not error");
+        assert_eq!(miss.status(), StatusCode::OK);
+        assert!(
+            stored().await.is_none(),
+            "cross-project write must not land"
+        );
+        assert!(audit.0.lock().unwrap().is_empty());
+
+        // Undecryptable ciphertext is indistinguishable from an unknown visitor.
+        let junk = call(can_enrich(), "enc_notarealciphertext", json!({"a": 1}))
+            .await
+            .expect("undecryptable id must not surface as an error for tokens");
+        assert_eq!(junk.status(), StatusCode::OK);
+
+        // The owning project's token writes, and the write is audited by key name.
+        let ok = call(
+            can_enrich(),
+            &sealed,
+            json!({"user_id": "u1", "email": "a@b.example"}),
+        )
+        .await
+        .expect("same-project enrichment succeeds");
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            stored().await,
+            Some(json!({"user_id": "u1", "email": "a@b.example"}))
+        );
+        {
+            let log = audit.0.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            let (operation, actor, payload) = &log[0];
+            assert_eq!(operation, "VISITOR_ENRICHED");
+            assert_eq!(*actor, None, "a deployment token has no users row");
+            assert!(payload.contains("app-token") && payload.contains("\"email\""));
+            assert!(
+                !payload.contains("a@b.example"),
+                "values must not be audited"
+            );
+        }
+
+        // Re-sending the same identity is a no-op: no rewrite, no second audit row.
+        call(
+            can_enrich(),
+            &sealed,
+            json!({"user_id": "u1", "email": "a@b.example"}),
+        )
+        .await
+        .expect("idempotent enrichment succeeds");
+        assert_eq!(audit.0.lock().unwrap().len(), 1);
+
+        // Later enrichment merges instead of replacing what is already stored.
+        call(can_enrich(), &sealed, json!({"name": "Ada"}))
+            .await
+            .expect("merge succeeds");
+        assert_eq!(
+            stored().await,
+            Some(json!({"user_id": "u1", "email": "a@b.example", "name": "Ada"}))
+        );
+        assert_eq!(audit.0.lock().unwrap().len(), 2);
+
+        cleanup_test_analytics!(db);
     }
 }
