@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use temps_core::docker_socket_grant::DockerSocketCapability;
 use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
@@ -416,6 +417,15 @@ pub struct ProjectResponse {
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
+    /// Where this project is granted host Docker access (ADR 045), and what to
+    /// set when it is granted nowhere.
+    ///
+    /// Populated only on the single-project detail responses — computing it
+    /// costs a `nodes` query, and the list endpoints must stay cheap. `None`
+    /// therefore means "not computed on this response", never "not granted";
+    /// clients read `granted` from the object, not from its presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_socket: Option<DockerSocketCapability>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -426,6 +436,16 @@ pub struct EnvironmentDomains {
 }
 
 impl ProjectResponse {
+    /// Attach the ADR-045 host Docker socket capability.
+    ///
+    /// Used by the single-project detail handlers only. Always attach it
+    /// there, granted or not: an unconfigured capability must onboard the
+    /// operator, not disappear from the response.
+    pub fn with_docker_socket(mut self, capability: DockerSocketCapability) -> Self {
+        self.docker_socket = Some(capability);
+        self
+    }
+
     pub fn map_from_project(project: crate::services::types::Project) -> Self {
         ProjectResponse {
             id: project.id,
@@ -463,6 +483,9 @@ impl ProjectResponse {
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,
+            // Filled in by the detail handlers via `with_docker_socket`; the
+            // list path deliberately leaves it unset.
+            docker_socket: None,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config

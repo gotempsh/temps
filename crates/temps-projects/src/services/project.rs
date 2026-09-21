@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use temps_core::docker_socket_grant::DockerSocketCapability;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{error, info, warn};
 
@@ -1468,6 +1469,43 @@ impl ProjectService {
             .filter_map(|(_, service)| service)
             .map(|service| service.service_type.to_ascii_lowercase())
             .collect())
+    }
+
+    /// Where this project is granted host Docker access (ADR 045).
+    ///
+    /// Answers from two sources, both authoritative for the host they describe:
+    /// this control plane's own process-wide grant, and each worker node's
+    /// advertised grant from its last heartbeat. Nodes of any status are
+    /// counted — an offline node still *grants* the project, and reporting
+    /// otherwise would send the operator to change a variable that is already
+    /// correct. Whether a granted project can be placed *right now* is the
+    /// scheduler's answer, not this one.
+    ///
+    /// Only ever computed for a single project's detail view, never per row of
+    /// a list: it is one extra query, and the list endpoints must stay cheap.
+    pub async fn docker_socket_capability(
+        &self,
+        slug: &str,
+    ) -> Result<DockerSocketCapability, ProjectError> {
+        let nodes = temps_entities::nodes::Entity::find()
+            .all(self.db.as_ref())
+            .await?;
+
+        let granting_node_names = nodes
+            .into_iter()
+            .filter(|node| {
+                temps_core::docker_socket_grant::capacity_grants(&node.capacity)
+                    .iter()
+                    .any(|granted| granted == slug)
+            })
+            .map(|node| node.name)
+            .collect();
+
+        Ok(DockerSocketCapability::evaluate(
+            slug,
+            temps_core::docker_socket_grant::process_grant().allows(slug),
+            granting_node_names,
+        ))
     }
 
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Project, ProjectError> {

@@ -508,6 +508,7 @@ async fn authorize_storage_service_scopes(
             ChangeProjectSourceRequest,
             SetAlternateSourcesRequest,
             ProjectResponse,
+            temps_core::docker_socket_grant::DockerSocketCapability,
             PaginatedProjectList,
             PaginationParams,
             UpdateProjectSettingsRequest,
@@ -1172,7 +1173,18 @@ pub async fn get_project(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(ProjectResponse::map_from_project(project)))
+    // ADR 045. Always attached on the detail response, granted or not: the
+    // console renders a badge when granted and an onboarding state when not,
+    // and a capability that is simply absent teaches the operator nothing.
+    let docker_socket = state
+        .project_service
+        .docker_socket_capability(&project.slug)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(
+        ProjectResponse::map_from_project(project).with_docker_socket(docker_socket),
+    ))
 }
 
 /// Get details of a specific project by slug
@@ -1205,7 +1217,19 @@ pub async fn get_project_by_slug(
     let project = state.project_service.get_project_by_slug(&slug).await?;
     project_scope_guard!(auth, project.id); // 2. deployment-token IDOR check
     project_access_guard!(auth, project.id, state.project_access_checker); // 3. team-based access
-    Ok(Json(ProjectResponse::map_from_project(project)).into_response())
+
+    // Same capability as `get_project` — the console uses whichever lookup it
+    // has, and the two must not disagree about whether the badge shows.
+    let docker_socket = state
+        .project_service
+        .docker_socket_capability(&project.slug)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(
+        Json(ProjectResponse::map_from_project(project).with_docker_socket(docker_socket))
+            .into_response(),
+    )
 }
 
 #[utoipa::path(
