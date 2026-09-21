@@ -305,7 +305,27 @@ impl Dialect {
             Scoping::Pseudonymous(link) => pseudonym(link, "external_service", &id.to_string()),
         }
     }
+
+    /// This instance's own key in the tenant's Cloud tables.
+    ///
+    /// One Cloud tenant can hold several linked instances, and `chunk_seq` is
+    /// only unique within one manifest: without this, one instance's
+    /// tombstone would mask another instance's chunk, and a read would count
+    /// another instance's lines. Derived per operation rather than cached
+    /// because it depends on the live link credential, exactly like the
+    /// clients.
+    pub fn instance_ref(&self) -> Result<String, LogAggregatorError> {
+        match &self.scoping {
+            Scoping::Raw => Ok(String::new()),
+            Scoping::Pseudonymous(link) => pseudonym(link, "instance", INSTANCE_REF_VALUE),
+        }
+    }
 }
+
+/// The value hashed into `instance_ref`. A constant, not an identifier: the
+/// key is the instance's own token, so hashing a fixed string already yields
+/// a value unique to this instance and stable across restarts.
+pub(crate) const INSTANCE_REF_VALUE: &str = "log-line-index";
 
 /// The scoping keys are derived with the same function that produced them on
 /// the way out; a link that cannot derive one is reported rather than papered
@@ -470,7 +490,16 @@ fn attr_equality_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorErr
 fn attr_number_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
     let raw = attr_raw_expr(key, d)?;
     if is_canonical_key(key) {
-        return Ok(format!("toFloat64({raw})"));
+        return Ok(if is_numeric_canonical_key(key) {
+            format!("toFloat64({raw})")
+        } else {
+            // A canonical *text* column (`trace_id`, `http_route`, …): the
+            // user can ask for `p95:trace_id`, and `toFloat64` on a String
+            // column is a server-side type error that fails the whole query.
+            // NULL, like the dynamic branch, makes it an empty result instead
+            // of an error page.
+            format!("toFloat64OrNull(toString({raw}))")
+        });
     }
     Ok(match d.attrs {
         AttrStorage::Json => format!("toFloat64OrNull(toString(ifNull({raw}, '')))"),
@@ -484,13 +513,20 @@ fn attr_number_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError
     })
 }
 
+/// The canonical keys stored in numeric columns; every other canonical key
+/// is a String column, and the two cannot share an expression.
+fn is_numeric_canonical_key(key: &str) -> bool {
+    matches!(key, "status_code" | "duration_ms")
+}
+
 /// Existence test for an attribute.
 fn attr_exists_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError> {
     let raw = attr_raw_expr(key, d)?;
     if is_canonical_key(key) {
-        return Ok(match key {
-            "status_code" | "duration_ms" => format!("{raw} != 0"),
-            _ => format!("{raw} != ''"),
+        return Ok(if is_numeric_canonical_key(key) {
+            format!("{raw} != 0")
+        } else {
+            format!("{raw} != ''")
         });
     }
     Ok(match d.attrs {
@@ -560,6 +596,17 @@ pub(crate) fn build_where(
 ) -> Result<Sql, LogAggregatorError> {
     let mut sql = Sql::default();
 
+    // First, and before anything else, on a shared (Cloud) table: the rows of
+    // another instance in the same tenant are not this instance's to read.
+    let instance_ref = if d.is_cloud() {
+        let value = d.instance_ref()?;
+        let p = sql.bind(Param::Str(value.clone()));
+        sql.conditions.push(format!("instance_ref = {p}"));
+        Some(value)
+    } else {
+        None
+    };
+
     let start = sql.bind(ts_param(query.start_time));
     sql.conditions
         .push(format!("ts >= fromUnixTimestamp64Milli({start})"));
@@ -596,10 +643,14 @@ pub(crate) fn build_where(
     }
     // Chunks the instance has forgotten (compacted away, purged, or missing)
     // are masked here where they cannot be deleted, so no aggregation counts
-    // a line the reader can no longer fetch.
+    // a line the reader can no longer fetch. Correlated on `instance_ref`:
+    // `chunk_seq` is only unique within one manifest, so an uncorrelated
+    // subquery would let one instance's tombstone hide a sibling instance's
+    // lines in the same tenant.
     if let Some(tombstones) = d.tombstones {
+        let p = sql.bind(Param::Str(instance_ref.unwrap_or_default()));
         sql.conditions.push(format!(
-            "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones})"
+            "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones} WHERE instance_ref = {p})"
         ));
     }
     if !query.levels.is_empty() {
@@ -1009,9 +1060,11 @@ mod tests {
     #[test]
     fn every_cloud_read_excludes_forgotten_chunks_and_no_local_read_does() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let tombstones = "chunk_seq NOT IN (SELECT chunk_seq FROM telemetry_log_forgotten_chunks)";
+        let tombstones = "chunk_seq NOT IN (SELECT chunk_seq FROM telemetry_log_forgotten_chunks \
+                          WHERE instance_ref = ?)";
         // Cloud cannot DELETE through the proxies, so the mask is the only
-        // thing keeping a compacted chunk out of every aggregation.
+        // thing keeping a compacted chunk out of every aggregation — and it
+        // is correlated, so it masks only this instance's chunks.
         for scope in [
             LogAccessScope::All,
             LogAccessScope::Allowed {
@@ -1020,12 +1073,69 @@ mod tests {
             },
         ] {
             let sql = build_where(&q(scope), &[], &cloud(&dir)).unwrap();
-            assert!(sql.where_clause().contains(tombstones));
+            assert!(
+                sql.where_clause().contains(tombstones),
+                "{}",
+                sql.where_clause()
+            );
         }
         let sql = build_where(&q(LogAccessScope::All), &[], &local()).unwrap();
         assert!(!sql
             .where_clause()
             .contains("telemetry_log_forgotten_chunks"));
+    }
+
+    #[test]
+    fn every_cloud_read_is_scoped_to_this_instance() {
+        // One tenant can hold several linked instances and `chunk_seq` is
+        // only unique per manifest, so without this a sibling instance's
+        // lines would be read and its tombstones would mask ours.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let d = cloud(&dir);
+        let sql = build_where(&q(LogAccessScope::All), &[], &d).unwrap();
+        let w = sql.where_clause();
+        assert!(w.starts_with("instance_ref = ?"), "{w}");
+        let instance_ref = d.instance_ref().unwrap();
+        assert!(!instance_ref.is_empty());
+        // Bound, and bound again for the correlated tombstone subquery — the
+        // two placeholders must both carry the same value, in order.
+        let bound: Vec<&String> = sql
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                Param::Str(s) if *s == instance_ref => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bound.len(), 2, "{:?}", sql.params);
+        // Local reads have no such column.
+        assert!(!build_where(&q(LogAccessScope::All), &[], &local())
+            .unwrap()
+            .where_clause()
+            .contains("instance_ref"));
+    }
+
+    #[test]
+    fn a_numeric_metric_on_a_text_column_is_null_not_a_type_error() {
+        // `p95:trace_id` is a query the user can type. `toFloat64` on a
+        // String column fails the whole statement server-side; NULL folds to
+        // an empty result, which is what "no numeric values here" means.
+        let dir = tempfile::tempdir().expect("temp dir");
+        for d in [local(), cloud(&dir)] {
+            assert_eq!(
+                attr_number_expr("trace_id", &d).unwrap(),
+                "toFloat64OrNull(toString(trace_id))"
+            );
+            // The two numeric canonical columns keep the direct cast.
+            assert_eq!(
+                attr_number_expr("duration_ms", &d).unwrap(),
+                "toFloat64(duration_ms)"
+            );
+            assert_eq!(
+                attr_number_expr("status_code", &d).unwrap(),
+                "toFloat64(status_code)"
+            );
+        }
     }
 
     #[test]

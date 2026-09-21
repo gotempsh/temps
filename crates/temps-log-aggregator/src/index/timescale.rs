@@ -30,13 +30,35 @@
 //! * **Attribute keys.** ClickHouse has a materialized `log_attr_keys`
 //!   rollup; here [`TimescaleLineIndex::attribute_keys`] unrolls `attrs`
 //!   with `jsonb_object_keys` over the queried window. That scales with
-//!   *lines in the window*, not with distinct keys, so the statement runs
-//!   under a `SET LOCAL statement_timeout` rather than being allowed to
-//!   pin a connection indefinitely.
+//!   *lines in the window*, not with distinct keys.
 //! * **Deletes.** `forget_chunks` is a plain `DELETE ... WHERE chunk_seq =
 //!   ANY($1)`. `chunk_seq` is a compression `segmentby` column, so
 //!   TimescaleDB (>= 2.14) drops whole compressed batches instead of
 //!   decompressing them.
+//! * **Deduplication.** ClickHouse collapses re-inserted lines on merge
+//!   (`ReplacingMergeTree`); here the same guarantee is a unique index on
+//!   `(chunk_seq, line_index, ts)` plus `ON CONFLICT DO NOTHING`, and a
+//!   chunk's batches are one transaction so a partial failure leaves
+//!   nothing behind. Both are load-bearing: the seal pipeline re-indexes a
+//!   chunk whenever `mark_indexed` fails after a successful insert, a
+//!   batch fails mid-chunk, the backend flaps, or the compactor
+//!   re-indexes, and a duplicated line inflates every facet, histogram and
+//!   aggregate permanently.
+//!
+//! # Bounds this backend imposes that ClickHouse does not
+//!
+//! Analytics here run on the **shared control-plane connection pool**, so
+//! an unbounded query is not just slow, it starves every other request on
+//! the instance. Two guards, both TimescaleDB-only:
+//!
+//! * Every read runs in a transaction under `SET LOCAL statement_timeout`
+//!   of [`READ_TIMEOUT_MS`], matching the chunk scan's time budget. A query
+//!   that cannot finish in that window returns an error the operator can
+//!   act on rather than pinning a connection.
+//! * The queried window is clamped to at most [`MAX_WINDOW_DAYS`] days
+//!   ([`clamped_start`]): a request with a 1970 `start_time` reads the last
+//!   90 days, not the whole hypertable. Configure ClickHouse for wider
+//!   windows — it is the backend built for unbounded historical scans.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -74,10 +96,17 @@ pub type FacetSlots = [Option<String>; FACET_SLOTS];
 /// amortising the round trip over a whole chunk in one or two statements.
 const INSERT_BATCH_ROWS: usize = 1_000;
 
-/// Ceiling on how long an `attribute_keys` unroll may run before Postgres
-/// cancels it. Without this a wide window on a busy instance can pin a
-/// connection for minutes; the caller gets a real error instead.
-const ATTRIBUTE_KEYS_TIMEOUT_MS: u32 = 10_000;
+/// Ceiling on how long *any* analytics read may run before Postgres cancels
+/// it. These queries share the control-plane pool with every other request
+/// on the instance, so an unbounded one is a availability problem, not just
+/// a slow response. 10 s matches the chunk scan's own time budget.
+pub const READ_TIMEOUT_MS: u32 = 10_000;
+
+/// Widest window this backend will scan, regardless of what the caller
+/// asked for. A request with a `start_time` of 1970 reads the last 90 days
+/// instead of the entire hypertable. ClickHouse has no such bound — point
+/// operators who need wider historical windows at it.
+pub const MAX_WINDOW_DAYS: i64 = 90;
 
 /// Column list of `log_lines_index`, in the order [`row_placeholders`] binds
 /// them. Kept as one constant so the INSERT and the binder cannot drift.
@@ -126,12 +155,32 @@ impl TimescaleLineIndex {
         Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
     }
 
+    /// Run one analytics statement under a statement timeout.
+    ///
+    /// Every read in this file goes through here, not just the expensive
+    /// ones: `SET LOCAL` only survives inside a transaction, so the
+    /// transaction is the timeout. Without it a handful of concurrent
+    /// wide-window requests can hold every connection in the shared
+    /// control-plane pool until they finish, which takes the whole instance
+    /// down, not just Global Logs.
     async fn query_all(
         &self,
         sql: String,
         values: Vec<Value>,
     ) -> Result<Vec<QueryResult>, LogAggregatorError> {
-        Ok(self.db.query_all(Self::stmt(sql, values)).await?)
+        let txn = self.db.begin().await.map_err(db_err)?;
+        txn.execute(Self::stmt(
+            format!("SET LOCAL statement_timeout = {READ_TIMEOUT_MS}"),
+            vec![],
+        ))
+        .await
+        .map_err(db_err)?;
+        let rows = txn
+            .query_all(Self::stmt(sql, values))
+            .await
+            .map_err(db_err)?;
+        txn.commit().await.map_err(db_err)?;
+        Ok(rows)
     }
 
     /// Is the `timescaledb` extension installed? The migration degrades to a
@@ -154,8 +203,17 @@ impl TimescaleLineIndex {
 
     /// Insert `lines` (chunk order, `line_index` starting at `first_index`)
     /// as rows for chunk `seq`, in batches of [`INSERT_BATCH_ROWS`].
-    pub async fn insert_lines(
+    ///
+    /// Takes the connection rather than using `self.db` so a whole chunk's
+    /// batches can share one transaction (see [`Self::index_chunk`]).
+    ///
+    /// `ON CONFLICT DO NOTHING` on `(chunk_seq, line_index, ts)` makes a
+    /// re-index a no-op instead of a silent double-count — this is the
+    /// TimescaleDB equivalent of ClickHouse's `ReplacingMergeTree`, and the
+    /// reindexer's idempotency guarantee rests on it.
+    pub async fn insert_lines<C: ConnectionTrait>(
         &self,
+        conn: &C,
         seq: i64,
         labels: &ChunkLabels,
         first_index: u32,
@@ -172,10 +230,11 @@ impl TimescaleLineIndex {
                 tuples.push(row_placeholders(values.len()));
             }
             let sql = format!(
-                "INSERT INTO log_lines_index ({INSERT_COLUMNS}) VALUES {}",
+                "INSERT INTO log_lines_index ({INSERT_COLUMNS}) VALUES {} \
+                 ON CONFLICT (chunk_seq, line_index, ts) DO NOTHING",
                 tuples.join(", ")
             );
-            self.db.execute(Self::stmt(sql, values)).await?;
+            conn.execute(Self::stmt(sql, values)).await?;
         }
         Ok(())
     }
@@ -394,7 +453,16 @@ fn attr_string_expr(key: &str) -> Result<String, LogAggregatorError> {
 fn attr_number_expr(key: &str) -> Result<String, LogAggregatorError> {
     validate_key(key)?;
     if crate::parser::is_canonical_key(key) {
-        return Ok(format!("{key}::float8"));
+        return Ok(match key {
+            // Already numeric columns (int2 / real): cast directly.
+            "status_code" | "duration_ms" => format!("{key}::float8"),
+            // The other canonical columns are `text`. A bare `::float8` on
+            // them errors the *whole query* the moment one row holds a
+            // non-numeric value — which is every row, for `trace_id`. So
+            // `p95:trace_id` must yield NULL per row (and therefore 0), the
+            // same as ClickHouse's `toFloat64OrNull`, not a 500.
+            _ => format!("(CASE WHEN {key} ~ '{NUMERIC_RE}' THEN {key}::float8 ELSE NULL END)"),
+        });
     }
     let path = attr_json_path(key)?;
     // A JSON number casts directly; a JSON string only when it looks like a
@@ -440,6 +508,20 @@ fn resource_condition(binder: &mut Binder, project_ids: &[i32], service_ids: &[i
     )
 }
 
+/// `query.start_time`, never more than [`MAX_WINDOW_DAYS`] before
+/// `query.end_time`.
+///
+/// A TimescaleDB-only bound. Analytics here run on the shared control-plane
+/// pool, so "since 1970" is a request to scan the entire hypertable while
+/// everything else on the instance waits for a connection. Narrowing beats
+/// erroring: the caller still gets an answer, for the most recent 90 days.
+/// Operators who need wider historical windows should configure ClickHouse,
+/// which is built for exactly that.
+pub(crate) fn clamped_start(query: &LogQuery) -> DateTime<Utc> {
+    let floor = query.end_time - chrono::Duration::days(MAX_WINDOW_DAYS);
+    query.start_time.max(floor)
+}
+
 /// `WHERE` for a [`LogQuery`] plus attribute predicates. Never omits the
 /// scope.
 pub(crate) fn build_where(
@@ -448,7 +530,7 @@ pub(crate) fn build_where(
 ) -> Result<Where, LogAggregatorError> {
     let mut w = Where::default();
 
-    let start = w.binder.bind(query.start_time);
+    let start = w.binder.bind(clamped_start(query));
     w.conditions.push(format!("ts >= {start}"));
     let end = w.binder.bind(query.end_time);
     w.conditions.push(format!("ts <= {end}"));
@@ -593,14 +675,26 @@ impl LineIndexSink for TimescaleLineIndex {
         labels: &ChunkLabels,
         segments: &[Arc<Vec<LogLine>>],
     ) -> Result<IndexOutcome, LogAggregatorError> {
+        // One transaction for the whole chunk: a failure partway through a
+        // multi-batch chunk must leave *nothing* behind, or the retry has to
+        // reason about which lines already landed. Combined with
+        // `ON CONFLICT DO NOTHING` this makes `index_chunk` idempotent under
+        // any interleaving of failure and retry.
+        let txn = self.db.begin().await.map_err(db_err)?;
         let mut first_index = 0u32;
         for segment in segments {
-            if let Err(e) = self.insert_lines(seq, labels, first_index, segment).await {
+            if let Err(e) = self
+                .insert_lines(&txn, seq, labels, first_index, segment)
+                .await
+            {
                 warn!(seq, error = %e, "line index insert failed");
+                // Dropping `txn` rolls back; be explicit about it.
+                let _ = txn.rollback().await;
                 return Err(e);
             }
             first_index += segment.len() as u32;
         }
+        txn.commit().await.map_err(db_err)?;
         Ok(IndexOutcome::Indexed)
     }
 
@@ -724,8 +818,8 @@ impl LogAnalytics for TimescaleLineIndex {
         // No materialized key rollup here (the ClickHouse backend has
         // `log_attr_keys`); the keys are unrolled from `attrs` over the
         // queried window, so this costs one pass over the window's lines.
-        // The statement timeout below is what keeps a too-wide window an
-        // honest error instead of a pinned connection.
+        // The clamped window plus `query_all`'s statement timeout are what
+        // keep that honest.
         let w = build_where(query, &[])?;
         let sql = format!(
             "SELECT k.key AS key, count(*)::int8 AS lines \
@@ -734,18 +828,7 @@ impl LogAnalytics for TimescaleLineIndex {
             w.clause(),
             limit.clamp(1, 1000)
         );
-        let txn = self.db.begin().await.map_err(db_err)?;
-        txn.execute(TimescaleLineIndex::stmt(
-            format!("SET LOCAL statement_timeout = {ATTRIBUTE_KEYS_TIMEOUT_MS}"),
-            vec![],
-        ))
-        .await
-        .map_err(db_err)?;
-        let rows = txn
-            .query_all(TimescaleLineIndex::stmt(sql, w.values()))
-            .await
-            .map_err(db_err)?;
-        txn.commit().await.map_err(db_err)?;
+        let rows = self.query_all(sql, w.values()).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(FacetValue {
@@ -960,6 +1043,52 @@ mod tests {
             "{clause}"
         );
         assert_eq!(w.values().len(), 4);
+    }
+
+    #[test]
+    fn window_is_clamped_to_the_backend_maximum() {
+        let mut query = q(LogAccessScope::All);
+        // Untouched when the caller asks for something sane.
+        assert_eq!(clamped_start(&query), query.start_time);
+
+        query.start_time = "1970-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            clamped_start(&query),
+            query.end_time - chrono::Duration::days(MAX_WINDOW_DAYS),
+            "a 1970 start must read the last {MAX_WINDOW_DAYS} days, not the whole hypertable"
+        );
+        // The clamp is what the SQL binds, not the raw start_time.
+        let mut w = build_where(&query, &[]).unwrap();
+        assert_eq!(
+            w.binder.values.remove(0),
+            Value::from(query.end_time - chrono::Duration::days(MAX_WINDOW_DAYS))
+        );
+    }
+
+    #[test]
+    fn numeric_metrics_never_cast_text_columns_unguarded() {
+        // `p95:trace_id` on a text column must yield NULL per row, not error
+        // the whole query.
+        for key in [
+            "trace_id",
+            "span_id",
+            "request_id",
+            "http_method",
+            "http_route",
+        ] {
+            let e = attr_number_expr(key).unwrap();
+            assert!(e.starts_with("(CASE WHEN"), "{key}: {e}");
+            assert!(e.contains(NUMERIC_RE), "{key}: {e}");
+        }
+        // The genuinely numeric columns stay a direct cast.
+        assert_eq!(
+            attr_number_expr("status_code").unwrap(),
+            "status_code::float8"
+        );
+        assert_eq!(
+            attr_number_expr("duration_ms").unwrap(),
+            "duration_ms::float8"
+        );
     }
 
     #[test]
@@ -1239,6 +1368,32 @@ mod live_tests {
         q.end_time = base + chrono::Duration::hours(1);
         q.limit = 4;
 
+        // ── re-indexing is a no-op, not a double-count ─────────────────
+        // The seal pipeline re-indexes a chunk on any retry; without the
+        // unique key + ON CONFLICT this silently doubles every count below
+        // and stays wrong forever.
+        let count = |q: LogQuery| {
+            let idx = idx.clone();
+            async move {
+                idx.aggregate(&q, &[], &[], &Metric::Count, 1)
+                    .await
+                    .unwrap()[0]
+                    .lines
+            }
+        };
+        assert_eq!(count(q.clone()).await, 10);
+        idx.index_chunk(seq_a, &labels, &[Arc::new(lines_a.clone())])
+            .await
+            .expect("re-index chunk a");
+        idx.index_chunk(seq_b, &labels, &[Arc::new(lines_b.clone())])
+            .await
+            .expect("re-index chunk b");
+        assert_eq!(
+            count(q.clone()).await,
+            10,
+            "re-indexing the same chunks must not duplicate rows"
+        );
+
         // ── facets ─────────────────────────────────────────────────────
         let facets = idx
             .facets(
@@ -1392,12 +1547,27 @@ mod live_tests {
         assert!(remaining.iter().all(|p| p.chunk_seq == seq_b));
 
         // ── forget the other chunk after forcing compression ───────────
-        // `chunk_seq` is a segmentby column, so this DELETE must succeed
-        // against compressed chunks without decompressing them.
-        db.connection()
-            .execute_unprepared("SELECT compress_chunk(c) FROM show_chunks('log_lines_index') c")
+        // Two things are being proved here. First, that compression still
+        // succeeds *with the unique index on (chunk_seq, line_index, ts)* —
+        // Timescale only allows a unique index on a compressed hypertable
+        // when its columns are covered by segmentby + orderby, and this is
+        // the assertion that catches it if that ever stops holding. Second,
+        // that the DELETE reaches compressed rows: `chunk_seq` is a
+        // segmentby column, so whole compressed batches are dropped rather
+        // than decompressed.
+        let compressed = db
+            .connection()
+            .query_all(TimescaleLineIndex::stmt(
+                "SELECT compress_chunk(c)::text AS chunk FROM show_chunks('log_lines_index') c"
+                    .into(),
+                vec![],
+            ))
             .await
-            .expect("compress chunks");
+            .expect("compress chunks with the unique index present");
+        assert!(
+            !compressed.is_empty(),
+            "expected at least one chunk to compress"
+        );
         idx.forget_chunks(&[seq_b])
             .await
             .expect("delete on a compressed chunk");

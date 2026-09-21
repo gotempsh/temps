@@ -318,20 +318,32 @@ in this order, and never mixes them:
 |---|---|---|---|---|
 | **Local ClickHouse** (`ServerConfig`, ADR-012) | `TEMPS_CLICKHOUSE_*` configured and ≥ 25.3 | yes — migrations, `MODIFY TTL` synced to retention | lightweight `DELETE` | `log_attr_keys` materialized view |
 | **Temps Cloud ClickHouse** | no local ClickHouse, instance linked to Cloud | Cloud — no DDL crosses the proxy | none; `forget_chunks` inserts tombstones into `telemetry_log_forgotten_chunks` and every read excludes them | `ARRAY JOIN JSONExtractKeys(attrs)` over the window |
-| **TimescaleDB** (control-plane Postgres) | neither of the above | yes — hypertable, compression after 2 h, retention policy synced | `DELETE … WHERE chunk_seq = ANY(…)`; segmenting compression by `chunk_seq` drops whole batches without decompressing | `jsonb_object_keys(attrs)` over the window |
+| **TimescaleDB** (control-plane Postgres) | neither of the above | yes — hypertable, unique `(chunk_seq, line_index, ts)`, compression after 2 h, retention policy synced | `DELETE … WHERE chunk_seq = ANY(…)`; segmenting compression by `chunk_seq` drops whole batches without decompressing | `jsonb_object_keys(attrs)` over the window |
 
 **Temps Cloud.** Uses the abstraction ADR-040/041/043 built for spans and
 metrics: `CloudLink::clickhouse_query_client()` (read proxy, wall-clock
 budget on every read, no silent fallback) and `clickhouse_insert_client()`
 (insert proxy, names-and-types validation). Rows are scoped by
-`project_ref` / `external_service_ref` — the same pseudonyms spans use —
-so Cloud never learns a local id; `attrs` travels as JSON text because
-per-request ClickHouse settings do not cross the proxy. Telemetry export
-being switched off makes the index *unavailable* (surfaced verbatim in the
-capabilities endpoint), not silently local: a sealed chunk that could not
-be indexed keeps `indexed_at = NULL` and the reindexer backfills it once
-export is enabled. The Cloud DDL this side relies on is written down next
-to the client as the only contract this repository owns.
+`instance_ref`, `project_ref` and `external_service_ref` — the same
+pseudonyms spans use — so Cloud never learns a local id; `attrs` travels
+as JSON text because per-request ClickHouse settings do not cross the
+proxy. **What leaves the machine follows the per-project consent model of
+ADR-040 §1, unchanged:** a project at the default `metered` fidelity
+contributes only `project_ref`, timestamp, level, stream and the chunk
+pointer — no service, environment, container, identifiers or attributes,
+the same projection its spans get; a project raised to `queryable` ships
+its labels and real trace/span/request ids, and its attributes (including
+`http_route`, `http_method`, `status_code`, `duration_ms` and the promoted
+facet slots) default-deny against `cloud_telemetry_attribute_allowlist`.
+Application log attributes are the highest-PII surface the instance has,
+so there is no Cloud-specific loosening of that model and a policy lookup
+failure resolves to `metered`. Telemetry export being switched off makes
+the index *unavailable* (surfaced verbatim in the capabilities endpoint),
+not silently local: a sealed chunk that could not be indexed keeps
+`indexed_at = NULL` and the reindexer backfills it once export is enabled.
+Cloud cannot delete, so `forget_chunks` writes instance-scoped tombstones
+that every read excludes. The Cloud DDL this side relies on is written
+down next to the client as the only contract this repository owns.
 
 **TimescaleDB.** A per-line table on the control-plane database is exactly
 what ADR-046 removed for *message bytes*; this is the index only — no
@@ -339,9 +351,19 @@ message, ≈ 90 B/row uncompressed, ~10–20 B/row once Timescale compresses
 the chunk — and it exists so that a TimescaleDB-only install has the same
 explorer as everyone else. Same columns as the ClickHouse table (`attrs` is
 `jsonb`), same `chunk_seq`/`line_index` pointer, same retention as the
-chunks. Coverage is deliberately partial where Postgres cannot be fast:
-anything the fallback refuses returns a validation error naming ClickHouse
-rather than a slow or wrong answer.
+chunks. Every read runs under a 10 s statement timeout and a 90-day window bound
+so the explorer can never exhaust the control-plane pool; inserts are
+`ON CONFLICT DO NOTHING` on the unique pointer so a retried chunk is never
+counted twice. Measured on 2M lines: 14.6 B/row once compressed (~400 B/row
+in the uncompressed two-hour window, half of it indexes), 36k rows/s
+insert, histogram over 9M rows 3.4 s versus 0.2 s in ClickHouse — the
+fallback trades speed, never correctness.
+
+**Fail closed, not sideways.** A *configured* local ClickHouse that is
+unreachable at startup disables the index with its verbatim reason; it is
+never a trigger to index somewhere else, because with Cloud next in line
+a ClickHouse blip would otherwise export the retention window on nobody's
+decision. Only an unconfigured store is skipped.
 
 **Switching stores.** The active store is recorded in
 `log_line_index_state`. When it differs from the last start (an operator

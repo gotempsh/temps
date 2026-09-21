@@ -24,6 +24,7 @@
 //!   below: text `attrs`, pseudonymous scoping columns, and tombstones
 //!   instead of deletes. See [`CLOUD_LINES_TABLE`] for the exact contract.
 
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use clickhouse::Row;
 use serde::Serialize;
 use temps_clickhouse::{ClickHouseConfig, Migration, ServerVersion};
 use temps_cloud_client::CloudLink;
+use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use tracing::{debug, info, warn};
 
 use super::analytics::{Dialect, Scoping};
@@ -85,6 +87,12 @@ pub(crate) const CLOUD_FORGOTTEN_CHUNKS_TABLE: &str = "telemetry_log_forgotten_c
 /// ```sql
 /// CREATE TABLE telemetry_log_lines
 /// (
+///     -- Which linked instance wrote the row. One Cloud tenant can hold
+///     -- several instances and `chunk_seq` is only unique within one
+///     -- manifest, so every read filters on this and every tombstone lookup
+///     -- is correlated on it. `HMAC(instance_token, "instance\0log-line-index")`.
+///     instance_ref         String,
+///
 ///     -- Scoping. Cloud never learns a local id: both are
 ///     -- HMAC(instance_token, domain || '\0' || id), derived on this side by
 ///     -- `CloudLink::pseudonymize_telemetry_id`. `external_service_ref = ''`
@@ -131,21 +139,22 @@ pub(crate) const CLOUD_FORGOTTEN_CHUNKS_TABLE: &str = "telemetry_log_forgotten_c
 /// )
 /// ENGINE = ReplacingMergeTree
 /// PARTITION BY toDate(ts)
-/// ORDER BY (project_ref, service, chunk_seq, line_index)
+/// ORDER BY (instance_ref, project_ref, service, chunk_seq, line_index)
 /// TTL toDateTime(ts) + INTERVAL <tenant retention> DAY
 /// SETTINGS ttl_only_drop_parts = 1;
 ///
 /// -- Chunks the instance has forgotten (compacted away, purged, or missing).
 /// -- The insert proxy accepts inserts and the read proxy rejects `DELETE`, so
 /// -- a tombstone is the only way to stop counting a line; every read here
-/// -- excludes `chunk_seq IN (SELECT chunk_seq FROM …)`.
+/// -- excludes `chunk_seq IN (SELECT chunk_seq FROM … WHERE instance_ref = ?)`.
 /// CREATE TABLE telemetry_log_forgotten_chunks
 /// (
+///     instance_ref String,
 ///     chunk_seq    UInt64,
 ///     forgotten_at DateTime64(3)
 /// )
 /// ENGINE = ReplacingMergeTree
-/// ORDER BY chunk_seq
+/// ORDER BY (instance_ref, chunk_seq)
 /// TTL toDateTime(forgotten_at) + INTERVAL <tenant retention> DAY;
 /// ```
 ///
@@ -153,6 +162,9 @@ pub(crate) const CLOUD_FORGOTTEN_CHUNKS_TABLE: &str = "telemetry_log_forgotten_c
 /// `ALTER … MODIFY TTL` (the proxies would reject it), so the tombstones must
 /// age out on the same clock as the lines they mask — otherwise they
 /// accumulate forever for lines that no longer exist.
+///
+/// How *much* of a line reaches these columns is not decided here: see
+/// [`cloud_index_row`] for the per-project consent projection (ADR-040 §1).
 pub(crate) const CLOUD_LINES_TABLE: &str = "telemetry_log_lines";
 
 /// Where a [`ClickHouseLineIndex`] stores and reads its rows.
@@ -162,25 +174,15 @@ pub enum LineIndexTarget {
     Local(ClickHouseConfig),
     /// Temps Cloud's tenant ClickHouse behind the telemetry proxies. Cloud
     /// owns the schema and the TTL; this side only reads and inserts.
-    Cloud(Arc<CloudLink>),
-}
-
-impl From<ClickHouseConfig> for LineIndexTarget {
-    fn from(config: ClickHouseConfig) -> Self {
-        Self::Local(config)
-    }
-}
-
-impl From<&ClickHouseConfig> for LineIndexTarget {
-    fn from(config: &ClickHouseConfig) -> Self {
-        Self::Local(config.clone())
-    }
-}
-
-impl From<Arc<CloudLink>> for LineIndexTarget {
-    fn from(link: Arc<CloudLink>) -> Self {
-        Self::Cloud(link)
-    }
+    Cloud {
+        link: Arc<CloudLink>,
+        /// Read on the write path for each project's
+        /// `cloud_telemetry_fidelity` and
+        /// `cloud_telemetry_attribute_allowlist` — the consent that decides
+        /// how much of a line may leave the instance (ADR-040 §1). Nothing
+        /// leaves at more than `Metered` without a row here saying so.
+        db: Arc<sea_orm::DatabaseConnection>,
+    },
 }
 
 /// Why the ClickHouse line index could not be enabled — surfaced verbatim
@@ -222,6 +224,145 @@ impl std::fmt::Display for IndexUnavailable {
                  enable telemetry export in Settings → Temps Cloud"
             ),
         }
+    }
+}
+
+// ── Per-project egress consent (ADR-040 §1) ─────────────────────────────
+
+/// How long a resolved per-project consent stays valid.
+///
+/// Short enough that raising or lowering fidelity in the UI takes effect
+/// without a restart, long enough that sealing a chunk is not a Postgres
+/// round trip per line. Matched to the TTL `CloudPolicyCache` uses for spans
+/// in spirit, not by import: `temps-log-aggregator` does not depend on
+/// `temps-otel`, and a shared cache across the two would tie the log seal
+/// path to the span ingest path's lifetime.
+const CONSENT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The resolved answer to "how much of this project's log lines may leave
+/// this instance".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudLinePolicy {
+    fidelity: CloudTelemetryFidelity,
+    /// Exact-match keys permitted at `Queryable`. Empty — the default even
+    /// there — ships no attributes at all.
+    allowlist: Arc<BTreeSet<String>>,
+}
+
+impl CloudLinePolicy {
+    /// The default and every failure's answer.
+    fn metered() -> Self {
+        Self {
+            fidelity: CloudTelemetryFidelity::Metered,
+            allowlist: Arc::new(BTreeSet::new()),
+        }
+    }
+
+    fn is_queryable(&self) -> bool {
+        self.fidelity.is_queryable()
+    }
+
+    /// Exact match only. No prefix or glob semantics — one `http.*` entry
+    /// would widen egress to whatever a parser decides to extract next
+    /// release.
+    fn allows(&self, key: &str) -> bool {
+        self.allowlist.contains(key)
+    }
+}
+
+/// Only the two consent columns, so the seal path never pulls the whole
+/// (wide) project row to read a flag.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct ProjectConsentRow {
+    cloud_telemetry_fidelity: CloudTelemetryFidelity,
+    cloud_telemetry_attribute_allowlist: Vec<String>,
+}
+
+/// TTL cache of per-project [`CloudLinePolicy`].
+///
+/// Every failure — a database error, a missing project row, a line with no
+/// project at all — resolves to [`CloudLinePolicy::metered`], the same
+/// direction `CloudPolicyCache` fails in for spans. Failing towards *less*
+/// egress costs a project that opted in up to one TTL of reduced fidelity,
+/// which is recoverable; failing the other way ships real service names and
+/// attributes because a `SELECT` timed out, which is not.
+struct CloudConsent {
+    db: Arc<sea_orm::DatabaseConnection>,
+    ttl: std::time::Duration,
+    entries: std::sync::Mutex<HashMap<i32, (CloudLinePolicy, std::time::Instant)>>,
+}
+
+impl CloudConsent {
+    fn new(db: Arc<sea_orm::DatabaseConnection>) -> Self {
+        Self {
+            db,
+            ttl: CONSENT_TTL,
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The policy for `project_id`. Never fails: it refuses to let a lookup
+    /// problem widen what leaves the instance.
+    async fn policy(&self, project_id: i32) -> CloudLinePolicy {
+        // A line with no owning project (an external service's container)
+        // has no row to consent with, so it never gets past Metered.
+        if project_id <= 0 {
+            return CloudLinePolicy::metered();
+        }
+        {
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((policy, at)) = entries.get(&project_id) {
+                if at.elapsed() < self.ttl {
+                    return policy.clone();
+                }
+            }
+        }
+        let policy = match self.fetch(project_id).await {
+            Ok(Some(policy)) => policy,
+            Ok(None) => {
+                warn!(
+                    project_id,
+                    "no project row for a log chunk; mirroring it to Temps Cloud at `metered` \
+                     fidelity"
+                );
+                CloudLinePolicy::metered()
+            }
+            Err(error) => {
+                warn!(
+                    project_id,
+                    %error,
+                    "could not read the Temps Cloud telemetry fidelity; mirroring this \
+                     project's log lines at `metered` fidelity until the lookup succeeds"
+                );
+                // Deliberately not cached: a transient database error must
+                // not pin a project to Metered for the whole TTL.
+                return CloudLinePolicy::metered();
+            }
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(project_id, (policy.clone(), std::time::Instant::now()));
+        policy
+    }
+
+    async fn fetch(&self, project_id: i32) -> Result<Option<CloudLinePolicy>, sea_orm::DbErr> {
+        use sea_orm::{EntityTrait, QuerySelect};
+        let row = temps_entities::projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(temps_entities::projects::Column::CloudTelemetryFidelity)
+            .column(temps_entities::projects::Column::CloudTelemetryAttributeAllowlist)
+            .into_model::<ProjectConsentRow>()
+            .one(self.db.as_ref())
+            .await?;
+        Ok(row.map(|row| CloudLinePolicy {
+            fidelity: row.cloud_telemetry_fidelity,
+            allowlist: Arc::new(
+                row.cloud_telemetry_attribute_allowlist
+                    .into_iter()
+                    .collect(),
+            ),
+        }))
     }
 }
 
@@ -271,12 +412,15 @@ struct IndexRow<'a> {
     facet_attr_20: Option<&'a str>,
 }
 
-/// The same row as Cloud stores it: the two scoping columns are pseudonyms
-/// (`external_service_ref = ''` is "none"), everything else is identical.
-/// Names and types are validated server-side on insert, so a drift against
-/// the DDL in [`CLOUD_LINES_TABLE`] fails loudly rather than writing garbage.
+/// The same row as Cloud stores it: the scoping columns are pseudonyms
+/// (`external_service_ref = ''` is "none"), and how many of the remaining
+/// columns are populated is the owning project's consent decision — see
+/// [`cloud_index_row`]. Names and types are validated server-side on insert,
+/// so a drift against the DDL in [`CLOUD_LINES_TABLE`] fails loudly rather
+/// than writing garbage.
 #[derive(Debug, Row, Serialize)]
 struct CloudIndexRow<'a> {
+    instance_ref: &'a str,
     project_ref: &'a str,
     external_service_ref: &'a str,
     env: &'a str,
@@ -321,58 +465,189 @@ struct CloudIndexRow<'a> {
     facet_attr_20: Option<&'a str>,
 }
 
-impl<'a> IndexRow<'a> {
-    /// Swap the two id columns for the refs Cloud knows them by; nothing
-    /// else about the row changes.
-    fn into_cloud(self, project_ref: &'a str, external_service_ref: &'a str) -> CloudIndexRow<'a> {
-        CloudIndexRow {
-            project_ref,
-            external_service_ref,
-            env: self.env,
-            service: self.service,
-            deploy_id: self.deploy_id,
-            container_id: self.container_id,
-            node_id: self.node_id,
-            ts: self.ts,
-            level: self.level,
-            stream: self.stream,
-            chunk_seq: self.chunk_seq,
-            line_index: self.line_index,
-            trace_id: self.trace_id,
-            span_id: self.span_id,
-            request_id: self.request_id,
-            status_code: self.status_code,
-            http_method: self.http_method,
-            http_route: self.http_route,
-            duration_ms: self.duration_ms,
-            attrs: self.attrs,
-            facet_attr_1: self.facet_attr_1,
-            facet_attr_2: self.facet_attr_2,
-            facet_attr_3: self.facet_attr_3,
-            facet_attr_4: self.facet_attr_4,
-            facet_attr_5: self.facet_attr_5,
-            facet_attr_6: self.facet_attr_6,
-            facet_attr_7: self.facet_attr_7,
-            facet_attr_8: self.facet_attr_8,
-            facet_attr_9: self.facet_attr_9,
-            facet_attr_10: self.facet_attr_10,
-            facet_attr_11: self.facet_attr_11,
-            facet_attr_12: self.facet_attr_12,
-            facet_attr_13: self.facet_attr_13,
-            facet_attr_14: self.facet_attr_14,
-            facet_attr_15: self.facet_attr_15,
-            facet_attr_16: self.facet_attr_16,
-            facet_attr_17: self.facet_attr_17,
-            facet_attr_18: self.facet_attr_18,
-            facet_attr_19: self.facet_attr_19,
-            facet_attr_20: self.facet_attr_20,
+/// The three pseudonyms every Cloud row carries, derived once per chunk.
+struct CloudScope<'a> {
+    instance_ref: &'a str,
+    project_ref: &'a str,
+    external_service_ref: &'a str,
+}
+
+/// Build one Cloud row at the owning project's consented fidelity
+/// (ADR-040 §1) — the projection that decides what actually leaves this
+/// instance.
+///
+/// This is the log-line counterpart of `cloud_span`, and deliberately the
+/// same shape of decision:
+///
+/// * **Metered** (the default for every project, and the answer to every
+///   failed or impossible consent lookup) ships only what billing and
+///   liveness need: the three pseudonyms, the timestamp, the level and
+///   stream, and the chunk pointer. Every label and every attribute column
+///   is written at its absent value — `''`, `0`, `'{}'`, `NULL`. A log line
+///   is application-controlled text: service names, container ids, routes
+///   and extracted attributes routinely carry customer identifiers, so none
+///   of it leaves without the project saying so.
+/// * **Queryable** is opt-in per project and ships what makes a line
+///   findable: the real labels (`env`, `service`, `container_id`,
+///   `deploy_id`, `node_id`) and the real correlation ids (`trace_id`,
+///   `span_id`, `request_id` — in the clear, as spans do at this tier, so
+///   the line joins to the user's own traces). Everything that carries
+///   application *content* — `http_route`, `http_method`, `status_code`,
+///   `duration_ms`, the residual `attrs` and the promoted facet slots — stays
+///   default-deny against `cloud_telemetry_attribute_allowlist`: a key ships
+///   only if it is listed, and the default empty allowlist ships none of it.
+fn cloud_index_row<'a>(
+    seq: i64,
+    labels: &'a ChunkLabels,
+    line_index: u32,
+    line: &'a LogLine,
+    slots: &'a FacetSlots,
+    scope: &CloudScope<'a>,
+    policy: &CloudLinePolicy,
+) -> CloudIndexRow<'a> {
+    // The always-shipped skeleton, with every optional column at its absent
+    // value. The `Queryable` branch below fills columns in; nothing is ever
+    // populated by omission.
+    let mut row = CloudIndexRow {
+        instance_ref: scope.instance_ref,
+        project_ref: scope.project_ref,
+        external_service_ref: scope.external_service_ref,
+        env: "",
+        service: "",
+        deploy_id: 0,
+        container_id: "",
+        node_id: 0,
+        ts: line.ts,
+        level: level_to_u8(line.level) as i8,
+        stream: match line.stream {
+            LogStream::Stdout => 0,
+            LogStream::Stderr => 1,
+        },
+        chunk_seq: seq as u64,
+        line_index,
+        trace_id: "",
+        span_id: "",
+        request_id: "",
+        status_code: 0,
+        http_method: "",
+        http_route: "",
+        duration_ms: 0.0,
+        attrs: "{}".into(),
+        facet_attr_1: None,
+        facet_attr_2: None,
+        facet_attr_3: None,
+        facet_attr_4: None,
+        facet_attr_5: None,
+        facet_attr_6: None,
+        facet_attr_7: None,
+        facet_attr_8: None,
+        facet_attr_9: None,
+        facet_attr_10: None,
+        facet_attr_11: None,
+        facet_attr_12: None,
+        facet_attr_13: None,
+        facet_attr_14: None,
+        facet_attr_15: None,
+        facet_attr_16: None,
+        facet_attr_17: None,
+        facet_attr_18: None,
+        facet_attr_19: None,
+        facet_attr_20: None,
+    };
+    if !policy.is_queryable() {
+        return row;
+    }
+
+    let fields = line.fields.as_ref();
+    let wk = fields.map(well_known).unwrap_or_default();
+    row.env = &labels.env;
+    row.service = &labels.service;
+    row.deploy_id = labels.deploy_id.unwrap_or(0);
+    row.container_id = &labels.container_id;
+    row.node_id = labels.node_id.unwrap_or(0);
+    // Correlation ids are identifiers this instance minted, not content, and
+    // a pseudonymised one would join to nothing the user owns.
+    row.trace_id = wk.trace_id.unwrap_or("");
+    row.span_id = wk.span_id.unwrap_or("");
+    row.request_id = wk.request_id.unwrap_or("");
+    // Everything below is content, and content is allowlisted by key.
+    if policy.allows("http_method") {
+        row.http_method = wk.http_method.unwrap_or("");
+    }
+    if policy.allows("http_route") {
+        row.http_route = wk.http_route.unwrap_or("");
+    }
+    if policy.allows("status_code") {
+        row.status_code = wk.status_code.unwrap_or(0);
+    }
+    if policy.allows("duration_ms") {
+        row.duration_ms = wk.duration_ms.unwrap_or(0.0);
+    }
+    row.attrs = fields
+        .map(|f| allowed_residual_attrs(f, policy))
+        .unwrap_or_else(|| "{}".into());
+    let values = allowed_slot_values(fields, slots, policy);
+    row.facet_attr_1 = values[0];
+    row.facet_attr_2 = values[1];
+    row.facet_attr_3 = values[2];
+    row.facet_attr_4 = values[3];
+    row.facet_attr_5 = values[4];
+    row.facet_attr_6 = values[5];
+    row.facet_attr_7 = values[6];
+    row.facet_attr_8 = values[7];
+    row.facet_attr_9 = values[8];
+    row.facet_attr_10 = values[9];
+    row.facet_attr_11 = values[10];
+    row.facet_attr_12 = values[11];
+    row.facet_attr_13 = values[12];
+    row.facet_attr_14 = values[13];
+    row.facet_attr_15 = values[14];
+    row.facet_attr_16 = values[15];
+    row.facet_attr_17 = values[16];
+    row.facet_attr_18 = values[17];
+    row.facet_attr_19 = values[18];
+    row.facet_attr_20 = values[19];
+    row
+}
+
+/// [`residual_attrs`] with the allowlist applied: a key ships only if the
+/// project listed it, so an empty allowlist yields `{}`.
+fn allowed_residual_attrs(fields: &serde_json::Value, policy: &CloudLinePolicy) -> String {
+    let Some(obj) = fields.as_object() else {
+        return "{}".into();
+    };
+    let allowed: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(k, _)| !crate::parser::is_canonical_key(k) && policy.allows(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if allowed.is_empty() {
+        return "{}".into();
+    }
+    serde_json::to_string(&allowed).unwrap_or_else(|_| "{}".into())
+}
+
+/// [`slot_values`] with the allowlist applied. A promoted facet is still an
+/// attribute value — promotion is a local indexing decision and says nothing
+/// about egress.
+fn allowed_slot_values<'a>(
+    fields: Option<&'a serde_json::Value>,
+    slots: &'a FacetSlots,
+    policy: &CloudLinePolicy,
+) -> [Option<&'a str>; FACET_SLOTS] {
+    let mut out = slot_values(fields, slots);
+    for (i, key) in slots.iter().enumerate() {
+        if !key.as_deref().is_some_and(|k| policy.allows(k)) {
+            out[i] = None;
         }
     }
+    out
 }
 
 /// One tombstone: the chunk this instance no longer has, and when it said so.
 #[derive(Debug, Row, Serialize)]
-struct ForgottenChunkRow {
+struct ForgottenChunkRow<'a> {
+    instance_ref: &'a str,
     chunk_seq: u64,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     forgotten_at: DateTime<Utc>,
@@ -391,6 +666,9 @@ pub struct ClickHouseLineIndex {
     /// `Some` only where the version was probed (local).
     version: Option<ServerVersion>,
     dialect: Dialect,
+    /// `Some` only for a Cloud target: nothing leaves the instance without
+    /// the owning project's consent, so the write path always has this.
+    consent: Option<CloudConsent>,
     slots: arc_swap::ArcSwap<FacetSlots>,
     /// Last TTL (days) applied with `ALTER TABLE … MODIFY TTL`; `0` = never.
     ttl_days: AtomicU32,
@@ -411,10 +689,8 @@ impl ClickHouseLineIndex {
     /// an instance that enables it a second later. Refusing on it would
     /// disable the index for the whole process lifetime over a race. The
     /// switch is enforced per operation instead, where it is current.
-    pub async fn connect(
-        target: impl Into<LineIndexTarget>,
-    ) -> Result<Arc<Self>, IndexUnavailable> {
-        let (client, version, dialect) = match target.into() {
+    pub async fn connect(target: LineIndexTarget) -> Result<Arc<Self>, IndexUnavailable> {
+        let (client, version, dialect, consent) = match target {
             LineIndexTarget::Local(config) => {
                 let client = config
                     .client()
@@ -448,9 +724,9 @@ impl ClickHouseLineIndex {
                     skipped = report.skipped,
                     "log line index ready (ClickHouse)"
                 );
-                (Some(client), Some(version), Dialect::local())
+                (Some(client), Some(version), Dialect::local(), None)
             }
-            LineIndexTarget::Cloud(link) => {
+            LineIndexTarget::Cloud { link, db } => {
                 if !link.is_linked() {
                     return Err(IndexUnavailable::CloudUnavailable {
                         error: "this instance is not linked to Temps Cloud".into(),
@@ -464,7 +740,12 @@ impl ClickHouseLineIndex {
                     table = CLOUD_LINES_TABLE,
                     "log line index ready (Temps Cloud)"
                 );
-                (None, None, Dialect::cloud(link))
+                (
+                    None,
+                    None,
+                    Dialect::cloud(link),
+                    Some(CloudConsent::new(db)),
+                )
             }
         };
 
@@ -472,6 +753,7 @@ impl ClickHouseLineIndex {
             client,
             version,
             dialect,
+            consent,
             slots: arc_swap::ArcSwap::from_pointee(Default::default()),
             ttl_days: AtomicU32::new(0),
             retention_note_logged: AtomicBool::new(false),
@@ -559,30 +841,47 @@ impl ClickHouseLineIndex {
         let slots = self.slots.load();
         let client = self.write_client()?;
         let table = self.dialect.lines_table;
-        let rows = lines.iter().enumerate().map(|(offset, line)| {
-            index_row(seq, labels, first_index + offset as u32, line, &slots)
-        });
         if !self.dialect.is_cloud() {
             let mut insert: clickhouse::insert::Insert<IndexRow<'_>> =
                 client.insert(table).await.map_err(ch_err)?;
-            for row in rows {
+            for (offset, line) in lines.iter().enumerate() {
+                let row = index_row(seq, labels, first_index + offset as u32, line, &slots);
                 insert.write(&row).await.map_err(ch_err)?;
             }
             return insert.end().await.map_err(ch_err);
         }
-        // Cloud scopes by pseudonym, and the whole chunk shares one: the
-        // labels are constant for it, so the HMAC is computed once.
+        // Cloud scopes by pseudonym, and the whole chunk shares all three:
+        // the labels are constant for it, so each HMAC is computed once.
+        let instance_ref = self.dialect.instance_ref()?;
         let project_ref = self.dialect.project_ref(labels.project_id)?;
         let service_ref = self
             .dialect
             .external_service_ref(labels.external_service_id.unwrap_or(0))?;
+        let scope = CloudScope {
+            instance_ref: &instance_ref,
+            project_ref: &project_ref,
+            external_service_ref: &service_ref,
+        };
+        // One consent read per chunk, not per line: every line in a chunk
+        // belongs to the same project by construction. Lines from an
+        // external service have no project row and stay Metered.
+        let policy = match (&self.consent, labels.external_service_id) {
+            (Some(consent), None) => consent.policy(labels.project_id).await,
+            _ => CloudLinePolicy::metered(),
+        };
         let mut insert: clickhouse::insert::Insert<CloudIndexRow<'_>> =
             client.insert(table).await.map_err(ch_err)?;
-        for row in rows {
-            insert
-                .write(&row.into_cloud(&project_ref, &service_ref))
-                .await
-                .map_err(ch_err)?;
+        for (offset, line) in lines.iter().enumerate() {
+            let row = cloud_index_row(
+                seq,
+                labels,
+                first_index + offset as u32,
+                line,
+                &slots,
+                &scope,
+                &policy,
+            );
+            insert.write(&row).await.map_err(ch_err)?;
         }
         insert.end().await.map_err(ch_err)
     }
@@ -766,11 +1065,15 @@ impl LineIndexSink for ClickHouseLineIndex {
             // the lines and their tombstones out together.
             let client = self.write_client()?;
             let now = Utc::now();
-            let mut insert: clickhouse::insert::Insert<ForgottenChunkRow> =
+            // Stamped with this instance's key: a tombstone must not mask a
+            // sibling instance's chunk of the same sequence number.
+            let instance_ref = self.dialect.instance_ref()?;
+            let mut insert: clickhouse::insert::Insert<ForgottenChunkRow<'_>> =
                 client.insert(tombstones).await.map_err(ch_err)?;
             for seq in seqs {
                 insert
                     .write(&ForgottenChunkRow {
+                        instance_ref: &instance_ref,
                         chunk_seq: *seq as u64,
                         forgotten_at: now,
                     })
@@ -875,7 +1178,12 @@ mod tests {
             "0.1.0-test",
         ));
 
-        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud(link)).await {
+        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud {
+            link,
+            db: test_db(),
+        })
+        .await
+        {
             Err(IndexUnavailable::CloudUnavailable { error }) => {
                 assert!(error.contains("not linked"), "{error}")
             }
@@ -896,9 +1204,12 @@ mod tests {
         link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches::default())
             .expect("apply feature switches");
 
-        let index = ClickHouseLineIndex::connect(LineIndexTarget::Cloud(link.clone()))
-            .await
-            .expect("a linked instance can host the index in Cloud");
+        let index = ClickHouseLineIndex::connect(LineIndexTarget::Cloud {
+            link: link.clone(),
+            db: test_db(),
+        })
+        .await
+        .expect("a linked instance can host the index in Cloud");
 
         assert_eq!(index.backend(), Some(LineIndexBackend::TempsCloud));
         assert!(index.version().is_none(), "Cloud probes no server version");
@@ -925,15 +1236,213 @@ mod tests {
     #[tokio::test]
     async fn cloud_retention_is_a_no_op() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let index = ClickHouseLineIndex::connect(LineIndexTarget::Cloud(
-            super::super::analytics::test_cloud_link(dir.path()),
-        ))
+        let index = ClickHouseLineIndex::connect(LineIndexTarget::Cloud {
+            link: super::super::analytics::test_cloud_link(dir.path()),
+            db: test_db(),
+        })
         .await
         .expect("connect");
         index.set_retention_days(30).await.expect("no-op");
         index.set_retention_days(7).await.expect("still a no-op");
         // Nothing to forget is nothing to write, with or without a client.
         index.forget_chunks(&[]).await.expect("no-op");
+    }
+
+    // ── The Cloud egress projection (ADR-040 §1) ─────────────────────────
+
+    /// A `DatabaseConnection` that answers nothing. Every consent test that
+    /// needs an answer asks for one explicitly.
+    fn test_db() -> Arc<sea_orm::DatabaseConnection> {
+        Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
+    }
+
+    fn test_labels() -> ChunkLabels {
+        let now = Utc::now();
+        ChunkLabels {
+            project_id: 7,
+            external_service_id: None,
+            env: "production".into(),
+            service: "api".into(),
+            container_id: "c0ffee".into(),
+            deploy_id: Some(42),
+            node_id: Some(3),
+            node_name: None,
+            started_at: now,
+            ended_at: now,
+            line_count: 1,
+            level_mask: 0,
+            level_counts: [0; 5],
+        }
+    }
+
+    fn test_line() -> LogLine {
+        LogLine {
+            ts: Utc::now(),
+            stream: LogStream::Stderr,
+            level: crate::types::LogLevel::Error,
+            msg: "boom".into(),
+            fields: Some(serde_json::json!({
+                "worker": "3",
+                "customer_email": "person@example.test",
+                "request_id": "r-1",
+                "trace_id": "t-1",
+                "status_code": 503,
+                "duration_ms": 12.5,
+                "http_route": "/orders/{id}",
+                "http_method": "POST",
+            })),
+            container_id: "unused".into(),
+            service: "unused".into(),
+            env: "unused".into(),
+            project_id: 7,
+            external_service_id: None,
+            deploy_id: None,
+            node_id: None,
+            node_name: None,
+        }
+    }
+
+    fn test_slots() -> FacetSlots {
+        let mut slots: FacetSlots = Default::default();
+        slots[0] = Some("worker".into());
+        slots[1] = Some("customer_email".into());
+        slots
+    }
+
+    fn projected(policy: &CloudLinePolicy) -> (CloudIndexRow<'static>, &'static ChunkLabels) {
+        // Leaked so the row's borrows outlive the helper; a test binary is
+        // the one place where that is simply free.
+        let labels: &'static ChunkLabels = Box::leak(Box::new(test_labels()));
+        let line: &'static LogLine = Box::leak(Box::new(test_line()));
+        let slots: &'static FacetSlots = Box::leak(Box::new(test_slots()));
+        let scope = CloudScope {
+            instance_ref: "i",
+            project_ref: "p",
+            external_service_ref: "",
+        };
+        (
+            cloud_index_row(9, labels, 4, line, slots, &scope, policy),
+            labels,
+        )
+    }
+
+    #[test]
+    fn a_metered_project_ships_no_labels_and_no_attributes() {
+        // The default for every project. Only billing and liveness leave:
+        // the pseudonyms, the clock, the severity and the chunk pointer.
+        let (row, _) = projected(&CloudLinePolicy::metered());
+
+        assert_eq!(row.instance_ref, "i");
+        assert_eq!(row.project_ref, "p");
+        assert_eq!(row.chunk_seq, 9);
+        assert_eq!(row.line_index, 4);
+        assert_eq!(row.stream, 1);
+
+        assert_eq!(row.env, "");
+        assert_eq!(row.service, "");
+        assert_eq!(row.container_id, "");
+        assert_eq!(row.deploy_id, 0);
+        assert_eq!(row.node_id, 0);
+        assert_eq!(row.trace_id, "");
+        assert_eq!(row.span_id, "");
+        assert_eq!(row.request_id, "");
+        assert_eq!(row.status_code, 0);
+        assert_eq!(row.http_method, "");
+        assert_eq!(row.http_route, "");
+        assert_eq!(row.duration_ms, 0.0);
+        assert_eq!(row.attrs, "{}");
+        assert_eq!(row.facet_attr_1, None);
+        assert_eq!(row.facet_attr_2, None);
+    }
+
+    #[test]
+    fn a_queryable_project_ships_only_the_allowlisted_content() {
+        let policy = CloudLinePolicy {
+            fidelity: CloudTelemetryFidelity::Queryable,
+            allowlist: Arc::new(BTreeSet::from(["worker".to_string()])),
+        };
+        let (row, labels) = projected(&policy);
+
+        // Labels and correlation ids become real at this tier.
+        assert_eq!(row.env, labels.env);
+        assert_eq!(row.service, labels.service);
+        assert_eq!(row.container_id, labels.container_id);
+        assert_eq!(row.deploy_id, 42);
+        assert_eq!(row.node_id, 3);
+        assert_eq!(row.trace_id, "t-1");
+        assert_eq!(row.request_id, "r-1");
+
+        // Content is default-deny: only `worker` was listed.
+        assert_eq!(row.attrs, r#"{"worker":"3"}"#);
+        assert!(!row.attrs.contains("person@example.test"));
+        assert_eq!(row.facet_attr_1, Some("3"));
+        assert_eq!(
+            row.facet_attr_2, None,
+            "a promoted slot is still an attribute value"
+        );
+        assert_eq!(row.http_route, "", "not listed, so it does not leave");
+        assert_eq!(row.http_method, "");
+        assert_eq!(row.status_code, 0);
+        assert_eq!(row.duration_ms, 0.0);
+    }
+
+    #[test]
+    fn an_empty_allowlist_ships_no_content_even_at_queryable() {
+        let (row, labels) = projected(&CloudLinePolicy {
+            fidelity: CloudTelemetryFidelity::Queryable,
+            allowlist: Arc::new(BTreeSet::new()),
+        });
+        assert_eq!(row.service, labels.service, "the line is still findable");
+        assert_eq!(row.attrs, "{}");
+        assert_eq!(row.facet_attr_1, None);
+        assert_eq!(row.status_code, 0);
+    }
+
+    #[test]
+    fn the_canonical_columns_a_queryable_project_listed_do_ship() {
+        let (row, _) = projected(&CloudLinePolicy {
+            fidelity: CloudTelemetryFidelity::Queryable,
+            allowlist: Arc::new(BTreeSet::from([
+                "http_route".to_string(),
+                "status_code".to_string(),
+                "duration_ms".to_string(),
+                "http_method".to_string(),
+            ])),
+        });
+        assert_eq!(row.http_route, "/orders/{id}");
+        assert_eq!(row.http_method, "POST");
+        assert_eq!(row.status_code, 503);
+        assert_eq!(row.duration_ms, 12.5);
+        // Canonical keys never double as residual attributes.
+        assert_eq!(row.attrs, "{}");
+    }
+
+    #[tokio::test]
+    async fn a_consent_lookup_failure_falls_back_to_metered() {
+        // Fail closed: a database blip must not widen what leaves the
+        // instance, and must not be cached as if it were an answer.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let consent = CloudConsent::new(Arc::new(db));
+
+        assert_eq!(consent.policy(7).await, CloudLinePolicy::metered());
+        assert!(
+            consent
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "an error must not pin the project to Metered for a whole TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_project_is_metered_without_a_lookup() {
+        // External-service containers have no project row to consent with.
+        let consent = CloudConsent::new(test_db());
+        assert_eq!(consent.policy(0).await, CloudLinePolicy::metered());
+        assert_eq!(consent.policy(-1).await, CloudLinePolicy::metered());
     }
 }
 
@@ -1375,7 +1884,9 @@ mod live_tests {
             eprintln!("TEMPS_TEST_CLICKHOUSE_URL unset; skipping");
             return;
         };
-        let idx = ClickHouseLineIndex::connect(cfg).await.expect("connect");
+        let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg))
+            .await
+            .expect("connect");
         let mut q = LogQuery::for_scope(LogAccessScope::All);
         q.start_time = Utc::now() - chrono::Duration::days(2);
         q.end_time = Utc::now();

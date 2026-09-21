@@ -20,7 +20,7 @@ use crate::chunk::cache::ChunkCache;
 use crate::handlers::{self, create_log_aggregator_app_state, LogAggregatorAppState};
 use crate::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
 use crate::index::timescale::TimescaleLineIndex;
-use crate::index::LineIndex;
+use crate::index::{LineIndex, NoLineIndex};
 use crate::services::{
     ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
     RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
@@ -887,22 +887,37 @@ fn spawn_local_container_discovery(
 }
 
 /// Pick the line index store in preference order (ADR-047 §8).
+///
+/// A *configured* local ClickHouse that cannot be reached is not a reason
+/// to index somewhere else: a restart during a ClickHouse blip would
+/// otherwise move the index (and, with Cloud next in line, export the whole
+/// retention window) on nobody's decision. Configured-but-unavailable fails
+/// closed with the verbatim reason; only an *unconfigured* store is skipped.
 async fn select_line_index(
     local: Option<&ClickHouseConfig>,
     cloud: Option<Arc<temps_cloud_client::CloudLink>>,
     db: Arc<sea_orm::DatabaseConnection>,
 ) -> Arc<dyn LineIndex> {
     if let Some(config) = local {
-        match ClickHouseLineIndex::connect(LineIndexTarget::Local(config.clone())).await {
-            Ok(index) => return index,
-            Err(reason) => tracing::warn!(
-                %reason,
-                "local ClickHouse cannot host the log line index; trying the next store"
-            ),
-        }
+        return match ClickHouseLineIndex::connect(LineIndexTarget::Local(config.clone())).await {
+            Ok(index) => index,
+            Err(reason) => {
+                tracing::warn!(
+                    %reason,
+                    "log line index disabled: the configured ClickHouse is unavailable \
+                     (not falling back — fix the connection or unset TEMPS_CLICKHOUSE_*)"
+                );
+                Arc::new(NoLineIndex::new(reason.to_string()))
+            }
+        };
     }
     if let Some(link) = cloud.filter(|link| link.is_linked()) {
-        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud(link)).await {
+        match ClickHouseLineIndex::connect(LineIndexTarget::Cloud {
+            link,
+            db: db.clone(),
+        })
+        .await
+        {
             Ok(index) => {
                 tracing::info!("log line index ready (Temps Cloud ClickHouse)");
                 return index;

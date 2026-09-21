@@ -28,7 +28,7 @@ use temps_log_aggregator::chunk::ChunkLabels;
 use temps_log_aggregator::index::analytics::{
     AttrOp, AttrPredicate, GroupKey, LogAnalytics, Metric,
 };
-use temps_log_aggregator::index::clickhouse::ClickHouseLineIndex;
+use temps_log_aggregator::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
 use temps_log_aggregator::index::{IndexOutcome, LineIndexSink};
 use temps_log_aggregator::store::{FacetField, LogAccessScope, LogQuery, LogSourceKind};
 use temps_log_aggregator::types::{LogLevel, LogLine, LogStream};
@@ -233,7 +233,7 @@ async fn connect_applies_migration_and_is_idempotent() {
         return;
     };
 
-    let idx = ClickHouseLineIndex::connect(cfg)
+    let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
         .await
         .expect("first connect should apply migration 0001 and version-gate the server");
     let version = idx
@@ -262,7 +262,7 @@ async fn connect_applies_migration_and_is_idempotent() {
 
     // Second connect against the same server must be idempotent: no
     // re-application, no duplicate tracking row (the "skipped=1" path).
-    let idx2 = ClickHouseLineIndex::connect(cfg)
+    let idx2 = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
         .await
         .expect("second connect should be idempotent");
     assert_eq!(idx2.version(), idx.version());
@@ -292,7 +292,9 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
         eprintln!("Skipping: Docker unavailable");
         return;
     };
-    let idx = ClickHouseLineIndex::connect(cfg).await.expect("connect");
+    let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
+        .await
+        .expect("connect");
 
     let base = Utc::now();
 
@@ -549,7 +551,9 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
         eprintln!("Skipping: Docker unavailable");
         return;
     };
-    let idx = ClickHouseLineIndex::connect(cfg).await.expect("connect");
+    let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
+        .await
+        .expect("connect");
 
     let base = Utc::now();
     let chunk_labels = labels(9201, "tmp-svc", "prod", "ch-tmp", 21);

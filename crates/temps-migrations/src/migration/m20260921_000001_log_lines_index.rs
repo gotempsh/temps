@@ -98,10 +98,26 @@ CREATE TABLE IF NOT EXISTS log_lines_index (
     facet_attr_17 TEXT, facet_attr_18 TEXT, facet_attr_19 TEXT, facet_attr_20 TEXT
 );
 
--- `forget_chunks` deletes by chunk_seq alone (compaction, purge, reconcile),
--- and it must not degrade into a full scan of every chunk in the window.
-CREATE INDEX IF NOT EXISTS idx_log_lines_index_chunk_seq
-    ON log_lines_index (chunk_seq);
+-- The line's identity, and the dedup key. This is what `ReplacingMergeTree`
+-- gives the ClickHouse backend for free, and it is not optional: the seal
+-- pipeline is idempotent by design and re-inserts a chunk whenever
+-- `mark_indexed` fails after a successful insert, whenever a batch fails
+-- mid-chunk and is retried, whenever the backend flaps, and whenever the
+-- compactor re-indexes (see `services/reindexer.rs`). Without a unique key
+-- each of those double-counts every facet, histogram and aggregate for the
+-- life of the row, silently. Every insert is `ON CONFLICT DO NOTHING`.
+--
+-- Column order is chosen so this index also serves `forget_chunks`
+-- (`DELETE ... WHERE chunk_seq = ANY(...)`), which is why no separate
+-- `(chunk_seq)` index exists.
+--
+-- `ts` is in the key because TimescaleDB requires the partition column in
+-- every unique index on a hypertable. The three columns are exactly
+-- `compress_segmentby` (chunk_seq) plus `compress_orderby` (ts, line_index),
+-- which is also what Timescale requires for a unique index to survive
+-- compression.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_log_lines_index_line
+    ON log_lines_index (chunk_seq, line_index, ts);
 
 -- The two shapes every analytics query has: scoped to a set of projects, or
 -- to a set of external services, always over a time window. The service
