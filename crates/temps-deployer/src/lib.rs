@@ -348,6 +348,27 @@ pub struct DeployRequest {
     /// never match a grant, so it means "no grant possible".
     #[serde(default)]
     pub project_slug: Option<String>,
+    /// Whether the **control plane** declares that this project requires the
+    /// host Docker socket (ADR 045).
+    ///
+    /// The second half of the mount decision, and the reason it is on the
+    /// wire at all: the slug alone is attacker-influenceable. A project writer
+    /// can name a project anything not reserved *by the control plane*, so a
+    /// worker whose operator set `TEMPS_DOCKER_SOCKET_PROJECTS` for a slug the
+    /// control plane never declared would otherwise mount the socket purely
+    /// from its own local environment, with the slug-claim guard and the
+    /// placement gate both inert. Requiring the control plane's own
+    /// declaration to travel with the request means both ends must agree.
+    ///
+    /// This is authorization, never instruction: a `true` here cannot make a
+    /// host mount anything its own environment does not also grant. The
+    /// executing process still answers from its own grant first.
+    ///
+    /// `#[serde(default)]` is `false`, so a request from a control plane built
+    /// before this field — or any request that loses it — fails closed and no
+    /// socket is mounted.
+    #[serde(default)]
+    pub control_plane_grants_socket: bool,
 }
 
 /// Docker container log rotation configuration
@@ -1017,6 +1038,9 @@ mod tests {
         let request: DeployRequest =
             serde_json::from_value(wire).expect("legacy DeployRequest must still deserialise");
         assert_eq!(request.project_slug, None);
+        // Fails closed: a control plane that predates the authorization field
+        // must not be read as having authorized the mount.
+        assert!(!request.control_plane_grants_socket);
     }
 
     #[test]
@@ -1040,6 +1064,39 @@ mod tests {
 
         let encoded = serde_json::to_value(&request).expect("serialises");
         assert_eq!(encoded["project_slug"], serde_json::json!("node-daemon"));
+        // The slug alone carries no authorization; the control plane's
+        // declaration is a separate field and defaults to false.
+        assert!(!request.control_plane_grants_socket);
+    }
+
+    /// The control plane's declaration must survive the agent wire hop, or a
+    /// legitimately declared project would silently deploy without its socket
+    /// on every worker.
+    #[test]
+    fn deploy_request_round_trips_the_control_plane_authorization() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+            "control_plane_grants_socket": true,
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert!(request.control_plane_grants_socket);
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(
+            encoded["control_plane_grants_socket"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -1220,6 +1277,7 @@ mod tests {
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -1545,6 +1603,7 @@ CMD ["echo", "Hello from container"]
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.environment_vars.len(), 3);

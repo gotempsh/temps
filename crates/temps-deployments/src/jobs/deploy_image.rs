@@ -349,6 +349,17 @@ pub struct DeploymentJobConfig {
     /// `None` disables both, which is the correct behaviour for job configs
     /// built outside a project context (and for tests).
     pub project_slug: Option<String>,
+    /// Whether **this control plane** declares that the project requires the
+    /// host Docker socket (ADR 045).
+    ///
+    /// Computed once, from this process's own grant, when the job is built —
+    /// see [`DeployImageJobBuilder::new`] — and sent to the executing host in
+    /// the `DeployRequest`. It is the control plane's half of the mount
+    /// decision; the host still answers from its own environment. Without it
+    /// a worker would mount the socket from its local grant alone, for a slug
+    /// nobody declared and which therefore passed neither the admin-only
+    /// claim guard nor the placement gate.
+    pub control_plane_grants_socket: bool,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
     /// (linked-service container names are replaced with their internal
@@ -415,6 +426,7 @@ impl Default for DeploymentJobConfig {
             target_nodes: None,
             target_labels: None,
             project_slug: None,
+            control_plane_grants_socket: false,
             remote_environment_variables: None,
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
@@ -2150,8 +2162,11 @@ impl DeployImageJob {
             labels,
             // ADR 045: the slug, never an instruction. The executing host
             // answers from its own environment whether this project gets
-            // `/var/run/docker.sock`.
+            // `/var/run/docker.sock` — but it may only answer "yes" when the
+            // control plane also declared the project, which is what the
+            // second field carries. Both halves must agree.
             project_slug: self.config.project_slug.clone(),
+            control_plane_grants_socket: self.config.control_plane_grants_socket,
         };
 
         let deploy_result = deployer
@@ -2964,9 +2979,19 @@ impl DeployImageJobBuilder {
             job_id: None,
             build_job_id: None,
             target: None,
-            config: DeploymentJobConfig {
-                project_slug: Some(project_slug.into()),
-                ..DeploymentJobConfig::default()
+            config: {
+                let project_slug = project_slug.into();
+                DeploymentJobConfig {
+                    // ADR 045: the control plane's own declaration, resolved
+                    // here rather than at each call site so no deploy path can
+                    // send a slug without the authorization that goes with it.
+                    // This code only ever runs on the control plane, so its
+                    // process grant *is* the control plane's grant.
+                    control_plane_grants_socket: temps_core::docker_socket_grant::process_grant()
+                        .declares(&project_slug),
+                    project_slug: Some(project_slug),
+                    ..DeploymentJobConfig::default()
+                }
             },
             node_scheduler: None,
             log_id: None,

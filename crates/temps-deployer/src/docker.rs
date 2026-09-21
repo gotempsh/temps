@@ -670,10 +670,33 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
 /// deployer — is unit-testable without a daemon. An absent `project_slug`
 /// (a pre-ADR-045 caller) can never match, and an empty grant (every install
 /// that never set the variable) can never match either.
+///
+/// **Both ends must agree (ADR 045).** `grant` is this process's own
+/// environment — the host's decision to provide the socket — and
+/// `control_plane_grants_socket` is the control plane's decision that the
+/// project requires it, carried in the `DeployRequest`. Neither alone is
+/// enough:
+///
+/// - Without the host's grant, a control plane (or anything that can forge a
+///   request to this agent) could turn any container root-equivalent here.
+///   This was always enforced and still is.
+/// - Without the control plane's declaration, a worker whose operator set the
+///   variable for some slug would mount the socket for *whoever* manages to
+///   get a project of that name scheduled onto it — and because the control
+///   plane never declared the slug, neither the admin-only claim guard nor the
+///   placement gate would have applied. That is the hole this parameter
+///   closes.
+///
+/// For local placement the two are the same process's grant, so this is a
+/// no-op there: `declares()` delegates to `allows()`.
 pub fn docker_socket_bind_for(
     grant: &DockerSocketGrant,
     project_slug: Option<&str>,
+    control_plane_grants_socket: bool,
 ) -> Option<&'static str> {
+    if !control_plane_grants_socket {
+        return None;
+    }
     project_slug
         .filter(|slug| grant.allows(slug))
         .map(|_| temps_core::docker_socket_grant::DOCKER_SOCKET_BIND)
@@ -3341,8 +3364,11 @@ impl ContainerDeployer for DockerRuntime {
         // ADR 045: this host's own grant decides, not the caller. The control
         // plane only says "this is project X"; the answer comes from the
         // environment of the process creating the container.
-        let docker_socket_bind =
-            docker_socket_bind_for(&self.docker_socket_grant, request.project_slug.as_deref());
+        let docker_socket_bind = docker_socket_bind_for(
+            &self.docker_socket_grant,
+            request.project_slug.as_deref(),
+            request.control_plane_grants_socket,
+        );
         if docker_socket_bind.is_some() {
             // Carries a stable `event` field so host-side log shipping can
             // select these lines without pattern-matching prose. The control
@@ -4253,7 +4279,7 @@ mod docker_tests {
         #[test]
         fn granted_slug_gets_the_socket_bind() {
             let grant = DockerSocketGrant::parse(Some("node-daemon,infra-agent"));
-            let bind = docker_socket_bind_for(&grant, Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
             assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
 
             let config = hardened_host_config(None, bind);
@@ -4264,7 +4290,7 @@ mod docker_tests {
         #[test]
         fn granted_slug_keeps_the_secrets_bind_alongside_the_socket() {
             let grant = DockerSocketGrant::parse(Some("node-daemon"));
-            let bind = docker_socket_bind_for(&grant, Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
             let config = hardened_host_config(
                 Some("/var/lib/temps/secrets/c:/run/secrets:ro".into()),
                 bind,
@@ -4280,7 +4306,10 @@ mod docker_tests {
         #[test]
         fn ungranted_slug_gets_no_socket_bind() {
             let grant = DockerSocketGrant::parse(Some("node-daemon"));
-            assert_eq!(docker_socket_bind_for(&grant, Some("infra-agent")), None);
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("infra-agent"), true),
+                None
+            );
 
             let config = hardened_host_config(None, None);
             assert!(config.binds.is_none());
@@ -4292,14 +4321,75 @@ mod docker_tests {
             // A pre-ADR-045 control plane sends no slug at all. It must never
             // be interpreted as "any project".
             let grant = DockerSocketGrant::parse(Some("node-daemon"));
-            assert_eq!(docker_socket_bind_for(&grant, None), None);
+            assert_eq!(docker_socket_bind_for(&grant, None, true), None);
         }
 
         #[test]
         fn a_host_that_grants_nothing_never_mounts_the_socket() {
             let grant = DockerSocketGrant::default();
-            assert_eq!(docker_socket_bind_for(&grant, Some("node-daemon")), None);
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
             assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn a_host_grant_alone_never_mounts_without_the_control_plane_declaration() {
+            // The finding this parameter exists for: an operator sets
+            // TEMPS_DOCKER_SOCKET_PROJECTS on a worker, the control plane does
+            // not declare the slug (removed, forgotten, never set), so the
+            // admin-only claim guard and the placement gate are both inert —
+            // anyone can create a project with that name and have it land
+            // here. The worker must refuse to mount from its own environment
+            // alone.
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn the_control_plane_declaration_alone_never_mounts_either() {
+            // The symmetric half, which was always true and must stay true:
+            // authorization is not instruction. A control plane (or anything
+            // that can forge a request to this agent) cannot make this host
+            // mount a socket its own environment does not grant.
+            let grant = DockerSocketGrant::default();
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
+        }
+
+        #[test]
+        fn both_halves_together_mount_exactly_one_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+            assert_eq!(
+                binds_of(&hardened_host_config(None, bind)),
+                vec![DOCKER_SOCKET_BIND.to_string()]
+            );
+        }
+
+        #[test]
+        fn a_request_that_lost_the_authorization_field_fails_closed() {
+            // `#[serde(default)]` is `false`: a pre-ADR-045 control plane, or
+            // a request whose field was dropped in transit, must deploy
+            // without the socket rather than with it.
+            let deserialized: serde_json::Value = serde_json::json!({});
+            assert!(!deserialized
+                .get("control_plane_grants_socket")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false));
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
         }
 
         #[test]
@@ -4929,6 +5019,7 @@ mod docker_tests {
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let info = match runtime.deploy_container(deploy_request).await {
@@ -4994,6 +5085,7 @@ mod docker_tests {
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         }
     }
 
@@ -5841,6 +5933,7 @@ CMD ["cat", "/hello.txt"]
                     log_config: Some(ContainerLogConfig::app_default()),
                     labels: HashMap::new(),
                     project_slug: None,
+                    control_plane_grants_socket: false,
                 };
 
                 let deploy_result = runtime.deploy_container(deploy_request).await;
@@ -5931,6 +6024,7 @@ CMD ["cat", "/hello.txt"]
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let inspect_caps = |id: String| {
@@ -6853,6 +6947,7 @@ CMD ["cat", "/hello.txt"]
             log_config: None,
             labels: HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
         let err = runtime
             .deploy_container(req)

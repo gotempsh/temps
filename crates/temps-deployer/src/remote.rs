@@ -970,6 +970,7 @@ mod tests {
             log_config: None,
             labels: std::collections::HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let result = deployer
@@ -1330,6 +1331,7 @@ mod tests {
             log_config: None,
             labels: std::collections::HashMap::new(),
             project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let result = deployer.deploy_container(request).await;
