@@ -63060,6 +63060,9 @@
           "403": {
             "description": "Deployment token used with a non-encrypted visitor ID"
           },
+          "429": {
+            "description": "The deployment token made too many visitor-changing enrichments in the last minute; retry shortly"
+          },
           "500": {
             "description": "Internal server error"
           }

@@ -29047,6 +29047,10 @@ export type EnrichVisitorErrors = {
      */
     403: unknown;
     /**
+     * The deployment token made too many visitor-changing enrichments in the last minute; retry shortly
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
