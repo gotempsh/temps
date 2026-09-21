@@ -114,6 +114,15 @@ and logged on every boot. Granting the socket to a project on a node whose
 private address is a public IP puts a host-root-equivalent API on the public
 internet; that combination is the one an operator must not ship.
 
+This binds the **published host port** only. It does not, by itself, make a
+granted project unreachable: the platform's own reverse proxy still serves
+the same container on its auto-managed environment subdomain, and on any
+custom domain attached to it, regardless of the private-address bind. The
+proxy-level password gate (`security.password_protection`) is therefore the
+actual control on public reachability for most granted projects, not the
+private address -- and, like every other write that changes what a granted
+project exposes, is admin-only (see "Nothing else can plant the payload").
+
 ### It is visible, and it is audited
 
 The project response carries a capability object -- `granted`, `reason`,
@@ -249,35 +258,82 @@ supplying that input is therefore behind the same
 enumerated exhaustively rather than gated one reported case at a time:
 
 - **Runtime config** -- the persisted `command` and image configuration
-  (`ProjectService::update_service_template_runtime`).
+  (`ProjectService::update_service_template_runtime`, `upgrade_service_template`).
 - **Source definition** -- `main_branch`, `repo_owner`, `repo_name`,
-  `directory`, `preset`, `preset_config` and `git_provider_connection_id`
-  (`update_project_settings_as`). The connection id was missing from the
-  first version of this list -- repointing *which* git connection a project
-  trusts is the same attack as repointing `repo_owner`/`repo_name`, since
-  either determines what code the next deploy pulls.
+  `directory`, `preset`, `preset_config`, `git_provider_connection_id` and
+  `enable_preview_environments` (`update_project_settings_as`), plus the
+  sibling handler `update_project` (`PUT /projects/{id}`), which rewrites the
+  same fields unconditionally and took no caller at all until it was found to
+  bypass the guard entirely. `git_provider_connection_id` was missing from
+  the first version of this list -- repointing *which* git connection a
+  project trusts is the same attack as repointing `repo_owner`/`repo_name`.
+  `enable_preview_environments` was missing from the second -- once on, a
+  push to any branch no environment tracks gets a preview environment
+  auto-created and deployed as `DeployCaller::Platform`, which neither the
+  deploy gate nor the exec gate refuses.
+- **Deploy triggers and exposure** -- `automatic_deploy` and `exposed_port`
+  (`update_automatic_deploy`, `update_project_deployment_config`), and their
+  environment-scoped twins `automatic_deploy`, `protected`, `exposed_port`,
+  `password`, `security`, `branch`, `target_nodes` and `target_labels`
+  (`update_environment_settings`, `create_environment`,
+  `add_environment_domain`, `update_environment_subdomain`, all in
+  `temps-environments`). `protected` is the query-level filter that stops a
+  push reaching an environment at all; `password`/`security` and the domain
+  routes are the only control on whether the platform proxy serves a granted
+  project's container publicly on its subdomain -- the private-address bind
+  described above only protects the *published host port*, not the proxy
+  route, so this is a correction to that section, not just an addition here.
+- **Source type and alternate sources** -- `set_source_type`,
+  `set_allow_alternate_sources`. Not currently exploitable on their own
+  (every image/static/drop deploy path already gates independently via the
+  deploy and exec gates), gated anyway as defense in depth.
 - **Git settings** -- `git_url` (`update_git_settings`).
-- **Environment variables and secrets** -- `create_environment_variable`,
-  `update_environment_variable`, `create_project_secret` and
-  `update_project_secret` (`temps-environments`). This is a separate crate
-  and request shape from the three above, and had no ADR-045 check of any
-  kind until it was found by review: an environment variable is delivered
-  into the container verbatim, and a secret is materialised as a file under
-  `/run/secrets/<KEY>` -- either is enough to get arbitrary code execution
-  in most runtimes once a shell reads it (`NODE_OPTIONS`, `PYTHONSTARTUP`,
-  `BASH_ENV`, ...), and `Role::User` holds `EnvironmentsCreate`/
-  `EnvironmentsWrite` against any project since OSS never registers a
-  `ProjectAccessChecker`.
+- **Environment variables and secrets** -- create, update *and delete* of
+  both (`temps-environments`). A delete can't plant a value, but it can
+  silently degrade a granted project's infrastructure service (e.g.
+  removing the credential it authenticates with) or re-expose a
+  lower-precedence, scope-shadowed variable -- kept symmetric with
+  create/update rather than gating some of the verbs on a resource. An
+  environment variable is delivered into the container verbatim, and a
+  secret is materialised as a file under `/run/secrets/<KEY>` -- either is
+  enough to get arbitrary code execution in most runtimes once a shell reads
+  it (`NODE_OPTIONS`, `PYTHONSTARTUP`, `BASH_ENV`, ...), and `Role::User`
+  holds `EnvironmentsCreate`/`EnvironmentsWrite` against any project since
+  OSS never registers a `ProjectAccessChecker`.
+- **The AI agent** -- the executor's push-and-open-PR step
+  (`temps-agents`), a genuinely different subsystem from the three above:
+  it commits AI-generated files to a granted project's own repository using
+  the project's own stored git connection (so the triggering principal
+  needs no git credentials of their own) and emits a `GitPushEvent`, which
+  the deployment pipeline treats exactly like a real webhook push
+  (`DeployCaller::Platform`). Refused unconditionally, matching
+  `SourceDropService`'s existing reasoning (also reachable from the AI
+  agent): a run may be triggered by an interactive `Role::User`, an
+  automated error-group trigger, or a public webhook trigger, and none of
+  those carries an `AuthContext` this guard could check instance-admin
+  authority against.
 
 Each of these follows the same shape as the deploy/exec gates: a pure
 function taking the grant explicitly (`guard_granted_project_write_against`,
-`require_granted_project_write_authority_against`) so it is unit-testable
-without mutating the process-wide `OnceLock`, plus a thin wrapper that reads
-`process_grant()` in production. The repeated discovery of a new channel in
-this family across several review rounds is the reason this section
-enumerates every one found rather than describing the mechanism once and
-trusting it generalizes -- the next channel that writes something a granted
-project's container later executes belongs on this list too.
+`require_granted_project_write_authority_against`,
+`refuse_granted_project_push`) so it is unit-testable without mutating the
+process-wide `OnceLock`, plus a thin wrapper that reads `process_grant()` in
+production.
+
+**This list has been incomplete four times in a row**, always in the same
+way: a hand-maintained `if field.is_some() || ...` predicate missing an
+entry, on a sibling of a field that *was* gated. The deploy and exec gates
+never had this problem, because they are enforced by a required constructor
+argument at a structural chokepoint (`DeployImageJobBuilder::new`,
+`WorkflowPlanner::create_deployment_jobs`) rather than a list -- a caller
+cannot compile without declaring an authority, so there is no "forgot to
+add it" state to reach. The write-guard predicates have no equivalent
+property yet: adding a field to `UpdateProjectSettingsParams` or
+`UpdateEnvironmentSettingsRequest` compiles whether or not it is added to
+the guard. Closing that gap structurally -- an exhaustive classification
+every new field must resolve one way or the other before the crate
+compiles -- is unshipped, tracked follow-up work, not something this
+section's enumeration is a substitute for.
 
 ## Consequences
 
