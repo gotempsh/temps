@@ -319,11 +319,9 @@ mod tests {
 
     // ── apply_migrations integration test (real ClickHouse, opt-in) ─────────
 
-    /// Runs against a real ClickHouse server. Ignored by default; run with
-    /// `TEMPS_TEST_CLICKHOUSE_URL` set and `cargo test -- --ignored` to
-    /// exercise it. Does not spin up testcontainers.
+    /// Runs against a real ClickHouse server when `TEMPS_TEST_CLICKHOUSE_URL`
+    /// is set; skips gracefully otherwise. Does not spin up testcontainers.
     #[tokio::test]
-    #[ignore]
     async fn apply_migrations_against_real_clickhouse() {
         let Ok(url) = std::env::var("TEMPS_TEST_CLICKHOUSE_URL") else {
             eprintln!("skipping: TEMPS_TEST_CLICKHOUSE_URL not set");
