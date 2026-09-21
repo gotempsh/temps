@@ -1630,6 +1630,58 @@ mod tests {
         assert_eq!(nodes[0].name, "worker-1");
     }
 
+    /// ADR 045: only the node that actually advertises `project_slug` under
+    /// `docker_socket_projects` is returned, and only its `id`/`name` --
+    /// this is the query the placement gate narrows to, and it decodes via a
+    /// named `#[derive(FromQueryResult)]` struct specifically because
+    /// `.into_tuple()` against `MockDatabase`'s full-row mocks was found to
+    /// silently decode the wrong column (see the doc comment on
+    /// `granting_node_ids_and_names`). A regression there would make every
+    /// node look like it grants every slug, or fail to decode at all.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_selects_only_the_advertising_node() {
+        let granting = nodes::Model {
+            id: 2,
+            name: "worker-a".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["node-daemon"] }),
+            ..sample_node()
+        };
+        let not_granting = nodes::Model {
+            id: 3,
+            name: "worker-b".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["some-other-project"] }),
+            ..sample_node()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![granting, not_granting]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert_eq!(rows, vec![(2, "worker-a".to_string())]);
+    }
+
+    /// A slug nobody advertises returns an empty list rather than an error --
+    /// the placement gate treats this as "no eligible host", not a failure.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_is_empty_when_nobody_advertises_the_slug() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // capacity: {}
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
     #[tokio::test]
     async fn test_get_by_id_not_found() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
