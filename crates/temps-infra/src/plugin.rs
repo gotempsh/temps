@@ -205,6 +205,89 @@ impl TempsPlugin for InfraPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, DatabaseConnection, MockDatabase};
+
+    fn control_plane_context(db: DatabaseConnection) -> ServiceRegistrationContext {
+        // Construct configuration directly: this fixture must not read process
+        // environment or create installation secrets in the user's data dir.
+        let config = temps_config::ServerConfig {
+            address: "127.0.0.1:0".into(),
+            database_url: "postgres://localhost/test".into(),
+            tls_address: None,
+            console_address: "127.0.0.1:0".into(),
+            console_admin_address: None,
+            admin_allowed_ips: vec![],
+            admin_allowed_hosts: vec![],
+            admin_trust_forwarded_for: false,
+            data_dir: std::path::PathBuf::from("unused-test-data"),
+            auth_secret: "test-auth-secret".into(),
+            encryption_key: "test-encryption-key".into(),
+            api_base_url: "http://localhost/api".into(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            docker_extra_networks: vec![],
+        };
+        let context = ServiceRegistrationContext::new();
+        context.register_service(Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            Arc::new(db),
+        )));
+        context.register_service(Arc::new(temps_core::LocalWorkloadPolicy::control_plane(
+            false,
+        )));
+        context
+    }
+
+    fn mode_database(stateless: bool) -> DatabaseConnection {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                [std::collections::BTreeMap::from([("present", true.into())])],
+                [std::collections::BTreeMap::from([(
+                    "present",
+                    stateless.into(),
+                )])],
+            ])
+            .into_connection()
+    }
+
+    #[tokio::test]
+    async fn stateless_control_plane_uses_persisted_capabilities() {
+        let context = control_plane_context(mode_database(true));
+        InfraPlugin::new()
+            .register_services(&context)
+            .await
+            .unwrap();
+        let state = context.require_service::<InfraState>();
+        let features = state.platform_info_service().features();
+        assert!(features.stateless);
+        assert!(!features.persistent_workspaces);
+        assert!(!features.external_plugins);
+        assert!(features.backups_remote);
+        assert!(features.log_aggregation);
+    }
+
+    #[tokio::test]
+    async fn installation_mode_lookup_failure_prevents_capability_registration() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("mode lookup unavailable".into())])
+            .into_connection();
+        let context = control_plane_context(db);
+        let error = InfraPlugin::new()
+            .register_services(&context)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PluginError::InitializationFailed(message)
+            if message.contains("mode lookup unavailable")));
+        assert!(context.get_service::<InfraState>().is_none());
+    }
 
     #[tokio::test]
     async fn test_infra_plugin_name() {
@@ -230,10 +313,7 @@ mod tests {
     /// the other two, `KvPlugin` really is gated on `local_workloads_enabled`.
     #[tokio::test]
     async fn control_plane_profile_reports_remote_backups_and_log_aggregation_as_available() {
-        let context = ServiceRegistrationContext::new();
-        context.register_service(Arc::new(temps_core::LocalWorkloadPolicy::control_plane(
-            false, // no Docker daemon in this test
-        )));
+        let context = control_plane_context(mode_database(false));
 
         let infra_plugin = InfraPlugin::new();
         infra_plugin
@@ -247,6 +327,9 @@ mod tests {
         let features = infra_state.platform_info_service().features();
 
         assert_eq!(features.profile, temps_core::PROFILE_CONTROL_PLANE);
+        assert!(!features.stateless);
+        assert!(features.persistent_workspaces);
+        assert!(features.external_plugins);
         assert!(
             features.backups_remote,
             "BackupPlugin runs in every profile; backups_remote must not be reported as unavailable"

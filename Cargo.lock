@@ -11981,6 +11981,7 @@ dependencies = [
  "log",
  "parking_lot",
  "reqwest 0.12.28",
+ "sea-orm",
  "serde",
  "serde_json",
  "temps-auth",
