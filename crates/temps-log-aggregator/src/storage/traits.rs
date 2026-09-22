@@ -93,11 +93,12 @@ pub fn build_storage_key(
 ///
 /// Layout: `logs/{scope}/{env}/{service}/{YYYY-MM-DD}/{HH}/{container_id[..12]}-{first_ts_nanos}[-{suffix}].zst`,
 /// where `scope` follows the same rule as [`build_storage_key`]. The key is
-/// deterministic from `(container_id, first_ts)` (plus `suffix` for
-/// compacted chunks), so a crash-and-replay seal re-PUTs the same key and the
-/// manifest's `ON CONFLICT (storage_key) DO NOTHING` absorbs the duplicate
-/// (ADR-046 §8a.2). The writer passes `suffix: None`; the compactor passes
-/// `Some("c")` so a merged chunk never collides with one of its inputs.
+/// deterministic from `(container_id, first_ts, suffix)`. The writer passes
+/// the SHA256 of the encoded generation as suffix, so exact WAL replay re-PUTs
+/// identical bytes while different generations sharing a timestamp cannot
+/// overwrite each other. The manifest's `ON CONFLICT (storage_key) DO NOTHING`
+/// absorbs exact replay. The compactor passes `Some("c")` to distinguish a
+/// merged chunk from its inputs.
 pub fn build_storage_key_v2(
     project_id: i32,
     external_service_id: Option<i32>,

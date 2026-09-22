@@ -3,7 +3,7 @@
 
 //! Chunk writer service (ADR-046 §1, §4, §6a, §8, §8a.2): owns the whole seal
 //! pipeline for a container's head buffer so the ordering invariant "object
-//! written → manifest committed → WAL truncated" lives in one function and
+//! written → manifest committed → WAL generation removed" lives in one function and
 //! readers never observe a gap.
 //!
 //! This is the v2 writer. It replaces the v1 `ChunkWriterService` that wrote
@@ -13,10 +13,11 @@
 //!
 //! ## Seal pipeline ordering
 //!
-//! 1. Under the buffer mutex: move `lines` into `sealing` (leave `lines`
-//!    empty so ingest continues). Release the mutex before any IO.
+//! 1. Under the buffer mutex: sync/rotate the active WAL into an immutable
+//!    generation, then move the current lines into `sealing`. New appends use
+//!    a fresh active WAL. Release the mutex before object/manifest IO.
 //! 2. Encode with [`ChunkEncoder`].
-//! 3. Deterministic `storage_key` from `(container_id, first_ts)` — a
+//! 3. Content-addressed `storage_key` from the encoded generation — a
 //!    crash-and-replay re-seal writes the same key (ADR-046 §8a.2).
 //! 4. `storage.write_chunk`, retried 3× with backoff (250ms/1s/4s). On
 //!    persistent failure: log, count, drop the lines from memory, but leave
@@ -32,7 +33,8 @@
 //! 7. Write-through: if a cache is configured, seed it with the sealed
 //!    chunk's footer so the node that sealed it never needs to re-fetch its
 //!    own index.
-//! 8. Under the buffer mutex: clear `sealing`, then truncate the WAL.
+//! 8. Remove only the committed WAL generation, then clear `sealing` under
+//!    the buffer mutex. New active WAL records are untouched.
 //!
 //! Readers see `sealing ++ lines` via [`HeadSource::snapshot`] until step 8,
 //! so a line is visible from the head or from the manifest at every instant
@@ -60,13 +62,14 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::chunk::cache::{CacheTier, ChunkCache};
 use crate::chunk::format::{ChunkEncoder, ChunkIdentity};
-use crate::chunk::wal::WalDir;
+use crate::chunk::wal::{WalDir, WalGeneration};
 use crate::chunk::{
     level_bit, ChunkLabels, DEFAULT_HEAD_MAX_BYTES, FLUSH_AGE_SECS, MAX_FLUSH_AGE_SECS,
     MIN_FLUSH_BYTES,
@@ -219,6 +222,7 @@ struct HeadBuffer {
     /// when nothing is sealing.
     sealing_stats: Option<BufferStats>,
     wal: Option<WalHandle>,
+    recovered_generation: Option<WalGeneration>,
     /// Notified whenever `sealing` transitions from `Some` back to `None`
     /// (both on success and on every failure path via [`drop_sealing`]).
     /// Callers that need to wait for an in-flight seal to finish — notably
@@ -250,6 +254,7 @@ impl HeadBuffer {
             stats: BufferStats::default(),
             sealing_stats: None,
             wal: wal.map(|stream| WalHandle { stream }),
+            recovered_generation: None,
             sealing_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -378,7 +383,7 @@ fn identity_from_line(line: &LogLine) -> ChunkIdentity {
 
 /// Owns per-container head buffers, the local WAL, and the whole seal
 /// pipeline (encode → object write → manifest insert → cache write-through →
-/// WAL truncate). See the module docs for the ordering guarantee.
+/// WAL generation cleanup). See the module docs for the ordering guarantee.
 pub struct ChunkWriterService {
     storage: Arc<dyn LogStorage>,
     manifests: Arc<dyn ManifestSink>,
@@ -552,6 +557,7 @@ impl ChunkWriterService {
             None => None,
         };
         let mut buffer = HeadBuffer::new(identity, wal);
+        buffer.recovered_generation = stream.generation;
         for line in stream.lines {
             buffer.push_line(line);
         }
@@ -892,7 +898,7 @@ impl ChunkWriterService {
         // Waiting here (rather than returning early) is what prevents
         // `remove_container` from silently no-oping while lines are stranded
         // in `sealing` by an aborted caller.
-        let (identity, sealing_segments) = loop {
+        let (identity, sealing_segments, generation) = loop {
             let maybe_notify = {
                 let mut buffers = self.buffers.lock().await;
                 let Some(buffer) = buffers.get_mut(container_id) else {
@@ -912,13 +918,26 @@ impl ChunkWriterService {
                     if buffer.segments.is_empty() {
                         return Ok(());
                     }
+                    // Persist the immutable generation before publishing any
+                    // object. Concurrent appends will use the fresh active WAL.
+                    let generation = if buffer.recovered_generation.is_some() {
+                        buffer.recovered_generation.take()
+                    } else if let Some(wal) = buffer.wal.as_mut() {
+                        Some(
+                            wal.stream
+                                .rotate(!self.shed_bloom.load(Ordering::Relaxed))
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
                     let sealing_segments = std::mem::take(&mut buffer.segments);
                     buffer.bytes = 0;
                     buffer.opened_at = Instant::now();
                     buffer.sealing = Some(sealing_segments.clone());
                     buffer.sealing_stats = Some(buffer.stats);
                     buffer.stats = BufferStats::default();
-                    break (buffer.identity.clone(), sealing_segments);
+                    break (buffer.identity.clone(), sealing_segments, generation);
                 }
             };
             // Lock is released here before awaiting.
@@ -927,7 +946,10 @@ impl ChunkWriterService {
             }
         };
 
-        let with_bloom = !self.shed_bloom.load(Ordering::Relaxed);
+        let with_bloom = generation.as_ref().map_or_else(
+            || !self.shed_bloom.load(Ordering::Relaxed),
+            |generation| generation.with_bloom,
+        );
         let encoded = match encode_segments(identity, &sealing_segments, with_bloom) {
             Ok(e) => e,
             Err(e) => {
@@ -942,6 +964,9 @@ impl ChunkWriterService {
         };
 
         let labels = &encoded.footer.labels;
+        // Bind object identity to its complete encoded contents, not merely
+        // its first timestamp: different generations may start at the same ts.
+        let content_hash = hex::encode(Sha256::digest(&encoded.bytes));
         let storage_key = build_storage_key_v2(
             labels.project_id,
             labels.external_service_id,
@@ -949,7 +974,7 @@ impl ChunkWriterService {
             &labels.service,
             labels.started_at,
             &labels.container_id,
-            None,
+            Some(&content_hash),
         );
 
         let write_result =
@@ -1029,29 +1054,24 @@ impl ChunkWriterService {
                 .await;
         }
 
-        let (notify, wal_result) = {
+        // Cleanup is independent of the active WAL and runs without the
+        // global buffer mutex, so slow filesystem I/O cannot stall other heads.
+        let wal_result = match generation {
+            Some(generation) => generation.remove().await,
+            None => Ok(()),
+        };
+        let notify = {
             let mut buffers = self.buffers.lock().await;
             if let Some(buffer) = buffers.get_mut(container_id) {
                 buffer.sealing = None;
                 buffer.sealing_stats = None;
-                // Lines appended during I/O still depend on the WAL. Retain
-                // the full log until the next seal drains the current head.
-                let result = if buffer.is_empty() {
-                    if let Some(wal) = buffer.wal.as_mut() {
-                        wal.stream.truncate().await
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                };
-                (Some(buffer.sealing_notify.clone()), result)
+                Some(buffer.sealing_notify.clone())
             } else {
-                (None, Ok(()))
+                None
             }
         };
         // Completion is a state transition, including WAL failure. Always
-        // wake subscribers before propagating the truncate error.
+        // wake subscribers before propagating the generation cleanup error.
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
@@ -1177,6 +1197,12 @@ mod tests {
     impl ManifestSink for VecSink {
         async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
             let mut rows = self.rows.lock().await;
+            if let Some(index) = rows
+                .iter()
+                .position(|row| row.storage_key == meta.storage_key)
+            {
+                return Ok(index as i64 + 1);
+            }
             rows.push(meta.clone());
             Ok(rows.len() as i64)
         }
@@ -1215,7 +1241,7 @@ mod tests {
     /// every chunk that was committed.
     #[derive(Default)]
     struct GatedSink {
-        rows: VecSink,
+        rows: Arc<VecSink>,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
@@ -1299,6 +1325,276 @@ mod tests {
         (writer, sink, tmp)
     }
 
+    async fn generation_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = tokio::fs::read_dir(root).await.unwrap();
+        let mut paths = Vec::new();
+        while let Some(file) = files.next_entry().await.unwrap() {
+            if file.path().extension().and_then(|s| s.to_str()) == Some("sealed-wal") {
+                paths.push(file.path());
+            }
+        }
+        paths
+    }
+
+    async fn assert_manifest_decodes(
+        storage: &dyn LogStorage,
+        meta: &ChunkMeta,
+        expected: &[&str],
+    ) {
+        let object = storage.read_chunk(&meta.storage_key).await.unwrap();
+        assert_eq!(object.len(), meta.compressed_size_bytes as usize);
+        let trailer = decode_trailer(&object).unwrap();
+        assert_eq!(Some(trailer.footer_offset()), meta.footer_offset);
+        assert_eq!(Some(trailer.footer_len() as u32), meta.footer_len);
+        let start = meta.footer_offset.unwrap() as usize;
+        let footer = decode_footer(
+            &object[start..start + meta.footer_len.unwrap() as usize],
+            &trailer,
+        )
+        .unwrap();
+        let messages: Vec<String> = footer
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                decode_block(
+                    &object[block.offset as usize..block.offset as usize + block.len as usize],
+                    block,
+                    &Default::default(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|line| line.message)
+            })
+            .collect();
+        assert_eq!(messages, expected);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_committed_chunk_and_replays_only_its_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let sink = Arc::new(GatedSink::default());
+        let wal_root = tmp.path().join("wal");
+        let writer =
+            ChunkWriterService::open(storage.clone(), sink.clone(), Some(wal_root.clone()), None)
+                .await
+                .unwrap();
+        let first = make_line("restart-tail", LogLevel::Info, "committed first generation");
+        let mut tail = make_line(
+            "restart-tail",
+            LogLevel::Info,
+            "uncommitted second generation with the same timestamp",
+        );
+        tail.ts = first.ts; // timestamp identity alone cannot distinguish generations
+        writer.write_line(first).await.unwrap();
+        let sealing_writer = writer.clone();
+        let sealing = tokio::spawn(async move { sealing_writer.seal("restart-tail").await });
+        sink.entered.notified().await;
+        writer.write_line(tail).await.unwrap();
+        writer.sync_wals().await;
+        sink.release.notify_one();
+        sealing.await.unwrap().unwrap();
+        let committed = sink.rows.all().await[0].clone();
+        let original_bytes = storage.read_chunk(&committed.storage_key).await.unwrap();
+        drop(writer); // restart using the same manifests, WAL and object store
+        let recovered = ChunkWriterService::open(
+            storage.clone(),
+            sink.rows.clone(),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.read_chunk(&committed.storage_key).await.unwrap(),
+            original_bytes,
+            "replay must never replace an already committed object with A+B"
+        );
+        let rows = sink.rows.all().await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "manifest conflict must not hide the replayed tail"
+        );
+        assert_manifest_decodes(storage.as_ref(), &rows[0], &["committed first generation"]).await;
+        assert_manifest_decodes(
+            storage.as_ref(),
+            &rows[1],
+            &["uncommitted second generation with the same timestamp"],
+        )
+        .await;
+        assert!(generation_paths(&wal_root).await.is_empty());
+        drop(recovered);
+        let _again = ChunkWriterService::open(storage, sink.rows.clone(), Some(wal_root), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.rows.all().await.len(),
+            2,
+            "completed generations must not replay again"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_after_manifest_commit_replays_each_generation_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let sink = Arc::new(GatedSink::default());
+        let wal_root = tmp.path().join("wal");
+        let writer =
+            ChunkWriterService::open(storage.clone(), sink.clone(), Some(wal_root.clone()), None)
+                .await
+                .unwrap();
+        writer.set_shed_bloom(true); // replay's default differs; the generation persists this mode
+        writer
+            .write_line(make_line("commit-crash", LogLevel::Info, "A"))
+            .await
+            .unwrap();
+        let sealing_writer = writer.clone();
+        let sealing = tokio::spawn(async move { sealing_writer.seal("commit-crash").await });
+        sink.entered.notified().await;
+        let generation = generation_paths(&wal_root).await.remove(0);
+        let saved = tmp.path().join("saved-generation");
+        tokio::fs::rename(&generation, &saved).await.unwrap();
+        tokio::fs::create_dir(&generation).await.unwrap(); // fail cleanup after manifest commit
+        writer
+            .write_line(make_line("commit-crash", LogLevel::Info, "B"))
+            .await
+            .unwrap();
+        writer.sync_wals().await;
+        sink.release.notify_one();
+        assert!(sealing.await.unwrap().is_err());
+        let committed = sink.rows.all().await[0].clone();
+        let original_bytes = storage.read_chunk(&committed.storage_key).await.unwrap();
+        drop(writer);
+        tokio::fs::remove_dir(&generation).await.unwrap();
+        tokio::fs::rename(saved, generation).await.unwrap(); // crash image retains A and active B
+        let _recovered = ChunkWriterService::open(
+            storage.clone(),
+            sink.rows.clone(),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let rows = sink.rows.all().await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "exact generation replay must hit ON CONFLICT while B gets its own manifest"
+        );
+        assert_eq!(
+            storage.read_chunk(&committed.storage_key).await.unwrap(),
+            original_bytes
+        );
+        assert_manifest_decodes(storage.as_ref(), &rows[0], &["A"]).await;
+        assert_manifest_decodes(storage.as_ref(), &rows[1], &["B"]).await;
+        assert!(generation_paths(&wal_root).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuous_tail_ingest_cleans_each_committed_wal_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GatedSink::default());
+        let wal_root = tmp.path().join("wal");
+        let writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        writer
+            .write_line(make_line("continuous-tail", LogLevel::Info, "first"))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            let sealing_writer = writer.clone();
+            let sealing = tokio::spawn(async move { sealing_writer.seal("continuous-tail").await });
+            sink.entered.notified().await;
+            assert_eq!(generation_paths(&wal_root).await.len(), 1);
+            writer
+                .write_line(make_line("continuous-tail", LogLevel::Info, "next"))
+                .await
+                .unwrap();
+            writer.sync_wals().await;
+            sink.release.notify_one();
+            sealing.await.unwrap().unwrap();
+            assert!(generation_paths(&wal_root).await.is_empty());
+            let active = WalDir::open(wal_root.clone())
+                .await
+                .unwrap()
+                .recover()
+                .await
+                .unwrap();
+            assert_eq!(active.len(), 1);
+            assert_eq!(
+                active[0].lines.len(),
+                1,
+                "committed prefixes must not accumulate on disk"
+            );
+        }
+    }
+
+    struct ProjectGatedSink {
+        blocked: GatedSink,
+        other: VecSink,
+    }
+
+    #[async_trait]
+    impl ManifestSink for ProjectGatedSink {
+        async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            if meta.project_id == 1 {
+                self.blocked.insert(meta).await
+            } else {
+                self.other.insert(meta).await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_project_seal_does_not_block_other_project_purge_or_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ProjectGatedSink {
+            blocked: GatedSink::default(),
+            other: VecSink::default(),
+        });
+        let writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(tmp.path().join("wal")),
+            None,
+        )
+        .await
+        .unwrap();
+        writer
+            .write_line(make_line("slow-project", LogLevel::Info, "A"))
+            .await
+            .unwrap();
+        let sealing_writer = writer.clone();
+        let sealing =
+            tokio::spawn(async move { sealing_writer.prepare_project_for_purge(1).await });
+        sink.blocked.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for (id, project) in [("purge-other", 2), ("remove-other", 3)] {
+                let mut line = make_line(id, LogLevel::Info, "independent");
+                line.project_id = project;
+                writer.write_line(line).await.unwrap();
+            }
+            drop(writer.prepare_project_for_purge(2).await.unwrap());
+            writer.remove_container("remove-other").await.unwrap();
+        })
+        .await
+        .expect("unrelated operations must finish while project 1 stays paused");
+        assert_eq!(sink.other.all().await.len(), 2);
+        assert!(!sealing.is_finished());
+        sink.blocked.release.notify_one();
+        drop(sealing.await.unwrap().unwrap());
+    }
+
     #[tokio::test]
     async fn threshold_seal_does_not_reacquire_a_read_permit_behind_purge() {
         let (writer, sink, _tmp) = writer_with_defaults().await;
@@ -1338,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wal_truncate_error_wakes_all_seal_waiters() {
+    async fn wal_generation_cleanup_error_wakes_all_seal_waiters() {
         let tmp = tempfile::tempdir().unwrap();
         let sink = Arc::new(GatedSink::default());
         let writer = ChunkWriterService::open(
@@ -1359,14 +1655,11 @@ mod tests {
         let (first, second) = {
             let mut buffers = writer.buffers.lock().await;
             let buffer = buffers.get_mut("wal-error").unwrap();
-            buffer.wal = Some(WalHandle {
-                stream: crate::chunk::wal::StreamWal::read_only_for_test(
-                    tmp.path().join("wal/wal-error.wal"),
-                )
-                .await,
-            });
             (buffer.seal_completion(), buffer.seal_completion())
         };
+        let path = generation_paths(&tmp.path().join("wal")).await.remove(0);
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
         sink.release.notify_one();
         assert!(matches!(
             seal.await.unwrap(),
@@ -1783,7 +2076,7 @@ mod tests {
         assert_eq!(writer.dropped_chunks(), 1);
 
         // The WAL file must still hold the record: reopening a writer over
-        // the same WAL dir recovers it (proves it wasn't truncated).
+        // the same WAL dir recovers it (proves its generation was retained).
         let storage2: Arc<dyn LogStorage> =
             Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
         let sink2 = Arc::new(VecSink::default());
