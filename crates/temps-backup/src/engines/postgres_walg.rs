@@ -10,7 +10,7 @@
 //! 2. `docker exec wal-g backup-push $PGDATA` against the target Postgres
 //!    container. WAL-G uploads the base backup directly to S3 — no host
 //!    file involved.
-//! 3. List the resulting S3 prefix to compute the on-disk size.
+//! 3. Read the new backup's WAL-G stop-sentinel to obtain its compressed size.
 //! 4. Record the current WAL LSN via `pg_current_wal_lsn()` so PITR
 //!    restores have an anchor.
 //! 5. Write the `metadata.json` companion.
@@ -22,7 +22,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_sdk_s3::Client as S3Client;
 use bollard::container::LogOutput;
 use bollard::exec::StartExecResults;
 use futures::StreamExt;
@@ -33,6 +32,7 @@ use tracing::{error, info, warn};
 use super::dispatch::service_container_name;
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
+use super::walg_size::load_backup_size_bytes;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use temps_providers::externalsvc::ExternalService;
 
@@ -287,14 +287,22 @@ impl BackupEngine for PostgresWalgEngine {
         }
 
         // ── Compute size + LSN ───────────────────────────────────────────────
-        let size_bytes =
-            match list_total_s3_size(&s3_client, &s3_source.bucket_name, &s3_list_prefix).await {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    warn!(backup_id, error = %e, "walg: could not compute size");
-                    None
-                }
-            };
+        let size_bytes = match load_backup_size_bytes(
+            &s3_client,
+            &s3_source.bucket_name,
+            &s3_list_prefix,
+            &exec_result.stdout,
+            &exec_result.stderr,
+            &backup_uuid,
+        )
+        .await
+        {
+            Ok(size) => Some(size),
+            Err(error) => {
+                warn!(backup_id, error = %error, "walg: could not read per-backup size");
+                None
+            }
+        };
         let lsn = query_current_wal_lsn(&deps.docker, &container_name, &pg)
             .await
             .unwrap_or_else(|e| {
@@ -512,33 +520,6 @@ async fn query_current_wal_lsn(
         }
     }
     Ok(result.trim().to_string())
-}
-
-async fn list_total_s3_size(
-    client: &S3Client,
-    bucket: &str,
-    prefix: &str,
-) -> Result<i64, BackupError> {
-    let mut total: i64 = 0;
-    let mut continuation: Option<String> = None;
-    loop {
-        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if let Some(tok) = continuation {
-            req = req.continuation_token(tok);
-        }
-        let resp = req.send().await.map_err(|e| BackupError::Failed {
-            reason: format!("list objects: {}", e),
-        })?;
-        for obj in resp.contents() {
-            total += obj.size().unwrap_or(0);
-        }
-        if resp.is_truncated().unwrap_or(false) {
-            continuation = resp.next_continuation_token().map(|s| s.to_string());
-        } else {
-            break;
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

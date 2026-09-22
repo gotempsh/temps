@@ -42,3 +42,4 @@ pub mod ring_buffer;
 pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
+mod walg_size;
