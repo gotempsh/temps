@@ -434,6 +434,7 @@ mod tests {
             health_check_path: None,
             command: None,
             recovery_of_deployment_id: None,
+            docker_socket_authorized: false,
         });
         assert_eq!(
             DurableBroadcastQueue::consumers(&image),
@@ -474,6 +475,7 @@ mod tests {
                 health_check_path: None,
                 command: None,
                 recovery_of_deployment_id: None,
+                docker_socket_authorized: false,
             }))
             .await
             .expect("persist image deployment");
@@ -526,6 +528,7 @@ mod tests {
                 health_check_path: None,
                 command: None,
                 recovery_of_deployment_id: None,
+                docker_socket_authorized: false,
             }))
             .await
             .expect("enqueue durable command");
@@ -596,6 +599,7 @@ mod tests {
                 health_check_path: None,
                 command: None,
                 recovery_of_deployment_id: None,
+                docker_socket_authorized: false,
             }))
             .await
             .expect("terminal history must not reject new work");
@@ -668,6 +672,7 @@ mod tests {
                 health_check_path: None,
                 command: None,
                 recovery_of_deployment_id: None,
+                docker_socket_authorized: false,
             }))
             .await
             .expect("enqueue valid command");

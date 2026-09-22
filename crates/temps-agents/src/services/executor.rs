@@ -36,6 +36,40 @@ use crate::services::config_service::AgentConfigService;
 use crate::services::prompt_builder::PromptBuilder;
 use crate::services::run_service::{AgentRunService, UpdateRunFields};
 
+/// ADR 045: refuse the agent executor's push+PR step for a project this host
+/// declares (`TEMPS_DOCKER_SOCKET_PROJECTS`).
+///
+/// Pushing AI-written code to a granted project's repository (and, once
+/// merged or previewed via the `GitPushEvent` this step emits, having it
+/// deployed) is the same "plant the payload a later deploy executes as host
+/// root" escalation `SourceDropService` already refuses, and for the same
+/// reason: nothing on this path has an `AuthContext` to prove instance-admin
+/// authority with, since a run may be triggered by any `Role::User` holding
+/// `ProjectsWrite`, an automated error-group trigger, or a public webhook
+/// trigger. Fails closed unconditionally rather than trusting whoever (or
+/// whatever) triggered the run — an admin who wants this deploys through a
+/// path that can actually establish who they are.
+///
+/// `pub(crate)`: called from [`AgentExecutor::prepare_sandbox_workspace`]
+/// (the required chokepoint every run path goes through to get a container
+/// at all) and, as defense in depth, directly from `autofixer::create_pr` —
+/// the sibling push+PR call site in this crate.
+pub(crate) fn refuse_granted_project_push(
+    grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+    project_slug: &str,
+) -> Result<(), AgentError> {
+    if temps_core::docker_socket_grant::deploy_requires_instance_admin(
+        grant,
+        project_slug,
+        temps_core::docker_socket_grant::DeployCaller::default(),
+    ) {
+        return Err(AgentError::DockerSocketWriteRequiresAdmin {
+            slug: project_slug.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Parameters for [`AgentExecutor::prepare_sandbox_workspace`].
 ///
 /// Kept as a struct (not positional args) because the setup function is the
@@ -399,6 +433,23 @@ impl AgentExecutor {
             host_work_dir,
             ephemeral_yaml,
         } = params;
+
+        // ADR 045: refuse *before* the sandbox is ever built, not only before
+        // the executor's own push step. This sandbox is about to be seeded
+        // with a push-capable git credential for `project`'s repository
+        // (`inject_config_repos_and_secrets` writes `.git-credentials` /
+        // `gh`/`glab` config below) on a full-network sandbox by default --
+        // an AI process holding that credential can `git push` directly,
+        // which is strictly stronger than the PR-branch push
+        // `refuse_granted_project_push`'s other call site blocks, and would
+        // otherwise reach it ungated. This is the one call every run path
+        // (the executor and the autofixer) makes to get a container at all,
+        // so refusing here is a required chokepoint rather than one more
+        // call site to remember.
+        refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
 
         // Load settings row once: used for both sandbox config and external_url.
         let settings_row = settings::Entity::find_by_id(1)
@@ -2714,6 +2765,13 @@ impl AgentExecutor {
             return Ok(());
         }
 
+        // ADR 045: see `refuse_granted_project_push`. Checked before any file
+        // is even read off disk.
+        refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
+
         // Safety check: abort if the AI modified an unreasonable number of files.
         // This guards against runaway AI behaviour that could produce enormous PRs.
         const MAX_FILES_CHANGED: usize = 50;
@@ -3754,6 +3812,34 @@ mod tests {
     use std::sync::Mutex;
     use temps_entities::{agent_run_logs, agent_runs, project_agents};
     use temps_git::{GitProviderManagerError, PullRequest, RepositoryInfo};
+
+    #[test]
+    fn refuse_granted_project_push_refuses_a_project_this_host_declares() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon"));
+
+        let error = refuse_granted_project_push(&grant, "node-daemon")
+            .expect_err("the agent executor must not push to a granted project");
+        assert!(matches!(
+            error,
+            AgentError::DockerSocketWriteRequiresAdmin { ref slug } if slug == "node-daemon"
+        ));
+    }
+
+    #[test]
+    fn refuse_granted_project_push_allows_an_undeclared_project() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon"));
+
+        refuse_granted_project_push(&grant, "ordinary-app")
+            .expect("an undeclared project's repository is untouched by ADR 045");
+    }
+
+    #[test]
+    fn refuse_granted_project_push_allows_every_project_on_an_ungranted_install() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::default();
+
+        refuse_granted_project_push(&grant, "node-daemon")
+            .expect("an install that never set TEMPS_DOCKER_SOCKET_PROJECTS declares nothing");
+    }
 
     #[test]
     fn test_branch_name_format() {

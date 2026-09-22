@@ -45,6 +45,31 @@ use temps_core::problemdetails::Problem;
 use temps_entities::source_type::SourceType;
 use tokio::io::AsyncWriteExt;
 
+/// Record who tried to claim a slug reserved by the host Docker socket grant
+/// (ADR 045).
+///
+/// The service refuses the write and logs what it knows; this adds the one
+/// thing only the HTTP layer has — the principal. There is no audit event for
+/// a write that did not happen, and inventing a `ProjectCreated` record for a
+/// project that was never created would be worse than a log line: this is the
+/// closest honest equivalent.
+fn log_reserved_slug_refusal(
+    error: &crate::services::types::ProjectError,
+    user_id: i32,
+    project_id: Option<i32>,
+) {
+    if let crate::services::types::ProjectError::DockerSocketSlugReserved { slug, change } = error {
+        warn!(
+            user_id,
+            project_id = ?project_id,
+            slug = %slug,
+            change = ?change,
+            "Rejected a non-admin attempt to move a project slug that is granted host Docker \
+             access on this host (ADR 045)"
+        );
+    }
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     use axum::extract::DefaultBodyLimit;
     let custom_domain_routes = super::custom_domains::configure_routes();
@@ -508,6 +533,7 @@ async fn authorize_storage_service_scopes(
             ChangeProjectSourceRequest,
             SetAlternateSourcesRequest,
             ProjectResponse,
+            temps_core::docker_socket_grant::DockerSocketCapability,
             PaginatedProjectList,
             PaginationParams,
             UpdateProjectSettingsRequest,
@@ -922,7 +948,9 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     responses(
         (status = 200, description = "Project created successfully", body = ProjectResponse),
         (status = 400, description = "Invalid input"),
+        (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 409, description = "Expected project slug is already in use"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -985,8 +1013,18 @@ pub async fn create_project(
 
     let new_project = state
         .project_service
-        .create_project(project_req)
+        // ADR 045: only an instance admin may claim a slug this host grants
+        // host Docker access to — including one derived from the name — and
+        // only with a recently MFA-verified session.
+        .create_project_as(
+            project_req,
+            &crate::services::types::SlugClaimCaller::from_request(
+                &auth,
+                state.sensitive_action_authorizer.as_ref(),
+            ),
+        )
         .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
         .map_err(Problem::from)?;
 
     // Create audit event
@@ -1172,7 +1210,18 @@ pub async fn get_project(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(ProjectResponse::map_from_project(project)))
+    // ADR 045. Always attached on the detail response, granted or not: the
+    // console renders a badge when granted and an onboarding state when not,
+    // and a capability that is simply absent teaches the operator nothing.
+    let docker_socket = state
+        .project_service
+        .docker_socket_capability(&project.slug)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(
+        ProjectResponse::map_from_project(project).with_docker_socket(docker_socket),
+    ))
 }
 
 /// Get details of a specific project by slug
@@ -1205,7 +1254,19 @@ pub async fn get_project_by_slug(
     let project = state.project_service.get_project_by_slug(&slug).await?;
     project_scope_guard!(auth, project.id); // 2. deployment-token IDOR check
     project_access_guard!(auth, project.id, state.project_access_checker); // 3. team-based access
-    Ok(Json(ProjectResponse::map_from_project(project)).into_response())
+
+    // Same capability as `get_project` — the console uses whichever lookup it
+    // has, and the two must not disagree about whether the badge shows.
+    let docker_socket = state
+        .project_service
+        .docker_socket_capability(&project.slug)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(
+        Json(ProjectResponse::map_from_project(project).with_docker_socket(docker_socket))
+            .into_response(),
+    )
 }
 
 #[utoipa::path(
@@ -1265,7 +1326,13 @@ pub async fn update_project(
     };
     let updated_project = state
         .project_service
-        .update_project(id, project_req)
+        .update_project(
+            id,
+            project_req,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
     // Create audit event
     let audit_context = AuditContext {
@@ -1334,7 +1401,13 @@ pub async fn change_project_source(
 
     let updated = state
         .project_service
-        .set_source_type(id, req.source_type)
+        .set_source_type(
+            id,
+            req.source_type,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit_event = ProjectUpdatedAudit {
@@ -1400,7 +1473,13 @@ pub async fn set_alternate_sources(
 
     let updated = state
         .project_service
-        .set_allow_alternate_sources(id, req.allow_alternate_sources)
+        .set_allow_alternate_sources(
+            id,
+            req.allow_alternate_sources,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit_event = ProjectUpdatedAudit {
@@ -1535,8 +1614,9 @@ pub async fn delete_project(
     responses(
         (status = 200, description = "Project settings updated successfully", body = ProjectResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)"),
         (status = 404, description = "Project not found"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1588,8 +1668,19 @@ pub async fn update_project_settings(
 
     let update = state
         .project_service
-        .update_project_settings(project_id, settings.clone().into())
+        .update_project_settings_as(
+            project_id,
+            settings.clone().into(),
+            // ADR 045: renaming onto or off a granted slug is admin-only and
+            // step-up verified. Every other settings change, including on an
+            // already-granted project, is neither.
+            &crate::services::types::SlugClaimCaller::from_request(
+                &auth,
+                state.sensitive_action_authorizer.as_ref(),
+            ),
+        )
         .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), Some(project_id)))
         .map_err(Problem::from)?;
 
     // Create audit event
@@ -1671,7 +1762,13 @@ pub async fn update_automatic_deploy(
 
     let updated_project = state
         .project_service
-        .update_automatic_deploy(project_id, request.automatic_deploy)
+        .update_automatic_deploy(
+            project_id,
+            request.automatic_deploy,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Error updating automatic deployment setting: {:?}", e);
@@ -1742,6 +1839,12 @@ pub async fn update_git_settings(
             settings.preset_config.clone(),
             settings.git_url.clone(),
             settings.is_public_repo,
+            // ADR 045: repointing a declared project's repository and pushing
+            // runs the caller's source as host root, without any HTTP deploy
+            // request for the deploy guard to refuse.
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
         )
         .await
         .map_err(|e| {
@@ -1914,6 +2017,9 @@ pub async fn update_project_deployment_config(
             // meaningfully constrained by them.
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
             ),
         )
         .await
@@ -2273,6 +2379,11 @@ pub async fn upgrade_project_service_template(
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
+            // ADR 045: see `update_service_template_runtime` — this is the
+            // other write that changes what a declared project runs.
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
         )
         .await
         .map_err(Problem::from)?;
@@ -2371,6 +2482,13 @@ pub async fn update_service_template_runtime(
             runtime,
             temps_core::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+            // ADR 045: the persisted command this writes becomes the default
+            // for every deploy that does not override it, so on a project this
+            // control plane declares it decides what runs as host root — and
+            // the deployment executing it may well be somebody else's.
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
             ),
         )
         .await
@@ -2499,12 +2617,18 @@ pub async fn trigger_project_pipeline(
     // Trigger the pipeline
     let (project_id, triggered_env_id, branch, tag, commit) = state
         .project_service
-        .trigger_pipeline(
+        // ADR 045: deploying a project that holds host Docker access runs the
+        // built image as host root, so it is admin-only regardless of who may
+        // otherwise deploy this project.
+        .trigger_pipeline_as(
             id,
             environment_id,
             payload.branch,
             payload.tag,
             payload.commit,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
         )
         .await
         .map_err(|e| {
@@ -3434,8 +3558,9 @@ async fn canonical_template_app_url(
         (status = 201, description = "Project created successfully", body = super::templates::CreateProjectFromTemplateResponse),
         (status = 400, description = "Invalid input"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)"),
         (status = 404, description = "Template not found"),
+        (status = 428, description = "The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3499,6 +3624,22 @@ pub async fn create_project_from_template(
         .project_service
         .plan_project_slug(&request.project_name)
         .await
+        .map_err(Problem::from)?;
+
+    // ADR 045: same claim rule as plain project creation — a template deploy
+    // is another way to name a slug. Built here, ahead of the fork-mode
+    // repository creation below, so it can pre-flight-check authorization
+    // and step-up before that irreversible external side effect — and then
+    // reused for the authoritative check at creation time.
+    let slug_claim_caller = crate::services::types::SlugClaimCaller::from_request(
+        &auth,
+        state.sensitive_action_authorizer.as_ref(),
+    );
+    state
+        .project_service
+        .preflight_guard_reserved_slug(&planned_project_slug, &slug_claim_caller)
+        .await
+        .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
         .map_err(Problem::from)?;
 
     // The browser normally enforces this selection, but the API must fail
@@ -3774,14 +3915,21 @@ pub async fn create_project_from_template(
         (create_request, repository_url, deploy_mode, None)
     };
 
+    // `slug_claim_caller` was already built above, ahead of the fork-mode
+    // repository creation, and pre-flight-checked against the planned slug —
+    // reused here as the authoritative check at actual creation time.
     let project = if let Some(service_template) = service_template_instance {
         state
             .project_service
-            .create_service_project(create_request, service_template)
+            .create_service_project_as(create_request, service_template, &slug_claim_caller)
             .await
     } else {
-        state.project_service.create_project(create_request).await
+        state
+            .project_service
+            .create_project_as(create_request, &slug_claim_caller)
+            .await
     }
+    .inspect_err(|error| log_reserved_slug_refusal(error, auth.user_id(), None))
     .map_err(Problem::from)?;
 
     // 4. Image mode: docker_image projects don't auto-deploy on create (no Git
@@ -3800,6 +3948,11 @@ pub async fn create_project_from_template(
                 health_check_path: runtime.health_check_path,
                 command: runtime.command,
                 recovery_of_deployment_id: None,
+                // ADR 045: the slug was just claimed, and claiming a declared
+                // slug is already instance-admin-only with step-up — so this
+                // is an admin, and the first deploy of the project they just
+                // created must not be refused by the planner.
+                docker_socket_authorized: auth.is_instance_admin(),
             });
         if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
             error!(

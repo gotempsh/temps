@@ -35,12 +35,21 @@ trait SourceDropWorkflowPlanner: Send + Sync {
 #[async_trait]
 impl SourceDropWorkflowPlanner for WorkflowPlanner {
     async fn plan(&self, deployment_id: i32) -> Result<(), SourceDropError> {
-        self.create_deployment_jobs(deployment_id)
-            .await
-            .map(|_| ())
-            .map_err(|error| SourceDropError::Workflow {
-                reason: error.to_string(),
-            })
+        // ADR 045, deliberately fail-closed: a source drop carries source the
+        // caller supplied, and nothing on this path has an `AuthContext` to
+        // prove instance-admin authority with (it is also reachable from the
+        // AI agent). Dropping source into a project that runs as host root is
+        // therefore refused, and an admin who really wants it deploys through
+        // a path that can establish who they are.
+        self.create_deployment_jobs(
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| SourceDropError::Workflow {
+            reason: error.to_string(),
+        })
     }
 }
 

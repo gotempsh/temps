@@ -99,6 +99,7 @@ import {
   toggleDatabaseSelection,
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   AlertCircle,
   Building2,
@@ -538,6 +539,11 @@ export function TemplateConfigurator({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repositoryNameWatch, baseKey])
 
+  // ADR 045: a template deploy is another way to name a slug this host
+  // grants the Docker socket to, so the create can come back 428.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
   // Create project mutation
   const createFromTemplateMutation = useMutation({
     ...createProjectFromTemplateMutation(),
@@ -555,7 +561,18 @@ export function TemplateConfigurator({
       onSuccess?.()
       navigate(`/projects/${data.project_slug}?new=true`)
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      // ADR 045: a slug this host grants the Docker socket to is admin-only
+      // and step-up verified, so this can be a 428 asking the admin to
+      // re-verify rather than a failure. Checked first — the toast below
+      // would otherwise report a create that is about to succeed as failed.
+      if (
+        handleSensitiveActionError(error, () =>
+          createFromTemplateMutation.mutate(variables)
+        )
+      ) {
+        return
+      }
       // The backend returns RFC 7807 Problem Details, which surface their
       // message via `detail` / `title` rather than `error.message` (which is
       // `undefined` and previously rendered as "Failed to create project: undefined").
@@ -748,6 +765,7 @@ export function TemplateConfigurator({
 
   return (
     <div className={cn('space-y-6', className)}>
+      {verificationDialog}
       {/* Template Info Header */}
       <Card>
         <CardHeader className="pb-3">

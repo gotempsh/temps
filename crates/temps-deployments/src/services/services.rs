@@ -132,6 +132,15 @@ pub enum DeploymentError {
     #[error("Queue error: {0}")]
     QueueError(String),
 
+    /// The caller asked to deploy a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045) without instance-admin
+    /// authority.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_deploy_reason(slug)
+    )]
+    DockerSocketDeployRequiresAdmin { slug: String },
+
     /// Bundle path (read from DB and joined to data_dir) resolved outside the
     /// data directory.  `path` is the offending resolved path; `reason`
     /// explains how the check failed.
@@ -372,6 +381,16 @@ pub struct DeploymentService {
     /// individual `deployer.remove_container` calls never touch -- when a
     /// project/environment that deployed via Docker Compose is deleted.
     compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// The rollback and promotion paths build their own `DeployImageJob`
+    /// rather than going through `WorkflowExecutionService`, so without this
+    /// they would always take the "no audit sink" branch and the ADR-045
+    /// `DEPLOYMENT_DOCKER_SOCKET_MOUNTED` record would silently never exist
+    /// for a rolled-back or promoted granted project. Late-bound like
+    /// `telemetry`: a missing sink degrades to a log line, never a failed
+    /// deployment.
+    audit_logger: std::sync::OnceLock<Arc<dyn temps_core::AuditLogger>>,
 }
 
 fn deployment_url_from_settings(
@@ -1025,6 +1044,7 @@ impl DeploymentService {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -1047,6 +1067,13 @@ impl DeploymentService {
     /// (currently `rollback_triggered`).
     pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
         let _ = self.telemetry.set(reporter);
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045), so
+    /// the rollback and promotion paths record a host-Docker-socket mount the
+    /// same way an ordinary deployment does.
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// The telemetry reporter, or a no-op when none has been wired.
@@ -1750,6 +1777,30 @@ impl DeploymentService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_pipeline_as(
+            project_id,
+            environment_id,
+            branch,
+            tag,
+            commit,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_pipeline`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn trigger_pipeline_as(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
         self.trigger_pipeline_inner(
             project_id,
             environment_id,
@@ -1860,6 +1911,34 @@ impl DeploymentService {
         health_check_path: Option<String>,
         command: Option<Vec<String>>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_image_deployment_as(
+            project_id,
+            target_environment_id,
+            image_ref,
+            health_check_path,
+            command,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_image_deployment`] for a caller whose authority is
+    /// known (ADR 045).
+    ///
+    /// This is the path that matters most for a granted project: the caller
+    /// supplies the image reference and the command that will run as host
+    /// root.
+    pub async fn trigger_image_deployment_as(
+        &self,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+        image_ref: String,
+        health_check_path: Option<String>,
+        command: Option<Vec<String>>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
         self.trigger_image_deployment_inner(
             project_id,
             target_environment_id,
@@ -1867,10 +1946,17 @@ impl DeploymentService {
             health_check_path,
             command,
             None,
+            caller,
         )
         .await
     }
 
+    // One argument over the lint's threshold, and the one that pushed it over
+    // is `caller` (ADR 045). Bundling the rest into a struct to satisfy the
+    // count would move five positional `Option`s into a struct literal that
+    // the two call sites would then have to keep in sync by name — no clearer,
+    // and a larger diff on a security fix.
+    #[allow(clippy::too_many_arguments)]
     async fn trigger_image_deployment_inner(
         &self,
         project_id: i32,
@@ -1879,6 +1965,7 @@ impl DeploymentService {
         health_check_path: Option<String>,
         command: Option<Vec<String>>,
         recovery_of_deployment_id: Option<i32>,
+        caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> Result<(), DeploymentError> {
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
@@ -1900,6 +1987,9 @@ impl DeploymentService {
                     health_check_path,
                     command,
                     recovery_of_deployment_id,
+                    // ADR 045: carried on the job because the consumer plans
+                    // the deployment with no request to re-derive it from.
+                    docker_socket_authorized: caller.may_deploy_granted_project(),
                 },
             ))
             .await
@@ -1989,6 +2079,12 @@ impl DeploymentService {
                         .as_ref()
                         .and_then(|metadata| metadata.command.clone()),
                     recovery_of_deployment_id,
+                    // ADR 045: node drain and failover redeploy the workload
+                    // that is already there, from the deployment's own stored
+                    // image and command. No caller-chosen input, and refusing
+                    // would leave a granted infrastructure service down after
+                    // its node died.
+                    temps_core::docker_socket_grant::DeployCaller::Platform,
                 )
                 .await;
         }
@@ -2013,12 +2109,77 @@ impl DeploymentService {
         .await
     }
 
+    /// Refuse a deployment of a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045), unless the caller is an
+    /// instance admin (or Temps itself).
+    ///
+    /// Every user-initiated path that can start a container for a project goes
+    /// through one of the methods that calls this. The check is here rather
+    /// than in the handlers because a granted project's container runs the
+    /// caller's image and command as host root, and a new deploy route added
+    /// later must not be able to miss it by forgetting a macro.
+    async fn guard_granted_project_deploy(
+        &self,
+        project_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<(), DeploymentError> {
+        // Cheap and skipped entirely on every install that never set the
+        // variable: with nothing declared, no slug can require the check, so
+        // the project row is never even read.
+        if temps_core::docker_socket_grant::process_grant().is_empty()
+            || caller.may_deploy_granted_project()
+        {
+            return Ok(());
+        }
+        let slug = projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(projects::Column::Slug)
+            .into_tuple::<String>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+        if temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            temps_core::docker_socket_grant::process_grant(),
+            &slug,
+            caller,
+        ) {
+            tracing::warn!(
+                project_id,
+                slug = %slug,
+                env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                "Refused a non-admin deployment of a project that holds host Docker access \
+                 (ADR 045)"
+            );
+            return Err(DeploymentError::DockerSocketDeployRequiresAdmin { slug });
+        }
+        Ok(())
+    }
+
     pub async fn rollback_to_deployment(
         &self,
         project_id: i32,
         deployment_id: i32,
     ) -> Result<Deployment, DeploymentError> {
+        self.rollback_to_deployment_as(
+            project_id,
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::rollback_to_deployment`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn rollback_to_deployment_as(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<Deployment, DeploymentError> {
         use temps_entities::deployments::DeploymentMetadata;
+
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
 
         // Fetch the target deployment (the one we're rolling back TO)
         let target_deployment = deployments::Entity::find_by_id(deployment_id)
@@ -2257,6 +2418,7 @@ impl DeploymentService {
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
             upload_request_id: Set(None),
+            docker_socket_mounted: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -2482,23 +2644,31 @@ impl DeploymentService {
                     )
                 };
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
-            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
-                .job_id("deploy_container".to_string())
-                .build_job_id("external-image".to_string())
-                .target(crate::jobs::DeploymentTarget::Docker {
-                    registry_url: "local".to_string(),
-                    network: Some(temps_core::NETWORK_NAME.to_string()),
-                })
-                .service_name(rollback_slug.clone())
-                .health_check_path(None)
-                .health_check_path_override(rollback_health_check_path)
-                .command(rollback_command)
-                .replicas(rollback_replicas)
-                .port(exposed_port)
-                .configured_port(configured_port)
-                .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone())
-                .failed_container_retention(self.db.clone(), rollback_deployment_id);
+            // ADR 045: the slug travels with every deploy, including this
+            // one. A rollback or promotion of a granted project that omitted
+            // it would be placed anywhere and started without its socket.
+            let mut deploy_builder =
+                crate::jobs::DeployImageJobBuilder::new(project.slug.clone(), caller)
+                    // ADR 045: the same audit sink an ordinary deploy uses, so a
+                    // rollback/promotion that mounts the socket is recorded rather
+                    // than only logged.
+                    .audit_logger(self.audit_logger.get().cloned())
+                    .job_id("deploy_container".to_string())
+                    .build_job_id("external-image".to_string())
+                    .target(crate::jobs::DeploymentTarget::Docker {
+                        registry_url: "local".to_string(),
+                        network: Some(temps_core::NETWORK_NAME.to_string()),
+                    })
+                    .service_name(rollback_slug.clone())
+                    .health_check_path(None)
+                    .health_check_path_override(rollback_health_check_path)
+                    .command(rollback_command)
+                    .replicas(rollback_replicas)
+                    .port(exposed_port)
+                    .configured_port(configured_port)
+                    .log_id(deploy_log_id.clone())
+                    .log_service(self.log_service.clone())
+                    .failed_container_retention(self.db.clone(), rollback_deployment_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {
@@ -2827,7 +2997,28 @@ impl DeploymentService {
         source_deployment_id: i32,
         target_environment_id: i32,
     ) -> Result<Deployment, DeploymentError> {
+        self.promote_deployment_as(
+            project_id,
+            source_deployment_id,
+            target_environment_id,
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::promote_deployment`] for a caller whose authority is known
+    /// (ADR 045).
+    pub async fn promote_deployment_as(
+        &self,
+        project_id: i32,
+        source_deployment_id: i32,
+        target_environment_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
+    ) -> Result<Deployment, DeploymentError> {
         use temps_entities::deployments::DeploymentMetadata;
+
+        self.guard_granted_project_deploy(project_id, caller)
+            .await?;
 
         // Fetch the source deployment
         let source = deployments::Entity::find_by_id(source_deployment_id)
@@ -2970,6 +3161,7 @@ impl DeploymentService {
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
             upload_request_id: Set(None),
+            docker_socket_mounted: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -3153,45 +3345,53 @@ impl DeploymentService {
             let configured_port =
                 super::port_resolver::configured_port_override(&target_env, &project);
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
-            let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
-                .job_id("deploy_container".to_string())
-                .build_job_id("external-image".to_string())
-                .target(crate::jobs::DeploymentTarget::Docker {
-                    registry_url: "local".to_string(),
-                    network: Some(temps_core::NETWORK_NAME.to_string()),
-                })
-                .service_name(promote_slug.clone())
-                .health_check_path(None)
-                .health_check_path_override(
-                    promoted_deployment
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.health_check_path.clone()),
-                )
-                .command(
-                    promoted_deployment
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.command.clone()),
-                )
-                .replicas(
-                    target_env
-                        .deployment_config
-                        .as_ref()
-                        .map(|c| c.replicas as u32)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .map(|c| c.replicas as u32)
-                        })
-                        .unwrap_or(1),
-                )
-                .port(exposed_port)
-                .configured_port(configured_port)
-                .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone())
-                .failed_container_retention(self.db.clone(), promoted_id);
+            // ADR 045: the slug travels with every deploy, including this
+            // one. A rollback or promotion of a granted project that omitted
+            // it would be placed anywhere and started without its socket.
+            let mut deploy_builder =
+                crate::jobs::DeployImageJobBuilder::new(project.slug.clone(), caller)
+                    // ADR 045: the same audit sink an ordinary deploy uses, so a
+                    // rollback/promotion that mounts the socket is recorded rather
+                    // than only logged.
+                    .audit_logger(self.audit_logger.get().cloned())
+                    .job_id("deploy_container".to_string())
+                    .build_job_id("external-image".to_string())
+                    .target(crate::jobs::DeploymentTarget::Docker {
+                        registry_url: "local".to_string(),
+                        network: Some(temps_core::NETWORK_NAME.to_string()),
+                    })
+                    .service_name(promote_slug.clone())
+                    .health_check_path(None)
+                    .health_check_path_override(
+                        promoted_deployment
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.health_check_path.clone()),
+                    )
+                    .command(
+                        promoted_deployment
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.command.clone()),
+                    )
+                    .replicas(
+                        target_env
+                            .deployment_config
+                            .as_ref()
+                            .map(|c| c.replicas as u32)
+                            .or_else(|| {
+                                project
+                                    .deployment_config
+                                    .as_ref()
+                                    .map(|c| c.replicas as u32)
+                            })
+                            .unwrap_or(1),
+                    )
+                    .port(exposed_port)
+                    .configured_port(configured_port)
+                    .log_id(deploy_log_id.clone())
+                    .log_service(self.log_service.clone())
+                    .failed_container_retention(self.db.clone(), promoted_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {
@@ -4681,6 +4881,48 @@ impl DeploymentService {
         Ok(container)
     }
 
+    /// The routing/identity slug of a project.
+    ///
+    /// Exists because the ADR-045 guards answer from the slug, not the id —
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS` names slugs — and handlers must not
+    /// query `projects` themselves. One indexed primary-key lookup, on
+    /// human-initiated paths only (exec, terminal); it is deliberately not
+    /// used anywhere per-request.
+    pub async fn project_slug(&self, project_id: i32) -> Result<String, DeploymentError> {
+        projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(projects::Column::Slug)
+            .into_tuple::<String>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("Project {project_id} not found")))
+    }
+
+    /// Whether this deployment ever had the host Docker socket mounted into
+    /// one of its containers (ADR 045).
+    ///
+    /// Used by exec/terminal authorization alongside (never instead of) the
+    /// project's *current* slug: renaming a project away from a granted slug
+    /// is admin-only, but it does not stop or recreate that project's
+    /// already-running containers, so checking only the current slug would
+    /// silently downgrade exec authorization on a still-root-equivalent
+    /// container the moment an admin renames the project for an unrelated
+    /// reason.
+    pub async fn deployment_docker_socket_mounted(
+        &self,
+        deployment_id: i32,
+    ) -> Result<bool, DeploymentError> {
+        deployments::Entity::find_by_id(deployment_id)
+            .select_only()
+            .column(deployments::Column::DockerSocketMounted)
+            .into_tuple::<bool>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!("Deployment {deployment_id} not found"))
+            })
+    }
+
     /// Check whether container exec/terminal access is enabled for an
     /// environment after applying project-level defaults and environment-level
     /// overrides.
@@ -5389,6 +5631,113 @@ mod tests {
         Ok((project, environment, deployment))
     }
 
+    /// ADR 045: proves `DeployImageJob::persist_docker_socket_mounted`'s
+    /// write is visible through the *exact* read path exec authorization
+    /// uses -- `DeploymentService::deployment_docker_socket_mounted` --
+    /// against a real database, and that it does not disturb a sibling
+    /// deployment's row. `guard_exec_against`'s own tests exercise the
+    /// boolean as a hand-supplied literal, which would keep passing even if
+    /// this write silently stopped happening; this is the test that would
+    /// actually fail in that case.
+    #[tokio::test]
+    async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker unavailable; skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to prepare test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        // A second deployment of the *same* project/environment -- the write
+        // must target only the row it was asked to persist, not every
+        // deployment of that project.
+        let sibling_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("test-deployment-sibling".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert sibling deployment");
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        assert!(
+            !deployment_service
+                .deployment_docker_socket_mounted(deployment.id)
+                .await
+                .expect("read freshly-created deployment"),
+            "a freshly-created deployment must not already read as socket-mounted"
+        );
+
+        let job = crate::jobs::DeployImageJobBuilder::new(
+            project.slug.clone(),
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(crate::jobs::DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name(project.slug.clone())
+        .failed_container_retention(db.clone(), deployment.id)
+        .build(Arc::new(MockContainerDeployer::new()))
+        .expect("valid deploy job");
+        let context = temps_core::WorkflowContext::new(
+            "run-persist".to_string(),
+            deployment.id,
+            project.id,
+            environment.id,
+            Arc::new(NoopLogWriter),
+        );
+
+        job.persist_docker_socket_mounted(&context).await;
+
+        assert!(
+            deployment_service
+                .deployment_docker_socket_mounted(deployment.id)
+                .await
+                .expect("read the deployment after the write"),
+            "the write must be visible through the read path exec authorization uses"
+        );
+        assert!(
+            !deployment_service
+                .deployment_docker_socket_mounted(sibling_deployment.id)
+                .await
+                .expect("read the sibling deployment"),
+            "persisting one deployment's mount must not affect a sibling deployment's row"
+        );
+    }
+
+    struct NoopLogWriter;
+
+    #[async_trait::async_trait]
+    impl temps_core::LogWriter for NoopLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), temps_core::WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
     #[tokio::test]
     async fn legacy_asset_origin_walks_partial_reuse_metadata_to_original_build() {
         let test_db = match TestDatabase::with_migrations().await {
@@ -5805,6 +6154,7 @@ mod tests {
                 container_port: 3000,
                 host_port: readiness_host_port,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         });
         deployer.expect_start_container().returning(|_| Ok(()));
@@ -5852,6 +6202,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -5933,6 +6284,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -6861,6 +7213,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         });
         deployer.expect_stop_container().returning(|_| Ok(()));
@@ -6880,6 +7233,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         }
     }
 
@@ -7075,7 +7429,10 @@ mod tests {
 
         // Create deployment jobs using workflow planner
         let created_jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify jobs were created
@@ -7167,7 +7524,10 @@ mod tests {
 
         // Create deployment jobs
         let created_jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify each job can be used to generate a log_id
@@ -8748,6 +9108,7 @@ mod tests {
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
+            audit_logger: std::sync::OnceLock::new(),
         };
 
         service

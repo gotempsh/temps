@@ -233,6 +233,11 @@ pub async fn deploy_from_uploaded_source(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {project_id} not found"))
         })?;
+    // ADR 045, before the upload is consumed or any row is written: the
+    // planner refuses this again (it is the enforcement point), but only after
+    // a deployment row exists, and a 500 on a failed plan is the wrong answer
+    // to "you are not allowed to do this".
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
     if !accepts_source_archive(project.source_type, project.allow_alternate_sources) {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Project Type")
@@ -451,7 +456,7 @@ pub async fn deploy_from_uploaded_source(
 
     if let Err(error) = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await
     {
         rollback_uploaded_source(&state, Some(deployment.id), Some(bundle.id), &absolute_path)
@@ -1061,6 +1066,11 @@ pub async fn deploy_from_image(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045, before anything is resolved or written: this project's
+    // containers receive `/var/run/docker.sock`, so the image and command in
+    // this request would run as host root. The planner refuses it again — it
+    // is the enforcement point — but only once a deployment row exists.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Reject cross-project or deleted environments before creating the
     // deployment. Runtime defaults come only from the project's persisted
@@ -1283,7 +1293,7 @@ pub async fn deploy_from_image(
     // 7. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1425,6 +1435,9 @@ pub async fn deploy_from_static(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. A static bundle still starts a
+    // container for this project, so it is refused on the same terms.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows static file deployments
     if !project
@@ -1555,7 +1568,7 @@ pub async fn deploy_from_static(
     // 8. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1703,6 +1716,9 @@ pub async fn deploy_from_image_upload(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. An uploaded image tarball is the same
+    // attacker-chosen image and command, arriving by a different route.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows Docker image deployments
     if !project
@@ -2064,7 +2080,7 @@ pub async fn deploy_from_image_upload(
     // 13. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {

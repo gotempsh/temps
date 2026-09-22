@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use temps_core::docker_socket_grant::DockerSocketCapability;
 use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
@@ -40,6 +41,12 @@ pub struct AppState {
     /// is guaranteed to see all registered services because `configure_routes`
     /// runs after every plugin's `initialize_plugin_services` has completed.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central policy evaluator for sensitive mutations — challenges with MFA
+    /// step-up when the acting user has one enrolled. Threaded into
+    /// `ProjectService` on the slug-claim path (ADR 045) rather than checked
+    /// in the handler, so the challenge cannot drift away from the guard it
+    /// protects. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 // Domain-related types
@@ -416,6 +423,15 @@ pub struct ProjectResponse {
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
+    /// Where this project is granted host Docker access (ADR 045), and what to
+    /// set when it is granted nowhere.
+    ///
+    /// Populated only on the single-project detail responses — computing it
+    /// costs a `nodes` query, and the list endpoints must stay cheap. `None`
+    /// therefore means "not computed on this response", never "not granted";
+    /// clients read `granted` from the object, not from its presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_socket: Option<DockerSocketCapability>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -426,6 +442,16 @@ pub struct EnvironmentDomains {
 }
 
 impl ProjectResponse {
+    /// Attach the ADR-045 host Docker socket capability.
+    ///
+    /// Used by the single-project detail handlers only. Always attach it
+    /// there, granted or not: an unconfigured capability must onboard the
+    /// operator, not disappear from the response.
+    pub fn with_docker_socket(mut self, capability: DockerSocketCapability) -> Self {
+        self.docker_socket = Some(capability);
+        self
+    }
+
     pub fn map_from_project(project: crate::services::types::Project) -> Self {
         ProjectResponse {
             id: project.id,
@@ -463,6 +489,9 @@ impl ProjectResponse {
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,
+            // Filled in by the detail handlers via `with_docker_socket`; the
+            // list path deliberately leaves it unset.
+            docker_socket: None,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -1176,6 +1205,37 @@ impl From<ProjectError> for Problem {
             ProjectError::InvalidGitUrl { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
+
+            // 403, not 409: the slug is not taken, the caller is not allowed
+            // to take it. An admin sending the same request succeeds.
+            ProjectError::DockerSocketSlugReserved { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Project Slug Reserved For Host Docker Access")
+                    .with_detail(error.to_string())
+            }
+
+            // Passed through verbatim: `require_sensitive_action` already
+            // built the 428 the console's step-up dialog parses (error_code,
+            // action name, mfa_setup_required). Rebuilding it here would be a
+            // second, drifting copy of that contract.
+            ProjectError::SlugClaimStepUpRequired { problem } => *problem,
+
+            // Also 403 and also admin-only, but a different refusal: the
+            // caller may write this project, just not run code as host root
+            // on its behalf.
+            ProjectError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(error.to_string())
+            }
+
+            // 403 again, and a third distinct refusal: the caller is not
+            // deploying, they are changing what a later deployment will run.
+            ProjectError::DockerSocketWriteRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Project Settings Require An Admin")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -1379,5 +1439,80 @@ mod tests {
         assert_eq!(omitted.image_retention_hours, None);
         assert_eq!(cleared.image_retention_hours, Some(None));
         assert_eq!(set.image_retention_hours, Some(Some(72)));
+    }
+
+    /// ADR 045 refusals are 403, not 400: an admin sending the identical
+    /// request succeeds, so the request itself is not malformed.
+    #[test]
+    fn docker_socket_refusals_map_to_forbidden_and_explain_themselves() {
+        let reserved: Problem = ProjectError::DockerSocketSlugReserved {
+            slug: "node-daemon".to_string(),
+            change: crate::services::types::ReservedSlugChange::Claim,
+        }
+        .into();
+        assert_eq!(reserved.status_code, StatusCode::FORBIDDEN);
+        let detail = reserved
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("ADR 045"), "{detail}");
+        assert!(detail.contains("TEMPS_DOCKER_SOCKET_PROJECTS"), "{detail}");
+
+        let deploy: Problem = ProjectError::DockerSocketDeployRequiresAdmin {
+            slug: "node-daemon".to_string(),
+        }
+        .into();
+        assert_eq!(deploy.status_code, StatusCode::FORBIDDEN);
+        // The two must not read alike — one is about naming the project, the
+        // other about running code inside it.
+        assert_ne!(reserved.body.get("title"), deploy.body.get("title"));
+
+        // And the third: changing what a declared project runs, without
+        // deploying anything. Telling this caller to "ask an admin to deploy
+        // it" would describe an operation they never attempted, and the
+        // refusal has to name the field so an operator who sent a settings
+        // patch with six of them can tell which one was the problem.
+        let write: Problem = ProjectError::DockerSocketWriteRequiresAdmin {
+            slug: "node-daemon".to_string(),
+            field: "the source repository".to_string(),
+        }
+        .into();
+        assert_eq!(write.status_code, StatusCode::FORBIDDEN);
+        assert_ne!(write.body.get("title"), deploy.body.get("title"));
+        assert_ne!(write.body.get("title"), reserved.body.get("title"));
+        let write_detail = write
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(write_detail.contains("ADR 045"), "{write_detail}");
+        assert!(
+            write_detail.contains("the source repository"),
+            "{write_detail}"
+        );
+    }
+
+    /// The step-up challenge is passed through byte for byte. Rebuilding it
+    /// here would be a second, drifting copy of the contract the console's
+    /// verification dialog parses.
+    #[test]
+    fn a_step_up_challenge_reaches_the_client_unchanged() {
+        let built = temps_core::error_builder::ErrorBuilder::new(StatusCode::PRECONDITION_REQUIRED)
+            .title("Additional Verification Required")
+            .value("error_code", "STEP_UP_REQUIRED")
+            .value("action", "claim_docker_socket_slug")
+            .value("mfa_setup_required", false)
+            .build();
+
+        let problem: Problem = ProjectError::SlugClaimStepUpRequired {
+            problem: Box::new(built.clone()),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(problem.body, built.body);
     }
 }

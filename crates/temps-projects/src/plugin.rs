@@ -100,6 +100,12 @@ impl TempsPlugin for ProjectsPlugin {
         // plugin is guaranteed to be present in the registry by this point.
         // When absent (plain OSS binary), project_access_guard! is a no-op.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        // Central sensitive-action policy (MFA step-up). Resolved here rather
+        // than in `register_services` for the same reason as the access
+        // checker above: `configure_routes` is the first point at which the
+        // final policy implementation is guaranteed to be registered.
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             external_service_manager,
@@ -113,6 +119,7 @@ impl TempsPlugin for ProjectsPlugin {
             project_archive_cleaner,
             telemetry,
             project_access_checker,
+            sensitive_action_authorizer,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes::new(routes))

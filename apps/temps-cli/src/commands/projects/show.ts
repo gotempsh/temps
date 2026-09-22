@@ -8,6 +8,28 @@ import { newline, header, icons, json, keyValue, info, colors, formatDate } from
 import { detailsTable, statusBadge } from '../../ui/table.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { getProject, getProjectBySlug } from '../../api/sdk.gen.js'
+import type { DockerSocketCapability } from '../../api/types.gen.js'
+
+/**
+ * Where this project holds host Docker access (ADR 045), in one line.
+ *
+ * `undefined`/`null` is *not* "not granted": the API attaches the capability
+ * only to the single-project detail responses, so an older server simply does
+ * not say. Returning null there keeps the row out of the table rather than
+ * printing a denial the server never made.
+ */
+export function describeDockerSocketAccess(
+  capability: DockerSocketCapability | null | undefined
+): string | null {
+  if (!capability) return null
+  if (capability.granted) {
+    const nodes = capability.nodes ?? []
+    return nodes.length ? `granted on ${nodes.join(', ')}` : 'granted'
+  }
+  // The server's reason names the exact variable, value and process to
+  // restart — the operator reading this has nobody to ask.
+  return `not granted — ${capability.reason ?? 'no host grants this project access to the Docker socket'}`
+}
 
 interface ShowOptions {
   project?: string
@@ -77,6 +99,8 @@ export async function show(options: ShowOptions): Promise<void> {
   newline()
   header(`${icons.folder} ${project.name}`)
 
+  const dockerSocketAccess = describeDockerSocketAccess(project.docker_socket)
+
   detailsTable({
     ID: project.id,
     Name: project.name,
@@ -88,6 +112,7 @@ export async function show(options: ShowOptions): Promise<void> {
     'Attack Mode': project.attack_mode ? 'Enabled' : 'Disabled',
     'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
     'Vulnerability Scanning': project.vulnerability_scanning_enabled ? 'Enabled' : 'Disabled',
+    ...(dockerSocketAccess ? { 'Host Docker access': dockerSocketAccess } : {}),
     Created: formatDate(new Date(project.created_at * 1000).toISOString()),
     Updated: formatDate(new Date(project.updated_at * 1000).toISOString()),
   })

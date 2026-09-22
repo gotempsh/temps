@@ -273,21 +273,24 @@ async fn test_container_cleanup_on_deployment_failure() {
     let mut env_vars = HashMap::new();
     env_vars.insert("TEST_VAR".to_string(), "test_value".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
-        .job_id("deploy_failing".to_string())
-        .build_job_id("build_failing".to_string())
-        .target(DeploymentTarget::Docker {
-            registry_url: "local".to_string(),
-            network: None,
-        })
-        .service_name("failing-app".to_string())
-        .namespace("default".to_string())
-        .port(3000)
-        .replicas(1)
-        .environment_variables(env_vars)
-        .health_check_timeout_secs(15) // Short timeout for test -- container will never be healthy
-        .build(container_deployer.clone())
-        .expect("Should create deploy job");
+    let deploy_job = DeployImageJobBuilder::new(
+        "container-cleanup-test",
+        temps_core::docker_socket_grant::DeployCaller::Platform,
+    )
+    .job_id("deploy_failing".to_string())
+    .build_job_id("build_failing".to_string())
+    .target(DeploymentTarget::Docker {
+        registry_url: "local".to_string(),
+        network: None,
+    })
+    .service_name("failing-app".to_string())
+    .namespace("default".to_string())
+    .port(3000)
+    .replicas(1)
+    .environment_variables(env_vars)
+    .health_check_timeout_secs(15) // Short timeout for test -- container will never be healthy
+    .build(container_deployer.clone())
+    .expect("Should create deploy job");
 
     println!("✅ All three jobs created successfully");
 

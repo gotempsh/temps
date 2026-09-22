@@ -425,6 +425,14 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Deployment Not Found")
                 .with_detail(msg),
+            // ADR 045: the caller may deploy this project in general, but not
+            // this one — its containers run as host root. An admin sending the
+            // same request succeeds, so 403, not 400.
+            DeploymentError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::DatabaseError { reason } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -712,7 +720,15 @@ pub async fn rollback_to_deployment(
 
     let deployment = state
         .deployment_service
-        .rollback_to_deployment(project_id, deployment_id)
+        // ADR 045: a project that holds host Docker access may only be
+        // deployed — in any direction — by an instance admin.
+        .rollback_to_deployment_as(
+            project_id,
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentRollbackAudit {
@@ -774,7 +790,14 @@ pub async fn promote_deployment(
 
     let deployment = state
         .deployment_service
-        .promote_deployment(project_id, deployment_id, request.target_environment_id)
+        .promote_deployment_as(
+            project_id,
+            deployment_id,
+            request.target_environment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentPromotedAudit {

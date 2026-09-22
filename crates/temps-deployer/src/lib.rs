@@ -32,6 +32,13 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+/// Host-level Docker socket grant (ADR 045).
+///
+/// Re-exported from `temps-core`, where the type lives so the agent, the
+/// scheduler, the projects API and the CLI can all read it without depending
+/// on the deployer's Docker toolchain. The deployer is where it is *applied*,
+/// so it is also reachable here.
+pub use temps_core::docker_socket_grant;
 pub mod metadata_egress;
 pub mod platform;
 pub mod plugin;
@@ -329,6 +336,39 @@ pub struct DeployRequest {
     /// `sh.temps.service`, and optionally `sh.temps.deploy_id`.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Slug of the project this container belongs to.
+    ///
+    /// Carried so the process that actually creates the container can compare
+    /// it against *its own* host-level Docker socket grant (ADR 045). The
+    /// control plane never tells a worker "mount the socket"; it says "this is
+    /// project X" and the worker answers from its own environment.
+    ///
+    /// `Option` + `#[serde(default)]` keeps the wire format compatible with
+    /// agents and control planes built before ADR 045: an absent slug can
+    /// never match a grant, so it means "no grant possible".
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Whether the **control plane** declares that this project requires the
+    /// host Docker socket (ADR 045).
+    ///
+    /// The second half of the mount decision, and the reason it is on the
+    /// wire at all: the slug alone is attacker-influenceable. A project writer
+    /// can name a project anything not reserved *by the control plane*, so a
+    /// worker whose operator set `TEMPS_DOCKER_SOCKET_PROJECTS` for a slug the
+    /// control plane never declared would otherwise mount the socket purely
+    /// from its own local environment, with the slug-claim guard and the
+    /// placement gate both inert. Requiring the control plane's own
+    /// declaration to travel with the request means both ends must agree.
+    ///
+    /// This is authorization, never instruction: a `true` here cannot make a
+    /// host mount anything its own environment does not also grant. The
+    /// executing process still answers from its own grant first.
+    ///
+    /// `#[serde(default)]` is `false`, so a request from a control plane built
+    /// before this field — or any request that loses it — fails closed and no
+    /// socket is mounted.
+    #[serde(default)]
+    pub control_plane_grants_socket: bool,
 }
 
 /// Docker container log rotation configuration
@@ -418,6 +458,15 @@ pub struct DeployResult {
     pub container_port: u16,
     pub host_port: u16,
     pub status: ContainerStatus,
+    /// Whether the executing host mounted `/var/run/docker.sock` into this
+    /// container because its own grant named the project (ADR 045).
+    ///
+    /// Reported back rather than inferred by the caller: only the process that
+    /// built the `HostConfig` knows its own environment, and this is what the
+    /// control plane audits. `#[serde(default)]` so a pre-ADR-045 agent's
+    /// response still deserialises as `false`.
+    #[serde(default)]
+    pub docker_socket_mounted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -968,6 +1017,103 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// A control plane built before ADR 045 sends no `project_slug`, and an
+    /// agent built before it sends no `docker_socket_mounted`. Both directions
+    /// of the agent wire protocol must keep deserialising.
+    #[test]
+    fn deploy_request_without_project_slug_deserialises() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+        });
+
+        let request: DeployRequest =
+            serde_json::from_value(wire).expect("legacy DeployRequest must still deserialise");
+        assert_eq!(request.project_slug, None);
+        // Fails closed: a control plane that predates the authorization field
+        // must not be read as having authorized the mount.
+        assert!(!request.control_plane_grants_socket);
+    }
+
+    #[test]
+    fn deploy_request_round_trips_the_project_slug() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert_eq!(request.project_slug.as_deref(), Some("node-daemon"));
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(encoded["project_slug"], serde_json::json!("node-daemon"));
+        // The slug alone carries no authorization; the control plane's
+        // declaration is a separate field and defaults to false.
+        assert!(!request.control_plane_grants_socket);
+    }
+
+    /// The control plane's declaration must survive the agent wire hop, or a
+    /// legitimately declared project would silently deploy without its socket
+    /// on every worker.
+    #[test]
+    fn deploy_request_round_trips_the_control_plane_authorization() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+            "control_plane_grants_socket": true,
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert!(request.control_plane_grants_socket);
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(
+            encoded["control_plane_grants_socket"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn deploy_result_without_socket_flag_deserialises_as_not_mounted() {
+        let wire = serde_json::json!({
+            "container_id": "abc",
+            "container_name": "app-1",
+            "container_port": 3000,
+            "host_port": 32768,
+            "status": "Running",
+        });
+
+        let result: DeployResult =
+            serde_json::from_value(wire).expect("legacy DeployResult must still deserialise");
+        assert!(!result.docker_socket_mounted);
+    }
+
     fn stats_with_cpu(cpu_percent: f64, cpu_limit_cores: Option<f64>) -> ContainerStats {
         ContainerStats {
             cpu_percent,
@@ -1130,6 +1276,8 @@ mod tests {
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -1257,6 +1405,7 @@ mod tests {
             container_port: 3000,
             host_port: 8080,
             status: ContainerStatus::Running,
+            docker_socket_mounted: false,
         };
 
         assert_eq!(result.container_id, "xyz789");
@@ -1453,6 +1602,8 @@ CMD ["echo", "Hello from container"]
             command: None, // No custom command, use default from image
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.environment_vars.len(), 3);

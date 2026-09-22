@@ -5,7 +5,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,25 +45,32 @@ pub enum NodeError {
     },
 
     #[error(
-        "{replicas} replicas requested with anti-affinity, but only {available} node(s) \
-         can run this image ({excluded}). Set replicas to {available}, add a compatible \
-         node, or disable anti-affinity to stack replicas on the nodes you have"
+        "{replicas} replicas requested with anti-affinity, but only {available} node(s) are \
+         eligible — {cause} ({excluded}). Set replicas to {available}, add an eligible node, \
+         or disable anti-affinity to stack replicas on the nodes you have"
     )]
     InsufficientCompatibleNodes {
         /// Replicas the deployment asked for.
         replicas: u32,
-        /// Nodes that can actually run the image.
+        /// Nodes that are actually eligible.
         available: usize,
-        /// What was dropped from the pool and why, already formatted.
+        /// What eliminated the rest, as one phrase. Not always the image
+        /// architecture: the ADR-045 Docker socket gate drops nodes from the
+        /// same pool, and a message that blamed the architecture for a socket
+        /// exclusion would send the operator to rebuild an image that is fine.
+        cause: String,
+        /// What was dropped from the pool and why, already formatted per node.
         excluded: String,
     },
 
     #[error(
-        "Placement constraints selected node(s) that cannot run this image ({excluded}); \
+        "Placement constraints selected node(s) that are not eligible ({excluded}); \
          refusing to ignore the requested placement"
     )]
     PlacementConstraintsUnsatisfied {
-        /// Constrained nodes that were dropped from the pool and why.
+        /// Constrained nodes that were dropped from the pool and why. Each
+        /// entry names its own reason, which is not necessarily the image
+        /// architecture — see `InsufficientCompatibleNodes::cause`.
         excluded: String,
     },
 
@@ -78,6 +85,23 @@ pub enum NodeError {
         /// Replicas the deployment asked for, so the message reflects the
         /// request rather than implying a single container.
         requested_replicas: u32,
+    },
+
+    #[error(
+        "Project '{project_slug}' is declared as requiring host Docker access on this control \
+         plane (ADR 045), but {reason}. Deploying it on a host that does not grant it would \
+         start the container without the Docker socket it exists to use, so placement is \
+         refused instead. Declare it on the control plane and grant it on at least one node: \
+         set TEMPS_DOCKER_SOCKET_PROJECTS={project_slug} on that host and restart its `temps \
+         agent` (or `temps serve` for the control plane)"
+    )]
+    DockerSocketNotSchedulable {
+        /// Project the deployment is for.
+        project_slug: String,
+        /// Which of the two failure shapes this is, already phrased for the
+        /// operator: no host grants it and is schedulable, or the hosts that
+        /// grant it are not schedulable right now.
+        reason: String,
     },
 
     #[error("Database error: {0}")]
@@ -139,6 +163,15 @@ pub struct HeartbeatRequest {
     /// columns are left untouched rather than cleared, same treatment as
     /// `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+    /// Project slugs this node grants host Docker access to (ADR 045), as
+    /// reported by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// `Some(vec![])` is meaningful and must be honoured: it is how an
+    /// operator who *removed* a grant and restarted the agent tells the
+    /// scheduler to stop placing that project here. `None` means "not
+    /// reported" — a pre-ADR-045 agent — and leaves the stored value
+    /// untouched, same rule as `architecture` above.
+    pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeatUpdate>,
 }
 
@@ -252,6 +285,56 @@ pub struct DnsResolverHeartbeatUpdate {
 /// "active") is considered live, and its identity may not be silently rebound
 /// by a re-registration. Mirrors the health-check stale threshold.
 const NODE_LIVE_THRESHOLD_SECS: i64 = 90;
+
+/// Merge the ADR-045 advertised Docker socket grant into the capacity JSON a
+/// heartbeat will persist.
+///
+/// Pure so the two rules that matter can be asserted without a database:
+/// an explicitly reported list always wins — including an **empty** one, which
+/// is how an operator who removed a grant and restarted the agent stops the
+/// scheduler placing that project there — and an absent list carries the
+/// previous value forward rather than clearing it, so a pre-ADR-045 agent
+/// binary cannot silently drop a grant the node is in fact honouring.
+fn resolve_heartbeat_capacity(
+    mut capacity: serde_json::Value,
+    reported: Option<Vec<String>>,
+    previous_capacity: &serde_json::Value,
+) -> serde_json::Value {
+    match reported {
+        Some(slugs) => {
+            temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &slugs);
+        }
+        None => {
+            let previous = temps_core::docker_socket_grant::capacity_grants(previous_capacity);
+            if !previous.is_empty() {
+                temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &previous);
+            }
+        }
+    }
+    capacity
+}
+
+/// Slugs a node advertises that this control plane never declared (ADR 045).
+///
+/// Such an advertisement does nothing — the placement gate exists only for
+/// projects named in the *control plane's* `TEMPS_DOCKER_SOCKET_PROJECTS`, so
+/// a node cannot conjure one — but it is never benign: either the operator set
+/// the variable on the worker and forgot the control plane (the common case,
+/// and otherwise invisible: the project simply deploys without the socket), or
+/// the node is reporting slugs nobody configured. Both deserve a line naming
+/// the node.
+///
+/// Pure, so the rule is testable without a database.
+fn undeclared_advertisements(
+    declared: &temps_core::docker_socket_grant::DockerSocketGrant,
+    advertised: &[String],
+) -> Vec<String> {
+    advertised
+        .iter()
+        .filter(|slug| !declared.declares(slug))
+        .cloned()
+        .collect()
+}
 
 /// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
 /// token hashes) to avoid leaking a match via timing.
@@ -588,7 +671,42 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.clone().into();
         active.last_heartbeat = Set(Some(chrono::Utc::now()));
-        active.capacity = Set(request.capacity);
+        // ADR 045: the advertised Docker socket grant rides in `capacity`
+        // rather than a dedicated column. `capacity` is agent-derived, wholly
+        // replaced on every beat and never written through the API — exactly
+        // the lifecycle this list has — so a migration would buy nothing but
+        // a column that can disagree with the beat that set it.
+        let resolved_capacity = resolve_heartbeat_capacity(
+            request.capacity,
+            request.docker_socket_projects,
+            &node.capacity,
+        );
+        // An advertisement narrows where a declared project may run; it never
+        // declares one. Say so when a node advertises something this control
+        // plane does not declare — rate-limited to the beats where the node's
+        // set actually changes, since heartbeats arrive continuously and a
+        // per-beat warning would be noise nobody reads.
+        let advertised = temps_core::docker_socket_grant::capacity_grants(&resolved_capacity);
+        if advertised != temps_core::docker_socket_grant::capacity_grants(&node.capacity) {
+            let undeclared = undeclared_advertisements(
+                temps_core::docker_socket_grant::process_grant(),
+                &advertised,
+            );
+            if !undeclared.is_empty() {
+                tracing::warn!(
+                    node_id,
+                    node_name = %node.name,
+                    slugs = %undeclared.join(", "),
+                    env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                    "Node advertises host Docker access for project(s) this control plane does \
+                     not declare; the advertisement is ignored for scheduling. Set {} on the \
+                     control plane too if this is intended — otherwise the node is \
+                     misconfigured, or reporting slugs nobody configured",
+                    temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+                );
+            }
+        }
+        active.capacity = Set(resolved_capacity);
         // Only transition to "active" if the node was "offline" (reconnecting).
         // Preserve managed states like "draining" and "drained".
         if node.status == "offline" {
@@ -765,6 +883,66 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
         Ok(nodes)
+    }
+
+    /// `(id, name)` of every node that advertises `project_slug` under
+    /// `docker_socket_projects` in its heartbeat capacity (ADR 045).
+    ///
+    /// Selects only `id`, `name` and `capacity` — never the full `nodes` row
+    /// (labels, token, address and timestamp columns), which this call
+    /// discards entirely to answer "which of these grant this one slug".
+    /// This runs on every placement of a project this control plane
+    /// declares, so trimming what's fetched matters at fleet size even
+    /// though the exact-match test itself still runs in Rust
+    /// (`capacity_grants`), the same test `docker_socket_gate` used before
+    /// this method existed. A `capacity->'docker_socket_projects' @>
+    /// '["<slug>"]'` predicate evaluated by Postgres (as
+    /// `ProjectService::docker_socket_capability` does for the read-only
+    /// capability response) would remove the Rust-side filter entirely, but
+    /// `Expr::cust_with_values` raw predicates are not mockable with
+    /// `sea_orm::MockDatabase`, which this module's placement tests rely on
+    /// throughout — left as a follow-up that also converts those tests to a
+    /// real database.
+    ///
+    /// Decodes via a named `#[derive(FromQueryResult)]` struct rather than
+    /// `.into_tuple()`. `MockDatabase` builds its rows from the *full*
+    /// `nodes::Model` (all columns, in struct-declaration order) regardless
+    /// of which columns `select_only()` asked for, and `.into_tuple()`
+    /// decodes positionally — so against a mocked row it silently read
+    /// whatever the model's 3rd declared field is (`token_hash`, a String)
+    /// instead of `capacity`, rather than the 3 columns actually selected.
+    /// A named struct resolves each field by column name instead, which
+    /// gives the intended column against both `MockDatabase` and a real
+    /// connection.
+    pub async fn granting_node_ids_and_names(
+        &self,
+        project_slug: &str,
+    ) -> Result<Vec<(i32, String)>, NodeError> {
+        #[derive(sea_orm::FromQueryResult)]
+        struct GrantingNode {
+            id: i32,
+            name: String,
+            capacity: serde_json::Value,
+        }
+
+        let rows: Vec<GrantingNode> = nodes::Entity::find()
+            .select_only()
+            .column(nodes::Column::Id)
+            .column(nodes::Column::Name)
+            .column(nodes::Column::Capacity)
+            .order_by_asc(nodes::Column::Name)
+            .into_model::<GrantingNode>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                temps_core::docker_socket_grant::capacity_grants(&row.capacity)
+                    .iter()
+                    .any(|slug| slug == project_slug)
+            })
+            .map(|row| (row.id, row.name))
+            .collect())
     }
 
     /// Total DNS records currently registered in the cluster zone (ADR-024).
@@ -1240,6 +1418,81 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 045: how an agent's advertised Docker socket grant is persisted
+    /// into the node's `capacity` JSON.
+    mod docker_socket_advertisement {
+        use super::super::resolve_heartbeat_capacity;
+        use temps_core::docker_socket_grant::capacity_grants;
+
+        #[test]
+        fn a_reported_list_is_persisted_alongside_the_rest_of_capacity() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.4}),
+                Some(vec!["node-daemon".to_string()]),
+                &serde_json::json!({}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["node-daemon".to_string()]);
+            assert_eq!(capacity["cpu_usage"], serde_json::json!(0.4));
+        }
+
+        #[test]
+        fn advertisements_outside_the_declared_set_are_reported_as_such() {
+            use super::super::undeclared_advertisements;
+            use temps_core::docker_socket_grant::DockerSocketGrant;
+
+            let declared = DockerSocketGrant::parse(Some("node-daemon"));
+            // A node advertising a slug the control plane never declared does
+            // nothing for scheduling, but it is never benign: either half a
+            // config change, or a node naming projects nobody configured.
+            assert_eq!(
+                undeclared_advertisements(
+                    &declared,
+                    &["node-daemon".to_string(), "hostile".to_string()],
+                ),
+                vec!["hostile".to_string()]
+            );
+            // The ordinary case is silent.
+            assert!(undeclared_advertisements(&declared, &["node-daemon".to_string()]).is_empty());
+            assert!(undeclared_advertisements(&declared, &[]).is_empty());
+        }
+
+        #[test]
+        fn an_empty_reported_list_clears_a_previous_grant() {
+            // The operator removed the grant and restarted the agent. The
+            // scheduler must stop placing the project there on the next beat,
+            // not at the next re-join.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({}),
+                Some(Vec::new()),
+                &serde_json::json!({"docker_socket_projects": ["node-daemon"]}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+
+        #[test]
+        fn an_unreported_list_carries_the_previous_value_forward() {
+            // A pre-ADR-045 agent binary reports nothing. Clearing here would
+            // make the control plane refuse placements the node would in fact
+            // have honoured.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({"docker_socket_projects": ["infra-agent"]}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["infra-agent".to_string()]);
+        }
+
+        #[test]
+        fn an_unreported_list_with_no_previous_value_stays_absent() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+    }
+
     /// A node registering under a fresh name must not be able to claim
     /// another node's address — the cluster CA signs SANs built from exactly
     /// these fields, so that certificate would be good for the victim's
@@ -1526,6 +1779,58 @@ mod tests {
         assert_eq!(nodes[0].name, "worker-1");
     }
 
+    /// ADR 045: only the node that actually advertises `project_slug` under
+    /// `docker_socket_projects` is returned, and only its `id`/`name` --
+    /// this is the query the placement gate narrows to, and it decodes via a
+    /// named `#[derive(FromQueryResult)]` struct specifically because
+    /// `.into_tuple()` against `MockDatabase`'s full-row mocks was found to
+    /// silently decode the wrong column (see the doc comment on
+    /// `granting_node_ids_and_names`). A regression there would make every
+    /// node look like it grants every slug, or fail to decode at all.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_selects_only_the_advertising_node() {
+        let granting = nodes::Model {
+            id: 2,
+            name: "worker-a".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["node-daemon"] }),
+            ..sample_node()
+        };
+        let not_granting = nodes::Model {
+            id: 3,
+            name: "worker-b".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["some-other-project"] }),
+            ..sample_node()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![granting, not_granting]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert_eq!(rows, vec![(2, "worker-a".to_string())]);
+    }
+
+    /// A slug nobody advertises returns an empty list rather than an error --
+    /// the placement gate treats this as "no eligible host", not a failure.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_is_empty_when_nobody_advertises_the_slug() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // capacity: {}
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
     #[tokio::test]
     async fn test_get_by_id_not_found() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1592,6 +1897,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1826,6 +2132,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                     public_ingress: None,
                 },
             )
@@ -1855,6 +2162,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                     public_ingress: None,
                 },
             )
@@ -1893,6 +2201,7 @@ mod tests {
                         last_sync_error: Some("resolver crashed: too many open files".into()),
                         record_count: 37,
                     }),
+                    docker_socket_projects: None,
                     public_ingress: None,
                 },
             )
@@ -1950,6 +2259,7 @@ mod tests {
                         capacity: serde_json::json!({}),
                         labels: None,
                         dns_resolver: None,
+                        docker_socket_projects: None,
                         public_ingress: None,
                     },
                 )
@@ -2007,6 +2317,7 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
                     public_ingress: None,
                 },
             )
@@ -2080,6 +2391,7 @@ mod tests {
                         last_sync_error: None,
                         record_count: 0,
                     }),
+                    docker_socket_projects: None,
                     public_ingress: None,
                 },
             )
@@ -2502,6 +2814,7 @@ mod tests {
             labels: None,
             architecture: None,
             dns_resolver: None,
+            docker_socket_projects: None,
             public_ingress: Some(PublicIngressHeartbeatUpdate {
                 running: true,
                 last_error: None,

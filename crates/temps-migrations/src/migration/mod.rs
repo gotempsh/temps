@@ -292,6 +292,7 @@ pub mod m20260921_000003_log_line_forget_backlog;
 pub mod m20260922_000001_stateless_control_plane_jobs;
 
 mod m20260920_000001_compose_security_policies;
+mod m20260921_000005_add_docker_socket_mounted_to_deployments;
 
 pub struct Migrator;
 
@@ -645,6 +646,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260921_000003_detection_retry::Migration),
             Box::new(m20260921_000004_credential_catalog::Migration),
             Box::new(m20260921_000001_add_worker_public_ingress::Migration),
+            Box::new(m20260921_000005_add_docker_socket_mounted_to_deployments::Migration),
             Box::new(m20260922_000001_stateless_control_plane_jobs::Migration),
         ]
     }

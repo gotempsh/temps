@@ -36,6 +36,7 @@ import { CronJobsSettings } from './CronJobsSettings'
 import { WebhooksSettings } from './WebhooksSettings'
 import { SkillsSettings } from './SkillsSettings'
 import { McpServersSettings } from './McpServersSettings'
+import { HostDockerAccessAlert } from '@/components/project/HostDockerAccessAlert'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { AutopilotPage } from '@/components/agents/AutopilotPage'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
@@ -66,6 +67,11 @@ export function CombinedProjectSettings({
 }) {
   usePageTitle(`${titles[page]} · ${project.name}`)
   let sections: { title: string; icon: LucideIcon; content: ReactNode }[]
+  // How this project's containers are created belongs next to the rest of the
+  // build and deploy settings. Renders itself away unless the operator can act
+  // on it — see `HostDockerAccessAlert`.
+  const banner =
+    page === 'delivery' ? <HostDockerAccessAlert project={project} /> : null
   switch (page) {
     case 'general':
       sections = [
@@ -205,6 +211,7 @@ export function CombinedProjectSettings({
   return (
     <div className="min-w-0 space-y-4">
       <h1 className="text-xl font-semibold tracking-tight">{titles[page]}</h1>
+      {banner}
       {sections.map((section) => (
         <SettingsSection
           key={`${page}-${section.title}`}

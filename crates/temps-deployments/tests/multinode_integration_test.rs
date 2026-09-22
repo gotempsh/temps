@@ -118,6 +118,7 @@ fn make_deployment(id: i32, project_id: i32, environment_id: i32) -> deployments
         deployment_config: None,
         promoted_from_deployment_id: None,
         upload_request_id: None,
+        docker_socket_mounted: false,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -424,6 +425,7 @@ async fn test_heartbeat_reactivates_offline_node() {
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
                 public_ingress: None,
             },
         )
@@ -451,6 +453,7 @@ async fn test_heartbeat_preserves_draining_status() {
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
                 public_ingress: None,
             },
         )
@@ -534,6 +537,7 @@ async fn test_heartbeat_records_reported_architecture() {
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
                 public_ingress: None,
             },
         )
@@ -568,6 +572,7 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
+                docker_socket_projects: None,
                 public_ingress: None,
             },
         )

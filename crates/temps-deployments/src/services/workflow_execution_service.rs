@@ -631,6 +631,13 @@ pub struct WorkflowExecutionService {
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// Currently the ADR-045 "this deployment received the host Docker socket"
+    /// record. Late-bound like `telemetry` so the deploy path never depends on
+    /// auditing being wired, and a missing sink degrades to a log line rather
+    /// than failing a deployment.
+    audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
 }
 
 impl WorkflowExecutionService {
@@ -669,7 +676,13 @@ impl WorkflowExecutionService {
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            audit_logger: OnceCell::new(),
         }
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045).
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
@@ -1620,28 +1633,40 @@ impl WorkflowExecutionService {
                     memory_request: memory_request_mb.map(|mb| format!("{}Mi", mb)),
                 };
 
-                let mut builder = DeployImageJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .build_job_id(build_job_id)
-                    .target(DeploymentTarget::Docker {
-                        registry_url: "local".to_string(),
-                        network: Some(temps_core::NETWORK_NAME.to_string()),
-                    })
-                    .service_name(deployment.slug.clone())
-                    .namespace("default".to_string())
-                    .port(port as u32)
-                    .configured_port(configured_port)
-                    .replicas(replicas)
-                    .environment_variables(env_variables)
-                    .remote_environment_variables(remote_env_variables)
-                    .cross_node_service_blockers(
-                        crate::services::workflow_planner::read_cross_node_blockers(config),
-                    )
-                    .secrets(secrets)
-                    .resources(resources)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .failed_container_retention(self.db.clone(), deployment.id);
+                // ADR 045: the executing host compares this against its own
+                // grant. A constructor argument, so no deploy path can omit it.
+                //
+                // The authority comes from the plan, not from an `AuthContext`
+                // — there is no request here, this runs from the queue. The
+                // planner recorded whether the principal that asked for the
+                // deployment was allowed to deploy a host-root project, and
+                // `planned_deploy_caller` fails closed when it did not say.
+                let mut builder = DeployImageJobBuilder::new(
+                    project.slug.clone(),
+                    crate::services::workflow_planner::planned_deploy_caller(config),
+                )
+                .job_id(db_job.job_id.clone())
+                .build_job_id(build_job_id)
+                .target(DeploymentTarget::Docker {
+                    registry_url: "local".to_string(),
+                    network: Some(temps_core::NETWORK_NAME.to_string()),
+                })
+                .service_name(deployment.slug.clone())
+                .namespace("default".to_string())
+                .audit_logger(self.audit_logger.get().cloned())
+                .port(port as u32)
+                .configured_port(configured_port)
+                .replicas(replicas)
+                .environment_variables(env_variables)
+                .remote_environment_variables(remote_env_variables)
+                .cross_node_service_blockers(
+                    crate::services::workflow_planner::read_cross_node_blockers(config),
+                )
+                .secrets(secrets)
+                .resources(resources)
+                .log_id(db_job.log_id.clone())
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), deployment.id);
 
                 if let Some(command) = deployment
                     .metadata
@@ -4159,6 +4184,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         }
 
@@ -5289,6 +5315,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

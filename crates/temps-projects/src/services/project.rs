@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use temps_core::docker_socket_grant::DockerSocketCapability;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{error, info, warn};
 
@@ -24,11 +25,12 @@ use serde::Serialize;
 
 use super::types::{
     CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
-    ProjectSettingsUpdate, ProjectStatistics, UpdateDeploymentSettingsRequest,
-    UpdateProjectSettingsParams,
+    ProjectSettingsUpdate, ProjectStatistics, ReservedSlugChange, SlugClaimAuthority,
+    SlugClaimCaller, UpdateDeploymentSettingsRequest, UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
+use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
 
 /// A project row plus the provider type of the Git connection it is linked to.
@@ -601,6 +603,14 @@ pub struct ProjectService {
     env_var_service: Arc<EnvVarService>,
     environment_service: Arc<temps_environments::EnvironmentService>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// This control plane's own host Docker socket grant (ADR 045).
+    ///
+    /// Snapshotted from the process-wide grant at construction rather than
+    /// read per call: the whole point of the `OnceLock` is that a later
+    /// `set_var` cannot change who is root-equivalent, and a field also lets
+    /// tests exercise the claim rule against an explicit grant without
+    /// mutating process-global environment state.
+    docker_socket_grant: temps_core::docker_socket_grant::DockerSocketGrant,
 }
 
 fn initial_deployment_config(
@@ -822,14 +832,44 @@ impl ProjectService {
             env_var_service,
             environment_service,
             encryption_service,
+            docker_socket_grant: temps_core::docker_socket_grant::process_grant().clone(),
         }
+    }
+
+    /// Override the host Docker socket grant this service answers from.
+    ///
+    /// Exists for tests: production always uses the process-wide grant read
+    /// from the environment at startup, which is deliberately un-settable at
+    /// runtime.
+    #[cfg(test)]
+    fn with_docker_socket_grant(
+        mut self,
+        grant: temps_core::docker_socket_grant::DockerSocketGrant,
+    ) -> Self {
+        self.docker_socket_grant = grant;
+        self
     }
 
     pub async fn create_project(
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
-        self.create_project_with_identity(request, None).await
+        self.create_project_as(request, &SlugClaimCaller::project_writer())
+            .await
+    }
+
+    /// Create a project on behalf of a caller whose authority is known.
+    ///
+    /// Only matters for one thing (ADR 045): whether the caller may claim a
+    /// slug this host grants host Docker access to. Every other path keeps
+    /// [`Self::create_project`], which is fail-closed.
+    pub async fn create_project_as(
+        &self,
+        request: CreateProjectRequest,
+        caller: &SlugClaimCaller<'_>,
+    ) -> Result<Project, ProjectError> {
+        self.create_project_with_identity(request, None, caller)
+            .await
     }
 
     /// Create a template-backed service project from an immutable resolved
@@ -839,6 +879,22 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
         service_template: temps_core::templates::ServiceTemplateInstance,
+    ) -> Result<Project, ProjectError> {
+        self.create_service_project_as(
+            request,
+            service_template,
+            &SlugClaimCaller::project_writer(),
+        )
+        .await
+    }
+
+    /// [`Self::create_service_project`] with the caller's slug-claim authority
+    /// (ADR 045).
+    pub async fn create_service_project_as(
+        &self,
+        request: CreateProjectRequest,
+        service_template: temps_core::templates::ServiceTemplateInstance,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         if service_template.template.kind != temps_core::templates::TemplateKind::Service {
             return Err(ProjectError::InvalidInput(format!(
@@ -858,7 +914,7 @@ impl ProjectService {
                 service_template.slug
             )));
         }
-        self.create_project_with_identity(request, Some(service_template))
+        self.create_project_with_identity(request, Some(service_template), caller)
             .await
     }
 
@@ -866,6 +922,7 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
         service_template: Option<temps_core::templates::ServiceTemplateInstance>,
+        caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         if request.template_slug.as_deref().is_some_and(|slug| {
             slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
@@ -925,6 +982,13 @@ impl ProjectService {
         } else {
             self.generate_unique_project_slug(&validated_name).await?
         };
+        // ADR 045: claiming a slug this host grants the Docker socket to is
+        // claiming host root on every machine that grants it, so it is an
+        // admin-only act. Checked here rather than in the handler because the
+        // slug can also be *derived* from the display name a line above —
+        // a caller never has to name it to claim it.
+        self.guard_reserved_slug(&project_slug, caller, None, ReservedSlugChange::Claim)
+            .await?;
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -1470,6 +1534,344 @@ impl ProjectService {
             .collect())
     }
 
+    /// Refuse a move of a slug this host grants host Docker access to
+    /// (ADR 045), unless the caller is an instance admin.
+    ///
+    /// Both directions are guarded, and for different reasons.
+    /// [`ReservedSlugChange::Claim`] hands a project host root on every host
+    /// that grants the slug. [`ReservedSlugChange::Release`] takes it away
+    /// from a project that has it — silently breaking an operator-owned
+    /// infrastructure service — and frees the slug for the next project
+    /// created, which would inherit the access. Guarding only the claim would
+    /// leave "rename it away, then create your own" open to any project
+    /// writer.
+    ///
+    /// `project_id` is `Some` for a rename and `None` for a create; it only
+    /// enriches the rejection log.
+    ///
+    /// Answers from this process's own grant, exactly like the deployer's bind
+    /// decision and the capability response, so the three can never disagree.
+    /// Two questions, in this order: *may* this caller move the slug, and is
+    /// their session *recent enough* to. The order is the security property —
+    /// a project writer gets the 403 that names ADR 045, never an MFA prompt
+    /// for an operation they still would not be allowed to perform.
+    ///
+    /// The step-up lives here rather than in the three handlers so it cannot
+    /// be forgotten by the fourth: every path that can move a slug already
+    /// funnels through this one guard.
+    ///
+    /// This guarantees the *result* is correct -- no project is ever
+    /// created or renamed onto a granted slug without authority and step-up
+    /// -- but says nothing about side effects a caller performs *before*
+    /// reaching it. A template deploy in fork mode was found doing exactly
+    /// that: creating and pushing to an upstream repository before this
+    /// guard ever ran, so a 428 here left a real external repository with
+    /// no Temps project. [`Self::preflight_guard_reserved_slug`] exists for
+    /// callers with an irreversible step between planning a slug and
+    /// creating the project -- check it first, then still go through this
+    /// guard at creation, since a slug can change between the two calls
+    /// (another create/rename racing on the same name) and only this one is
+    /// authoritative.
+    async fn guard_reserved_slug(
+        &self,
+        slug: &str,
+        caller: &SlugClaimCaller<'_>,
+        project_id: Option<i32>,
+        change: ReservedSlugChange,
+    ) -> Result<(), ProjectError> {
+        Self::guard_reserved_slug_against(
+            &self.docker_socket_grant,
+            slug,
+            caller.authority,
+            project_id,
+            change,
+        )?;
+        self.require_slug_claim_step_up(slug, caller, project_id, change)
+            .await
+    }
+
+    /// Check authority and step-up for creating a project with `slug`,
+    /// before a caller does anything irreversible on the strength of "this
+    /// creation will probably succeed".
+    ///
+    /// A template deploy in fork mode creates and pushes to a real upstream
+    /// repository before it ever calls [`Self::create_project_as`], using a
+    /// slug it already planned with [`Self::plan_project_slug`]. Without
+    /// this check, a refusal at creation time (403, or a 428 step-up
+    /// challenge) arrives *after* that external side effect, leaving a real
+    /// repository with no Temps project — and, for the 428 case, a retry
+    /// that resends the same repository name fails with "already exists"
+    /// instead of completing.
+    ///
+    /// This does not replace the check inside [`Self::create_project_as`]:
+    /// the planned slug can change between this call and creation (a
+    /// concurrent create or rename claiming the same name), so only the
+    /// creation-time guard is authoritative. This is purely fail-fast for
+    /// the common case, at the cost of one extra check.
+    pub async fn preflight_guard_reserved_slug(
+        &self,
+        slug: &str,
+        caller: &SlugClaimCaller<'_>,
+    ) -> Result<(), ProjectError> {
+        self.guard_reserved_slug(slug, caller, None, ReservedSlugChange::Claim)
+            .await
+    }
+
+    /// The step-up half of [`Self::guard_reserved_slug`], reached only once
+    /// the authority check has already said yes.
+    ///
+    /// Returns `Ok(())` immediately for a slug this host does not reserve, so
+    /// an ordinary project create or rename never sees an MFA prompt.
+    async fn require_slug_claim_step_up(
+        &self,
+        slug: &str,
+        caller: &SlugClaimCaller<'_>,
+        project_id: Option<i32>,
+        change: ReservedSlugChange,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::slug_is_reserved(&self.docker_socket_grant, slug) {
+            return Ok(());
+        }
+        let Some(step_up) = caller.step_up.as_ref() else {
+            // Admin authority with nothing to challenge. No production path
+            // constructs that — `SlugClaimCaller::from_request` always carries
+            // the authorizer, and `project_writer()` can never reach this line
+            // because the authority check above refuses it first. Reaching it
+            // means a future caller asserted an authority out of band, so
+            // refuse rather than silently skip the challenge.
+            warn!(
+                slug = %slug,
+                project_id = ?project_id,
+                change = ?change,
+                "Refused a reserved-slug change from a caller claiming admin authority with no \
+                 session to challenge (ADR 045)"
+            );
+            return Err(ProjectError::DockerSocketSlugReserved {
+                slug: slug.to_string(),
+                change,
+            });
+        };
+        // `project_id` is `None` on create, where there is no row yet to name.
+        // `0` is the "not yet persisted" sentinel in the action identity; it
+        // only ever appears in the challenge's `action` payload and the
+        // step-up audit trail, never as a lookup key.
+        let project_id = project_id.unwrap_or(0);
+        let action = match change {
+            ReservedSlugChange::Claim => {
+                temps_core::SensitiveAction::ClaimDockerSocketSlug { project_id }
+            }
+            ReservedSlugChange::Release => {
+                temps_core::SensitiveAction::ReleaseDockerSocketSlug { project_id }
+            }
+        };
+        temps_auth::require_sensitive_action(step_up.authorizer, step_up.auth, action)
+            .await
+            .map_err(|problem| ProjectError::SlugClaimStepUpRequired {
+                problem: Box::new(problem),
+            })
+    }
+
+    /// [`Self::guard_reserved_slug`] with the grant injected.
+    ///
+    /// Pure, mirroring `temps_deployer::docker::docker_socket_bind_for`: the
+    /// process grant is a `OnceLock` frozen at first use, so the rule would
+    /// otherwise be untestable without mutating process-global environment
+    /// state from parallel tests.
+    fn guard_reserved_slug_against(
+        grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+        slug: &str,
+        authority: SlugClaimAuthority,
+        project_id: Option<i32>,
+        change: ReservedSlugChange,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::slug_is_reserved(grant, slug)
+            || authority.may_claim_reserved_slug()
+        {
+            return Ok(());
+        }
+        // No audit event covers "a write that never happened", and this one
+        // matters: it is an attempt to move host root between projects. Logged
+        // with everything the service knows, so an operator reviewing host
+        // logs can see who tried and on which project.
+        warn!(
+            slug = %slug,
+            project_id = ?project_id,
+            change = ?change,
+            env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            "{}",
+            match change {
+                ReservedSlugChange::Claim =>
+                    "Refused a non-admin claim on a slug this host grants host Docker access to \
+                     (ADR 045)",
+                ReservedSlugChange::Release =>
+                    "Refused a non-admin rename away from a slug this host grants host Docker \
+                     access to (ADR 045)",
+            }
+        );
+        Err(ProjectError::DockerSocketSlugReserved {
+            slug: slug.to_string(),
+            change,
+        })
+    }
+
+    /// Refuse a deployment of a project this control plane declares as
+    /// requiring the host Docker socket (ADR 045), unless the caller is an
+    /// instance admin (or Temps itself).
+    ///
+    /// The slug guard decides who may *point a project at* host root; this one
+    /// decides who may *run code as* host root, and they are different
+    /// principals: a granted project created by an admin carries no
+    /// restrictive access grants, so without this any holder of
+    /// `ProjectsWrite`/`DeploymentsCreate` on it could deploy their own image
+    /// and command into a container that receives `/var/run/docker.sock`.
+    fn guard_granted_project_deploy(
+        &self,
+        project_slug: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        Self::guard_granted_project_deploy_against(&self.docker_socket_grant, project_slug, caller)
+    }
+
+    /// [`Self::guard_granted_project_deploy`] with the grant injected, so the
+    /// rule is testable without the process-wide `OnceLock`.
+    fn guard_granted_project_deploy_against(
+        grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+        project_slug: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            grant,
+            project_slug,
+            caller,
+        ) {
+            return Ok(());
+        }
+        warn!(
+            slug = %project_slug,
+            env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            "Refused a non-admin deployment of a project that holds host Docker access (ADR 045)"
+        );
+        Err(ProjectError::DockerSocketDeployRequiresAdmin {
+            slug: project_slug.to_string(),
+        })
+    }
+
+    /// Refuse a write that decides what a project holding host Docker access
+    /// (ADR 045) *runs*, unless the caller is an instance admin.
+    ///
+    /// The third of the three ADR-045 guards, and the one that closes the
+    /// two-step version of the attack the other two refuse in one step.
+    /// `guard_reserved_slug` decides who may point a project at host root;
+    /// `guard_granted_project_deploy` decides who may run code as host root
+    /// right now. Neither covers a project writer who *plants* the input and
+    /// lets somebody else's deployment execute it: the persisted runtime
+    /// command becomes the default for every deploy that does not override it
+    /// (including an admin's), and the source-repository fields decide what a
+    /// git push builds and runs — and a git push carries no authenticated
+    /// principal to gate at deploy time at all.
+    ///
+    /// `field` is the caller-facing name of what they tried to change; it
+    /// reaches the API message, so it must read as a noun phrase.
+    fn guard_granted_project_write(
+        &self,
+        project_slug: &str,
+        field: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        Self::guard_granted_project_write_against(
+            &self.docker_socket_grant,
+            project_slug,
+            field,
+            caller,
+        )
+    }
+
+    /// [`Self::guard_granted_project_write`] with the grant injected, so the
+    /// rule is testable without the process-wide `OnceLock`.
+    fn guard_granted_project_write_against(
+        grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+        project_slug: &str,
+        field: &str,
+        caller: DeployCaller,
+    ) -> Result<(), ProjectError> {
+        if !temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            grant,
+            project_slug,
+            caller,
+        ) {
+            return Ok(());
+        }
+        warn!(
+            slug = %project_slug,
+            field = %field,
+            env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+            "Refused a non-admin write to a setting that decides what a project holding host \
+             Docker access runs (ADR 045)"
+        );
+        Err(ProjectError::DockerSocketWriteRequiresAdmin {
+            slug: project_slug.to_string(),
+            field: field.to_string(),
+        })
+    }
+
+    /// Where this project is granted host Docker access (ADR 045).
+    ///
+    /// Answers from two sources, both authoritative for the host they describe:
+    /// this control plane's own process-wide grant, and each worker node's
+    /// advertised grant from its last heartbeat. Nodes of any status are
+    /// counted — an offline node still *grants* the project, and reporting
+    /// otherwise would send the operator to change a variable that is already
+    /// correct. Whether a granted project can be placed *right now* is the
+    /// scheduler's answer, not this one.
+    ///
+    /// Only ever computed for a single project's detail view, never per row of
+    /// a list: it is one extra query, and the list endpoints must stay cheap.
+    ///
+    /// The match is done by Postgres, not by Rust: this runs on every
+    /// project-detail request, and loading every `nodes` row (each carrying a
+    /// full heartbeat `capacity` blob and a labels blob) to then discard
+    /// almost all of them costs memory proportional to the fleet for an answer
+    /// that is usually one name or none. JSONB containment on the array the
+    /// agent advertises does the same test in the index-able place, and only
+    /// the node *name* is selected, since that is all the capability carries.
+    pub async fn docker_socket_capability(
+        &self,
+        slug: &str,
+    ) -> Result<DockerSocketCapability, ProjectError> {
+        // `capacity->'docker_socket_projects' @> '["<slug>"]'` is true only for
+        // an exact element match, which is the same exact-match rule the
+        // deployer's bind and the reservation guard use — a near miss must
+        // fail closed rather than widen the grant. The slug is bound as a
+        // parameter (never interpolated), and a node whose capacity has no
+        // such key, or a non-array there, simply does not match — the tolerant
+        // behaviour `capacity_grants` already has for an older agent.
+        let granting_node_names: Vec<String> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Name)
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!(
+                    "\"capacity\" -> '{}' @> $1::jsonb",
+                    temps_core::docker_socket_grant::NODE_CAPACITY_KEY
+                ),
+                [sea_orm::Value::from(
+                    serde_json::Value::from(vec![slug.to_string()]).to_string(),
+                )],
+            ))
+            .order_by_asc(temps_entities::nodes::Column::Name)
+            .into_tuple::<String>()
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(DockerSocketCapability::evaluate(
+            slug,
+            // The control plane's declaration is the gate: a node advertising
+            // a slug this process never declared is a misconfigured (or
+            // hostile) node, not a grant.
+            self.docker_socket_grant.declares(slug),
+            granting_node_names,
+        ))
+    }
+
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Project, ProjectError> {
         let project_found_db = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::Slug.eq(slug))
@@ -1531,6 +1933,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         request: CreateProjectRequest,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Find the existing project
         let project = projects::Entity::find_by_id(project_id)
@@ -1546,6 +1949,18 @@ impl ProjectService {
                     .to_string(),
             ));
         }
+
+        // ADR 045: this method unconditionally rewrites repo_owner, repo_name,
+        // directory, main_branch and preset/preset_config below -- the same
+        // source-definition fields `update_project_settings_as` gates -- but
+        // took no caller at all until this was found to bypass that guard
+        // entirely through a sibling handler. The guard is therefore
+        // unconditional here too, since every call rewrites every field.
+        self.guard_granted_project_write(
+            &project.slug,
+            "the source repository, branch, directory or build preset",
+            caller,
+        )?;
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
@@ -1600,6 +2015,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         source_type: temps_entities::source_type::SourceType,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         use temps_entities::source_type::SourceType;
         let project = projects::Entity::find_by_id(project_id)
@@ -1614,6 +2030,14 @@ impl ProjectService {
                 "A service project's source type is fixed by its applied template".to_string(),
             ));
         }
+        // ADR 045, defense in depth: `source_type` decides which deploy
+        // pipeline runs, and every image/static/drop deploy path already
+        // gates on `guard_deploy` and `DeployImageJobBuilder::build`
+        // independently of this flag -- so this is not currently a way
+        // around those gates. Gated anyway, unconditionally, since this
+        // method has exactly one caller-facing effect and the alternative is
+        // trusting that stays true as the deploy pipelines evolve.
+        self.guard_granted_project_write(&project.slug, "the source type", caller)?;
 
         // Switching to Git is a direct flip only when a repository is already
         // configured (repo owner + name). A project can carry git info without
@@ -1668,12 +2092,24 @@ impl ProjectService {
         &self,
         project_id: i32,
         allow: bool,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+
+        // ADR 045, defense in depth: accepting an alternate source (a
+        // dropped archive) is not by itself a deploy -- `SourceDropService`
+        // plans with the fail-closed `DeployCaller::default()` regardless of
+        // this flag -- but it does widen what can trigger one, so it is
+        // gated the same way as `set_source_type`.
+        self.guard_granted_project_write(
+            &project.slug,
+            "whether alternate sources are accepted",
+            caller,
+        )?;
 
         let mut active_project: projects::ActiveModel = project.into();
         active_project.allow_alternate_sources = Set(Some(allow));
@@ -1770,6 +2206,21 @@ impl ProjectService {
         project_id: i32,
         params: UpdateProjectSettingsParams,
     ) -> Result<ProjectSettingsUpdate, ProjectError> {
+        self.update_project_settings_as(project_id, params, &SlugClaimCaller::project_writer())
+            .await
+    }
+
+    /// [`Self::update_project_settings`] for a caller whose authority is known.
+    ///
+    /// Only the *claim* is gated (ADR 045): a project whose slug already
+    /// matches the host grant keeps working through every update that does not
+    /// change it, whoever sends them.
+    pub async fn update_project_settings_as(
+        &self,
+        project_id: i32,
+        params: UpdateProjectSettingsParams,
+        caller: &SlugClaimCaller<'_>,
+    ) -> Result<ProjectSettingsUpdate, ProjectError> {
         let UpdateProjectSettingsParams {
             name: new_name,
             slug: new_slug,
@@ -1852,6 +2303,43 @@ impl ProjectService {
                     .to_string(),
             ));
         }
+        // ADR 045, before any of this request's several independent writes
+        // commit: on a project this control plane declares, the source
+        // definition *is* what runs as host root. Repointing the repository,
+        // branch, subdirectory or build preset and then pushing produces a
+        // deployment from a git webhook — which carries no authenticated
+        // principal, so there is nothing for the deploy guard to check and no
+        // HTTP deploy request is ever made. Gating the source here is what
+        // closes that two-step path, at the same choke point the slug claim
+        // and release are already gated. `git_provider_connection_id` belongs
+        // in this list too: `DownloadRepoJob` resolves the clone host from the
+        // connection, not from a stored URL, so repointing the connection
+        // alone -- without touching owner/name/branch -- is the same
+        // escalation through a field this list previously missed.
+        // `enable_preview_environments` belongs here for the same reason:
+        // once on, any push to a branch no environment already tracks gets a
+        // preview environment auto-created and deployed
+        // (`find_environments_for_branch`) as `DeployCaller::Platform`, which
+        // neither the deploy gate nor the exec gate refuses -- so flipping
+        // this one boolean turns "push a branch" into the same host-root
+        // execution path a repository repoint gives, without needing the
+        // project's primary source touched at all.
+        if git_provider_connection_id.is_some()
+            || main_branch.is_some()
+            || repo_owner.is_some()
+            || repo_name.is_some()
+            || directory.is_some()
+            || preset.is_some()
+            || preset_config.is_some()
+            || enable_preview_environments.is_some()
+        {
+            self.guard_granted_project_write(
+                &project.slug,
+                "the source repository, connection, branch, directory, build preset or preview \
+                 environments",
+                DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
+            )?;
+        }
         let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
 
         // Update the slug if provided
@@ -1861,6 +2349,30 @@ impl ProjectService {
                 return Err(ProjectError::InvalidInput(
                     "Project slug must contain 1-63 lowercase DNS-safe characters".to_string(),
                 ));
+            }
+            // ADR 045: a slug change that touches a granted slug in either
+            // direction is admin-only. Renaming *onto* one is a claim on host
+            // root; renaming *away* from one revokes an infrastructure
+            // service's access and frees the slug for the next project — so
+            // guarding only the claim would leave "rename it away, then create
+            // your own" open. Re-sending the current slug unchanged is neither,
+            // and an ungranted slug is untouched by both: an existing project
+            // must keep working through ordinary settings saves.
+            if slug_value != project.slug {
+                self.guard_reserved_slug(
+                    &slug_value,
+                    caller,
+                    Some(project_id),
+                    ReservedSlugChange::Claim,
+                )
+                .await?;
+                self.guard_reserved_slug(
+                    &project.slug,
+                    caller,
+                    Some(project_id),
+                    ReservedSlugChange::Release,
+                )
+                .await?;
             }
             let txn = self.db.begin().await?;
             txn.execute(Statement::from_sql_and_values(
@@ -2345,6 +2857,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         automatic_deploy: bool,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Get the current project
         let project = projects::Entity::find_by_id(project_id)
@@ -2354,6 +2867,15 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        // ADR 045: arming automatic_deploy is what turns a plain git push
+        // into a deployment (`DeployCaller::Platform`, which the deploy gate
+        // does not refuse) -- the same mechanism the preview-environment and
+        // environment-settings guards close for their own trigger fields.
+        self.guard_granted_project_write(
+            &project.slug,
+            "whether pushes deploy automatically",
+            caller,
+        )?;
         // Update automatic_deploy setting in deployment_config
         let mut active_project: projects::ActiveModel = project.clone().into();
 
@@ -2380,6 +2902,7 @@ impl ProjectService {
         preset_config: Option<serde_json::Value>,
         git_url: Option<String>,
         is_public_repo: Option<bool>,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Get the current project (includes the old gitlab_webhook_id / signing_token)
         let project = projects::Entity::find_by_id(project_id)
@@ -2389,6 +2912,12 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        // ADR 045: the other half of the source-definition gate (see
+        // `update_project_settings_as`). This endpoint owns `git_url` — the
+        // URL the deployment actually clones — and always rewrites the owner,
+        // name, branch and directory, so on a declared project every call
+        // decides what the next git push builds and runs as host root.
+        self.guard_granted_project_write(&project.slug, "the source repository", caller)?;
         if project.project_type == ProjectType::Service {
             return Err(ProjectError::InvalidInput(
                 "A service project cannot be converted to a Git source; update its applied template or runtime instead"
@@ -3762,6 +4291,7 @@ impl ProjectService {
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -3770,6 +4300,19 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+
+        // ADR 045: `automatic_deploy` arms the same push-deploy trigger
+        // `ProjectService::update_automatic_deploy` guards, and `exposed_port`
+        // republishes a *different* port of a host-root-equivalent container
+        // on the node's private address -- both change the attack surface of
+        // a granted project without going through a deploy at all.
+        if config.exposed_port.is_some() || config.automatic_deploy.is_some() {
+            self.guard_granted_project_write(
+                &project.slug,
+                "the exposed port or whether pushes deploy automatically",
+                caller,
+            )?;
+        }
 
         // Get existing deployment config or create default
         let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
@@ -3874,11 +4417,19 @@ impl ProjectService {
     /// Both JSON columns live on `projects`, so one row update is enough. A
     /// rejected image, command, health path, resource profile, or tenant
     /// ceiling leaves every previous value intact.
+    ///
+    /// `caller` is required (ADR 045): this is where a project's *persisted*
+    /// runtime image and command are written, and on a project this control
+    /// plane declares, that command is what the next deployment runs as host
+    /// root — including a deployment started by an admin, who would be
+    /// executing a payload they did not write. Ordinary `ProjectsWrite` is
+    /// therefore not sufficient here for a declared project.
     pub async fn update_service_template_runtime(
         &self,
         project_id: i32,
         runtime: UpdateServiceTemplateRuntimeRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
         let project = projects::Entity::find_by_id(project_id)
@@ -3889,6 +4440,7 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+        self.guard_granted_project_write(&project.slug, "the runtime image and command", caller)?;
 
         if project.source_type != temps_entities::source_type::SourceType::DockerImage
             || project.project_type != ProjectType::Service
@@ -3975,6 +4527,7 @@ impl ProjectService {
         target: temps_core::templates::ServiceTemplateInstance,
         new_environment_variables: Vec<CreateProjectEnvVar>,
         ceiling_enforcement: temps_core::CeilingEnforcement,
+        caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
         let project = projects::Entity::find_by_id(project_id)
@@ -3985,6 +4538,18 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
             })?;
+        // ADR 045: the sibling of `update_service_template_runtime`, and the
+        // other way the persisted image and command of a service project
+        // change. The target comes from the operator-installed catalog rather
+        // than from the request body, so this is the weaker of the two — but
+        // it still decides what a declared project runs as host root, and
+        // leaving it open would make "downgrade to a release with a different
+        // entrypoint" the way around the guard next to it.
+        self.guard_granted_project_write(
+            &project.slug,
+            "the applied service template release",
+            caller,
+        )?;
 
         if project.project_type != ProjectType::Service {
             return Err(ProjectError::InvalidInput(
@@ -4822,12 +5387,39 @@ impl ProjectService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(i32, i32, Option<String>, Option<String>, Option<String>), ProjectError> {
+        self.trigger_pipeline_as(
+            project_id,
+            environment_id,
+            branch,
+            tag,
+            commit,
+            DeployCaller::default(),
+        )
+        .await
+    }
+
+    /// [`Self::trigger_pipeline`] for a caller whose authority is known.
+    ///
+    /// ADR 045: deploying a project that holds host Docker access runs the
+    /// deployed image and command as host root, so it is admin-only — deploy
+    /// permission on the project is not sufficient. Every other project is
+    /// unaffected.
+    pub async fn trigger_pipeline_as(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+        caller: DeployCaller,
+    ) -> Result<(i32, i32, Option<String>, Option<String>, Option<String>), ProjectError> {
         // Get the project to validate it exists and get repository information
         let project = temps_entities::projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?
             .ok_or_else(|| ProjectError::NotFound("Project not found".to_string()))?;
+        self.guard_granted_project_deploy(&project.slug, caller)?;
 
         // Validate environment belongs to this project and is not soft-deleted
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
@@ -5763,7 +6355,11 @@ mod tests {
         assert_eq!(project.allow_alternate_sources, None, "defaults to off");
 
         let opted_in = service
-            .set_allow_alternate_sources(project.id, true)
+            .set_allow_alternate_sources(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
 
@@ -5779,7 +6375,11 @@ mod tests {
 
         // And it must be reversible, without disturbing git config either.
         let opted_out = service
-            .set_allow_alternate_sources(project.id, false)
+            .set_allow_alternate_sources(
+                project.id,
+                false,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(opted_out.allow_alternate_sources, Some(false));
@@ -5910,7 +6510,11 @@ mod tests {
         // mutation response would otherwise downgrade a connected project to
         // "no provider" until its next read.
         let after_write = service
-            .set_allow_alternate_sources(connected.id, true)
+            .set_allow_alternate_sources(
+                connected.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5920,7 +6524,11 @@ mod tests {
         );
 
         let after_write_unconnected = service
-            .set_allow_alternate_sources(standalone.id, true)
+            .set_allow_alternate_sources(
+                standalone.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
         assert_eq!(after_write_unconnected.git_provider_type, None);
@@ -5981,7 +6589,11 @@ mod tests {
         };
 
         let result = project_service
-            .update_project(inserted_project.id, update_request)
+            .update_project(
+                inserted_project.id,
+                update_request,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await;
 
         assert!(result.is_ok(), "update_project should succeed");
@@ -6466,7 +7078,11 @@ mod tests {
         };
 
         project_service
-            .update_project(project_id, update_request)
+            .update_project(
+                project_id,
+                update_request,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .unwrap();
 
@@ -6628,6 +7244,7 @@ mod tests {
                     exposed_port: None,
                 },
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await
             .unwrap();
@@ -6665,6 +7282,7 @@ mod tests {
                     exposed_port: Some(9090),
                 },
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await;
         assert!(matches!(invalid, Err(ProjectError::InvalidInput(_))));
@@ -6885,6 +7503,7 @@ mod tests {
                 target.clone(),
                 Vec::new(),
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await;
         assert!(matches!(missing_value, Err(ProjectError::InvalidInput(_))));
@@ -6899,6 +7518,7 @@ mod tests {
                     is_secret: false,
                 }],
                 temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
             )
             .await
             .expect("same-family template upgrade");
@@ -6955,6 +7575,1514 @@ mod tests {
             .map(str::to_string)
             .collect()
         );
+    }
+
+    // ── ADR 045: claiming a slug the host grants the Docker socket to ────
+    //
+    // The rule itself, against an explicit grant. `ProjectService` answers
+    // from a snapshot of the process grant, which is a `OnceLock` frozen at
+    // first use and therefore not settable from a parallel test — the same
+    // reason `docker_socket_bind_for` is a free function in the deployer.
+    mod reserved_slug {
+        use super::*;
+        use temps_core::docker_socket_grant::DockerSocketGrant;
+
+        fn guard(
+            granted: &str,
+            slug: &str,
+            authority: SlugClaimAuthority,
+        ) -> Result<(), ProjectError> {
+            guard_change(granted, slug, authority, ReservedSlugChange::Claim)
+        }
+
+        fn guard_change(
+            granted: &str,
+            slug: &str,
+            authority: SlugClaimAuthority,
+            change: ReservedSlugChange,
+        ) -> Result<(), ProjectError> {
+            ProjectService::guard_reserved_slug_against(
+                &DockerSocketGrant::parse(Some(granted)),
+                slug,
+                authority,
+                None,
+                change,
+            )
+        }
+
+        #[test]
+        fn a_project_writer_cannot_claim_a_granted_slug() {
+            let error = guard(
+                "node-daemon",
+                "node-daemon",
+                SlugClaimAuthority::ProjectWriter,
+            )
+            .expect_err("a non-admin claim on host root must be refused");
+            match error {
+                ProjectError::DockerSocketSlugReserved {
+                    ref slug,
+                    change: ReservedSlugChange::Claim,
+                } => {
+                    assert_eq!(slug, "node-daemon");
+                    // The operator reading the 403 has nobody to ask: it must
+                    // name the ADR, the variable and who may do it.
+                    let rendered = error.to_string();
+                    assert!(rendered.contains("ADR 045"), "{rendered}");
+                    assert!(
+                        rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS"),
+                        "{rendered}"
+                    );
+                }
+                other => panic!("expected DockerSocketSlugReserved, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_instance_admin_may_claim_a_granted_slug() {
+            // Whoever can set the variable on the host is the same person who
+            // is allowed to point a project at it.
+            guard(
+                "node-daemon",
+                "node-daemon",
+                SlugClaimAuthority::InstanceAdmin,
+            )
+            .expect("an admin may claim a granted slug");
+        }
+
+        #[test]
+        fn an_unrelated_slug_is_unaffected_for_anyone() {
+            guard("node-daemon", "my-app", SlugClaimAuthority::ProjectWriter)
+                .expect("ordinary project creation is untouched");
+            // Exact match, same as the bind: a near miss is not reserved
+            // *and* would not be granted, so the two cannot disagree.
+            guard(
+                "node-daemon",
+                "node-daemon-2",
+                SlugClaimAuthority::ProjectWriter,
+            )
+            .expect("a near miss is not the granted slug");
+        }
+
+        #[test]
+        fn nothing_is_reserved_when_this_host_grants_nothing() {
+            // The state of every install that never set the variable.
+            ProjectService::guard_reserved_slug_against(
+                &DockerSocketGrant::default(),
+                "node-daemon",
+                SlugClaimAuthority::ProjectWriter,
+                None,
+                ReservedSlugChange::Claim,
+            )
+            .expect("an empty grant reserves nothing");
+        }
+
+        #[test]
+        fn giving_up_a_granted_slug_is_admin_only_too() {
+            // The symmetric half: guarding only the claim would leave
+            // "rename it away, then create your own project with it" open to
+            // any project writer, which is the same host-root outcome by two
+            // requests instead of one.
+            let error = guard_change(
+                "node-daemon",
+                "node-daemon",
+                SlugClaimAuthority::ProjectWriter,
+                ReservedSlugChange::Release,
+            )
+            .expect_err("a non-admin must not rename a granted project away");
+            match error {
+                ProjectError::DockerSocketSlugReserved {
+                    ref slug,
+                    change: ReservedSlugChange::Release,
+                } => {
+                    assert_eq!(slug, "node-daemon");
+                    // The two refusals must not read alike: this one is about
+                    // losing access, not gaining it.
+                    let rendered = error.to_string();
+                    assert!(
+                        rendered.contains("Renaming this project away"),
+                        "{rendered}"
+                    );
+                    assert!(rendered.contains("revoke"), "{rendered}");
+                    assert!(rendered.contains("instance admin"), "{rendered}");
+                }
+                other => panic!("expected a Release refusal, got {other:?}"),
+            }
+
+            guard_change(
+                "node-daemon",
+                "node-daemon",
+                SlugClaimAuthority::InstanceAdmin,
+                ReservedSlugChange::Release,
+            )
+            .expect("an admin may rename a granted project away");
+
+            // A project that never held a granted slug can be renamed freely.
+            guard_change(
+                "node-daemon",
+                "my-app",
+                SlugClaimAuthority::ProjectWriter,
+                ReservedSlugChange::Release,
+            )
+            .expect("an ungranted slug is not reserved in either direction");
+        }
+
+        #[test]
+        fn authority_defaults_to_the_fail_closed_answer() {
+            // A caller that never thought about this must not be able to
+            // claim host root by omission.
+            assert_eq!(
+                SlugClaimAuthority::default(),
+                SlugClaimAuthority::ProjectWriter
+            );
+            assert!(!SlugClaimAuthority::default().may_claim_reserved_slug());
+            assert!(SlugClaimAuthority::from_instance_admin(true).may_claim_reserved_slug());
+            assert!(!SlugClaimAuthority::from_instance_admin(false).may_claim_reserved_slug());
+        }
+    }
+
+    // ── ADR 045: writes that decide what a granted project runs ──────────
+    //
+    // The two-step version of the deploy attack: a project writer does not
+    // deploy anything, they change the input a later deployment executes as
+    // host root. Same injected-grant treatment as `reserved_slug` above, for
+    // the same reason.
+    mod granted_project_write {
+        use super::*;
+        use temps_core::docker_socket_grant::DockerSocketGrant;
+
+        fn guard(granted: &str, slug: &str, caller: DeployCaller) -> Result<(), ProjectError> {
+            ProjectService::guard_granted_project_write_against(
+                &DockerSocketGrant::parse(Some(granted)),
+                slug,
+                "the runtime image and command",
+                caller,
+            )
+        }
+
+        /// The planted-payload path: `Role::User` holds `ProjectsWrite`, and
+        /// the command it persists becomes the default for the *next*
+        /// deployment — including one an admin starts.
+        #[test]
+        fn a_project_writer_cannot_change_what_a_granted_project_runs() {
+            let error = guard("node-daemon", "node-daemon", DeployCaller::ProjectWriter)
+                .expect_err("a non-admin must not decide what runs as host root");
+            match error {
+                ProjectError::DockerSocketWriteRequiresAdmin {
+                    ref slug,
+                    ref field,
+                } => {
+                    assert_eq!(slug, "node-daemon");
+                    assert_eq!(field, "the runtime image and command");
+                    // The operator reading the 403 is alone: it has to name
+                    // the ADR, the variable, and which field was refused.
+                    let rendered = error.to_string();
+                    assert!(rendered.contains("ADR 045"), "{rendered}");
+                    assert!(
+                        rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS"),
+                        "{rendered}"
+                    );
+                    assert!(
+                        rendered.contains("the runtime image and command"),
+                        "{rendered}"
+                    );
+                }
+                other => panic!("expected DockerSocketWriteRequiresAdmin, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_instance_admin_may_change_it() {
+            guard("node-daemon", "node-daemon", DeployCaller::InstanceAdmin)
+                .expect("an admin may change what a granted project runs");
+        }
+
+        #[test]
+        fn every_other_project_is_untouched() {
+            for caller in [
+                DeployCaller::ProjectWriter,
+                DeployCaller::InstanceAdmin,
+                DeployCaller::Platform,
+            ] {
+                guard("node-daemon", "my-app", caller)
+                    .expect("an undeclared project is untouched by ADR 045");
+                // Exact match, same as the bind: a near miss is neither
+                // declared nor granted, so the two cannot disagree.
+                guard("node-daemon", "node-daemon-2", caller)
+                    .expect("a near miss is not the declared slug");
+                ProjectService::guard_granted_project_write_against(
+                    &DockerSocketGrant::default(),
+                    "node-daemon",
+                    "the source repository",
+                    caller,
+                )
+                .expect("an install that never set the variable declares nothing");
+            }
+        }
+    }
+
+    /// What the acting user has done about MFA — the whole input to the
+    /// step-up policy (ADR 045).
+    #[derive(Clone, Copy)]
+    enum MfaState {
+        /// No factor enrolled. `DefaultSensitiveActionAuthorizer` has nothing
+        /// to re-verify and allows the action through without a challenge —
+        /// deliberate, and documented in the ADR.
+        NotEnrolled,
+        /// Enrolled, but the session has not verified recently (or ever).
+        EnrolledStale,
+        /// Enrolled and verified inside the step-up window.
+        EnrolledVerified,
+    }
+
+    static NEXT_SLUG_CLAIM_USER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(1);
+
+    /// A signed-in caller for the reserved-slug guard: their session, and the
+    /// real step-up policy evaluated against the same database the session
+    /// lives in.
+    ///
+    /// Built through [`SlugClaimCaller::from_request`], exactly as the
+    /// handlers build it, so a test cannot assert an authority the request
+    /// itself would not have carried.
+    struct SlugClaimSession {
+        auth: temps_auth::AuthContext,
+        authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    }
+
+    impl SlugClaimSession {
+        async fn create(
+            db: &Arc<temps_database::DbConnection>,
+            role: temps_auth::Role,
+            mfa: MfaState,
+        ) -> Self {
+            let seq = NEXT_SLUG_CLAIM_USER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let user = temps_entities::users::ActiveModel {
+                name: Set(format!("Slug Claimant {seq}")),
+                email: Set(format!("slug-claimant-{seq}@example.com")),
+                mfa_enabled: Set(!matches!(mfa, MfaState::NotEnrolled)),
+                mfa_secret: Set(match mfa {
+                    MfaState::NotEnrolled => None,
+                    _ => Some("TOTPSECRET".to_string()),
+                }),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("the acting user is inserted");
+            let session = temps_entities::sessions::ActiveModel {
+                user_id: Set(user.id),
+                session_token: Set(format!("slug-claim-session-{seq}")),
+                expires_at: Set(chrono::Utc::now() + chrono::Duration::hours(1)),
+                mfa_pending: Set(false),
+                step_up_expires_at: Set(match mfa {
+                    MfaState::EnrolledVerified => {
+                        Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+                    }
+                    _ => None,
+                }),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("the acting session is inserted");
+            Self {
+                auth: temps_auth::AuthContext::new_persisted_session(user, role, session.id),
+                authorizer: Arc::new(temps_auth::DefaultSensitiveActionAuthorizer::new(
+                    db.clone(),
+                )),
+            }
+        }
+
+        /// An instance admin who never enrolled MFA — the shape most existing
+        /// ADR 045 tests need, and the documented pass-through case.
+        async fn admin(db: &Arc<temps_database::DbConnection>) -> Self {
+            Self::create(db, temps_auth::Role::Admin, MfaState::NotEnrolled).await
+        }
+
+        /// An ordinary project writer, MFA enrolled and *not* stepped up, so
+        /// a test can prove the 403 comes out before step-up is consulted.
+        async fn project_writer(db: &Arc<temps_database::DbConnection>) -> Self {
+            Self::create(db, temps_auth::Role::User, MfaState::EnrolledStale).await
+        }
+
+        fn caller(&self) -> SlugClaimCaller<'_> {
+            SlugClaimCaller::from_request(&self.auth, self.authorizer.as_ref())
+        }
+    }
+
+    /// A non-admin creating a project whose slug this host grants the Docker
+    /// socket to is refused — including when the slug is only *derived* from
+    /// the display name, which is how the claim would be made in practice.
+    #[tokio::test]
+    async fn create_project_refuses_a_non_admin_claim_on_a_granted_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        // `Project`/`ProjectSettingsUpdate` are not `Debug`, so the error is
+        // taken by match rather than `expect_err`.
+        let error = match project_service
+            .create_project_as(create_request("Node Daemon"), &writer.caller())
+            .await
+        {
+            Ok(project) => panic!("a project writer claimed a granted slug: {}", project.slug),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketSlugReserved {
+                ref slug,
+                change: ReservedSlugChange::Claim,
+            } if slug == "node-daemon"
+        ));
+
+        // Nothing was written: the guard runs before the insert.
+        let existing = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("node-daemon"))
+            .one(db.as_ref())
+            .await
+            .unwrap();
+        assert!(existing.is_none(), "no project row may be created");
+    }
+
+    #[tokio::test]
+    async fn create_project_allows_an_instance_admin_to_claim_a_granted_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let admin = SlugClaimSession::admin(&db).await;
+
+        let project = project_service
+            .create_project_as(create_request("Node Daemon"), &admin.caller())
+            .await
+            .expect("an admin may create the granted project");
+        assert_eq!(project.slug, "node-daemon");
+    }
+
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_rename_onto_a_granted_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+        let admin = SlugClaimSession::admin(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Ordinary App".to_string()),
+            slug: Set("ordinary-app".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("node-daemon".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer renamed a project onto a granted slug"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketSlugReserved {
+                ref slug,
+                change: ReservedSlugChange::Claim,
+            } if slug == "node-daemon"
+        ));
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(reloaded.slug, "ordinary-app", "the rename must not persist");
+
+        // The same rename from an admin goes through.
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("node-daemon".to_string()),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an admin may claim the granted slug");
+    }
+
+    /// ADR 045, the git-push path: the slug guard and the deploy guard both
+    /// leave this open. A project writer who cannot rename the project and
+    /// cannot deploy it can still repoint its repository and push — and the
+    /// resulting build+deploy arrives from a provider webhook with no
+    /// authenticated principal, so there is nothing for the deploy guard to
+    /// refuse and no HTTP deploy request is ever made.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_repo_change_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    repo_owner: Some("attacker".to_string()),
+                    repo_name: Some("payload".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer repointed a granted project's repository"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        // Nothing was written: the guard runs before the first of this
+        // endpoint's several independent writes.
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(reloaded.repo_owner, "operator");
+        assert_eq!(reloaded.repo_name, "node-daemon");
+
+        // A project no host declares is untouched — the ordinary case, and
+        // the only one on an install that never set the variable.
+        let ordinary = temps_entities::projects::ActiveModel {
+            name: Set("Ordinary App".to_string()),
+            slug: Set("ordinary-app".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        project_service
+            .update_project_settings_as(
+                ordinary.id,
+                UpdateProjectSettingsParams {
+                    main_branch: Some("release".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+            .expect("an undeclared project's source is writable by any project writer");
+    }
+
+    /// `git_provider_connection_id` alone, with owner/name/branch untouched.
+    /// `DownloadRepoJob` resolves the clone host from the *connection*, not
+    /// from a stored URL, so repointing only the connection is the same
+    /// escalation as the repo-owner/repo-name case above through a field the
+    /// guard's predicate previously missed.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_connection_change_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        // Two real connections on the same provider -- the escalation is
+        // repointing *which one* the project trusts, not whether the target
+        // id exists, so both ends of the move must resolve.
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("Operator Git".to_string()),
+            provider_type: Set("gitea".to_string()),
+            base_url: Set(Some("https://git.example.internal".to_string())),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let operator_connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("operator".to_string()),
+            account_type: Set("Organization".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let attacker_connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("attacker".to_string()),
+            account_type: Set("User".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            git_provider_connection_id: Set(Some(operator_connection.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    git_provider_connection_id: Some(attacker_connection.id),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer repointed a granted project's git connection"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(
+            reloaded.git_provider_connection_id,
+            Some(operator_connection.id)
+        );
+
+        // An instance admin may still repoint it.
+        let admin = SlugClaimSession::admin(&db).await;
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    git_provider_connection_id: Some(attacker_connection.id),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an instance admin may repoint a granted project's git connection");
+    }
+
+    /// `enable_preview_environments` was missing from the guard predicate:
+    /// once on, any push to an untracked branch gets a preview environment
+    /// auto-created and deployed as `DeployCaller::Platform`, which neither
+    /// the deploy gate nor the exec gate refuses.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_enabling_preview_environments_on_a_granted_project(
+    ) {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    enable_preview_environments: Some(true),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer enabled preview environments on a granted project"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let admin = SlugClaimSession::admin(&db).await;
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    enable_preview_environments: Some(true),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an instance admin may enable preview environments on a granted project");
+    }
+
+    /// ADR 045: `update_project` took no `caller` at all until this test —
+    /// it unconditionally rewrites the same source-definition fields
+    /// `update_project_settings_as` gates, through a sibling handler that
+    /// bypassed the guard entirely.
+    #[tokio::test]
+    async fn update_project_refuses_a_non_admin_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let mut attacker_request = create_request("Node Daemon");
+        attacker_request.repo_owner = Some("attacker".to_string());
+        attacker_request.repo_name = Some("payload".to_string());
+
+        let error = match project_service
+            .update_project(
+                project.id,
+                attacker_request,
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter,
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer repointed a granted project's repository"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(reloaded.repo_owner, "operator");
+        assert_eq!(reloaded.repo_name, "node-daemon");
+
+        // An instance admin may still update it.
+        let mut admin_request = create_request("Node Daemon");
+        admin_request.repo_owner = Some("attacker".to_string());
+        admin_request.repo_name = Some("payload".to_string());
+        project_service
+            .update_project(
+                project.id,
+                admin_request,
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin,
+            )
+            .await
+            .expect("an instance admin may update a granted project");
+    }
+
+    /// A new environment is a new push-deploy target bound to whatever
+    /// branch the request names, and inherits the project's
+    /// `automatic_deploy` — reachable by `EnvironmentsCreate`
+    /// (`Role::User`) with no ADR-045 check until this test.
+    #[tokio::test]
+    async fn update_automatic_deploy_refuses_a_non_admin_on_a_granted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("node-daemon".to_string()),
+            repo_owner: Set("operator".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_automatic_deploy(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter,
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer armed auto-deploy on a granted project"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::DockerSocketWriteRequiresAdmin { ref slug, .. } if slug == "node-daemon"
+        ));
+
+        project_service
+            .update_automatic_deploy(
+                project.id,
+                true,
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin,
+            )
+            .await
+            .expect("an instance admin may arm auto-deploy on a granted project");
+    }
+
+    /// The symmetric case: renaming a project *away* from a granted slug is
+    /// admin-only too. It revokes that project's host Docker access on every
+    /// host, and frees the slug for the next project created — so allowing it
+    /// would let any project writer reach host root in two requests.
+    #[tokio::test]
+    async fn update_project_settings_refuses_a_non_admin_rename_away_from_a_granted_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+        let admin = SlugClaimSession::admin(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a project writer renamed a granted project away from its slug"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ProjectError::DockerSocketSlugReserved {
+                    ref slug,
+                    change: ReservedSlugChange::Release,
+                } if slug == "node-daemon"
+            ),
+            "the refusal must name the slug being given up, not the new one: {error}"
+        );
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(reloaded.slug, "node-daemon", "the rename must not persist");
+
+        // The same rename from an admin goes through.
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &admin.caller(),
+            )
+            .await
+            .expect("an admin may rename a granted project away");
+        assert_eq!(updated.project.slug, "something-else");
+    }
+
+    /// Only a slug *change* is gated. An existing granted project must keep
+    /// working through ordinary settings saves by anyone who can write it —
+    /// including one that re-sends its current (granted) slug unchanged.
+    #[tokio::test]
+    async fn update_project_settings_leaves_an_already_granted_project_alone() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer = SlugClaimSession::project_writer(&db).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // No slug in the request at all.
+        project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Node Daemon v2".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+            .expect("an unrelated settings change is not a claim");
+
+        // The current slug, re-sent unchanged (what a settings form posts).
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("node-daemon".to_string()),
+                    ..Default::default()
+                },
+                &writer.caller(),
+            )
+            .await
+            .expect("re-sending the existing slug is not a claim");
+        assert_eq!(updated.project.slug, "node-daemon");
+    }
+
+    /// The capability query asks Postgres which nodes advertise the slug,
+    /// rather than loading the fleet and filtering in Rust. Exercised against
+    /// a real database because the whole point of the change is the SQL — a
+    /// mock would assert the shape of a query nobody ran.
+    #[tokio::test]
+    async fn docker_socket_capability_matches_advertised_slugs_in_the_database() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+
+        let insert_node = |name: &'static str, capacity: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                temps_entities::nodes::ActiveModel {
+                    name: Set(name.to_string()),
+                    token_hash: Set(format!("hash-{name}")),
+                    address: Set(format!("https://{name}.invalid:3100")),
+                    private_address: Set("10.100.0.2".to_string()),
+                    role: Set("worker".to_string()),
+                    status: Set("active".to_string()),
+                    labels: Set(serde_json::json!({})),
+                    capacity: Set(capacity),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("the node is inserted");
+            }
+        };
+
+        insert_node(
+            "worker-b",
+            serde_json::json!({ "docker_socket_projects": ["node-daemon"] }),
+        )
+        .await;
+        insert_node(
+            "worker-a",
+            serde_json::json!({ "docker_socket_projects": ["other-thing", "node-daemon"] }),
+        )
+        .await;
+        // Near miss, wrong key, malformed value and no capacity at all: every
+        // one of these must fail closed rather than widen the grant.
+        insert_node(
+            "worker-c",
+            serde_json::json!({ "docker_socket_projects": ["node-daemon-2"] }),
+        )
+        .await;
+        insert_node(
+            "worker-d",
+            serde_json::json!({ "docker_socket_projects": "node-daemon" }),
+        )
+        .await;
+        insert_node("worker-e", serde_json::json!({ "cpu_cores": 4 })).await;
+
+        let capability = project_service
+            .docker_socket_capability("node-daemon")
+            .await
+            .expect("the capability is computed");
+        assert!(capability.granted, "the control plane declares this slug");
+        assert_eq!(
+            capability.nodes,
+            vec![
+                // This control plane grants it too, by declaring it.
+                "control-plane".to_string(),
+                "worker-a".to_string(),
+                "worker-b".to_string()
+            ],
+            "only exact advertisements count, ordered by name"
+        );
+
+        // A slug this control plane never declared is not granted, whatever
+        // any node advertises — the declare/provide split of ADR 045.
+        let undeclared = project_service
+            .docker_socket_capability("other-thing")
+            .await
+            .expect("the capability is computed");
+        assert!(!undeclared.granted);
+    }
+
+    // ── ADR 045: MFA step-up on top of the instance-admin check ─────────
+    //
+    // The admin check answers "may this principal move host root between
+    // projects". These answer "and is this really them, right now". The order
+    // is load-bearing and is asserted explicitly below.
+
+    /// A granted project, so both directions of the guard have something to
+    /// bite on.
+    async fn insert_granted_project(
+        db: &Arc<temps_database::DbConnection>,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set("Node Daemon".to_string()),
+            slug: Set("node-daemon".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("the granted project is inserted")
+    }
+
+    /// The 428 body the console's step-up dialog reads. Asserted here rather
+    /// than trusted, because `ProjectError::SlugClaimStepUpRequired` passes
+    /// the `Problem` through verbatim — if the contract ever changed, this is
+    /// where it must fail.
+    fn assert_step_up_challenge(error: &ProjectError, expected_action: &str) {
+        let ProjectError::SlugClaimStepUpRequired { problem } = error else {
+            panic!("expected a step-up challenge, got {error:?}");
+        };
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            problem.body.get("error_code").and_then(|v| v.as_str()),
+            Some("STEP_UP_REQUIRED")
+        );
+        assert_eq!(
+            problem.body.get("action").and_then(|v| v.as_str()),
+            Some(expected_action),
+            "the challenge must name the exact action, not a shared one"
+        );
+    }
+
+    /// An MFA-enrolled admin whose session has not verified recently is
+    /// challenged for the claim, and nothing is written until they do.
+    #[tokio::test]
+    async fn claiming_a_granted_slug_challenges_an_mfa_enrolled_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .create_project_as(create_request("Node Daemon"), &stale.caller())
+            .await
+        {
+            Ok(project) => panic!(
+                "an admin claimed host root without recent verification: {}",
+                project.slug
+            ),
+            Err(error) => error,
+        };
+        assert_step_up_challenge(&error, "claim_docker_socket_slug");
+
+        // The challenge is a refusal, not a warning: the project must not
+        // exist yet.
+        assert!(
+            projects::Entity::find()
+                .filter(projects::Column::Slug.eq("node-daemon"))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a challenged claim must not create the project"
+        );
+
+        // Same admin, same authority — only the verification is new.
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+        let project = project_service
+            .create_project_as(create_request("Node Daemon"), &verified.caller())
+            .await
+            .expect("a verified admin may claim the granted slug");
+        assert_eq!(project.slug, "node-daemon");
+    }
+
+    /// Giving the slug up is a separate action with its own name, so an
+    /// operator reading the audit trail can tell a grant from a revocation.
+    #[tokio::test]
+    async fn releasing_a_granted_slug_challenges_with_its_own_action_name() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let project = insert_granted_project(&db).await;
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &stale.caller(),
+            )
+            .await
+        {
+            Ok(_) => panic!("an admin revoked host Docker access without recent verification"),
+            Err(error) => error,
+        };
+        // The claim half of the rename passes first (`something-else` is not
+        // reserved), so the challenge that surfaces is the release.
+        assert_step_up_challenge(&error, "release_docker_socket_slug");
+
+        let reloaded = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(
+            reloaded.slug, "node-daemon",
+            "a challenged release must not persist"
+        );
+
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("something-else".to_string()),
+                    ..Default::default()
+                },
+                &verified.caller(),
+            )
+            .await
+            .expect("a verified admin may release the granted slug");
+        assert_eq!(updated.project.slug, "something-else");
+    }
+
+    /// An admin who never enrolled MFA is allowed through with no challenge.
+    ///
+    /// Asserted rather than left implicit, because it is a deliberate policy
+    /// choice of `DefaultSensitiveActionAuthorizer` (there is no second factor
+    /// to re-verify, and denying would lock the only admin out of their own
+    /// instance), not an oversight in this guard. An operator who wants the
+    /// stronger rule enrolls MFA — or registers an authorizer that denies
+    /// unenrolled principals. See ADR 045.
+    #[tokio::test]
+    async fn an_admin_without_mfa_is_allowed_through_without_a_challenge() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let unenrolled =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::NotEnrolled).await;
+
+        let project = project_service
+            .create_project_as(create_request("Node Daemon"), &unenrolled.caller())
+            .await
+            .expect("an admin with no enrolled factor is not challenged");
+        assert_eq!(project.slug, "node-daemon");
+    }
+
+    /// Order matters: a project writer is refused by the authority check,
+    /// *before* step-up is considered. They must get the 403 that explains the
+    /// rule, never an MFA prompt for an operation they still could not perform
+    /// after satisfying it.
+    #[tokio::test]
+    async fn a_non_admin_is_refused_before_step_up_is_considered() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        // MFA enrolled and stale: this session *would* be challenged if the
+        // guard ever reached step-up for it.
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        let error = match project_service
+            .create_project_as(create_request("Node Daemon"), &writer.caller())
+            .await
+        {
+            Ok(project) => panic!("a project writer claimed a granted slug: {}", project.slug),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ProjectError::DockerSocketSlugReserved {
+                    change: ReservedSlugChange::Claim,
+                    ..
+                }
+            ),
+            "a non-admin must be refused outright, not challenged: {error:?}"
+        );
+    }
+
+    /// The challenge is scoped to reserved slugs. Every other project an
+    /// MFA-enrolled admin creates or renames goes through untouched — this is
+    /// the regression that would turn one operator control into friction on
+    /// every project in the console.
+    #[tokio::test]
+    async fn an_unreserved_slug_never_challenges_anyone() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let project = project_service
+            .create_project_as(create_request("Ordinary App"), &stale.caller())
+            .await
+            .expect("an ordinary project is not a sensitive action");
+        assert_eq!(project.slug, "ordinary-app");
+
+        let updated = project_service
+            .update_project_settings_as(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("still-ordinary".to_string()),
+                    ..Default::default()
+                },
+                &stale.caller(),
+            )
+            .await
+            .expect("renaming between two unreserved slugs is not a sensitive action");
+        assert_eq!(updated.project.slug, "still-ordinary");
+    }
+
+    /// [`ProjectService::preflight_guard_reserved_slug`] exists so a caller
+    /// with an irreversible side effect (a template fork's upstream repo
+    /// creation) between planning a slug and creating the project can fail
+    /// fast, before that side effect runs. It must therefore apply the exact
+    /// same authority check as the creation-time guard it stands in front
+    /// of: a project writer preflighting a granted slug is refused outright,
+    /// with no MFA prompt, identically to `create_project_as`.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_refuses_a_non_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        let error = project_service
+            .preflight_guard_reserved_slug("node-daemon", &writer.caller())
+            .await
+            .expect_err("a project writer must not pass the preflight for a granted slug");
+        assert!(
+            matches!(
+                error,
+                ProjectError::DockerSocketSlugReserved {
+                    change: ReservedSlugChange::Claim,
+                    ..
+                }
+            ),
+            "a non-admin must be refused outright, not challenged: {error:?}"
+        );
+    }
+
+    /// The preflight is a sensitive action too: an admin whose MFA is
+    /// enrolled but stale gets the same 428 step-up challenge the
+    /// creation-time guard would give, so the console can prompt for
+    /// re-verification before the caller does anything irreversible.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_challenges_stale_mfa() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let stale =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledStale).await;
+
+        let error = project_service
+            .preflight_guard_reserved_slug("node-daemon", &stale.caller())
+            .await
+            .expect_err("stale MFA must be challenged before an irreversible side effect");
+        assert_step_up_challenge(&error, "claim_docker_socket_slug");
+    }
+
+    /// The success path: a recently-verified admin passes the preflight for
+    /// the exact slug they plan to create, clearing the way for the
+    /// irreversible side effect (e.g. the template fork's repository push)
+    /// to run before the authoritative creation-time guard is reached.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_allows_a_verified_admin() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let verified =
+            SlugClaimSession::create(&db, temps_auth::Role::Admin, MfaState::EnrolledVerified)
+                .await;
+
+        project_service
+            .preflight_guard_reserved_slug("node-daemon", &verified.caller())
+            .await
+            .expect("a recently-verified admin may preflight a granted slug");
+    }
+
+    /// The preflight is scoped to reserved slugs, exactly like the
+    /// creation-time guard: an ordinary slug never challenges anyone, so a
+    /// template fork onto a non-granted name sees no MFA friction.
+    #[tokio::test]
+    async fn preflight_guard_reserved_slug_ignores_an_unreserved_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let writer =
+            SlugClaimSession::create(&db, temps_auth::Role::User, MfaState::EnrolledStale).await;
+
+        project_service
+            .preflight_guard_reserved_slug("ordinary-app", &writer.caller())
+            .await
+            .expect("an unreserved slug is not a sensitive action for anyone");
     }
 
     fn create_request(name: &str) -> CreateProjectRequest {
@@ -7361,7 +9489,11 @@ mod tests {
         let mut update = create_request("Leave Nixpacks");
         update.preset = "nextjs".to_string();
         let updated = project_service
-            .update_project(created.id, update)
+            .update_project(
+                created.id,
+                update,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .expect("switch to nextjs");
 
@@ -7781,7 +9913,11 @@ mod tests {
         let mut update = create_request("Reset Through Full Update");
         update.preset = "nixpacks".to_string();
         let updated = project_service
-            .update_project(created.id, update)
+            .update_project(
+                created.id,
+                update,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
             .await
             .expect("select base nixpacks");
 
@@ -7960,6 +10096,7 @@ mod tests {
                 Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
                 None,
                 None,
+                DeployCaller::Platform,
             )
             .await;
 
@@ -8080,6 +10217,7 @@ mod tests {
                 })),
                 None,
                 None,
+                DeployCaller::Platform,
             )
             .await
             .expect("update custom Dockerfile Git config");
@@ -8180,6 +10318,7 @@ mod tests {
                 Some(serde_json::json!({ "providers": ["...", "python"] })),
                 None,
                 None,
+                DeployCaller::Platform,
             )
             .await
             .expect("update git settings");
@@ -8521,6 +10660,7 @@ mod tests {
                 None,
                 None,
                 None,
+                DeployCaller::Platform,
             )
             .await;
 
@@ -8685,6 +10825,7 @@ mod tests {
                 None,
                 Some("https://github.com/test-owner/blank-git-dir-repo".to_string()),
                 Some(true),
+                DeployCaller::Platform,
             )
             .await
             .expect("update_git_settings should succeed");
@@ -8747,6 +10888,7 @@ mod tests {
                 })),
                 None,
                 None,
+                DeployCaller::Platform,
             )
             .await
             .expect("compose port save should succeed");

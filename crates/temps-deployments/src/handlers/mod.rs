@@ -6,6 +6,7 @@ pub mod container_exec;
 pub mod crons;
 pub mod deployment_tokens;
 pub mod deployments;
+pub(crate) mod docker_socket;
 pub mod external_images;
 pub mod failure_report;
 pub mod network;
