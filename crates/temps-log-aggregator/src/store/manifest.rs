@@ -645,10 +645,10 @@ impl ManifestRepo {
         }
     }
 
-    /// Insert a manifest row. `ON CONFLICT (storage_key) DO NOTHING` makes a
-    /// crash-and-replay of the same chunk key idempotent (ADR-046 §8a.2):
-    /// the retried insert is absorbed and this returns the existing row's
-    /// `seq` rather than erroring or duplicating the row.
+    /// Insert a v2 manifest row. Storage-key uniqueness applies only to v2
+    /// chunks because legacy v1 metadata may contain multiple rows referring
+    /// to the same object. A crash-and-replay of a v2 key is absorbed and
+    /// returns the existing v2 row's `seq` (ADR-046 §8a.2).
     pub async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
         let sql = "INSERT INTO log_chunks \
                     (id, project_id, external_service_id, env, service, container_id, \
@@ -657,7 +657,7 @@ impl ManifestRepo {
                      format_version, level_mask, footer_offset, footer_len, bloom_len, \
                      level_counts) \
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) \
-                    ON CONFLICT (storage_key) DO NOTHING \
+                    ON CONFLICT (storage_key) WHERE format_version >= 2 DO NOTHING \
                     RETURNING seq"
             .to_string();
         let values: Vec<Value> = vec![
@@ -696,11 +696,14 @@ impl ManifestRepo {
             return Ok(row.try_get::<i64>("", "seq")?);
         }
 
-        // Conflict: another writer already inserted this storage_key. Fetch
-        // its seq rather than treating the insert as a failure.
+        // Conflict: another writer already inserted this v2 storage_key.
+        // Fetch that v2 row rather than selecting legacy metadata that happens
+        // to refer to the same object.
         let rows = self
             .query_all(
-                "SELECT seq FROM log_chunks WHERE storage_key = $1".to_string(),
+                "SELECT seq FROM log_chunks \
+                 WHERE storage_key = $1 AND format_version >= 2"
+                    .to_string(),
                 vec![meta.storage_key.clone().into()],
             )
             .await?;
@@ -756,6 +759,8 @@ impl ManifestRepo {
     }
 
     /// Tombstoned rows past `cutoff` (the GC grace period), oldest first.
+    /// A shared object remains protected while any manifest with the same
+    /// storage key is live or still within its grace period.
     pub async fn tombstoned_before(
         &self,
         cutoff: DateTime<Utc>,
@@ -763,9 +768,14 @@ impl ManifestRepo {
     ) -> Result<Vec<(Uuid, String)>, LogAggregatorError> {
         let rows = self
             .query_all(
-                "SELECT id, storage_key FROM log_chunks \
-                 WHERE deleted_at IS NOT NULL AND deleted_at < $1 \
-                 ORDER BY deleted_at ASC LIMIT $2"
+                "SELECT candidate.id, candidate.storage_key FROM log_chunks AS candidate \
+                 WHERE candidate.deleted_at IS NOT NULL AND candidate.deleted_at < $1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM log_chunks AS sibling \
+                       WHERE sibling.storage_key = candidate.storage_key \
+                         AND (sibling.deleted_at IS NULL OR sibling.deleted_at >= $1) \
+                   ) \
+                 ORDER BY candidate.deleted_at ASC LIMIT $2"
                     .to_string(),
                 vec![cutoff.into(), i64::from(limit).into()],
             )
@@ -1390,6 +1400,142 @@ mod tests {
             footer_len: Some(2048),
             bloom_len: 512,
         }
+    }
+
+    async fn legacy_regression_database() -> Option<temps_database::test_utils::TestDatabase> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none() {
+            let available = match bollard::Docker::connect_with_local_defaults() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            };
+            if !available {
+                eprintln!("Skipping legacy manifest regression: Docker unavailable");
+                return None;
+            }
+        }
+        Some(
+            temps_database::test_utils::TestDatabase::with_migrations()
+                .await
+                .expect("apply migrations for legacy manifest regression"),
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_duplicates_preserve_v2_replay_and_shared_object_gc() {
+        let Some(db) = legacy_regression_database().await else {
+            return;
+        };
+        let repo = ManifestRepo::new(db.connection_arc());
+        let metadata = crate::services::LogMetadataService::new(db.connection_arc());
+        let mut legacy = test_chunk_meta(990_003, "legacy-shared-object");
+        legacy.format_version = 1;
+        legacy.footer_offset = None;
+        legacy.footer_len = None;
+        metadata.insert_chunk_meta(&legacy).await.unwrap();
+        let first_id = legacy.id;
+        legacy.id = Uuid::new_v4();
+        legacy.started_at += chrono::Duration::seconds(30);
+        legacy.ended_at += chrono::Duration::seconds(30);
+        legacy.compressed_size_bytes += 20;
+        metadata.insert_chunk_meta(&legacy).await.unwrap();
+
+        // Even if a legacy row has this key, replay must resolve the v2 seq.
+        let mut current = test_chunk_meta(990_003, "legacy-shared-object");
+        current.storage_key = legacy.storage_key.clone();
+        let seq = repo.insert(&current).await.unwrap();
+        let current_id = current.id;
+        current.id = Uuid::new_v4();
+        assert_eq!(repo.insert(&current).await.unwrap(), seq);
+        let rows = repo
+            .query_all(
+                "SELECT seq FROM log_chunks WHERE storage_key = $1".to_string(),
+                vec![legacy.storage_key.clone().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3, "replay must not duplicate the v2 manifest");
+
+        let cutoff = Utc::now() - chrono::Duration::hours(1);
+        let old = cutoff - chrono::Duration::seconds(1);
+        repo.query_all(
+            "UPDATE log_chunks SET deleted_at = $1 WHERE id = ANY($2::uuid[]) RETURNING id"
+                .to_string(),
+            vec![old.into(), vec![first_id, current_id].into()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.tombstoned_before(cutoff, 100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a live legacy sibling must protect the shared object"
+        );
+
+        // Exactly at the cutoff is still protected, including across formats.
+        repo.query_all(
+            "UPDATE log_chunks SET deleted_at = $1 WHERE id = $2 RETURNING id".to_string(),
+            vec![cutoff.into(), legacy.id.into()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.tombstoned_before(cutoff, 100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a sibling still in its grace period must protect the object"
+        );
+
+        repo.query_all(
+            "UPDATE log_chunks SET deleted_at = $1 WHERE id = $2 RETURNING id".to_string(),
+            vec![old.into(), legacy.id.into()],
+        )
+        .await
+        .unwrap();
+        let eligible = repo.tombstoned_before(cutoff, 100).await.unwrap();
+        assert_eq!(eligible.len(), 3);
+        assert!(eligible.iter().all(|(_, key)| key == &legacy.storage_key));
+        assert_eq!(
+            repo.insert(&current).await.unwrap(),
+            seq,
+            "replay must not resurrect a tombstoned v2 manifest"
+        );
+        assert_eq!(
+            repo.hard_delete(&[first_id, legacy.id, current_id])
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(repo
+            .tombstoned_before(cutoff, 100)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn v2_replay_supports_previously_installed_full_unique_index() {
+        let Some(db) = legacy_regression_database().await else {
+            return;
+        };
+        let repo = ManifestRepo::new(db.connection_arc());
+        db.execute_sql("DROP INDEX idx_log_chunks_storage_key")
+            .await
+            .unwrap();
+        db.execute_sql("CREATE UNIQUE INDEX idx_log_chunks_storage_key ON log_chunks(storage_key)")
+            .await
+            .unwrap();
+        let mut meta = test_chunk_meta(990_004, "already-upgraded-instance");
+        let seq = repo.insert(&meta).await.unwrap();
+        meta.id = Uuid::new_v4();
+        assert_eq!(
+            repo.insert(&meta).await.unwrap(),
+            seq,
+            "the new conflict predicate must also infer the old full unique index"
+        );
     }
 
     /// The collector's resume position must survive the chunk rows: after
