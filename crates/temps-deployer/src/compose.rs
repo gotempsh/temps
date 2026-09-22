@@ -751,20 +751,56 @@ impl ComposeExecutor {
     async fn require_compose_v2(&self) -> Result<(), ComposeError> {
         let mut command = isolated_docker_command();
         command.args(["compose", "version"]);
-        Self::check_compose_v2(command).await
+        Self::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT).await
     }
 
-    async fn check_compose_v2(mut command: tokio::process::Command) -> Result<(), ComposeError> {
-        let output = tokio::time::timeout(COMPOSE_VERSION_TIMEOUT, command.output())
+    async fn check_compose_v2(
+        mut command: tokio::process::Command,
+        timeout: std::time::Duration,
+    ) -> Result<(), ComposeError> {
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| ComposeError::ComposeUnavailable {
+                reason: format!("failed to run `docker compose version`: {error}"),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComposeError::ComposeUnavailable {
+                reason: "`docker compose version` did not expose stdout".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ComposeError::ComposeUnavailable {
+                reason: "`docker compose version` did not expose stderr".to_string(),
+            })?;
+        let run = async {
+            let (stdout, stderr, status) = tokio::try_join!(
+                Self::read_bounded_stream(stdout),
+                Self::read_bounded_stream(stderr),
+                child.wait()
+            )?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        let output = tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| ComposeError::ComposeUnavailable {
                 reason: format!(
                     "`docker compose version` did not finish within {} seconds",
-                    COMPOSE_VERSION_TIMEOUT.as_secs()
+                    timeout.as_secs_f64()
                 ),
             })?
             .map_err(|error| ComposeError::ComposeUnavailable {
-                reason: format!("failed to run `docker compose version`: {error}"),
+                reason: format!("failed while running `docker compose version`: {error}"),
             })?;
 
         if output.status.success() {
@@ -7609,7 +7645,7 @@ mod tests {
             "printf \"unknown shorthand flag: 'p' in -p\\n\" >&2; exit 125",
         ]);
 
-        let error = ComposeExecutor::check_compose_v2(command)
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
             .await
             .expect_err("a Docker CLI without Compose must fail preflight");
 
@@ -7649,12 +7685,66 @@ mod tests {
         let mut command = isolated_docker_command_with_candidates(&[first, second]);
         command.args(["compose", "version"]);
 
-        let error = ComposeExecutor::check_compose_v2(command)
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
             .await
             .expect_err("preflight must check the same first candidate used by deployment");
 
         assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
         assert!(error.to_string().contains("compose is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn compose_v2_preflight_bounds_diagnostic_output() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "head -c 2097152 /dev/zero | tr '\\0' x >&2; exit 125"]);
+
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
+            .await
+            .expect_err("a noisy failing Compose probe must fail preflight");
+        let diagnostic = error.to_string();
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        assert!(
+            diagnostic.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES + 512,
+            "diagnostic must remain bounded, got {} bytes",
+            diagnostic.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_v2_preflight_kills_child_when_probe_times_out() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let pid_file = directory.path().join("compose-probe.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 30"])
+            .env("PID_FILE", &pid_file);
+
+        let error =
+            ComposeExecutor::check_compose_v2(command, std::time::Duration::from_millis(100))
+                .await
+                .expect_err("a hanging Compose probe must time out");
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("probe should record its pid before timing out");
+        let pid = pid.trim();
+        let mut still_running = true;
+        for _ in 0..50 {
+            still_running = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !still_running,
+            "timed-out Compose probe {pid} is still running"
+        );
     }
 
     #[test]
