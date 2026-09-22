@@ -59,6 +59,10 @@ pub struct EnrollRequest {
     /// Reported for support and skew diagnostics only — never trusted for
     /// authorization decisions.
     pub agent_version: String,
+    /// Whether this client can atomically adopt an existing Cloud instance
+    /// identity returned while redeeming a targeted enrollment code.
+    #[serde(default)]
+    pub supports_instance_reassignment: bool,
 }
 
 impl std::fmt::Debug for EnrollRequest {
@@ -67,6 +71,10 @@ impl std::fmt::Debug for EnrollRequest {
             .field("enrollment_code", &"[REDACTED]")
             .field("instance_id", &self.instance_id)
             .field("agent_version", &self.agent_version)
+            .field(
+                "supports_instance_reassignment",
+                &self.supports_instance_reassignment,
+            )
             .finish()
     }
 }
@@ -74,6 +82,10 @@ impl std::fmt::Debug for EnrollRequest {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub tenant_id: Uuid,
+    /// Existing Cloud identity to adopt for a replacement installation.
+    /// Absent for ordinary enrollments and older managed backends.
+    #[serde(default)]
+    pub instance_id: Option<Uuid>,
     /// Human-readable Cloud account identity for the local connection UI.
     /// Optional for compatibility with older managed backends.
     #[serde(default)]
@@ -95,6 +107,7 @@ impl std::fmt::Debug for EnrollResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnrollResponse")
             .field("tenant_id", &self.tenant_id)
+            .field("instance_id", &self.instance_id)
             .field("account_email", &self.account_email)
             .field("instance_token", &"[REDACTED]")
             .field("capabilities", &self.capabilities)
@@ -1463,9 +1476,11 @@ mod tests {
             enrollment_code: "secret-code".into(),
             instance_id: Uuid::new_v4(),
             agent_version: "test".into(),
+            supports_instance_reassignment: true,
         };
         let response = EnrollResponse {
             tenant_id: Uuid::new_v4(),
+            instance_id: None,
             account_email: Some("owner@example.com".into()),
             instance_token: "inst_secret".into(),
             capabilities: vec![],
@@ -1604,8 +1619,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.tenant_id, tenant_id);
+        assert!(response.instance_id.is_none());
         assert!(response.account_email.is_none());
         assert!(response.capabilities.is_empty());
+    }
+
+    #[test]
+    fn enrollment_request_defaults_reassignment_support_for_legacy_clients() {
+        let request: EnrollRequest = serde_json::from_value(serde_json::json!({
+            "enrollment_code": "legacy-code",
+            "instance_id": Uuid::new_v4(),
+            "agent_version": "legacy"
+        }))
+        .unwrap();
+
+        assert!(!request.supports_instance_reassignment);
     }
 
     #[test]

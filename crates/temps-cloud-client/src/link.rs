@@ -1212,7 +1212,7 @@ impl CloudLink {
         if let Some(error) = self.outbound_blocked_error() {
             return Err(error);
         }
-        let (base_url, instance_id, generation) = {
+        let (base_url, instance_id, supports_instance_reassignment, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             let s = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
             // Same guard as the generation snapshot below: a concurrent
@@ -1223,13 +1223,19 @@ impl CloudLink {
             (
                 s.base_url.clone(),
                 s.instance_id,
+                !s.is_linked(),
                 self.generation.load(Ordering::SeqCst),
             )
         };
 
         let backend = self.parse_backend(&base_url)?;
         let res = CloudClient::new(backend)?
-            .enroll(code, instance_id, &self.agent_version)
+            .enroll_with_instance_reassignment(
+                code,
+                instance_id,
+                &self.agent_version,
+                supports_instance_reassignment,
+            )
             .await?;
 
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
@@ -1251,12 +1257,22 @@ impl CloudLink {
                 detail: "link state changed while enrollment was in progress; try again".into(),
             });
         }
+        if !supports_instance_reassignment
+            && res
+                .instance_id
+                .is_some_and(|response_id| response_id != instance_id)
+        {
+            return Err(CloudError::EnrollmentRefused {
+                detail: "Cloud returned a different instance identity while this installation is linked; disconnect it before reconnecting with that enrollment code".into(),
+            });
+        }
         // Read *before* the overwrite below: after it, there is no record on
         // this instance that a different credential was ever held, and a caller
         // asking "did this call establish the link?" would have to guess.
         let kind = EnrollmentKind::classify(current.is_linked(), current.tenant_id, res.tenant_id);
 
         let mut next = current.clone();
+        next.instance_id = res.instance_id.unwrap_or(instance_id);
         next.token = Some(res.instance_token);
         next.tenant_id = Some(res.tenant_id);
         next.account_email = res.account_email;
@@ -2857,6 +2873,7 @@ mod first_link_enrollment_tests {
         slow_requests_parked: Arc<AtomicUsize>,
         release: Arc<Notify>,
         redeemed: Arc<AtomicUsize>,
+        reassignment_support: Arc<Mutex<Vec<bool>>>,
     }
 
     fn tenant_for(code: &str) -> Uuid {
@@ -2874,8 +2891,17 @@ mod first_link_enrollment_tests {
                             stub.release.notified().await;
                         }
                         stub.redeemed.fetch_add(1, Ordering::SeqCst);
+                        stub.reassignment_support
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(request.supports_instance_reassignment);
+                        let reassigned_instance_id =
+                            (request.enrollment_code.starts_with("RECONNECT-")
+                                || request.enrollment_code.starts_with("UNSAFE-RECONNECT-"))
+                            .then(|| tenant_for("historical-instance"));
                         Json(serde_json::json!({
                             "tenant_id": tenant_for(&request.enrollment_code),
+                            "instance_id": reassigned_instance_id,
                             "instance_token": format!("inst_{}", request.enrollment_code),
                         }))
                     },
@@ -2969,6 +2995,87 @@ mod first_link_enrollment_tests {
             "a stale code must not be redeemed on the backend"
         );
         assert_eq!(link.tenant_id(), Some(tenant_for("OPERATOR-CODE")));
+    }
+
+    #[tokio::test]
+    async fn a_targeted_enrollment_atomically_adopts_and_persists_the_cloud_identity() {
+        let stub = Stub::default();
+        let Some((link, directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+        let generated_instance_id = link.instance_id().expect("configured instance identity");
+        let historical_instance_id = tenant_for("historical-instance");
+
+        link.enroll("reconnect-abcd-efgh")
+            .await
+            .expect("targeted enrollment must succeed");
+
+        assert_ne!(generated_instance_id, historical_instance_id);
+        assert_eq!(link.instance_id(), Some(historical_instance_id));
+        assert_eq!(
+            stub.reassignment_support
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[true]
+        );
+
+        drop(link);
+        let restored = CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "first-link-test",
+        );
+        assert_eq!(restored.instance_id(), Some(historical_instance_id));
+        assert!(restored.is_linked());
+    }
+
+    #[tokio::test]
+    async fn credential_recovery_does_not_advertise_identity_reassignment() {
+        let stub = Stub::default();
+        let Some((link, _directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+
+        link.enroll("first-code").await.expect("first enrollment");
+        link.enroll("recovery-code")
+            .await
+            .expect("credential recovery enrollment");
+
+        assert_eq!(
+            stub.reassignment_support
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_linked_instance_rejects_a_different_returned_identity_without_persisting_it() {
+        let stub = Stub::default();
+        let Some((link, directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+        link.enroll("first-code").await.expect("first enrollment");
+        let linked_instance_id = link.instance_id().expect("linked instance identity");
+        let linked_tenant_id = link.tenant_id().expect("linked tenant identity");
+
+        let error = link
+            .enroll("unsafe-reconnect-abcd-efgh")
+            .await
+            .expect_err("a linked installation must not change identity");
+
+        assert!(error.to_string().contains("disconnect"));
+        assert_eq!(link.instance_id(), Some(linked_instance_id));
+        assert_eq!(link.tenant_id(), Some(linked_tenant_id));
+        drop(link);
+
+        let restored = CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "first-link-test",
+        );
+        assert_eq!(restored.instance_id(), Some(linked_instance_id));
+        assert_eq!(restored.tenant_id(), Some(linked_tenant_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

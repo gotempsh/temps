@@ -579,6 +579,7 @@ mod tests {
     async fn enroll_stub() -> Json<EnrollResponse> {
         Json(EnrollResponse {
             tenant_id: uuid::Uuid::new_v4(),
+            instance_id: None,
             account_email: Some("operator@example.com".into()),
             instance_token: "instance-token".into(),
             capabilities: Vec::new(),
