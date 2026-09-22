@@ -34769,6 +34769,10 @@
             "description": "Whether a Docker client exists AND a daemon answered a ping at startup.\nIn the `control-plane` profile a daemon may still be present for\ndiagnostics, but no workloads are placed here regardless.",
             "type": "boolean"
           },
+          "external_plugins": {
+            "description": "External plugin binaries and plugin-owned files may be installed.",
+            "type": "boolean"
+          },
           "image_builds_local": {
             "description": "Container images can be built by this process. Requires a local Docker\ndaemon; always `false` when `docker` is `false`.",
             "type": "boolean"
@@ -34789,12 +34793,20 @@
             "description": "Managed services (PostgreSQL, Redis, MariaDB, …) can be provisioned on\nthis host. Requires a local Docker daemon.",
             "type": "boolean"
           },
+          "persistent_workspaces": {
+            "description": "AI editing workspaces and chat attachments have durable local storage.",
+            "type": "boolean"
+          },
           "profile": {
             "description": "Serve profile this process was started with: `\"full\"` or\n`\"control-plane\"`.",
             "type": "string"
           },
           "sandboxes": {
             "description": "Agent sandboxes / workspace previews run in this process. Requires a\nlocal Docker daemon.",
+            "type": "boolean"
+          },
+          "stateless": {
+            "description": "This installation uses Postgres, injected secrets and S3 for durable\nstate; its control-plane scratch disk may be discarded.",
             "type": "boolean"
           },
           "vulnerability_scanning": {
@@ -101450,6 +101462,9 @@
           "404": {
             "description": "Project or environment not found"
           },
+          "409": {
+            "description": "Deployment method unavailable in stateless mode"
+          },
           "413": {
             "description": "Image tarball too large"
           },
@@ -101587,6 +101602,9 @@
           },
           "404": {
             "description": "Project or environment not found"
+          },
+          "409": {
+            "description": "Deployment method unavailable in stateless mode"
           }
         },
         "security": [
@@ -101656,6 +101674,9 @@
           },
           "404": {
             "description": "Project, environment, or bundle not found"
+          },
+          "409": {
+            "description": "Deployment method unavailable in stateless mode"
           },
           "500": {
             "description": "Internal server error"
@@ -108386,6 +108407,9 @@
           },
           "404": {
             "description": "Project not found"
+          },
+          "409": {
+            "description": "Deployment method unavailable in stateless mode"
           },
           "413": {
             "description": "Bundle too large"

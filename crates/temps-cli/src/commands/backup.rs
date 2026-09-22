@@ -496,6 +496,15 @@ impl BackupCommand {
         let encryption_key = Self::extract_encryption_key(&server_config)?;
         let auth_secret = Self::extract_auth_secret(&server_config)?;
         let data_dir = Self::resolve_data_dir(args.data_dir.as_deref())?;
+        if temps_config::stateless_mode_enabled()? {
+            let injected = temps_config::resolve_installation_secrets(&data_dir)?;
+            Self::validate_injected_recovery_secrets(
+                &injected.encryption_key,
+                &injected.auth_secret,
+                &encryption_key,
+                &auth_secret,
+            )?;
+        }
 
         if !args.database_url.starts_with("postgres://")
             && !args.database_url.starts_with("postgresql://")
@@ -706,7 +715,9 @@ impl BackupCommand {
             &metadata,
             &encryption_key,
         ))?;
-        Self::install_recovery_secrets(&data_dir, &encryption_key, &auth_secret)?;
+        if !temps_config::stateless_mode_enabled()? {
+            Self::install_recovery_secrets(&data_dir, &encryption_key, &auth_secret)?;
+        }
 
         println!();
         println!(
@@ -1352,6 +1363,23 @@ impl BackupCommand {
                 .map(|home| home.join(".temps"))
                 .ok_or_else(|| anyhow::anyhow!("Could not determine the Temps data directory")),
         }
+    }
+
+    fn validate_injected_recovery_secrets(
+        injected_key: &str,
+        injected_auth: &str,
+        recovered_key: &str,
+        recovered_auth: &str,
+    ) -> anyhow::Result<()> {
+        let injected = temps_core::EncryptionService::new(injected_key)?;
+        let recovered = temps_core::EncryptionService::new(recovered_key)?;
+        if injected.derive_subkey("temps/stateless/recovery-check")
+            != recovered.derive_subkey("temps/stateless/recovery-check")
+            || injected_auth != recovered_auth
+        {
+            anyhow::bail!("Stateless recovery requires the original injected encryption and auth secrets. Update the external secret configuration to match the backup before restoring; no database changes have been made.");
+        }
+        Ok(())
     }
 
     fn install_recovery_secrets(
@@ -2153,6 +2181,25 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn stateless_restore_requires_both_original_secrets_before_writing() {
+        let key = "01234567890123456789012345678901";
+        assert!(
+            BackupCommand::validate_injected_recovery_secrets(key, "auth-a", key, "auth-a").is_ok()
+        );
+        assert!(
+            BackupCommand::validate_injected_recovery_secrets(key, "auth-b", key, "auth-a")
+                .is_err()
+        );
+        assert!(BackupCommand::validate_injected_recovery_secrets(
+            "11111111111111111111111111111111",
+            "auth-a",
+            key,
+            "auth-a"
+        )
+        .is_err());
     }
 
     #[test]

@@ -158,15 +158,18 @@ impl TempsPlugin for DeploymentsPlugin {
             context.register_service(remote_log_source);
 
             // Cancel any running deployments from previous server instance
-            let cancel_service = deployment_service.clone();
-            tokio::spawn(async move {
-                if let Err(e) = cancel_service
-                    .cancel_running_deployments("Server restarted")
-                    .await
-                {
-                    tracing::error!("Failed to cancel running deployments: {}", e);
-                }
-            });
+            // Complete restart reconciliation before the durable queue consumer
+            // starts. Spawning this used to race a replayed deployment: the new
+            // workflow could transition to running and then be cancelled by the
+            // predecessor cleanup task.
+            deployment_service
+                .cancel_running_deployments("Server restarted")
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "failed to reconcile running deployments before queue startup: {error}"
+                    ))
+                })?;
 
             // Get encryption service for deployment token encryption (needed by cron service and workflow planner)
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
@@ -381,7 +384,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
             // Create JobProcessor with workflow execution capability
-            let job_receiver = queue_service.subscribe();
+            let job_receiver = queue_service.subscribe_durable(temps_queue::DEPLOYMENT_CONSUMER);
             let workflow_planner = Arc::new(WorkflowPlanner::new(
                 db.clone(),
                 log_service.clone(),
@@ -456,14 +459,21 @@ impl TempsPlugin for DeploymentsPlugin {
                     "deployment gate slot was not initialized for source Drop".to_string(),
                 )
             })?;
-            let source_drop_service = Arc::new(crate::services::SourceDropService::new(
-                db.clone(),
-                config_service.data_dir(),
-                source_drop_planner,
-                workflow_execution_service.clone(),
-                queue_service.clone(),
-                deployment_gate,
-            ));
+            let source_drop_service = Arc::new(
+                crate::services::SourceDropService::new(
+                    db.clone(),
+                    config_service.data_dir(),
+                    source_drop_planner,
+                    workflow_execution_service.clone(),
+                    queue_service.clone(),
+                    deployment_gate,
+                )
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                    "could not resolve stateless configuration for source Drop service: {error}"
+                ))
+                })?,
+            );
             context.register_service(source_drop_service.clone());
             let source_drop_deployer =
                 source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;

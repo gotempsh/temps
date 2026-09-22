@@ -38,6 +38,7 @@ use std::time::Duration;
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde::{Deserialize, Serialize};
 use temps_audit::AuditService;
 use temps_core::{AuditLogger, DBDateTime};
@@ -108,8 +109,9 @@ pub struct CloudTelemetryBackfillArgs {
     #[arg(long)]
     pub resume: bool,
 
-    /// Where to persist the resume checkpoint. Defaults to
-    /// `<data-dir>/cloud-telemetry-backfill.state`.
+    /// Where to persist the resume checkpoint in local mode. Defaults to
+    /// `<data-dir>/cloud-telemetry-backfill.state`. Stateless mode stores the
+    /// checkpoint in PostgreSQL and ignores this option.
     #[arg(long)]
     pub state_file: Option<PathBuf>,
 
@@ -153,8 +155,26 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     let (from, to) = parse_window(&args)?;
     let data_dir = resolve_data_dir(args.data_dir.clone())?;
 
-    let db = temps_database::establish_connection(&args.database_url).await?;
-    let link = load_cloud_link(&data_dir)?;
+    let stateless = temps_config::stateless_mode_enabled()?;
+    let _control_plane_owner = if stateless {
+        Some(
+            super::serve::stateless::ControlPlaneOwner::acquire(&args.database_url)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Could not acquire exclusive stateless control-plane ownership for Cloud backfill: {error}"
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let db = if stateless {
+        temps_database::connect_without_migrations(&args.database_url).await?
+    } else {
+        temps_database::establish_connection(&args.database_url).await?
+    };
+    let link = load_cloud_link(&data_dir, db.clone(), &args.database_url, stateless).await?;
     let source = build_source(&args, db.clone())?;
 
     // `resolve_project` rather than `policy_for`: the latter answers `Metered`
@@ -194,17 +214,18 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     println!(
         "{} {}",
         "!".bright_yellow(),
-        "This drives the same Cloud link state file `temps serve` uses. Stop the \
+        "This drives the same Cloud link state `temps serve` uses. Stop the \
          server first, or expect this run's counters to interleave with the live mirror's."
             .bright_yellow()
     );
     println!();
 
-    let state_path = args
-        .state_file
-        .clone()
-        .unwrap_or_else(|| data_dir.join("cloud-telemetry-backfill.state"));
-    let mut cursor = load_checkpoint_or_default(&args, &state_path, from, to);
+    let state_path = checkpoint_path(&args, &data_dir);
+    let mut cursor = if stateless {
+        load_postgres_checkpoint(db.as_ref(), &args, from, to).await?
+    } else {
+        load_checkpoint_or_default(&args, &state_path, from, to)
+    };
     if cursor != CloudBackfillCursor::default() {
         println!(
             "{} Resuming from checkpoint at {}",
@@ -330,7 +351,11 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         );
 
         if args.resume {
-            persist_checkpoint(&state_path, &args, from, to, &cursor)?;
+            if stateless {
+                persist_postgres_checkpoint(db.as_ref(), &args, from, to, &cursor).await?;
+            } else {
+                persist_checkpoint(&state_path, &args, from, to, &cursor)?;
+            }
         }
     }
 
@@ -365,7 +390,11 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     if args.resume {
         // A clean end-to-end run: clear the checkpoint so the next invocation
         // against a different window does not resume into it.
-        let _ = fs::remove_file(&state_path);
+        if stateless {
+            clear_postgres_checkpoint(db.as_ref(), args.project).await?;
+        } else {
+            let _ = fs::remove_file(&state_path);
+        }
     }
 
     Ok(())
@@ -461,25 +490,45 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 /// Load the same link state the server uses, decrypted with the same key.
-fn load_cloud_link(data_dir: &Path) -> anyhow::Result<Arc<temps_cloud_client::CloudLink>> {
-    let key_path = data_dir.join("encryption_key");
-    let key = fs::read_to_string(&key_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Could not read the instance encryption key at {}: {e}. \
-             This command must run on the instance's own machine, with \
-             --data-dir (or TEMPS_DATA_DIR) pointing at its data directory.",
-            key_path.display()
+async fn load_cloud_link(
+    data_dir: &Path,
+    db: Arc<sea_orm::DatabaseConnection>,
+    database_url: &str,
+    stateless: bool,
+) -> anyhow::Result<Arc<temps_cloud_client::CloudLink>> {
+    let key = temps_config::resolve_installation_secrets(data_dir)
+        .map_err(|error| anyhow::anyhow!("Could not resolve installation secrets: {error}"))?
+        .encryption_key;
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(&key)
+            .map_err(|error| anyhow::anyhow!("Could not initialise encryption: {error}"))?,
+    );
+
+    if stateless {
+        return temps_cloud_client::CloudLink::load_encrypted_postgres(
+            data_dir.to_path_buf(),
+            env!("CARGO_PKG_VERSION"),
+            encryption,
+            db,
+            database_url.to_string(),
+            false,
         )
-    })?;
-    let encryption = Arc::new(temps_core::EncryptionService::new(key.trim()).map_err(|e| {
-        anyhow::anyhow!("Could not initialise the encryption service from {key_path:?}: {e}")
-    })?);
+        .await
+        .map(Arc::new)
+        .map_err(|error| anyhow::anyhow!("Could not load stateless Cloud link state: {error}"));
+    }
 
     Ok(Arc::new(temps_cloud_client::CloudLink::load_encrypted(
         data_dir.to_path_buf(),
         env!("CARGO_PKG_VERSION"),
         encryption,
     )))
+}
+
+fn checkpoint_path(args: &CloudTelemetryBackfillArgs, data_dir: &Path) -> PathBuf {
+    args.state_file
+        .clone()
+        .unwrap_or_else(|| data_dir.join("cloud-telemetry-backfill.state"))
 }
 
 /// Pick the span source. ClickHouse when it is fully configured, Postgres
@@ -748,6 +797,116 @@ fn persist_checkpoint(
     Ok(())
 }
 
+async fn load_postgres_checkpoint(
+    db: &sea_orm::DatabaseConnection,
+    args: &CloudTelemetryBackfillArgs,
+    window_from: DBDateTime,
+    window_to: DBDateTime,
+) -> anyhow::Result<CloudBackfillCursor> {
+    if !args.resume {
+        return Ok(CloudBackfillCursor::default());
+    }
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT window_from, window_to, cursor FROM stateless_cloud_backfill_checkpoints WHERE project_id = $1",
+            [args.project.into()],
+        ))
+        .await
+        .map_err(|error| anyhow::anyhow!(
+            "Could not load durable Cloud backfill checkpoint for project {}: {error}",
+            args.project
+        ))?;
+    let Some(row) = row else {
+        return Ok(CloudBackfillCursor::default());
+    };
+    let stored_from: DBDateTime = row.try_get("", "window_from")?;
+    let stored_to: DBDateTime = row.try_get("", "window_to")?;
+    if stored_from != window_from || stored_to != window_to {
+        warn!(
+            project_id = args.project,
+            "durable checkpoint is for a different window; starting fresh"
+        );
+        return Ok(CloudBackfillCursor::default());
+    }
+    let cursor: serde_json::Value = row.try_get("", "cursor")?;
+    let file: CheckpointFile = serde_json::from_value(cursor).map_err(|error| {
+        anyhow::anyhow!(
+            "Durable Cloud backfill checkpoint for project {} is corrupt: {error}",
+            args.project
+        )
+    })?;
+    Ok(CloudBackfillCursor {
+        last_start_time: file
+            .last_start_time
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                "Durable Cloud backfill checkpoint timestamp for project {} is corrupt: {error}",
+                args.project
+            )
+            })?
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc)),
+        last_row_id: file.last_row_id,
+        last_span_id: file.last_span_id,
+    })
+}
+
+async fn persist_postgres_checkpoint(
+    db: &sea_orm::DatabaseConnection,
+    args: &CloudTelemetryBackfillArgs,
+    window_from: DBDateTime,
+    window_to: DBDateTime,
+    cursor: &CloudBackfillCursor,
+) -> anyhow::Result<()> {
+    let cursor = serde_json::to_value(CheckpointFile {
+        last_start_time: cursor
+            .last_start_time
+            .map(|timestamp| timestamp.to_rfc3339()),
+        last_row_id: cursor.last_row_id,
+        last_span_id: cursor.last_span_id.clone(),
+        window_from: None,
+        window_to: None,
+        project_id: None,
+    })?;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO stateless_cloud_backfill_checkpoints (project_id, window_from, window_to, cursor, updated_at) VALUES ($1, $2, $3, $4, now()) ON CONFLICT (project_id) DO UPDATE SET window_from = EXCLUDED.window_from, window_to = EXCLUDED.window_to, cursor = EXCLUDED.cursor, updated_at = EXCLUDED.updated_at",
+        [
+            args.project.into(),
+            window_from.into(),
+            window_to.into(),
+            cursor.into(),
+        ],
+    ))
+    .await
+    .map_err(|error| anyhow::anyhow!(
+        "Could not persist durable Cloud backfill checkpoint for project {}: {error}",
+        args.project
+    ))?;
+    Ok(())
+}
+
+async fn clear_postgres_checkpoint(
+    db: &sea_orm::DatabaseConnection,
+    project_id: i32,
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM stateless_cloud_backfill_checkpoints WHERE project_id = $1",
+        [project_id.into()],
+    ))
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Could not clear durable Cloud backfill checkpoint for project {project_id}: {error}"
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +1074,72 @@ mod tests {
 
         assert_eq!(
             load_checkpoint_or_default(&args(), &path, from, to),
+            CloudBackfillCursor::default()
+        );
+    }
+
+    #[test]
+    fn local_checkpoint_path_preserves_explicit_override() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut arguments = args();
+        assert_eq!(
+            checkpoint_path(&arguments, directory.path()),
+            directory.path().join("cloud-telemetry-backfill.state")
+        );
+
+        arguments.state_file = Some(PathBuf::from("/durable/backfill.state"));
+        assert_eq!(
+            checkpoint_path(&arguments, directory.path()),
+            PathBuf::from("/durable/backfill.state")
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_checkpoint_survives_control_plane_replacement() {
+        let database = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping durable checkpoint test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("checkpoint test database failed: {error}"),
+        };
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "CREATE TABLE stateless_cloud_backfill_checkpoints (project_id INTEGER PRIMARY KEY, window_from TIMESTAMPTZ NOT NULL, window_to TIMESTAMPTZ NOT NULL, cursor JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())".to_string(),
+            ))
+            .await
+            .expect("create checkpoint table");
+        let mut arguments = args();
+        arguments.resume = true;
+        let (from, to) = parse_window(&arguments).expect("window");
+        let expected = CloudBackfillCursor {
+            last_start_time: Some(from + chrono::Duration::hours(2)),
+            last_row_id: Some(91),
+            last_span_id: Some("span-91".to_string()),
+        };
+        persist_postgres_checkpoint(&database.db, &arguments, from, to, &expected)
+            .await
+            .expect("persist checkpoint");
+        assert_eq!(
+            load_postgres_checkpoint(&database.db, &arguments, from, to)
+                .await
+                .expect("reload checkpoint"),
+            expected
+        );
+        clear_postgres_checkpoint(&database.db, arguments.project)
+            .await
+            .expect("clear checkpoint");
+        assert_eq!(
+            load_postgres_checkpoint(&database.db, &arguments, from, to)
+                .await
+                .expect("checkpoint cleared"),
             CloudBackfillCursor::default()
         );
     }

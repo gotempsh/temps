@@ -26,9 +26,11 @@ headless_chrome = {version ="1.0.18", features = ["fetch", "offline"] }
 reqwest = { workspace = true }
 url = { workspace = true }
 base64 = "0.23"
+bytes = { workspace = true }
 
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-file-store = { path = "../temps-file-store" }
 
 [dev-dependencies]
 tokio-test = "0.4"

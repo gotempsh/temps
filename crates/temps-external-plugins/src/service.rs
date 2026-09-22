@@ -58,6 +58,8 @@ pub struct ExternalPluginsService {
 
 #[derive(Debug, Error)]
 pub enum ExternalPluginsError {
+    #[error("External plugins require durable local binary and plugin-data storage and cannot be installed on a stateless control plane. Use a full-profile instance for external plugins.")]
+    PersistentStorageRequired,
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
@@ -359,6 +361,10 @@ impl ExternalPluginsService {
         selected: SelectedRepository,
         progress: Option<&ProgressHandle>,
     ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+
         if let Some(progress) = progress {
             progress.advance(Stage::WaitingForLifecycle).await;
         }
@@ -678,6 +684,10 @@ impl ExternalPluginsService {
     ///
     /// Returns every successful manifest and every verification/start failure.
     pub async fn reload_plugins(&self) -> Result<PluginReloadResult, ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
@@ -820,6 +830,10 @@ impl ExternalPluginsService {
         &self,
         selected: SelectedPlugin,
     ) -> Result<InstallOutcome, ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
@@ -1141,6 +1155,28 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn stateless_plugins_refuse_local_lifecycle_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ExternalPluginConfig::new(
+            directory.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        config.persistent_installations = false;
+        let service = ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        assert!(matches!(
+            service.reload_plugins().await,
+            Err(ExternalPluginsError::PersistentStorageRequired)
+        ));
+        assert!(!directory.path().join("plugins").exists());
+    }
 
     #[tokio::test]
     async fn repository_install_preparation_validates_before_reserving_progress() {

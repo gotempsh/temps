@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
 use thiserror::Error;
 
@@ -161,6 +162,27 @@ impl TelemetryService {
     /// one on first run. The id is a random UUID v4 — not derived from anything
     /// machine-identifying.
     fn load_or_create_anonymous_id(data_dir: &Path) -> Result<String, TelemetryInitError> {
+        if temps_config::stateless_mode_enabled().map_err(|error| {
+            TelemetryInitError::AnonymousIdIo {
+                path: "TEMPS_STATELESS".to_string(),
+                reason: error.to_string(),
+            }
+        })? {
+            let instance_id = std::env::var("TEMPS_INSTANCE_ID").map_err(|error| {
+                TelemetryInitError::AnonymousIdIo {
+                    path: "TEMPS_INSTANCE_ID".to_string(),
+                    reason: format!("stateless installation identity is missing: {error}"),
+                }
+            })?;
+            if instance_id.trim().is_empty() {
+                return Err(TelemetryInitError::AnonymousIdIo {
+                    path: "TEMPS_INSTANCE_ID".to_string(),
+                    reason: "stateless installation identity is empty".to_string(),
+                });
+            }
+            return Ok(Self::stateless_anonymous_id(&instance_id));
+        }
+
         let path = Self::anonymous_id_path(data_dir);
 
         if path.exists() {
@@ -188,6 +210,11 @@ impl TelemetryService {
         })?;
 
         Ok(id)
+    }
+
+    fn stateless_anonymous_id(instance_id: &str) -> String {
+        let digest = Sha256::digest(instance_id.as_bytes());
+        format!("inst_{}", hex::encode(&digest[..16]))
     }
 
     /// The stable anonymous id for this instance (exposed for diagnostics).
@@ -371,6 +398,19 @@ mod tests {
         let id = TelemetryService::load_or_create_anonymous_id(&dir).unwrap();
         assert!(id.starts_with("inst_"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stateless_anonymous_id_is_stable_and_hides_operator_identity() {
+        let first = TelemetryService::stateless_anonymous_id("production-control-plane");
+        let second = TelemetryService::stateless_anonymous_id("production-control-plane");
+        assert_eq!(first, second);
+        assert!(first.starts_with("inst_"));
+        assert!(!first.contains("production-control-plane"));
+        assert_ne!(
+            first,
+            TelemetryService::stateless_anonymous_id("another-installation")
+        );
     }
 
     #[tokio::test]

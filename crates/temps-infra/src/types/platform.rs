@@ -29,6 +29,16 @@ pub struct PlatformInfo {
 /// silently fail instead of showing an onboarding state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PlatformFeatures {
+    /// This installation uses Postgres, injected secrets and S3 for durable
+    /// state; its control-plane scratch disk may be discarded.
+    #[serde(default)]
+    pub stateless: bool,
+    /// AI editing workspaces and chat attachments have durable local storage.
+    #[serde(default)]
+    pub persistent_workspaces: bool,
+    /// External plugin binaries and plugin-owned files may be installed.
+    #[serde(default)]
+    pub external_plugins: bool,
     /// Serve profile this process was started with: `"full"` or
     /// `"control-plane"`.
     pub profile: String,
@@ -71,12 +81,22 @@ pub struct PlatformFeatures {
 }
 
 impl PlatformFeatures {
+    pub fn with_stateless_mode(mut self, stateless: bool) -> Self {
+        self.stateless = stateless;
+        self.persistent_workspaces = !stateless;
+        self.external_plugins = !stateless;
+        self
+    }
+
     /// A fully-capable single-binary process: every subsystem enabled.
     ///
     /// `docker` is supplied by the caller because only the serve bootstrap
     /// has pinged the daemon at startup and knows whether it answered.
     pub fn full(docker: bool) -> Self {
         Self {
+            stateless: false,
+            persistent_workspaces: true,
+            external_plugins: true,
             profile: temps_core::PROFILE_FULL.to_string(),
             docker,
             deployments_local: true,
@@ -112,6 +132,9 @@ impl PlatformFeatures {
         log_aggregation: bool,
     ) -> Self {
         Self {
+            stateless: false,
+            persistent_workspaces: true,
+            external_plugins: true,
             profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
             docker,
             // Local workloads are definitionally absent in this profile.

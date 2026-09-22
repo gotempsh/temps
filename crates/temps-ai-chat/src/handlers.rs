@@ -2711,7 +2711,10 @@ pub async fn deploy_application_workspace_project(
                 | temps_core::SourceDropError::EnvironmentNotFound { .. }
                 | temps_core::SourceDropError::NoEnvironment { .. } => StatusCode::NOT_FOUND,
                 temps_core::SourceDropError::SourceNotAllowed { .. }
-                | temps_core::SourceDropError::InvalidArchive { .. } => StatusCode::BAD_REQUEST,
+                | temps_core::SourceDropError::InvalidArchive { .. }
+                | temps_core::SourceDropError::UnsupportedInStateless { .. } => {
+                    StatusCode::BAD_REQUEST
+                }
                 temps_core::SourceDropError::ArchiveTooLarge { .. } => {
                     StatusCode::PAYLOAD_TOO_LARGE
                 }

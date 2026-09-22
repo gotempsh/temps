@@ -43,6 +43,14 @@ use std::sync::Arc;
 use temps_core::{Job, JobQueue, RouteTableUpdatedJob};
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, thiserror::Error)]
+enum RouteReloadError {
+    #[error("failed to load routes: {0}")]
+    Load(String),
+    #[error("failed to publish route reload confirmation: {0}")]
+    Confirm(#[from] temps_core::QueueError),
+}
+
 /// Subscribes to the shared job queue and reloads routes on demand.
 pub struct RouteReloadSubscriber {
     peer_table: Arc<CachedPeerTable>,
@@ -66,30 +74,58 @@ impl RouteReloadSubscriber {
     /// dropped. The caller MUST keep the returned subscriber alive for the
     /// lifetime of the process — its `Drop` aborts the task.
     pub fn start(&self) {
-        let mut receiver = self.queue.subscribe();
+        let mut receiver = self.queue.subscribe_durable("routes");
         let peer_table = self.peer_table.clone();
         let queue = self.queue.clone();
 
         let handle = tokio::spawn(async move {
             info!("Started in-process route reload subscriber");
             loop {
-                match receiver.recv().await {
-                    Ok(Job::ForceRouteReload(req)) => {
+                match receiver.recv_delivery().await {
+                    Ok(delivery) => {
+                        let route_request = match &delivery.job {
+                            Job::ForceRouteReload(req) => {
+                                Some((req.environment_id, req.deployment_id))
+                            }
+                            Job::CustomDomainAdded(_)
+                            | Job::CustomDomainRemoved(_)
+                            | Job::CustomRouteAdded(_)
+                            | Job::CustomRouteRemoved(_) => Some((None, None)),
+                            _ => None,
+                        };
+                        let Some((environment_id, deployment_id)) = route_request else {
+                            if let Some(receipt) = delivery.receipt {
+                                if let Err(error) = queue.acknowledge(receipt).await {
+                                    error!(error = %error, "Failed to acknowledge obsolete route command");
+                                }
+                            }
+                            continue;
+                        };
                         debug!(
-                            environment_id = ?req.environment_id,
-                            deployment_id = ?req.deployment_id,
+                            environment_id = ?environment_id,
+                            deployment_id = ?deployment_id,
                             "ForceRouteReload received — reloading route table in-process"
                         );
-                        Self::reload_and_confirm(
+                        let result = Self::reload_and_confirm(
                             &peer_table,
                             &queue,
-                            req.environment_id,
-                            req.deployment_id,
+                            environment_id,
+                            deployment_id,
                         )
                         .await;
+                        if let Some(receipt) = delivery.receipt {
+                            let persistence = match result {
+                                Ok(()) => queue.acknowledge(receipt).await,
+                                Err(error) => {
+                                    error!(error = %error, "Route reload command failed; retaining durable delivery");
+                                    queue.fail(receipt, error.to_string()).await
+                                }
+                            };
+                            if let Err(error) = persistence {
+                                error!(error = %error, "Failed to settle route reload delivery");
+                            }
+                        }
                     }
-                    // Any other job type is irrelevant to this subscriber.
-                    Ok(_) => continue,
                     Err(temps_core::QueueError::ChannelClosed) => {
                         // The queue is gone — the process is shutting down.
                         warn!("Route reload subscriber: queue channel closed, stopping");
@@ -105,7 +141,11 @@ impl RouteReloadSubscriber {
                             "Route reload subscriber lagged ({}); reloading defensively",
                             e
                         );
-                        Self::reload_and_confirm(&peer_table, &queue, None, None).await;
+                        if let Err(error) =
+                            Self::reload_and_confirm(&peer_table, &queue, None, None).await
+                        {
+                            error!(error = %error, "Defensive route reload failed");
+                        }
                     }
                 }
             }
@@ -124,37 +164,25 @@ impl RouteReloadSubscriber {
         queue: &Arc<dyn JobQueue>,
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
-    ) {
-        match peer_table.load_routes().await {
-            Ok(_) => {
-                let route_count = peer_table.len();
-                debug!(
-                    route_count,
-                    environment_id = ?environment_id,
-                    deployment_id = ?deployment_id,
-                    "Route table reloaded in-process"
-                );
-                let event = Job::RouteTableUpdated(RouteTableUpdatedJob {
-                    environment_id,
-                    deployment_id,
-                    route_count,
-                });
-                if let Err(e) = queue.send(event).await {
-                    error!(
-                        "Failed to publish RouteTableUpdated after in-process reload: {}",
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    environment_id = ?environment_id,
-                    deployment_id = ?deployment_id,
-                    "In-process route reload failed: {}",
-                    e
-                );
-            }
-        }
+    ) -> Result<(), RouteReloadError> {
+        peer_table
+            .load_routes()
+            .await
+            .map_err(|error| RouteReloadError::Load(error.to_string()))?;
+        let route_count = peer_table.len();
+        debug!(
+            route_count,
+            environment_id = ?environment_id,
+            deployment_id = ?deployment_id,
+            "Route table reloaded in-process"
+        );
+        let event = Job::RouteTableUpdated(RouteTableUpdatedJob {
+            environment_id,
+            deployment_id,
+            route_count,
+        });
+        queue.send(event).await?;
+        Ok(())
     }
 
     /// Stop the background task.
@@ -250,6 +278,32 @@ mod tests {
         let sub = RouteReloadSubscriber::new(test_peer_table(), queue);
         sub.shutdown();
         assert!(sub.task_handle.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_failure_is_returned_before_confirmation() {
+        let (tx, _rx) = broadcast::channel(16);
+        let updates = Arc::new(AtomicUsize::new(0));
+        let queue: Arc<dyn JobQueue> = Arc::new(TestQueue {
+            tx,
+            route_updates: updates.clone(),
+        });
+        let peer_table = Arc::new(CachedPeerTable::new(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("route query failed".to_string())])
+                .into_connection(),
+        )));
+
+        let result = RouteReloadSubscriber::reload_and_confirm(
+            peer_table.as_ref(),
+            &queue,
+            Some(7),
+            Some(11),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RouteReloadError::Load(_))));
+        assert_eq!(updates.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

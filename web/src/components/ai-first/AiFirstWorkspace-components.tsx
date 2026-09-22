@@ -160,6 +160,8 @@ import {
   workspacePageTitle,
 } from './thread-title-event'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
+import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
 import {
   batchLocalImportFiles,
   fileToBase64,
@@ -223,6 +225,35 @@ function threadRuntimeLabel(
 }
 
 export function AiFirstWorkspace() {
+  const platformFeatures = usePlatformFeatures()
+  if (platformFeatures.data === undefined) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+        Loading workspace capabilities…
+      </div>
+    )
+  }
+  if (!persistentWorkspaceStorageSupported(platformFeatures.data)) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <div className="max-w-lg rounded-xl border bg-card p-6 text-center shadow-sm">
+          <h1 className="text-lg font-semibold">
+            AI workspaces need persistent storage
+          </h1>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            This stateless control plane cannot retain workspace files,
+            attachments, or local imports across replacement. Use AI chat from a
+            project page for diagnostics, or run a full-profile instance for
+            persistent workspaces.
+          </p>
+        </div>
+      </div>
+    )
+  }
+  return <PersistentAiFirstWorkspace />
+}
+
+function PersistentAiFirstWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
   const { data: workspaceFileLimits } = useQuery(

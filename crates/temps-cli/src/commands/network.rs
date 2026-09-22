@@ -305,16 +305,11 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
         .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
         .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
-    let key_path = data_dir.join("encryption_key");
-    let encryption_key = std::fs::read_to_string(&key_path).map_err(|error| {
-        anyhow::anyhow!(
-            "could not read the existing encryption key at {}: {error}; pass the same \
-             --data-dir used by `temps serve`",
-            key_path.display()
-        )
-    })?;
+    let encryption_key = temps_config::resolve_installation_secrets(&data_dir)
+        .map_err(|error| anyhow::anyhow!("could not resolve installation secrets: {error}"))?
+        .encryption_key;
     let encryption = Arc::new(
-        temps_core::EncryptionService::new(encryption_key.trim())
+        temps_core::EncryptionService::new(&encryption_key)
             .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
     );
     let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));

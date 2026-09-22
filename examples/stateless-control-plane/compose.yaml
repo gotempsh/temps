@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# One active, replaceable console. PostgreSQL (with Temps' required extensions)
+# and S3 are external services. Pin TEMPS_IMAGE to the tested release/digest.
+# Point a stable HTTPS management origin at this console. App DNS and public
+# ports 80/443 belong to ingress-enabled workers, not this container.
+#
+# Before replacing: retain the SAME database, instance ID, management origin,
+# bucket/endpoint and secrets. Back up Postgres and enable bucket versioning.
+# Use S3 credentials restricted to the instance prefix (see s3-policy.json).
+# To adopt an existing OSS database, first migrate files with
+# scripts/migrate-stateless-files.py while the old server is stopped, then
+# mount its original encryption_key and auth_secret in TEMPS_DATA_DIR for
+# the first stateless startup. Subsequent starts need only injected secrets.
+# TEMPS_DATA_DIR is disposable; no persistent volume or Docker socket is needed.
+services:
+  control-plane:
+    image: ${TEMPS_IMAGE:?Set a tested Temps image digest}
+    command: ["/app/temps", "serve", "--profile", "control-plane", "--role", "console", "--console-address", "0.0.0.0:9000"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=1073741824,mode=1777
+    ports:
+      - "127.0.0.1:${TEMPS_CONSOLE_PORT:-9000}:9000"
+    environment:
+      TEMPS_STATELESS: "true"
+      TEMPS_INSTANCE_ID: ${TEMPS_INSTANCE_ID:?Set a stable instance ID}
+      TEMPS_MANAGEMENT_URL: ${TEMPS_MANAGEMENT_URL:?Set the stable HTTPS console origin}
+      TEMPS_DATABASE_URL: ${TEMPS_DATABASE_URL:?Set the external Postgres URL}
+      TEMPS_DATA_DIR: /tmp/temps
+      TEMPS_AUTH_SECRET_FILE: /run/secrets/auth_secret
+      TEMPS_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      TEMPS_ADMIN_EMAIL: ${TEMPS_ADMIN_EMAIL:?Set initial administrator email}
+      TEMPS_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      TEMPS_LOG_S3_BUCKET: ${TEMPS_LOG_S3_BUCKET:?Set the durable S3 bucket}
+      TEMPS_LOG_S3_REGION: ${TEMPS_LOG_S3_REGION:-us-east-1}
+      TEMPS_LOG_S3_ENDPOINT: ${TEMPS_LOG_S3_ENDPOINT:-}
+      TEMPS_LOG_S3_FORCE_PATH_STYLE: ${TEMPS_LOG_S3_FORCE_PATH_STYLE:-false}
+      TEMPS_LOG_S3_ACCESS_KEY_ID: ${TEMPS_LOG_S3_ACCESS_KEY_ID:?Set prefix-scoped S3 credentials}
+      TEMPS_LOG_S3_SECRET_ACCESS_KEY: ${TEMPS_LOG_S3_SECRET_ACCESS_KEY:?Set prefix-scoped S3 credentials}
+    secrets: [auth_secret, encryption_key, admin_password]
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 30s
+secrets:
+  auth_secret:
+    file: ${TEMPS_AUTH_SECRET_FILE:?Set auth secret file path}
+  encryption_key:
+    file: ${TEMPS_ENCRYPTION_KEY_FILE:?Set encryption key file path}
+  admin_password:
+    file: ${TEMPS_ADMIN_PASSWORD_FILE:?Set bootstrap password file path}

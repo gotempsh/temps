@@ -1909,24 +1909,13 @@ WHERE project.id = $2
             "deployment-container-logs/{}/{}.log",
             container.deployment_id, container.id
         );
-        let full_path = log_service.base_path().join(&log_path);
-
-        if let Some(parent) = full_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                self.log(format!(
-                    "Failed to create log capture directory for container {}: {}",
-                    container.container_name, e
-                ))
-                .await
-                .ok();
-                return;
-            }
-        }
-
         let size_bytes = logs.len() as i64;
-        if let Err(e) = tokio::fs::write(&full_path, logs.as_bytes()).await {
+        if let Err(e) = log_service
+            .write_completed_log(&log_path, logs.as_bytes())
+            .await
+        {
             self.log(format!(
-                "Failed to write captured logs for container {}: {}",
+                "Failed to durably write captured logs for container {}: {}",
                 container.container_name, e
             ))
             .await

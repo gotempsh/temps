@@ -38,6 +38,11 @@ struct EncryptedEnrollmentState {
 
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error("Cloud link state database operation '{operation}' failed: {reason}")]
+    Database {
+        operation: &'static str,
+        reason: String,
+    },
     #[error(
         "Cloud link state at {path} is unreadable. Restore the encryption key used to create it, or back up and remove the state file before reconnecting"
     )]
@@ -115,6 +120,43 @@ impl std::fmt::Debug for EnrollmentState {
 }
 
 impl EnrollmentState {
+    pub(crate) fn from_encrypted_ciphertext(
+        ciphertext: &str,
+        encryption: &temps_core::EncryptionService,
+        location: &str,
+    ) -> Result<Self, StateError> {
+        let plaintext =
+            encryption
+                .decrypt_string(ciphertext)
+                .map_err(|error| StateError::Encryption {
+                    path: location.to_string(),
+                    operation: "decrypt",
+                    reason: error.to_string(),
+                })?;
+        serde_json::from_str(&plaintext).map_err(|error| StateError::Corrupt {
+            path: location.to_string(),
+            reason: format!("decrypted state is invalid: {error}"),
+        })
+    }
+
+    pub(crate) fn to_encrypted_ciphertext(
+        &self,
+        encryption: &temps_core::EncryptionService,
+        location: &str,
+    ) -> Result<String, StateError> {
+        let plaintext = serde_json::to_string(self).map_err(|error| StateError::Corrupt {
+            path: location.to_string(),
+            reason: error.to_string(),
+        })?;
+        encryption
+            .encrypt_string(&plaintext)
+            .map_err(|error| StateError::Encryption {
+                path: location.to_string(),
+                operation: "encrypt",
+                reason: error.to_string(),
+            })
+    }
+
     /// A brand-new, unlinked instance.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -214,18 +256,11 @@ impl EnrollmentState {
                     reason: format!("unsupported encrypted state version {}", envelope.version),
                 });
             }
-            let plaintext = encryption
-                .decrypt_string(&envelope.ciphertext)
-                .map_err(|error| StateError::Encryption {
-                    path: path.display().to_string(),
-                    operation: "decrypt",
-                    reason: error.to_string(),
-                })?;
-            let mut state: Self =
-                serde_json::from_str(&plaintext).map_err(|error| StateError::Corrupt {
-                    path: path.display().to_string(),
-                    reason: format!("decrypted state is invalid: {error}"),
-                })?;
+            let mut state = Self::from_encrypted_ciphertext(
+                &envelope.ciphertext,
+                encryption,
+                &path.display().to_string(),
+            )?;
             if state.migrate_legacy_loopback_policy() {
                 state.save_encrypted(path, encryption)?;
             }
@@ -300,18 +335,7 @@ impl EnrollmentState {
         path: &Path,
         encryption: &temps_core::EncryptionService,
     ) -> Result<(), StateError> {
-        let plaintext = serde_json::to_string(self).map_err(|error| StateError::Corrupt {
-            path: path.display().to_string(),
-            reason: error.to_string(),
-        })?;
-        let ciphertext =
-            encryption
-                .encrypt_string(&plaintext)
-                .map_err(|error| StateError::Encryption {
-                    path: path.display().to_string(),
-                    operation: "encrypt",
-                    reason: error.to_string(),
-                })?;
+        let ciphertext = self.to_encrypted_ciphertext(encryption, &path.display().to_string())?;
         write_state_file(
             path,
             &serde_json::to_string_pretty(&EncryptedEnrollmentState {

@@ -54,7 +54,33 @@ impl TempsPlugin for CloudPlugin {
             let config = context.require_service::<ConfigService>();
             let encryption = context.require_service::<temps_core::EncryptionService>();
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let link = if self.allow_loopback_development {
+            let stateless = temps_config::stateless_mode_enabled().map_err(|error| {
+                PluginError::PluginRegistrationFailed {
+                    plugin_name: "cloud".to_string(),
+                    error: error.to_string(),
+                }
+            })?;
+            let link = if stateless {
+                Arc::new(
+                    CloudLink::load_encrypted_postgres(
+                        self.data_dir.clone(),
+                        self.agent_version.clone(),
+                        encryption.clone(),
+                        db.clone(),
+                        config.get_server_config().database_url.clone(),
+                        self.allow_loopback_development,
+                    )
+                    .await
+                    .map_err(|error| {
+                        PluginError::PluginRegistrationFailed {
+                            plugin_name: "cloud".to_string(),
+                            error: format!(
+                                "stateless Cloud link state initialization failed: {error}"
+                            ),
+                        }
+                    })?,
+                )
+            } else if self.allow_loopback_development {
                 Arc::new(CloudLink::load_encrypted_for_loopback_development(
                     self.data_dir.clone(),
                     self.agent_version.clone(),

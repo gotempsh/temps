@@ -141,6 +141,7 @@ pub struct ProjectEnvironmentStatus {
 #[derive(Clone)]
 pub struct ApplicationWorkspaceService {
     root: PathBuf,
+    local_workspaces_enabled: bool,
     import_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -195,8 +196,26 @@ impl ApplicationWorkspaceService {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             root: data_dir.join("ai-applications"),
+            local_workspaces_enabled: true,
             import_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Stateless control planes must not acknowledge files stored only on
+    /// their disposable scratch disk. Remote workspace support is required
+    /// before enabling this capability for that installation profile.
+    pub fn with_local_workspaces_enabled(mut self, enabled: bool) -> Self {
+        self.local_workspaces_enabled = enabled;
+        self
+    }
+
+    fn require_durable_workspace(&self) -> Result<(), ApplicationError> {
+        if !self.local_workspaces_enabled {
+            return Err(ApplicationError::InvalidWorkspaceSetting(
+                "AI workspace files and chat attachments require persistent workspace storage; they are unavailable on a stateless control plane. Use a full-profile instance for workspace editing and deploy prebuilt images to workers here.".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -362,6 +381,7 @@ impl ApplicationWorkspaceService {
         max_workspace_bytes: u64,
         max_workspace_entries: usize,
     ) -> Result<usize, ApplicationError> {
+        self.require_durable_workspace()?;
         validate_workspace_component(project_slug)?;
         let prefix = PathBuf::from("projects").join(project_slug);
         let files = files
@@ -387,6 +407,7 @@ impl ApplicationWorkspaceService {
         max_workspace_bytes: u64,
         max_workspace_entries: usize,
     ) -> Result<usize, ApplicationError> {
+        self.require_durable_workspace()?;
         use unicode_casefold::UnicodeCaseFold;
         use unicode_normalization::UnicodeNormalization;
 
@@ -456,6 +477,7 @@ impl ApplicationWorkspaceService {
         application_public_id: &str,
         projects: &[projects::Model],
     ) -> Result<HarnessWorkspace, ApplicationError> {
+        self.require_durable_workspace()?;
         validate_workspace_component(application_public_id)?;
         // Only the configured data root may be created recursively. Every
         // user-writable descendant is opened one component at a time and must
@@ -601,6 +623,7 @@ impl ApplicationWorkspaceService {
         file_name: &str,
         bytes: Vec<u8>,
     ) -> Result<PathBuf, ApplicationError> {
+        self.require_durable_workspace()?;
         let _mutation = self.import_lock.lock().await;
         for component in [workspace_id, conversation_id, attachment_id] {
             validate_workspace_component(component)?;
@@ -3057,6 +3080,22 @@ mod tests {
         ApplicationService::new(Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
         ))
+    }
+
+    #[tokio::test]
+    async fn stateless_workspace_refuses_acknowledging_disposable_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = ApplicationWorkspaceService::new(directory.path().to_path_buf())
+            .with_local_workspaces_enabled(false);
+        let error = workspace
+            .ensure("app_stateless_test", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApplicationError::InvalidWorkspaceSetting(_)
+        ));
+        assert!(!workspace.root().exists());
     }
 
     #[tokio::test]

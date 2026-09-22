@@ -33,6 +33,7 @@ import {
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
   usePlugins,
   useReloadPlugins,
@@ -71,6 +72,9 @@ import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsD
 
 export function PluginsPage() {
   const navigate = useNavigate()
+  const platformFeatures = usePlatformFeatures()
+  const requiresPersistentStorage = platformFeatures.data?.external_plugins === false
+
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
   const canManagePlugins = canManageExternalPlugins(user?.role)
@@ -85,7 +89,7 @@ export function PluginsPage() {
     []
   )
   const [tab, setTab] = useState('browse')
-  const managementPending = reloadPlugins.isPending || uninstallPlugin.isPending
+  const managementPending = requiresPersistentStorage || reloadPlugins.isPending || uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -135,6 +139,16 @@ export function PluginsPage() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
+      {requiresPersistentStorage && (
+        <Alert>
+          <AlertTitle>Plugins need persistent storage</AlertTitle>
+          <AlertDescription>
+            Browse available plugins here. Installing them requires a full-profile
+            instance that retains plugin binaries and data. This stateless control
+            plane replaces its local disk when it restarts.
+          </AlertDescription>
+        </Alert>
+      )}
       <Dialog
         open={updateName !== null}
         onOpenChange={(open) => {
@@ -247,7 +261,7 @@ export function PluginsPage() {
         )}
         <TabsContent value="browse" className="space-y-4">
           <RepositoryCatalog
-            canInstall={canManagePlugins}
+            canInstall={canManagePlugins && !requiresPersistentStorage}
             disabled={managementPending}
             installedNames={plugins.map((plugin) => plugin.name)}
             onSelect={(plugin) => {

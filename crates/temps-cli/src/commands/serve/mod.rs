@@ -9,6 +9,7 @@ pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
+pub(crate) mod stateless;
 
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -296,8 +297,51 @@ impl ServeCommand {
         // leave both stranded -- the maintenance task unpolled and the pooled
         // sockets bound to a driver nothing runs -- and the first query issued
         // from the main runtime would hang forever.
+        // Declare the owner before the runtime so the runtime (including all
+        // detached plugin tasks) shuts down before the ownership guard drops.
+        let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let stateless_mode = temps_config::stateless_mode_enabled()?;
+        _control_plane_owner = if stateless_mode {
+            stateless::validate_profile(self.profile, self.role)?;
+            stateless::validate_scratch_directory(&serve_config.data_dir)?;
+            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
+        } else {
+            None
+        };
+        let db = rt.block_on(temps_database::connect_without_migrations(
+            &self.database_url,
+        ))?;
+        let storage_identity = if stateless_mode {
+            Some(stateless::storage_identity()?)
+        } else {
+            None
+        };
+        rt.block_on(stateless::preflight_identity(
+            db.as_ref(),
+            serve_config.as_ref(),
+            encryption_service.as_ref(),
+            storage_identity
+                .as_ref()
+                .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
+        ))?;
+        if stateless_mode {
+            rt.block_on(stateless::prepare_storage())?;
+        }
+        rt.block_on(temps_database::run_migrations(db.as_ref()))?;
+        if let Some((instance_id, storage_identity)) = storage_identity {
+            rt.block_on(stateless::verify_identity(
+                db.clone(),
+                serve_config.clone(),
+                encryption_service.as_ref(),
+                &instance_id,
+                &storage_identity,
+            ))?;
+        } else {
+            rt.block_on(stateless::reject_local_mode_for_managed_database(
+                db.as_ref(),
+            ))?;
+        }
 
         // Update private address setting from CLI flag
         if let Some(ref private_address) = self.private_address {
@@ -355,8 +399,16 @@ impl ServeCommand {
 
         // Create the shared job queue FIRST — it is used by route table listeners
         // (to publish RouteTableUpdated) and by the console API (for all other jobs).
-        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) =
-            temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) = if stateless_mode {
+            (
+                rt.block_on(temps_queue::DurableBroadcastQueue::create(db.clone(), 1000))?,
+                None,
+            )
+        } else {
+            let (queue, receiver) =
+                temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+            (queue, Some(receiver))
+        };
 
         // Create shared route table instance (used by both console API and proxy)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(

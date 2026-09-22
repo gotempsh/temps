@@ -129,9 +129,15 @@ impl TempsPlugin for AiChatPlugin {
             ];
 
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let application_workspaces = Arc::new(crate::ApplicationWorkspaceService::new(
-                config_service.data_dir(),
-            ));
+            let stateless = temps_config::stateless_mode_enabled().map_err(|error| {
+                PluginError::InitializationFailed(format!(
+                    "AI workspace storage configuration: {error}"
+                ))
+            })?;
+            let application_workspaces = Arc::new(
+                crate::ApplicationWorkspaceService::new(config_service.data_dir())
+                    .with_local_workspaces_enabled(!stateless),
+            );
             context.register_service(application_workspaces.clone());
             let application_sandboxes = context.get_service::<temps_sandbox::SandboxService>();
             if let (Some(sandboxes), Some(resolver_slot)) = (

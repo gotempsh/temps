@@ -1844,6 +1844,9 @@ fn docker_unavailable_error(reason: &str) -> anyhow::Error {
 /// Storage backend selection for the log aggregator.
 #[derive(Debug, thiserror::Error)]
 pub enum LogStorageConfigError {
+    #[error(transparent)]
+    Stateless(#[from] temps_file_store::s3_config::StaticStorageConfigError),
+
     #[error(
         "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
          other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
@@ -1866,6 +1869,23 @@ fn log_aggregator_storage_config(
             .ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or(LogStorageConfigError::MissingS3Variable { variable })
+    }
+
+    let stateless = temps_file_store::s3_config::resolve_stateless_storage()?;
+    if let Some(prefix) = stateless.subsystem_prefix("logs") {
+        if let temps_file_store::s3_config::StaticStorageBackend::S3(storage) =
+            temps_file_store::s3_config::resolve_static_storage_backend()?
+        {
+            return Ok(StorageConfig::S3 {
+                bucket: storage.bucket,
+                region: storage.region,
+                endpoint: storage.endpoint,
+                access_key_id: storage.access_key_id,
+                secret_access_key: storage.secret_access_key,
+                prefix: Some(prefix),
+                force_path_style: storage.force_path_style,
+            });
+        }
     }
 
     let backend =
@@ -3428,7 +3448,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // 15. ExternalPluginsPlugin - discovers and manages standalone binary plugins
     debug!("Registering ExternalPluginsPlugin");
-    let external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
+    let mut external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
         config.data_dir.clone(),
         config.database_url.clone(),
     )
@@ -3438,6 +3458,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // construct one without being told the address the proxy listens on.
     .with_proxy_address(&config.address)
     .with_registry(external_plugin_registry);
+    external_plugin_config.persistent_installations = !temps_config::stateless_mode_enabled()?;
     let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
         external_plugin_config,
     ));

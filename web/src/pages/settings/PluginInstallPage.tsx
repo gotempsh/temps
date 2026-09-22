@@ -12,6 +12,7 @@ import { RepositoryInstall } from '@/components/plugins/RepositoryInstall'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { canManageExternalPlugins } from '@/lib/plugin-registry'
 import {
@@ -31,6 +32,9 @@ export function PluginInstallPage() {
   const name = params.get('plugin')
   const commit = params.get('commit')
   const navigate = useNavigate()
+  const platformFeatures = usePlatformFeatures()
+  const requiresPersistentStorage = platformFeatures.data?.external_plugins === false
+
   const { user } = useAuth()
   const canInstall = canManageExternalPlugins(user?.role)
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -74,7 +78,16 @@ export function PluginInstallPage() {
             : 'Review a plugin’s source and choose its access to your instance.'
         }
       />
-      {name && catalog.isPending ? (
+      {requiresPersistentStorage ? (
+        <section role="status" className="space-y-3 rounded-lg border p-5">
+          <h2 className="font-semibold">Plugins need persistent storage</h2>
+          <p className="text-sm text-muted-foreground">
+            Install plugins on a full-profile instance that retains plugin binaries
+            and data. This stateless control plane cannot retain those files.
+          </p>
+          <Button asChild variant="outline"><Link to="/settings/plugins">Browse plugins</Link></Button>
+        </section>
+      ) : name && catalog.isPending ? (
         <Skeleton className="h-64 w-full" />
       ) : name && (!plugin || !catalog.data?.available || catalog.isError) ? (
         <section role="alert" className="space-y-3 rounded-lg border p-5">

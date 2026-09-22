@@ -126,6 +126,8 @@ impl Drop for ExternalPluginProcess {
 /// Configuration for the external plugin manager.
 #[derive(Debug, Clone)]
 pub struct ExternalPluginConfig {
+    /// Installed plugin binaries and plugin-owned files require durable local storage.
+    pub persistent_installations: bool,
     /// Directory to scan for plugin binaries
     pub plugins_dir: PathBuf,
     /// Directory for plugin Unix sockets
@@ -286,6 +288,7 @@ impl ExternalPluginConfig {
         let sockets_dir = PathBuf::from(format!("/tmp/tp-{}", short_hash));
 
         Self {
+            persistent_installations: true,
             plugins_dir: data_dir.join("plugins"),
             sockets_dir,
             pids_dir: data_dir.join("run").join("plugin-pids"),
@@ -409,6 +412,13 @@ impl ExternalPluginManager {
     }
 
     async fn discover_and_start_report(&self) -> PluginReloadResult {
+        if !self.config.persistent_installations {
+            return PluginReloadResult {
+                manifests: Vec::new(),
+                failures: Vec::new(),
+            };
+        }
+
         #[cfg(unix)]
         if let Err(error) = secure_socket_directory(&self.config.sockets_dir) {
             error!(

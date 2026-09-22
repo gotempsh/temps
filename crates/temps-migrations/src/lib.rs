@@ -27,3 +27,4 @@ pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHist
 pub use migration::m20260921_000003_detection_retry::Migration as DetectionRetryMigration;
 
 pub use migration::m20260921_000004_credential_catalog::Migration as CredentialCatalogMigration;
+pub use migration::m20260922_000001_stateless_control_plane_jobs::Migration as StatelessControlPlaneJobsMigration;

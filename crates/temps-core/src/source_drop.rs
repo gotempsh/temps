@@ -44,6 +44,8 @@ pub enum SourceDropError {
     NoEnvironment { project_id: i32 },
     #[error("project {project_id} does not accept uploaded source archives: {reason}")]
     SourceNotAllowed { project_id: i32, reason: String },
+    #[error("uploaded source deployments are unavailable in stateless mode: {guidance}")]
+    UnsupportedInStateless { guidance: String },
     #[error("source archive is invalid: {reason}")]
     InvalidArchive { reason: String },
     #[error("source archive exceeds the {max_bytes} byte limit")]

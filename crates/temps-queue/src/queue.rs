@@ -47,7 +47,7 @@ pub struct BroadcastQueueService {
 
 // Wrapper for broadcast::Receiver to implement JobReceiver trait
 pub struct BroadcastJobReceiver {
-    receiver: broadcast::Receiver<Job>,
+    pub(crate) receiver: broadcast::Receiver<Job>,
 }
 
 #[async_trait]

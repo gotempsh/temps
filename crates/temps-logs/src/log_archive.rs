@@ -25,7 +25,18 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::Config;
+use tokio::io::AsyncReadExt;
 use tracing::debug;
+
+const CHUNK_KEY_PREFIX: &str = "build-log-chunks";
+const MAX_CHUNK_PAGE: usize = 1_000;
+const MAX_CHUNK_OBJECT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableLogChunk {
+    pub line: u64,
+    pub data: Vec<u8>,
+}
 
 /// Errors from the log archive storage backend.
 #[derive(Debug, thiserror::Error)]
@@ -111,8 +122,56 @@ fn is_retryable_s3_error(err: &impl ProvideErrorMetadata) -> bool {
 /// never run for an install that never opted in.
 #[async_trait::async_trait]
 pub trait LogArchiveStorage: Send + Sync + 'static {
+    /// Persist one immutable JSONL entry before its producer is acknowledged.
+    async fn upload_log_chunk(
+        &self,
+        _log_id: &str,
+        _line: u64,
+        _data: Vec<u8>,
+    ) -> Result<(), LogArchiveStorageError> {
+        Ok(())
+    }
+
+    /// Read durable entries after `after_line`, in ascending line order.
+    async fn download_log_chunks(
+        &self,
+        _log_id: &str,
+        _after_line: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Read the most recent durable entries in ascending line order.
+    async fn download_recent_log_chunks(
+        &self,
+        _log_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        Ok(Vec::new())
+    }
+
     /// Upload the full contents of a finished log as one object.
     async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError>;
+
+    /// Upload a finished log from a file. Production object stores override
+    /// this to stream from disk with constant memory; the default keeps small
+    /// test backends source-compatible.
+    async fn upload_log_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+    ) -> Result<(), LogArchiveStorageError> {
+        let data = tokio::fs::read(path)
+            .await
+            .map_err(|error| LogArchiveStorageError::Upload {
+                bucket: "local-file".to_string(),
+                key: key.to_string(),
+                reason: format!("failed to read '{}': {error}", path.display()),
+                retryable: false,
+            })?;
+        self.upload_log(key, data).await
+    }
 
     /// Download the full contents of a previously archived log.
     async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError>;
@@ -175,10 +234,237 @@ impl S3LogArchive {
             None => key.to_string(),
         }
     }
+
+    fn chunk_prefix(&self, log_id: &str) -> String {
+        self.full_key(&format!("{CHUNK_KEY_PREFIX}/{}/", hex::encode(log_id)))
+    }
+
+    fn chunk_key(&self, log_id: &str, line: u64) -> String {
+        format!("{}{:020}.jsonl", self.chunk_prefix(log_id), line)
+    }
+
+    fn line_from_chunk_key(key: &str) -> Option<u64> {
+        key.rsplit('/').next()?.strip_suffix(".jsonl")?.parse().ok()
+    }
 }
 
 #[async_trait::async_trait]
 impl LogArchiveStorage for S3LogArchive {
+    async fn upload_log_chunk(
+        &self,
+        log_id: &str,
+        line: u64,
+        data: Vec<u8>,
+    ) -> Result<(), LogArchiveStorageError> {
+        let key = self.chunk_key(log_id, line);
+        let expected = data.clone();
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(ByteStream::from(data))
+            .content_type("application/jsonl")
+            .if_none_match("*")
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.code() == Some("PreconditionFailed") => {
+                let response = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|get_error| LogArchiveStorageError::Upload {
+                        bucket: self.bucket.clone(),
+                        key: key.clone(),
+                        reason: format!(
+                            "chunk already exists but could not be verified: {get_error}"
+                        ),
+                        retryable: is_retryable_s3_error(&get_error),
+                    })?;
+                let mut reader = response
+                    .body
+                    .into_async_read()
+                    .take(MAX_CHUNK_OBJECT_BYTES + 1);
+                let mut existing =
+                    Vec::with_capacity(expected.len().min(MAX_CHUNK_OBJECT_BYTES as usize));
+                reader
+                    .read_to_end(&mut existing)
+                    .await
+                    .map_err(|read_error| LogArchiveStorageError::Upload {
+                        bucket: self.bucket.clone(),
+                        key: key.clone(),
+                        reason: format!(
+                            "chunk already exists but its body could not be verified: {read_error}"
+                        ),
+                        retryable: true,
+                    })?;
+                if existing == expected {
+                    Ok(())
+                } else {
+                    Err(LogArchiveStorageError::Upload {
+                        bucket: self.bucket.clone(),
+                        key,
+                        reason: format!(
+                            "immutable chunk key collision: existing object is {} bytes and differs from the {}-byte retry payload",
+                            existing.len(), expected.len()
+                        ),
+                        retryable: false,
+                    })
+                }
+            }
+            Err(error) => Err(LogArchiveStorageError::Upload {
+                bucket: self.bucket.clone(),
+                key: key.clone(),
+                reason: error.to_string(),
+                retryable: is_retryable_s3_error(&error),
+            }),
+        }
+    }
+
+    async fn download_log_chunks(
+        &self,
+        log_id: &str,
+        after_line: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        let prefix = self.chunk_prefix(log_id);
+        let start_after = self.chunk_key(log_id, after_line);
+        let page_limit = limit.clamp(1, MAX_CHUNK_PAGE) as i32;
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .start_after(start_after)
+            .max_keys(page_limit)
+            .send()
+            .await
+            .map_err(|error| LogArchiveStorageError::Download {
+                bucket: self.bucket.clone(),
+                key: prefix.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let mut chunks = Vec::with_capacity(response.contents().len());
+        for object in response.contents() {
+            let Some(key) = object.key() else { continue };
+            let Some(line) = Self::line_from_chunk_key(key) else {
+                continue;
+            };
+            let body = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.to_string(),
+                    reason: error.to_string(),
+                })?
+                .body
+                .collect()
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.to_string(),
+                    reason: error.to_string(),
+                })?;
+            chunks.push(DurableLogChunk {
+                line,
+                data: body.into_bytes().to_vec(),
+            });
+        }
+        chunks.sort_by_key(|chunk| chunk.line);
+        Ok(chunks)
+    }
+
+    async fn download_recent_log_chunks(
+        &self,
+        log_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = self.chunk_prefix(log_id);
+        let mut continuation = None;
+        let mut keys = std::collections::VecDeque::with_capacity(limit.min(MAX_CHUNK_PAGE));
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .max_keys(MAX_CHUNK_PAGE as i32);
+            if let Some(token) = continuation {
+                request = request.continuation_token(token);
+            }
+            let response =
+                request
+                    .send()
+                    .await
+                    .map_err(|error| LogArchiveStorageError::Download {
+                        bucket: self.bucket.clone(),
+                        key: prefix.clone(),
+                        reason: error.to_string(),
+                    })?;
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    if keys.len() == limit {
+                        keys.pop_front();
+                    }
+                    if limit > 0 {
+                        keys.push_back(key.to_string());
+                    }
+                }
+            }
+            if !response.is_truncated().unwrap_or(false) {
+                break;
+            }
+            continuation = response.next_continuation_token().map(str::to_string);
+        }
+
+        let mut chunks = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(line) = Self::line_from_chunk_key(&key) else {
+                continue;
+            };
+            let body = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.clone(),
+                    reason: error.to_string(),
+                })?
+                .body
+                .collect()
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.clone(),
+                    reason: error.to_string(),
+                })?;
+            chunks.push(DurableLogChunk {
+                line,
+                data: body.into_bytes().to_vec(),
+            });
+        }
+        chunks.sort_by_key(|chunk| chunk.line);
+        Ok(chunks)
+    }
+
     async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError> {
         let full_key = self.full_key(key);
         let body = ByteStream::from(data);
@@ -202,6 +488,41 @@ impl LogArchiveStorage for S3LogArchive {
             })?;
 
         debug!(bucket = %self.bucket, key = %full_key, "Archived build/deploy log to S3");
+        Ok(())
+    }
+
+    async fn upload_log_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+    ) -> Result<(), LogArchiveStorageError> {
+        let full_key = self.full_key(key);
+        let body =
+            ByteStream::from_path(path)
+                .await
+                .map_err(|error| LogArchiveStorageError::Upload {
+                    bucket: self.bucket.clone(),
+                    key: full_key.clone(),
+                    reason: format!("failed to open '{}' for streaming: {error}", path.display()),
+                    retryable: false,
+                })?;
+
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .body(body)
+            .content_type("application/jsonl")
+            .send()
+            .await
+            .map_err(|error| LogArchiveStorageError::Upload {
+                bucket: self.bucket.clone(),
+                key: full_key.clone(),
+                reason: error.to_string(),
+                retryable: is_retryable_s3_error(&error),
+            })?;
+
+        debug!(bucket = %self.bucket, key = %full_key, path = %path.display(), "Streamed build/deploy log to S3");
         Ok(())
     }
 

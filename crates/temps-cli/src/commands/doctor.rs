@@ -268,67 +268,97 @@ impl DoctorCommand {
             }
         }
 
-        // Check encryption_key
-        let enc_key_path = data_dir.join("encryption_key");
-        if enc_key_path.exists() {
-            match std::fs::read_to_string(&enc_key_path) {
-                Ok(content) => {
-                    let trimmed = content.trim();
-                    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                        report.add(
-                            "Encryption key",
-                            CheckResult::Pass("Valid (32 bytes)".to_string()),
-                        );
-                    } else {
-                        report.add(
-                            "Encryption key",
-                            CheckResult::Fail(format!(
-                                "Invalid format (expected 64 hex chars, got {})",
-                                trimmed.len()
-                            )),
-                        );
-                    }
-                }
-                Err(e) => {
+        let injected_secrets_configured = [
+            temps_config::STATELESS_ENV,
+            temps_config::AUTH_SECRET_ENV,
+            temps_config::AUTH_SECRET_FILE_ENV,
+            temps_config::ENCRYPTION_KEY_ENV,
+            temps_config::ENCRYPTION_KEY_FILE_ENV,
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+
+        if injected_secrets_configured {
+            match temps_config::resolve_installation_secrets(data_dir) {
+                Ok(_) => {
                     report.add(
                         "Encryption key",
-                        CheckResult::Fail(format!("Cannot read: {}", e)),
+                        CheckResult::Pass("Valid injected secret".to_string()),
                     );
-                }
-            }
-        } else {
-            report.add(
-                "Encryption key",
-                CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-            );
-        }
-
-        // Check auth_secret
-        let auth_secret_path = data_dir.join("auth_secret");
-        if auth_secret_path.exists() {
-            match std::fs::read_to_string(&auth_secret_path) {
-                Ok(content) => {
-                    if content.trim().is_empty() {
-                        report.add(
-                            "Auth secret",
-                            CheckResult::Fail("File is empty".to_string()),
-                        );
-                    } else {
-                        report.add("Auth secret", CheckResult::Pass("Present".to_string()));
-                    }
-                }
-                Err(e) => {
                     report.add(
                         "Auth secret",
-                        CheckResult::Fail(format!("Cannot read: {}", e)),
+                        CheckResult::Pass("Valid injected secret".to_string()),
                     );
+                }
+                Err(error) => {
+                    let details = format!("Invalid injected installation secrets: {error}");
+                    report.add("Encryption key", CheckResult::Fail(details.clone()));
+                    report.add("Auth secret", CheckResult::Fail(details));
                 }
             }
         } else {
-            report.add(
-                "Auth secret",
-                CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-            );
+            // Check encryption_key
+            let enc_key_path = data_dir.join("encryption_key");
+            if enc_key_path.exists() {
+                match std::fs::read_to_string(&enc_key_path) {
+                    Ok(content) => {
+                        let trimmed = content.trim();
+                        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                            report.add(
+                                "Encryption key",
+                                CheckResult::Pass("Valid (32 bytes)".to_string()),
+                            );
+                        } else {
+                            report.add(
+                                "Encryption key",
+                                CheckResult::Fail(format!(
+                                    "Invalid format (expected 64 hex chars, got {})",
+                                    trimmed.len()
+                                )),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        report.add(
+                            "Encryption key",
+                            CheckResult::Fail(format!("Cannot read: {}", e)),
+                        );
+                    }
+                }
+            } else {
+                report.add(
+                    "Encryption key",
+                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
+                );
+            }
+
+            // Check auth_secret
+            let auth_secret_path = data_dir.join("auth_secret");
+            if auth_secret_path.exists() {
+                match std::fs::read_to_string(&auth_secret_path) {
+                    Ok(content) => {
+                        if content.trim().is_empty() {
+                            report.add(
+                                "Auth secret",
+                                CheckResult::Fail("File is empty".to_string()),
+                            );
+                        } else {
+                            report.add("Auth secret", CheckResult::Pass("Present".to_string()));
+                        }
+                    }
+                    Err(e) => {
+                        report.add(
+                            "Auth secret",
+                            CheckResult::Fail(format!("Cannot read: {}", e)),
+                        );
+                    }
+                }
+            } else {
+                report.add(
+                    "Auth secret",
+                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
+                );
+            }
         }
 
         // Check GeoLite2 database

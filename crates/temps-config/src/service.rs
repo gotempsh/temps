@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::resolve_installation_secrets;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -13,10 +14,6 @@ use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
-use tokio::{
-    fs as tokio_fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
 use tracing::{debug, info, warn};
 // Well-known paths relative to data_dir
 pub const STATIC_DIR_NAME: &str = "static";
@@ -114,6 +111,52 @@ pub enum ConfigServiceError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Invalid value for environment variable {variable}: {details}")]
+    InvalidEnvironmentValue {
+        variable: &'static str,
+        details: String,
+    },
+
+    #[error("Conflicting secret sources: set only one of {value_variable} or {file_variable}")]
+    ConflictingSecretSources {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Stateless mode requires {value_variable} or {file_variable}")]
+    MissingStatelessSecret {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Invalid installation secret from {origin}: {details}")]
+    InvalidInjectedSecret {
+        origin: &'static str,
+        details: String,
+    },
+
+    #[error("Failed to read installation secret file from {variable} at {path}: {source}")]
+    SecretFileRead {
+        variable: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to read local installation secret at {path}: {source}")]
+    LocalSecretRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to write local installation secret at {path}: {source}")]
+    LocalSecretWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("Setting not found: {key}")]
     SettingNotFound { key: String },
 
@@ -162,10 +205,7 @@ pub struct ClusterCaRotationResult {
     pub revoked_enrollment_tokens: u64,
 }
 
-fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
-    fill_random_bytes_with(&mut rand::rngs::SysRng, operation, bytes)
-}
-
+#[cfg(test)]
 fn fill_random_bytes_with<R: rand::TryCryptoRng>(
     rng: &mut R,
     operation: &str,
@@ -403,27 +443,9 @@ impl ServerConfig {
         // Create data directory if it doesn't exist
         fs::create_dir_all(&data_dir)?;
 
-        // Generate or load auth_secret (32 bytes in hex format)
-        let auth_secret_path = data_dir.join("auth_secret");
-        let auth_secret = if auth_secret_path.exists() {
-            fs::read_to_string(&auth_secret_path)?.trim().to_string()
-        } else {
-            let secret = Self::generate_auth_secret()?;
-            fs::write(&auth_secret_path, &secret)?;
-            Self::restrict_file_permissions(&auth_secret_path);
-            secret
-        };
-
-        // Generate or load encryption_key (32 bytes in hex format)
-        let encryption_key_path = data_dir.join("encryption_key");
-        let encryption_key = if encryption_key_path.exists() {
-            fs::read_to_string(&encryption_key_path)?.trim().to_string()
-        } else {
-            let key = Self::generate_encryption_key()?;
-            fs::write(&encryption_key_path, &key)?;
-            Self::restrict_file_permissions(&encryption_key_path);
-            key
-        };
+        let installation_secrets = resolve_installation_secrets(&data_dir)?;
+        let auth_secret = installation_secrets.auth_secret;
+        let encryption_key = installation_secrets.encryption_key;
 
         // Get console address - use a random available port
         let console_address = console_address.unwrap_or_else(Self::get_random_console_address);
@@ -544,32 +566,6 @@ impl ServerConfig {
             && self.clickhouse_database.is_some()
             && self.clickhouse_user.is_some()
             && self.clickhouse_password.is_some()
-    }
-
-    /// Generate a 32-byte auth secret (64 hex characters)
-    fn generate_auth_secret() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server auth secret", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Generate a 32-byte encryption key (64 hex characters)
-    fn generate_encryption_key() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server encryption key", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Set file permissions to owner-only (0o600) for sensitive files.
-    #[cfg(unix)]
-    fn restrict_file_permissions(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_file_permissions(_path: &std::path::Path) {
-        // File permissions are handled differently on non-Unix platforms
     }
 
     /// Get a random available port for console address
@@ -901,65 +897,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// Get or create the encryption key
     /// Loads from data_dir/encryption_key if exists, otherwise generates and saves a new one
     pub async fn get_or_create_encryption_key(&self) -> Result<String, ConfigServiceError> {
-        let key_path = self.data_dir().join(ENCRYPTION_KEY_FILE);
-
-        if self.path_exists(&key_path).await {
-            // Read existing key
-            let mut file = tokio_fs::File::open(&key_path).await?;
-            let mut key = String::new();
-            file.read_to_string(&mut key).await?;
-            Ok(key.trim().to_string())
-        } else {
-            // Generate new key using OS CSPRNG
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted encryption key", &mut bytes)?;
-            let key = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write key to file
-            let mut file = tokio_fs::File::create(&key_path).await?;
-            file.write_all(key.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&key_path);
-
-            Ok(key)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.encryption_key)
     }
 
     /// Get or create the auth secret
     /// Loads from data_dir/auth_secret if exists, otherwise generates and saves a new one
     pub async fn get_or_create_auth_secret(&self) -> Result<String, ConfigServiceError> {
-        let secret_path = self.data_dir().join(AUTH_SECRET_FILE);
-
-        if self.path_exists(&secret_path).await {
-            // Read existing secret
-            let mut file = tokio_fs::File::open(&secret_path).await?;
-            let mut secret = String::new();
-            file.read_to_string(&mut secret).await?;
-            Ok(secret.trim().to_string())
-        } else {
-            // Generate new secret using OS CSPRNG (32 bytes as 64 hex characters)
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted auth secret", &mut bytes)?;
-            let secret = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write secret to file
-            let mut file = tokio_fs::File::create(&secret_path).await?;
-            file.write_all(secret.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&secret_path);
-
-            Ok(secret)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.auth_secret)
     }
     pub async fn get_external_url(&self) -> Result<Option<String>, ConfigServiceError> {
         let settings = self.get_settings().await?;

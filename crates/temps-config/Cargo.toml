@@ -38,3 +38,6 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 sqlx = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

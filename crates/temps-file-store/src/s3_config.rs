@@ -68,8 +68,14 @@ pub const DEFAULT_S3_TIMEOUT_SECS: u64 = 10;
 /// the same bucket. See the module doc comment.
 pub const STATIC_ASSETS_KEY_PREFIX: &str = "static-assets/";
 
+/// Root namespace used by every durable object-store consumer in stateless
+/// mode. Keeping all objects for one installation below one stable prefix
+/// gives each installation a stable namespace. Isolation still requires the
+/// bucket policy to restrict credentials to this prefix.
+pub const STATELESS_INSTANCES_KEY_PREFIX: &str = "instances";
+
 /// Resolved connection details for the S3-compatible deployment-asset backend.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3StorageConfig {
     pub bucket: String,
     pub region: String,
@@ -83,6 +89,22 @@ pub struct S3StorageConfig {
     /// key-building call site) so `s3_store`/`s3_static_deployer` share one
     /// value and one place that could change it.
     pub prefix: Option<String>,
+}
+
+impl std::fmt::Debug for S3StorageConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3StorageConfig")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("force_path_style", &self.force_path_style)
+            .field("timeout", &self.timeout)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 /// Which backend deployment assets (static-site output + CAS blobs) are
@@ -106,6 +128,78 @@ pub enum StaticStorageConfigError {
          asset store on local disk"
     )]
     MissingS3Variable { variable: &'static str },
+
+    #[error("Invalid TEMPS_STATELESS value '{value}': expected exactly 'true' or 'false'")]
+    InvalidStatelessFlag { value: String },
+
+    #[error("TEMPS_STATELESS=true requires a non-empty TEMPS_INSTANCE_ID")]
+    MissingInstanceId,
+
+    #[error(
+        "Invalid TEMPS_INSTANCE_ID '{value}': use 1-64 ASCII letters, digits, '.', '_', or '-'"
+    )]
+    InvalidInstanceId { value: String },
+}
+
+/// Validated process-wide stateless storage selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatelessStorage {
+    Disabled,
+    Enabled { instance_id: String },
+}
+
+impl StatelessStorage {
+    /// Prefix shared by durable subsystems for this installation.
+    pub fn instance_prefix(&self) -> Option<String> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { instance_id } => {
+                Some(format!("{STATELESS_INSTANCES_KEY_PREFIX}/{instance_id}/"))
+            }
+        }
+    }
+
+    /// Place a subsystem below the validated installation namespace.
+    pub fn subsystem_prefix(&self, subsystem: &str) -> Option<String> {
+        self.instance_prefix()
+            .map(|prefix| format!("{prefix}{}/", subsystem.trim_matches('/')))
+    }
+}
+
+/// Resolve and validate the installation-wide stateless mode opt-in.
+pub fn resolve_stateless_storage() -> Result<StatelessStorage, StaticStorageConfigError> {
+    let enabled = match std::env::var("TEMPS_STATELESS") {
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(StaticStorageConfigError::InvalidStatelessFlag {
+                value: value.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(value) => match value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(StaticStorageConfigError::InvalidStatelessFlag { value }),
+        },
+    };
+    if !enabled {
+        return Ok(StatelessStorage::Disabled);
+    }
+
+    let instance_id = std::env::var("TEMPS_INSTANCE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(StaticStorageConfigError::MissingInstanceId)?;
+    if matches!(instance_id.as_str(), "." | "..")
+        || instance_id.len() > 64
+        || !instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(StaticStorageConfigError::InvalidInstanceId { value: instance_id });
+    }
+
+    Ok(StatelessStorage::Enabled { instance_id })
 }
 
 /// Resolve the deployment-asset storage backend from the process environment.
@@ -128,23 +222,30 @@ pub fn resolve_static_storage_backend() -> Result<StaticStorageBackend, StaticSt
             .ok_or(StaticStorageConfigError::MissingS3Variable { variable })
     }
 
+    let stateless = resolve_stateless_storage()?;
     let backend =
         std::env::var("TEMPS_STATIC_STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into());
-    if backend != "s3" {
+    if backend != "s3" && stateless == StatelessStorage::Disabled {
         return Ok(StaticStorageBackend::Filesystem);
     }
+
+    let prefix = stateless
+        .subsystem_prefix("static-assets")
+        .unwrap_or_else(|| STATIC_ASSETS_KEY_PREFIX.to_string());
 
     Ok(StaticStorageBackend::S3(S3StorageConfig {
         bucket: required("TEMPS_LOG_S3_BUCKET")?,
         region: std::env::var("TEMPS_LOG_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT").ok(),
+        endpoint: std::env::var("TEMPS_LOG_S3_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         access_key_id: required("TEMPS_LOG_S3_ACCESS_KEY_ID")?,
         secret_access_key: required("TEMPS_LOG_S3_SECRET_ACCESS_KEY")?,
         force_path_style: std::env::var("TEMPS_LOG_S3_FORCE_PATH_STYLE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
         timeout: Duration::from_secs(DEFAULT_S3_TIMEOUT_SECS),
-        prefix: Some(STATIC_ASSETS_KEY_PREFIX.to_string()),
+        prefix: Some(prefix),
     }))
 }
 
@@ -162,6 +263,8 @@ mod tests {
     fn clear_env() {
         for variable in [
             "TEMPS_STATIC_STORAGE_BACKEND",
+            "TEMPS_STATELESS",
+            "TEMPS_INSTANCE_ID",
             "TEMPS_LOG_STORAGE_BACKEND",
             "TEMPS_LOG_S3_BUCKET",
             "TEMPS_LOG_S3_REGION",
@@ -319,6 +422,23 @@ mod tests {
 
     #[test]
     #[serial(temps_static_storage_env)]
+    fn blank_endpoint_uses_aws_default_resolution() {
+        clear_env();
+        std::env::set_var("TEMPS_STATIC_STORAGE_BACKEND", "s3");
+        std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-static");
+        std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
+        std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
+        std::env::set_var("TEMPS_LOG_S3_ENDPOINT", "");
+
+        let StaticStorageBackend::S3(config) = resolve_static_storage_backend().unwrap() else {
+            panic!("expected S3 backend");
+        };
+        assert_eq!(config.endpoint, None);
+        clear_env();
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
     fn resolved_prefix_is_the_fixed_static_assets_namespace_regardless_of_input() {
         // There is deliberately no TEMPS_STATIC_S3_PREFIX / TEMPS_LOG_S3_PREFIX
         // read here (see module doc comment) -- setting the log side's own
@@ -339,6 +459,87 @@ mod tests {
 
         assert_eq!(config.prefix.as_deref(), Some(STATIC_ASSETS_KEY_PREFIX));
         std::env::remove_var("TEMPS_LOG_S3_PREFIX");
+        clear_env();
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn stateless_mode_requires_instance_id() {
+        clear_env();
+        std::env::set_var("TEMPS_STATELESS", "true");
+
+        assert!(matches!(
+            resolve_stateless_storage(),
+            Err(StaticStorageConfigError::MissingInstanceId)
+        ));
+        clear_env();
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn stateless_mode_rejects_unsafe_instance_id() {
+        clear_env();
+        std::env::set_var("TEMPS_STATELESS", "true");
+        std::env::set_var("TEMPS_INSTANCE_ID", "../another-install");
+
+        assert!(matches!(
+            resolve_stateless_storage(),
+            Err(StaticStorageConfigError::InvalidInstanceId { .. })
+        ));
+        clear_env();
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn stateless_mode_rejects_dot_instance_ids() {
+        for unsafe_id in [".", ".."] {
+            clear_env();
+            std::env::set_var("TEMPS_STATELESS", "true");
+            std::env::set_var("TEMPS_INSTANCE_ID", unsafe_id);
+            assert!(matches!(
+                resolve_stateless_storage(),
+                Err(StaticStorageConfigError::InvalidInstanceId { .. })
+            ));
+        }
+        clear_env();
+    }
+
+    #[test]
+    fn s3_config_debug_redacts_credentials() {
+        let config = S3StorageConfig {
+            bucket: "bucket".to_string(),
+            region: "region".to_string(),
+            endpoint: None,
+            access_key_id: "visible-key-id".to_string(),
+            secret_access_key: "visible-secret".to_string(),
+            force_path_style: false,
+            timeout: Duration::from_secs(1),
+            prefix: None,
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("visible-key-id"));
+        assert!(!debug.contains("visible-secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn stateless_mode_forces_scoped_s3_storage() {
+        clear_env();
+        std::env::set_var("TEMPS_STATELESS", "true");
+        std::env::set_var("TEMPS_INSTANCE_ID", "control-plane-01");
+        std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-state");
+        std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
+        std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
+
+        let StaticStorageBackend::S3(config) = resolve_static_storage_backend().unwrap() else {
+            panic!("stateless mode must force S3 storage");
+        };
+        assert_eq!(
+            config.prefix.as_deref(),
+            Some("instances/control-plane-01/static-assets/")
+        );
         clear_env();
     }
 }

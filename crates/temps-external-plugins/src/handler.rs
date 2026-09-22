@@ -841,6 +841,9 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::BAD_GATEWAY,
             "Plugin Startup Verification Failed",
         ),
+        ExternalPluginsError::PersistentStorageRequired => {
+            (StatusCode::CONFLICT, "Persistent Plugin Storage Required")
+        }
         ExternalPluginsError::ShuttingDown => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Plugin Service Is Shutting Down",
@@ -905,7 +908,8 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ) => error.to_string(),
         ExternalPluginsError::NotInRegistry { .. }
         | ExternalPluginsError::DuplicateRegistryEntry { .. }
-        | ExternalPluginsError::ShuttingDown => error.to_string(),
+        | ExternalPluginsError::ShuttingDown
+        | ExternalPluginsError::PersistentStorageRequired => error.to_string(),
         ExternalPluginsError::NotInstalled { .. } => error.to_string(),
         ExternalPluginsError::Catalog(CatalogError::Trust(_)) => {
             "The registry catalogue-key document did not pass offline-root verification".to_string()

@@ -88,6 +88,8 @@ import {
   type SearchableSelectOption,
 } from '@/components/ui/searchable-select'
 import { cn } from '@/lib/utils'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
+import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
 import {
   useCallback,
   useEffect,
@@ -1941,6 +1943,10 @@ export function DebugChatPanel({
   readOnly = false,
   runtimeUpdateRequired = false,
 }: DebugChatPanelProps) {
+  const platformFeatures = usePlatformFeatures()
+  const persistentAttachments = persistentWorkspaceStorageSupported(
+    platformFeatures.data
+  )
   const paths = chatApiPaths(userScoped, projectId)
   const base = paths.conversations
   const ctxId = String(contextId)
@@ -2633,7 +2639,7 @@ export function DebugChatPanel({
 
   const uploadAttachments = useCallback(
     async (files: FileList | null) => {
-      if (!files || !publicId || !userScoped) return
+      if (!persistentAttachments || !files || !publicId || !userScoped) return
       if (attachmentUploadLock.current) {
         setError(
           localChatFailure(
@@ -2708,7 +2714,7 @@ export function DebugChatPanel({
       attachmentUploadLock.current = false
       if (attachmentInputRef.current) attachmentInputRef.current.value = ''
     },
-    [publicId, userScoped]
+    [persistentAttachments, publicId, userScoped]
   )
 
   const removePendingAttachment = useCallback((id: string) => {
@@ -3464,6 +3470,12 @@ export function DebugChatPanel({
         contextType={contextType}
         permissionMode={runtimeSelection.permissionModeId}
       />
+      {platformFeatures.data !== undefined && !persistentAttachments && (
+        <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          File attachments need persistent workspace storage and are disabled on
+          this stateless control plane. Text chat remains available.
+        </div>
+      )}
       {providerStatusState === 'loading' && providerOptions.length === 0 && (
         <div
           className="flex items-center gap-2 text-xs text-muted-foreground"
@@ -3550,10 +3562,14 @@ export function DebugChatPanel({
         <div
           className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20"
           onDragOver={(event) => {
-            if (event.dataTransfer.types.includes('Files'))
+            if (
+              persistentAttachments &&
+              event.dataTransfer.types.includes('Files')
+            )
               event.preventDefault()
           }}
           onDrop={(event) => {
+            if (!persistentAttachments) return
             if (!event.dataTransfer.types.includes('Files')) return
             event.preventDefault()
             if (!userScoped || !publicId) {
@@ -3569,13 +3585,14 @@ export function DebugChatPanel({
             void uploadAttachments(event.dataTransfer.files)
           }}
           onPaste={(event) => {
+            if (!persistentAttachments) return
             if (!event.clipboardData.files.length || !userScoped || !publicId)
               return
             event.preventDefault()
             void uploadAttachments(event.clipboardData.files)
           }}
         >
-          {userScoped && publicId && (
+          {userScoped && publicId && persistentAttachments && (
             <p className="px-3 pt-2 text-xs text-muted-foreground">
               Attach, drop, or paste images and files · up to 8 files, 20 MB
               each
@@ -3629,6 +3646,7 @@ export function DebugChatPanel({
                 ref={attachmentInputRef}
                 type="file"
                 multiple
+                disabled={!persistentAttachments}
                 className="sr-only"
                 onChange={(event) => void uploadAttachments(event.target.files)}
               />
@@ -3638,6 +3656,7 @@ export function DebugChatPanel({
                 size="icon"
                 className="h-8 w-8 shrink-0 rounded-full"
                 disabled={
+                  !persistentAttachments ||
                   !userScoped ||
                   !publicId ||
                   attachmentUploads > 0 ||
@@ -3646,9 +3665,13 @@ export function DebugChatPanel({
                 onClick={() => attachmentInputRef.current?.click()}
                 aria-label="Attach files or images"
                 title={
-                  !publicId
-                    ? 'Create the workspace thread before attaching files'
-                    : 'Attach files or images (20 MB each)'
+                  platformFeatures.data === undefined
+                    ? 'Loading file attachment capabilities'
+                    : !persistentAttachments
+                      ? 'File attachments require persistent workspace storage'
+                      : !publicId
+                        ? 'Create the workspace thread before attaching files'
+                        : 'Attach files or images (20 MB each)'
                 }
               >
                 <Paperclip className="size-3.5" />

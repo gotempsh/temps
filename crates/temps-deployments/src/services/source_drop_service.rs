@@ -141,6 +141,7 @@ pub struct SourceDropService {
     workflow_executor: Option<Arc<WorkflowExecutionService>>,
     queue: Arc<dyn JobQueue>,
     deployment_gate: DeploymentGateSlot,
+    stateless: bool,
 }
 
 impl SourceDropService {
@@ -151,15 +152,17 @@ impl SourceDropService {
         workflow_executor: Arc<WorkflowExecutionService>,
         queue: Arc<dyn JobQueue>,
         deployment_gate: DeploymentGateSlot,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, temps_config::ConfigServiceError> {
+        let stateless = temps_config::stateless_mode_enabled()?;
+        Ok(Self {
             db,
             data_dir,
             workflow_planner,
             workflow_executor: Some(workflow_executor),
             queue,
             deployment_gate,
-        }
+            stateless,
+        })
     }
 
     async fn compensate(
@@ -195,6 +198,7 @@ impl SourceDropService {
             workflow_executor: None,
             queue,
             deployment_gate: Arc::new(tokio::sync::RwLock::new(None)),
+            stateless: false,
         }
     }
 }
@@ -288,6 +292,7 @@ impl SourceDropDeployer for SourceDropService {
         &self,
         request: SourceDropRequest,
     ) -> Result<SourceDropDeployment, SourceDropError> {
+        ensure_source_drop_supported(self.stateless)?;
         let project = projects::Entity::find_by_id(request.project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
@@ -481,7 +486,7 @@ impl SourceDropDeployer for SourceDropService {
             let deployment_id = deployment.id;
             let project_id = project.id;
             tokio::spawn(async move {
-                JobProcessorService::gate_check_then_run(
+                let _ = JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -502,6 +507,17 @@ impl SourceDropDeployer for SourceDropService {
     }
 }
 
+fn ensure_source_drop_supported(stateless: bool) -> Result<(), SourceDropError> {
+    if stateless {
+        return Err(SourceDropError::UnsupportedInStateless {
+            guidance:
+                "build the image in CI, push it to a registry, then deploy the prebuilt image"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +526,17 @@ mod tests {
     use temps_core::{JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+    #[test]
+    fn stateless_mode_rejects_source_archives_before_staging() {
+        let error = ensure_source_drop_supported(true)
+            .expect_err("stateless source archives must be rejected");
+        assert!(matches!(
+            error,
+            SourceDropError::UnsupportedInStateless { .. }
+        ));
+        assert!(ensure_source_drop_supported(false).is_ok());
+    }
 
     struct RecordingPlanner {
         calls: AtomicUsize,

@@ -2004,19 +2004,9 @@ fn get_data_dir(data_dir: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 fn load_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
-    let encryption_key_path = data_dir.join("encryption_key");
-
-    if !encryption_key_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Encryption key not found at {}. Run 'temps setup' first to initialize the data directory.",
-            encryption_key_path.display()
-        ));
-    }
-
-    let key = fs::read_to_string(&encryption_key_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read encryption key: {}", e))?;
-
-    Ok(key.trim().to_string())
+    temps_config::resolve_installation_secrets(data_dir)
+        .map(|secrets| secrets.encryption_key)
+        .map_err(|error| anyhow::anyhow!("Failed to resolve installation secrets: {error}"))
 }
 
 fn validate_and_parse_certificate(

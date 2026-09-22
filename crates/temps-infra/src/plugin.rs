@@ -140,6 +140,14 @@ impl TempsPlugin for InfraPlugin {
                 )
             };
 
+            let features = features.with_stateless_mode(
+                temps_config::stateless_mode_enabled().map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "Platform stateless configuration: {error}"
+                    ))
+                })?,
+            );
+
             // Create PlatformInfoService
             let platform_info_service = Arc::new(
                 PlatformInfoService::with_handle(Arc::new(docker_handle)).with_features(features),

@@ -44,7 +44,12 @@ impl temps_core::plugin::TempsPlugin for StaticFilesPlugin {
     > {
         Box::pin(async move {
             let config_service = context.require_service::<ConfigService>();
-            let file_service = Arc::new(FileService::new(config_service.clone()));
+            let file_service = Arc::new(FileService::from_config(config_service.clone()).map_err(
+                |error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "static-files".to_string(),
+                    error: format!("Failed to configure static file storage: {error}"),
+                },
+            )?);
             context.register_service(file_service);
             Ok(())
         })

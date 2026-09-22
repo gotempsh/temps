@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 let role = 'reader'
+let pluginsSupported = true
 let reportingEnabledValues: boolean[] = []
 
 mock.module('@/contexts/AuthContext', () => ({
@@ -15,6 +16,10 @@ mock.module('@/contexts/AuthContext', () => ({
 
 mock.module('@/contexts/BreadcrumbContext', () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: () => undefined }),
+}))
+
+mock.module('@/hooks/usePlatformFeatures', () => ({
+  usePlatformFeatures: () => ({ data: { external_plugins: pluginsSupported } }),
 }))
 
 mock.module('@/hooks/usePageTitle', () => ({
@@ -76,8 +81,18 @@ function renderPage() {
 }
 
 describe('PluginsPage management permissions', () => {
+  test('explains durable storage requirements while keeping plugins discoverable', () => {
+    role = 'admin'
+    pluginsSupported = false
+    const markup = renderPage()
+    expect(markup).toContain('Plugins need persistent storage')
+    expect(markup).toContain('Available plugins')
+    expect(markup).toContain('full-profile')
+  })
+
   beforeEach(() => {
     reportingEnabledValues = []
+    pluginsSupported = true
   })
 
   test('lets readers browse the GitHub catalog without management controls', () => {
