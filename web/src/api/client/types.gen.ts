@@ -26788,6 +26788,7 @@ export type DeployApplicationWorkspaceProjectErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
+    409: unknown;
     413: unknown;
     503: unknown;
 };

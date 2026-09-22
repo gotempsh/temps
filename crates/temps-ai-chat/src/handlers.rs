@@ -2614,7 +2614,7 @@ pub async fn create_application_project(
     responses(
         (status = 202, body = ApplicationProjectDeploymentResponse),
         (status = 400), (status = 401), (status = 403), (status = 404),
-        (status = 413), (status = 503)
+        (status = 409), (status = 413), (status = 503)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2706,20 +2706,7 @@ pub async fn deploy_application_workspace_project(
         })
         .await
         .map_err(|error| {
-            let status = match error {
-                temps_core::SourceDropError::ProjectNotFound { .. }
-                | temps_core::SourceDropError::EnvironmentNotFound { .. }
-                | temps_core::SourceDropError::NoEnvironment { .. } => StatusCode::NOT_FOUND,
-                temps_core::SourceDropError::SourceNotAllowed { .. }
-                | temps_core::SourceDropError::InvalidArchive { .. }
-                | temps_core::SourceDropError::UnsupportedInStateless { .. } => {
-                    StatusCode::BAD_REQUEST
-                }
-                temps_core::SourceDropError::ArchiveTooLarge { .. } => {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                }
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            let status = source_drop_error_status(&error);
             problemdetails::new(status)
                 .with_title("Workspace Drop Failed")
                 .with_detail(error.to_string())
@@ -2744,6 +2731,23 @@ pub async fn deploy_application_workspace_project(
             source_type: "uploaded_source".to_string(),
         }),
     ))
+}
+
+fn source_drop_error_status(error: &temps_core::SourceDropError) -> StatusCode {
+    match error {
+        temps_core::SourceDropError::ProjectNotFound { .. }
+        | temps_core::SourceDropError::EnvironmentNotFound { .. }
+        | temps_core::SourceDropError::NoEnvironment { .. } => StatusCode::NOT_FOUND,
+        temps_core::SourceDropError::SourceNotAllowed { .. }
+        | temps_core::SourceDropError::InvalidArchive { .. } => StatusCode::BAD_REQUEST,
+        temps_core::SourceDropError::UnsupportedInStateless { .. } => StatusCode::CONFLICT,
+        temps_core::SourceDropError::ArchiveTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        temps_core::SourceDropError::Storage { .. }
+        | temps_core::SourceDropError::Database { .. }
+        | temps_core::SourceDropError::Workflow { .. }
+        | temps_core::SourceDropError::Queue { .. }
+        | temps_core::SourceDropError::Compensation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[utoipa::path(
@@ -9897,6 +9901,23 @@ pub struct AiChatApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stateless_source_drop_is_reported_as_a_conflict() {
+        let error = temps_core::SourceDropError::UnsupportedInStateless {
+            guidance: "deploy by registry image reference".to_string(),
+        };
+
+        assert_eq!(source_drop_error_status(&error), StatusCode::CONFLICT);
+        let document = AiChatApiDoc::openapi();
+        let operation = document
+            .paths
+            .paths
+            .get("/ai/applications/{application_public_id}/projects/{project_id}/deploy")
+            .and_then(|path| path.post.as_ref())
+            .expect("workspace deploy operation must be documented");
+        assert!(operation.responses.responses.contains_key("409"));
+    }
     use crate::PendingPermissionEntry;
     use axum::http::{StatusCode, Uri};
     use temps_auth::permissions::Role;
