@@ -203,8 +203,7 @@ impl RetentionService {
         // selecting manifests so a successful purge cannot leave live-tail
         // lines visible with synthetic HEAD_LINE_ID_BASE identifiers.
         let mut project_purge_guard = if let Some(writer) = &self.chunk_writer {
-            let guard = writer.lock_project_for_purge(project_id).await;
-            writer.flush_project_for_purge(project_id).await?;
+            let guard = writer.prepare_project_for_purge(project_id).await?;
             Some(guard)
         } else {
             None
