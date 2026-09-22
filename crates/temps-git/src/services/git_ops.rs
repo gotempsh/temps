@@ -461,6 +461,7 @@ fn apply_git_http_credentials(
 }
 
 async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(), String> {
+    command.stdin(Stdio::null());
     let child = command
         .spawn()
         .map_err(|e| format!("failed to run git ({action}): {e}"))?;
@@ -1008,5 +1009,27 @@ mod tests {
 
         let error = run_git(command, "clone test repository").await.unwrap_err();
         assert_eq!(error, "clone test repository: transport-failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_closes_inherited_stdin() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("server-stdin");
+        std::fs::write(&input_path, "unexpected input\n").unwrap();
+        let input = std::fs::File::open(input_path).unwrap();
+
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .kill_on_drop(true)
+            .process_group(0)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("-c")
+            .arg("if IFS= read -r line; then echo \"read inherited stdin: $line\" >&2; exit 9; fi");
+
+        let result = run_git(command, "test detached stdin").await;
+        assert!(result.is_ok(), "git command read server stdin: {result:?}");
     }
 }
