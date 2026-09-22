@@ -2967,12 +2967,14 @@ mod first_link_enrollment_tests {
                             (request.enrollment_code.starts_with("RECONNECT-")
                                 || request.enrollment_code.starts_with("UNSAFE-RECONNECT-"))
                             .then(|| tenant_for("historical-instance"));
-                        Json(serde_json::json!({
-                            "tenant_id": tenant_for(&request.enrollment_code),
-                            "instance_id": reassigned_instance_id,
-                            "reconnected": request.enrollment_code.starts_with("RECONNECT-"),
-                            "instance_token": format!("inst_{}", request.enrollment_code),
-                        }))
+                        Json(temps_cloud_protocol::EnrollResponse {
+                            tenant_id: tenant_for(&request.enrollment_code),
+                            instance_id: reassigned_instance_id,
+                            reconnected: request.enrollment_code.starts_with("RECONNECT-"),
+                            instance_token: format!("inst_{}", request.enrollment_code),
+                            account_email: None,
+                            capabilities: vec![],
+                        })
                     },
                 ),
             )
