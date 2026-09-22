@@ -19,6 +19,7 @@
 //! service deletes the objects — and then the rows — once a tombstone is
 //! older than [`GC_GRACE`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -641,12 +642,17 @@ impl CompactorService {
                 return report;
             }
         };
-        let mut done: Vec<uuid::Uuid> = Vec::with_capacity(rows.len());
+        let mut objects: HashMap<String, Vec<uuid::Uuid>> = HashMap::with_capacity(rows.len());
         for (id, key) in rows {
+            objects.entry(key).or_default().push(id);
+        }
+
+        let mut done = Vec::new();
+        for (key, ids) in objects {
             match self.storage.delete_chunk(&key).await {
                 Ok(()) => {
                     report.objects_deleted += 1;
-                    done.push(id);
+                    done.extend(ids);
                 }
                 Err(e) => {
                     warn!(storage_key = key, error = %e, "log chunk gc: object delete failed");
@@ -687,7 +693,12 @@ mod tests {
     use crate::chunk::ChunkLabels;
     use crate::index::IndexOutcome;
     use crate::types::LogLevel;
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use std::collections::HashSet;
     use std::sync::Mutex;
+    use testcontainers::{
+        core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+    };
 
     /// Records what the compactor tells the index, in order, and can be
     /// told to reject the next `index_chunk`.
@@ -894,6 +905,202 @@ mod tests {
         assert!(
             ctx[2].key().chunk_position().map(|(s, _)| s) == Some(merged[0].seq),
             "relocated into the merged chunk"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingGcStorage {
+        delete_calls: Mutex<Vec<String>>,
+        failed_keys: HashSet<String>,
+    }
+
+    impl RecordingGcStorage {
+        fn failing(keys: &[&str]) -> Self {
+            Self {
+                delete_calls: Mutex::new(Vec::new()),
+                failed_keys: keys.iter().map(|key| (*key).to_string()).collect(),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.delete_calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogStorage for RecordingGcStorage {
+        async fn write_chunk(&self, _key: &str, _data: &[u8]) -> Result<u64, LogAggregatorError> {
+            panic!("gc test must not write objects")
+        }
+
+        async fn read_chunk(&self, _key: &str) -> Result<Vec<u8>, LogAggregatorError> {
+            panic!("gc test must not read objects")
+        }
+
+        async fn read_chunk_range(
+            &self,
+            _key: &str,
+            _start: u64,
+            _end: Option<u64>,
+        ) -> Result<Vec<u8>, LogAggregatorError> {
+            panic!("gc test must not range-read objects")
+        }
+
+        async fn list_chunks(&self, _prefix: &str) -> Result<Vec<String>, LogAggregatorError> {
+            panic!("gc test must not list objects")
+        }
+
+        async fn delete_chunk(&self, key: &str) -> Result<(), LogAggregatorError> {
+            self.delete_calls.lock().unwrap().push(key.to_string());
+            if self.failed_keys.contains(key) {
+                return Err(LogAggregatorError::StorageConfiguration {
+                    message: format!("injected delete failure for {key}"),
+                });
+            }
+            Ok(())
+        }
+
+        async fn chunk_exists(&self, _key: &str) -> Result<bool, LogAggregatorError> {
+            panic!("gc test must not check object existence")
+        }
+    }
+
+    async fn gc_test_database() -> Option<(ContainerAsync<GenericImage>, Arc<DatabaseConnection>)> {
+        let container = match GenericImage::new("postgres", "17-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "gc-test")
+            .with_startup_timeout(Duration::from_secs(120))
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                let message = error.to_string().to_lowercase();
+                if message.contains("socket")
+                    || message.contains("connection refused")
+                    || message.contains("permission denied")
+                    || message.contains("docker host")
+                    || message.contains("daemon")
+                {
+                    eprintln!("Skipping compactor GC test: Docker unavailable: {error}");
+                    return None;
+                }
+                panic!("compactor GC database startup failed: {error}");
+            }
+        };
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Postgres port");
+        let db = Arc::new(
+            Database::connect(format!(
+                "postgres://postgres:gc-test@127.0.0.1:{port}/postgres"
+            ))
+            .await
+            .expect("connect to isolated compactor GC database"),
+        );
+        db.execute_unprepared(
+            "CREATE TABLE log_chunks (\
+                 id UUID PRIMARY KEY, \
+                 storage_key TEXT NOT NULL, \
+                 deleted_at TIMESTAMPTZ NULL\
+             )",
+        )
+        .await
+        .expect("create minimal log_chunks table");
+        Some((container, db))
+    }
+
+    async fn remaining_gc_ids(db: &DatabaseConnection) -> Vec<uuid::Uuid> {
+        let rows = db
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT id FROM log_chunks ORDER BY id",
+            ))
+            .await
+            .expect("query remaining GC manifests");
+        rows.into_iter()
+            .map(|row| row.try_get("", "id").expect("remaining manifest UUID"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_gc_once_groups_duplicate_keys_and_isolates_object_failures() {
+        let Some((_container, db)) = gc_test_database().await else {
+            return;
+        };
+        db.execute_unprepared(
+            "INSERT INTO log_chunks (id, storage_key, deleted_at) VALUES \
+             ('30000000-0000-0000-0000-000000000001', 'logs/gc/shared.zst', now() - interval '2 hours'), \
+             ('30000000-0000-0000-0000-000000000002', 'logs/gc/shared.zst', now() - interval '3 hours'), \
+             ('30000000-0000-0000-0000-000000000003', 'logs/gc/distinct.zst', now() - interval '4 hours')",
+        )
+        .await
+        .expect("seed successful GC groups");
+        let storage = Arc::new(RecordingGcStorage::default());
+        let service = CompactorService::new(
+            Arc::new(ManifestRepo::new(db.clone())),
+            storage.clone(),
+            None,
+        );
+        let report = service.gc_once().await;
+        assert_eq!(
+            (report.objects_deleted, report.rows_deleted, report.failed),
+            (2, 3, 0),
+            "two objects can own three manifests"
+        );
+        let mut calls = storage.calls();
+        calls.sort();
+        assert_eq!(calls, ["logs/gc/distinct.zst", "logs/gc/shared.zst"]);
+        assert!(remaining_gc_ids(&db).await.is_empty());
+
+        let failed_a = uuid::Uuid::from_u128(0x40000000000000000000000000000001);
+        let failed_b = uuid::Uuid::from_u128(0x40000000000000000000000000000002);
+        let protected_old = uuid::Uuid::from_u128(0x40000000000000000000000000000004);
+        let protected_live = uuid::Uuid::from_u128(0x40000000000000000000000000000005);
+        let protected_young = uuid::Uuid::from_u128(0x40000000000000000000000000000006);
+        db.execute_unprepared(&format!(
+            "INSERT INTO log_chunks (id, storage_key, deleted_at) VALUES \
+             ('{failed_a}', 'logs/gc/fail.zst', now() - interval '2 hours'), \
+             ('{failed_b}', 'logs/gc/fail.zst', now() - interval '3 hours'), \
+             ('40000000-0000-0000-0000-000000000003', 'logs/gc/success.zst', now() - interval '4 hours'), \
+             ('{protected_old}', 'logs/gc/live-protected.zst', now() - interval '5 hours'), \
+             ('{protected_live}', 'logs/gc/live-protected.zst', NULL), \
+             ('{protected_young}', 'logs/gc/young.zst', now() - interval '30 minutes')"
+        ))
+        .await
+        .expect("seed failed and protected GC manifests");
+
+        let storage = Arc::new(RecordingGcStorage::failing(&["logs/gc/fail.zst"]));
+        let service = CompactorService::new(
+            Arc::new(ManifestRepo::new(db.clone())),
+            storage.clone(),
+            None,
+        );
+        let report = service.gc_once().await;
+        assert_eq!(
+            (report.objects_deleted, report.rows_deleted, report.failed),
+            (1, 1, 1),
+            "failure is counted per object and its whole group is retained"
+        );
+        let mut calls = storage.calls();
+        calls.sort();
+        assert_eq!(
+            calls,
+            ["logs/gc/fail.zst", "logs/gc/success.zst"],
+            "protected live/grace keys are never offered to storage"
+        );
+        assert_eq!(
+            remaining_gc_ids(&db).await,
+            vec![
+                failed_a,
+                failed_b,
+                protected_old,
+                protected_live,
+                protected_young
+            ]
         );
     }
 }
