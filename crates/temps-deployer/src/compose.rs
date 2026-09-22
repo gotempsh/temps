@@ -50,6 +50,7 @@ const COMPOSE_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// quickly. Keep it bounded independently from image pulls so a wedged Compose
 /// plugin cannot stall a deployment after all images have already downloaded.
 const COMPOSE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPOSE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A merged Compose model expands anchors and interpolation, so its output can
 /// be much larger than the source. Bound both memory and subsequent Docker API
@@ -171,7 +172,11 @@ const DOCKER_BINARY_CANDIDATES: &[&str] = &[
 /// clear the inherited environment, and restore the small set of non-secret
 /// Docker connection/configuration paths needed by legitimate installations.
 fn isolated_docker_command() -> tokio::process::Command {
-    let docker_binary = DOCKER_BINARY_CANDIDATES
+    isolated_docker_command_with_candidates(DOCKER_BINARY_CANDIDATES)
+}
+
+fn isolated_docker_command_with_candidates(candidates: &[&str]) -> tokio::process::Command {
+    let docker_binary = candidates
         .iter()
         .find(|candidate| std::path::Path::new(candidate).is_file())
         .copied()
@@ -209,6 +214,11 @@ pub enum ComposeError {
 
     #[error("Docker API error: {0}")]
     Docker(String),
+
+    #[error(
+        "Docker Compose v2 is unavailable: {reason}. Install the Docker Compose CLI plugin and verify it with `docker compose version`, then restart Temps"
+    )]
+    ComposeUnavailable { reason: String },
 
     #[error("Compose security policy rejected {field} for service '{service}': {reason}")]
     SecurityPolicyViolation {
@@ -736,6 +746,42 @@ impl ComposeExecutor {
     /// failure part-way through.
     fn require_docker(&self) -> Result<Arc<Docker>, ComposeError> {
         self.docker.require().map_err(ComposeError::from)
+    }
+
+    async fn require_compose_v2(&self) -> Result<(), ComposeError> {
+        let mut command = isolated_docker_command();
+        command.args(["compose", "version"]);
+        Self::check_compose_v2(command).await
+    }
+
+    async fn check_compose_v2(mut command: tokio::process::Command) -> Result<(), ComposeError> {
+        let output = tokio::time::timeout(COMPOSE_VERSION_TIMEOUT, command.output())
+            .await
+            .map_err(|_| ComposeError::ComposeUnavailable {
+                reason: format!(
+                    "`docker compose version` did not finish within {} seconds",
+                    COMPOSE_VERSION_TIMEOUT.as_secs()
+                ),
+            })?
+            .map_err(|error| ComposeError::ComposeUnavailable {
+                reason: format!("failed to run `docker compose version`: {error}"),
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let reason = if stderr.is_empty() {
+            format!(
+                "`docker compose version` exited with status {}",
+                output.status
+            )
+        } else {
+            format!("`docker compose version` failed: {stderr}")
+        };
+        Err(ComposeError::ComposeUnavailable { reason })
     }
 
     /// Whether this executor was constructed with an available Docker
@@ -1359,6 +1405,11 @@ impl ComposeExecutor {
         // the actionable `DockerUnavailable` instead of a raw CLI failure
         // after files are already written to disk.
         self.require_docker()?;
+        // Docker Engine and the Compose CLI plugin are separate packages on
+        // Linux. Probe the exact isolated CLI environment used by every later
+        // command before writing files, building images, or allowing the
+        // workflow to stop the currently-serving stack.
+        self.require_compose_v2().await?;
         let resolved_request;
         let request = if !self.policy.disabled_checks.is_empty()
             && self.needs_resolution(
@@ -7548,6 +7599,62 @@ mod tests {
         let entry: ComposePsEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.service, "redis");
         assert!(entry.publishers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compose_v2_preflight_returns_actionable_error_when_plugin_is_missing() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf \"unknown shorthand flag: 'p' in -p\\n\" >&2; exit 125",
+        ]);
+
+        let error = ComposeExecutor::check_compose_v2(command)
+            .await
+            .expect_err("a Docker CLI without Compose must fail preflight");
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("Docker Compose v2 is unavailable"));
+        assert!(diagnostic.contains("Install the Docker Compose CLI plugin"));
+        assert!(diagnostic.contains("docker compose version"));
+        assert!(diagnostic.contains("restart Temps"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_v2_preflight_checks_the_same_first_docker_candidate_used_for_deploys() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let first = directory.path().join("first-docker");
+        let second = directory.path().join("second-docker");
+        std::fs::write(
+            &first,
+            "#!/bin/sh\nprintf \"compose is unavailable\\n\" >&2\nexit 125\n",
+        )
+        .expect("first fake Docker CLI should be written");
+        std::fs::write(&second, "#!/bin/sh\nexit 0\n")
+            .expect("second fake Docker CLI should be written");
+        for path in [&first, &second] {
+            let mut permissions = std::fs::metadata(path)
+                .expect("fake Docker CLI metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)
+                .expect("fake Docker CLI should be executable");
+        }
+        let first = first.to_str().expect("temporary path should be UTF-8");
+        let second = second.to_str().expect("temporary path should be UTF-8");
+        let mut command = isolated_docker_command_with_candidates(&[first, second]);
+        command.args(["compose", "version"]);
+
+        let error = ComposeExecutor::check_compose_v2(command)
+            .await
+            .expect_err("preflight must check the same first candidate used by deployment");
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        assert!(error.to_string().contains("compose is unavailable"));
     }
 
     #[test]
