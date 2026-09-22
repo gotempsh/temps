@@ -1164,6 +1164,12 @@ mod tests {
         }
     }
 
+    fn reconnected() -> temps_cloud_client::EnrollmentKind {
+        temps_cloud_client::EnrollmentKind::Reconnected {
+            instance_id: uuid::Uuid::new_v4(),
+        }
+    }
+
     #[test]
     fn a_fresh_enrollment_by_an_instance_admin_still_queues_the_activation() {
         // The behaviour ADR-042 P3 shipped, and the one both gates must leave
@@ -1187,6 +1193,14 @@ mod tests {
         assert!(
             !may_start_activation(&principal(temps_auth::Role::Admin), re_enrollment()),
             "a credential recovery is not a purchase"
+        );
+    }
+
+    #[test]
+    fn reconnecting_historical_identity_does_not_trigger_purchase_activation() {
+        assert!(
+            !may_start_activation(&principal(temps_auth::Role::Admin), reconnected()),
+            "a replacement installation reconnecting historical identity must not repeat purchase activation"
         );
     }
 
