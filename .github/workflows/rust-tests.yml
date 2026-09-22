@@ -62,6 +62,9 @@ jobs:
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
 
+      - name: Test stateless file migration safety
+        run: python3 scripts/test_migrate_stateless_files.py
+
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
 

@@ -811,6 +811,7 @@ mod tests {
     use axum::middleware;
     use axum_test::TestServer;
     use chrono::{Duration, Utc};
+    use sea_orm::ConnectionTrait;
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use uuid::Uuid;
@@ -1553,6 +1554,80 @@ mod tests {
             "Expected no logs after purge, found {}",
             remaining_lines.len()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_tombstone_keeps_cutoff_open_for_delayed_ingest() {
+        let ctx = create_test_context().await;
+        let project_id = next_test_project_id();
+        let now = Utc::now();
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Error,
+                "original sensitive line",
+                now - Duration::hours(2),
+                "container-failed-purge",
+            ))
+            .await
+            .expect("write original head");
+
+        ctx._db
+            .db
+            .execute_unprepared(
+                "CREATE FUNCTION reject_log_chunk_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected tombstone failure'; END $$; \
+                 CREATE TRIGGER reject_log_chunk_tombstone BEFORE UPDATE OF deleted_at ON log_chunks FOR EACH ROW EXECUTE FUNCTION reject_log_chunk_tombstone();",
+            )
+            .await
+            .expect("install tombstone failure trigger");
+
+        let server = build_test_server(ctx.app_state.clone());
+        let response = server
+            .delete(&format!("/projects/{project_id}/logs"))
+            .json(&serde_json::json!({ "before": now.to_rfc3339() }))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["chunks_deleted"].as_u64(), Some(0));
+        assert_eq!(body["chunks_failed"].as_u64(), Some(1));
+
+        // Docker may deliver a buffered line after the failed purge returns.
+        // It must remain accepted because the destructive boundary did not
+        // commit every selected manifest.
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Info,
+                "delayed line after failed purge",
+                now - Duration::hours(1),
+                "container-delayed-after-failure",
+            ))
+            .await
+            .expect("failed purge must not suppress delayed ingest");
+
+        let search = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(3)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        assert_eq!(search.status_code(), StatusCode::OK);
+        let search_body: serde_json::Value = search.json();
+        let messages: Vec<&str> = search_body["lines"]
+            .as_array()
+            .expect("search lines")
+            .iter()
+            .filter_map(|line| line["message"].as_str())
+            .collect();
+        assert!(messages.contains(&"original sensitive line"));
+        assert!(messages.contains(&"delayed line after failed purge"));
     }
 
     #[tokio::test]

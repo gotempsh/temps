@@ -103,6 +103,19 @@ enum DeploymentCreationOutcome {
     },
 }
 
+pub(crate) const SERVER_RESTART_CANCELLED_REASON: &str = "Server restarted";
+const CONTROL_PLANE_RESTART_JOB_REASON: &str = "Control plane restarted while this job was running";
+pub(crate) const CONTROL_PLANE_RESTART_FAILED_REASON: &str =
+    "Control plane restarted during deployment";
+
+fn is_restart_interrupted_durable_deployment(deployment: &deployments::Model) -> bool {
+    matches!(deployment.state.as_str(), "cancelled" | "failed")
+        && matches!(
+            deployment.cancelled_reason.as_deref(),
+            Some(SERVER_RESTART_CANCELLED_REASON | CONTROL_PLANE_RESTART_FAILED_REASON)
+        )
+}
+
 /// Shared slot for the optional [`temps_core::DeploymentGate`] — see the
 /// `deployment_gate` field doc on [`JobProcessorService`] for why this is
 /// a lock instead of a plain `Option`.
@@ -312,7 +325,7 @@ impl JobProcessorService {
             } else {
                 duplicate_query
             };
-            let duplicate_query = match duplicate_key {
+            let duplicate_query = match &duplicate_key {
                 DeploymentDuplicateKey::Commit(commit) => duplicate_query
                     .filter(deployments::Column::State.is_in(vec![
                         "pending",
@@ -321,7 +334,7 @@ impl JobProcessorService {
                         "built",
                         "ready",
                     ]))
-                    .filter(deployments::Column::CommitSha.eq(commit)),
+                    .filter(deployments::Column::CommitSha.eq(commit.clone())),
                 DeploymentDuplicateKey::Image(image) => duplicate_query
                     .filter(deployments::Column::State.is_in(vec![
                         "pending",
@@ -330,10 +343,10 @@ impl JobProcessorService {
                         "built",
                         "ready",
                     ]))
-                    .filter(deployments::Column::ImageName.eq(image)),
+                    .filter(deployments::Column::ImageName.eq(image.clone())),
                 DeploymentDuplicateKey::DurableCommand(job_id) => {
                     duplicate_query.filter(Expr::cust_with_values(
-                        "context_vars ->> 'durable_job_id' = ?",
+                        "context_vars ->> 'durable_job_id' = $1",
                         [job_id.to_string()],
                     ))
                 }
@@ -347,15 +360,63 @@ impl JobProcessorService {
                     creation_error("check duplicate generations before creating", error)
                 })?
             {
-                let outcome = DeploymentCreationOutcome::Duplicate {
-                    deployment_id: existing.id,
-                    state: existing.state,
-                };
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| creation_error("finish duplicate validation for", error))?;
-                return Ok(outcome);
+                // Reconciliation makes interrupted work terminal before queue
+                // replay. That row records an incomplete attempt, so retain it
+                // as history and create a fresh generation with fresh jobs. If
+                // a retry is already active or completed, it sorts first and
+                // remains an ordinary duplicate, preventing two workflows.
+                if matches!(duplicate_key, DeploymentDuplicateKey::DurableCommand(_))
+                    && is_restart_interrupted_durable_deployment(&existing)
+                {
+                    let newer_generation = deployments::Entity::find()
+                        .filter(deployments::Column::ProjectId.eq(project_id))
+                        .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                        .filter(
+                            Condition::any()
+                                .add(deployments::Column::CreatedAt.gt(existing.created_at))
+                                .add(
+                                    Condition::all()
+                                        .add(deployments::Column::CreatedAt.eq(existing.created_at))
+                                        .add(deployments::Column::Id.gt(existing.id)),
+                                ),
+                        )
+                        .order_by_desc(deployments::Column::CreatedAt)
+                        .order_by_desc(deployments::Column::Id)
+                        .one(&transaction)
+                        .await
+                        .map_err(|error| {
+                            creation_error(
+                                "check newer generations before replaying interrupted command",
+                                error,
+                            )
+                        })?;
+                    if let Some(newer) = newer_generation {
+                        let outcome = DeploymentCreationOutcome::Duplicate {
+                            deployment_id: newer.id,
+                            state: newer.state,
+                        };
+                        transaction.commit().await.map_err(|error| {
+                            creation_error("finish stale replay validation for", error)
+                        })?;
+                        return Ok(outcome);
+                    }
+                    info!(
+                        project_id,
+                        environment_id,
+                        interrupted_deployment_id = existing.id,
+                        interrupted_state = %existing.state,
+                        "Replaying durable deployment command after an interrupted attempt"
+                    );
+                } else {
+                    let outcome = DeploymentCreationOutcome::Duplicate {
+                        deployment_id: existing.id,
+                        state: existing.state,
+                    };
+                    transaction.commit().await.map_err(|error| {
+                        creation_error("finish duplicate validation for", error)
+                    })?;
+                    return Ok(outcome);
+                }
             }
         }
 
@@ -866,7 +927,7 @@ impl JobProcessorService {
     async fn reconcile_interrupted_workflows(&mut self) -> Result<(), JobProcessorError> {
         let result = self
             .db
-            .execute(Statement::from_string(
+            .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
 WITH interrupted AS (
@@ -874,7 +935,7 @@ WITH interrupted AS (
     SET status = 3,
         finished_at = now(),
         updated_at = now(),
-        error_message = COALESCE(error_message, 'Control plane restarted while this job was running')
+        error_message = COALESCE(error_message, $1)
     WHERE status = 2
     RETURNING deployment_id
 ), affected AS (
@@ -884,13 +945,17 @@ UPDATE deployments d
 SET state = 'failed',
     finished_at = now(),
     updated_at = now(),
-    cancelled_reason = COALESCE(cancelled_reason, 'Control plane restarted during deployment')
+    cancelled_reason = COALESCE(cancelled_reason, $2)
 FROM affected a, environments e
 WHERE d.id = a.deployment_id
   AND e.id = d.environment_id
   AND d.state IN ('pending', 'running')
   AND e.current_deployment_id IS DISTINCT FROM d.id
 "#,
+                [
+                    CONTROL_PLANE_RESTART_JOB_REASON.into(),
+                    CONTROL_PLANE_RESTART_FAILED_REASON.into(),
+                ],
             ))
             .await
             .map_err(|error| {
@@ -2477,7 +2542,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use mockall::mock;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::preset::Preset;
@@ -3150,6 +3215,367 @@ mod tests {
             .find(|deployment| deployment.id == routed.id)
             .expect("routed deployment remains");
         assert_eq!(routed.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_durable_image_delivery_creates_fresh_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping interrupted durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut interrupted = generation_model(
+            project_id,
+            environment_id,
+            "interrupted-durable-image",
+            "cancelled",
+            "durable-image-request",
+            now,
+        );
+        interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+        interrupted.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let interrupted = interrupted
+            .insert(db.as_ref())
+            .await
+            .expect("insert interrupted durable deployment");
+
+        let mut replay = generation_model(
+            project_id,
+            environment_id,
+            "replayed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            replay,
+        )
+        .await
+        .expect("replay interrupted durable deployment");
+
+        let replayed = match outcome {
+            DeploymentCreationOutcome::Created { deployment, .. } => deployment,
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                panic!("interrupted deployment {deployment_id} in {state} must not consume replay")
+            }
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        };
+        assert_ne!(replayed.id, interrupted.id);
+        assert_eq!(replayed.state, "pending");
+        let mut second_replay = generation_model(
+            project_id,
+            environment_id,
+            "second-replayed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        second_replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let second_outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            second_replay,
+        )
+        .await
+        .expect("deduplicate second replay against active retry");
+        match second_outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, replayed.id);
+                assert_eq!(state, "pending");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "active durable retry must prevent a second workflow, created {}",
+                deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+        let rows = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .all(db.as_ref())
+            .await
+            .expect("load durable deployment attempts");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|deployment| deployment.id == interrupted.id)
+                .expect("interrupted attempt remains as history")
+                .state,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_restart_durable_image_delivery_creates_fresh_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping failed durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut interrupted = generation_model(
+            project_id,
+            environment_id,
+            "failed-durable-image",
+            "failed",
+            "durable-image-request",
+            now,
+        );
+        interrupted.cancelled_reason = Set(Some(CONTROL_PLANE_RESTART_FAILED_REASON.to_string()));
+        interrupted.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let interrupted = interrupted
+            .insert(db.as_ref())
+            .await
+            .expect("insert failed durable deployment");
+        let mut replay = generation_model(
+            project_id,
+            environment_id,
+            "replayed-failed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            replay,
+        )
+        .await
+        .expect("replay failed restart deployment");
+
+        match outcome {
+            DeploymentCreationOutcome::Created { deployment, .. } => {
+                assert_ne!(deployment.id, interrupted.id);
+                assert_eq!(deployment.state, "pending");
+            }
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => panic!(
+                "restart-failed deployment {deployment_id} in {state} must not consume replay"
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_durable_replay_does_not_supersede_newer_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping stale durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut interrupted = generation_model(
+            project_id,
+            environment_id,
+            "interrupted-old-command",
+            "cancelled",
+            "old-command",
+            now,
+        );
+        interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+        interrupted.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        interrupted
+            .insert(db.as_ref())
+            .await
+            .expect("insert interrupted old command");
+        let newer = generation_model(
+            project_id,
+            environment_id,
+            "newer-manual-generation",
+            "pending",
+            "newer-command",
+            now + chrono::Duration::seconds(1),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert newer manual generation");
+        let mut replay = generation_model(
+            project_id,
+            environment_id,
+            "stale-command-replay",
+            "pending",
+            "old-command",
+            now,
+        );
+        replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            replay,
+        )
+        .await
+        .expect("reject stale durable replay");
+
+        match outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, newer.id);
+                assert_eq!(state, "pending");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "stale durable command must not supersede newer generation {}, created {}",
+                newer.id, deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be failover recovery")
+            }
+        }
+        let newer = deployments::Entity::find_by_id(newer.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload newer generation")
+            .expect("newer generation remains");
+        assert_eq!(newer.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_completed_durable_image_delivery_remains_deduplicated() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping completed durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut completed = generation_model(
+            project_id,
+            environment_id,
+            "completed-durable-image",
+            "completed",
+            "durable-image-request",
+            now,
+        );
+        completed.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let completed = completed
+            .insert(db.as_ref())
+            .await
+            .expect("insert completed durable deployment");
+
+        let mut duplicate = generation_model(
+            project_id,
+            environment_id,
+            "duplicate-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        duplicate.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            duplicate,
+        )
+        .await
+        .expect("deduplicate completed durable deployment");
+
+        match outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, completed.id);
+                assert_eq!(state, "completed");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "completed durable delivery must be reused, created {}",
+                deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+        let count = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .count(db.as_ref())
+            .await
+            .expect("count durable deployment attempts");
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

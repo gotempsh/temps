@@ -269,6 +269,27 @@ pub async fn reject_local_mode_for_managed_database(
     if db.get_database_backend() != DatabaseBackend::Postgres {
         return Ok(());
     }
+    let table = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('stateless_control_plane') IS NOT NULL AS present".to_owned(),
+        ))
+        .await
+        .map_err(|error| StatelessStartupError::State {
+            detail: format!("cannot inspect installation mode: {error}"),
+        })?
+        .ok_or_else(|| StatelessStartupError::State {
+            detail: "database did not return installation-mode schema inspection".into(),
+        })?;
+    let table_present =
+        table
+            .try_get::<bool>("", "present")
+            .map_err(|error| StatelessStartupError::State {
+                detail: format!("cannot decode installation-mode schema inspection: {error}"),
+            })?;
+    if !table_present {
+        return Ok(());
+    }
     let row = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -276,7 +297,7 @@ pub async fn reject_local_mode_for_managed_database(
         ))
         .await
         .map_err(|error| StatelessStartupError::State {
-            detail: format!("cannot inspect installation mode: {error}"),
+            detail: format!("cannot inspect installation binding: {error}"),
         })?;
     if row.is_some() {
         return Err(StatelessStartupError::Configuration {

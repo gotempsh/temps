@@ -13,12 +13,25 @@ describe('platform capability presentation', () => {
     expect(sourceArchiveUploadsSupported({ stateless: false })).toBe(true)
   })
 
-  test('keeps actions disabled until capabilities load', () => {
-    expect(sourceArchiveUploadsSupported(undefined)).toBe(false)
+  test('preserves legacy support when fields are omitted or discovery fails', () => {
+    expect(sourceArchiveUploadsSupported(undefined)).toBe(true)
+    expect(sourceArchiveUploadsSupported({})).toBe(true)
+    expect(persistentWorkspaceStorageSupported(undefined)).toBe(true)
+    expect(persistentWorkspaceStorageSupported({})).toBe(true)
+    expect(persistentWorkspaceStorageSupported({ stateless: false })).toBe(true)
+  })
+
+  test('honors explicit workspace restrictions, including stateless mode', () => {
     expect(
       persistentWorkspaceStorageSupported({ persistent_workspaces: false })
     ).toBe(false)
-    expect(persistentWorkspaceStorageSupported(undefined)).toBe(false)
+    expect(persistentWorkspaceStorageSupported({ stateless: true })).toBe(false)
+    expect(
+      persistentWorkspaceStorageSupported({
+        stateless: true,
+        persistent_workspaces: true,
+      })
+    ).toBe(false)
     expect(
       persistentWorkspaceStorageSupported({ persistent_workspaces: true })
     ).toBe(true)

@@ -42,6 +42,18 @@ pub struct RetentionService {
     chunk_writer: Option<Arc<ChunkWriterService>>,
 }
 
+fn next_purge_cutoff(
+    previous: Option<DateTime<Utc>>,
+    requested: DateTime<Utc>,
+    chunks_failed: u64,
+) -> Option<DateTime<Utc>> {
+    if chunks_failed > 0 {
+        previous
+    } else {
+        Some(previous.map_or(requested, |cutoff| cutoff.max(requested)))
+    }
+}
+
 impl RetentionService {
     pub fn new(manifests: Arc<ManifestRepo>, metadata_service: Arc<LogMetadataService>) -> Self {
         Self {
@@ -123,8 +135,10 @@ impl RetentionService {
 
     /// Run retention cleanup for a specific project.
     ///
-    /// Deletes chunks older than the configured retention period.
-    /// Storage object is deleted first; metadata row is deleted only after confirmed.
+    /// Tombstones chunks older than the configured retention period so they
+    /// immediately leave search results. Deferred GC removes their objects and
+    /// manifest rows after the reader-safety grace period; index cleanup is
+    /// durably queued and retried by the forget sweeper.
     pub async fn cleanup_project(
         &self,
         project_id: i32,
@@ -170,8 +184,10 @@ impl RetentionService {
 
     /// Manual purge: delete all log data for a project before a given timestamp.
     ///
-    /// Used for GDPR compliance or accidental sensitive data logging.
-    /// Deletes both S3 chunks and log_events rows within the time range.
+    /// Used for GDPR compliance or accidental sensitive data logging. Matching
+    /// manifests are tombstoned so their lines immediately leave search;
+    /// object deletion and index cleanup follow through the same deferred GC
+    /// and durable forget queue as scheduled retention.
     pub async fn manual_purge(
         &self,
         project_id: i32,
@@ -202,8 +218,7 @@ impl RetentionService {
         let (deleted, failed, bytes) = self.tombstone(&chunks).await;
 
         if let Some(guard) = project_purge_guard.as_mut() {
-            let cutoff = (**guard).map_or(before, |previous| previous.max(before));
-            **guard = Some(cutoff);
+            **guard = next_purge_cutoff(**guard, before, failed);
         }
 
         info!(
@@ -219,5 +234,26 @@ impl RetentionService {
             chunks_failed: failed,
             bytes_reclaimed: bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_purge_cutoff;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn partial_tombstone_failure_does_not_advance_delayed_ingest_cutoff() {
+        let previous = Utc::now() - Duration::hours(2);
+        let requested = Utc::now();
+        assert_eq!(next_purge_cutoff(None, requested, 1), None);
+        assert_eq!(
+            next_purge_cutoff(Some(previous), requested, 1),
+            Some(previous)
+        );
+        assert_eq!(
+            next_purge_cutoff(Some(previous), requested, 0),
+            Some(requested)
+        );
     }
 }

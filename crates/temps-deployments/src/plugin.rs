@@ -175,7 +175,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // workflow could transition to running and then be cancelled by the
             // predecessor cleanup task.
             deployment_service
-                .cancel_running_deployments("Server restarted")
+                .cancel_running_deployments(
+                    crate::services::job_processor::SERVER_RESTART_CANCELLED_REASON,
+                )
                 .await
                 .map_err(|error| {
                     PluginError::InitializationFailed(format!(

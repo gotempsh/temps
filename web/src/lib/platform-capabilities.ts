@@ -4,11 +4,15 @@
 export function sourceArchiveUploadsSupported(
   features: { stateless?: boolean } | undefined
 ): boolean {
-  return features?.stateless === false
+  // Older servers omit this capability. Only an explicit restriction disables
+  // the action; the API remains authoritative if capability discovery fails.
+  return features?.stateless !== true
 }
 
 export function persistentWorkspaceStorageSupported(
-  features: { persistent_workspaces?: boolean } | undefined
+  features: { stateless?: boolean; persistent_workspaces?: boolean } | undefined
 ): boolean {
-  return features?.persistent_workspaces === true
+  return (
+    features?.stateless !== true && features?.persistent_workspaces !== false
+  )
 }

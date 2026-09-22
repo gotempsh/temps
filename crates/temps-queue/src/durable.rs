@@ -123,7 +123,7 @@ UPDATE durable_job_deliveries d
 SET claimed_at = now(), attempts = d.attempts + 1
 FROM candidate c, durable_jobs j
 WHERE d.job_id = c.job_id AND d.consumer = c.consumer AND j.id = d.job_id
-RETURNING d.job_id, j.payload
+RETURNING d.job_id, j.payload::TEXT AS payload_json
 "#;
         let row = self
             .db
@@ -144,10 +144,10 @@ RETURNING d.job_id, j.payload
         let job_id: Uuid = row.try_get("", "job_id").map_err(|error| {
             QueueError::InvalidData(format!("durable job id for {}: {error}", self.consumer))
         })?;
-        let payload: serde_json::Value = row.try_get("", "payload").map_err(|error| {
+        let payload: String = row.try_get("", "payload_json").map_err(|error| {
             QueueError::InvalidData(format!("durable job payload for {job_id}: {error}"))
         })?;
-        let job = match serde_json::from_value(payload) {
+        let job: Job = match serde_json::from_str(&payload) {
             Ok(job) => job,
             Err(error) => {
                 self.fail_claim(job_id, format!("deserialize durable job {job_id}: {error}"))
@@ -269,13 +269,13 @@ impl JobQueue for DurableBroadcastQueue {
                 });
             }
             let job_id = Uuid::new_v4();
-            let payload = serde_json::to_value(&job).map_err(|error| {
+            let payload = serde_json::to_string(&job).map_err(|error| {
                 QueueError::InvalidData(format!("serialize durable job {job_id}: {error}"))
             })?;
             transaction
                 .execute(Statement::from_sql_and_values(
                     DbBackend::Postgres,
-                    "INSERT INTO durable_jobs (id, job_type, payload) VALUES ($1, $2, $3)",
+                    "INSERT INTO durable_jobs (id, job_type, payload) VALUES ($1, $2, $3::jsonb)",
                     [job_id.into(), job.to_string().into(), payload.into()],
                 ))
                 .await

@@ -7,6 +7,8 @@
 Stop the source control plane first. This script never deletes source files.
 Use the same TEMPS_LOG_S3_* credentials as the destination installation.
 Without --apply it only reports the file count and destination namespace.
+Duplicate destination keys are rejected before any uploads; reconcile files
+shared by cas/cache and static before retrying.
 PostgreSQL must be backed up separately, with the original auth/encryption
 secrets retained outside the backup. Git checkouts and caches are disposable.
 """
@@ -21,10 +23,14 @@ import sys
 
 
 def mappings(data_dir, log_dir):
+    destinations = {}
+    planned = []
     for folder, namespace in [(data_dir / "cas" / "blobs", "static-assets/blobs"),
                               (data_dir / "cas" / "cache", "static-assets/paths"),
                               (data_dir / "static", "static-assets/paths"),
                               (log_dir, "logs/build-logs")]:
+        if folder.is_symlink():
+            raise ValueError(f"Refusing symlink in source tree: {folder}")
         if not folder.exists():
             continue
         for source in sorted(folder.rglob("*")):
@@ -33,7 +39,17 @@ def mappings(data_dir, log_dir):
             if not source.is_file():
                 continue
             relative = source.relative_to(folder).as_posix()
-            yield source, f"{namespace}/{relative}"
+            key = f"{namespace}/{relative}"
+            if key in destinations:
+                raise ValueError(
+                    f"Destination collision for {key}: {destinations[key]} and {source}; "
+                    "resolve the source conflict before migration"
+                )
+            destinations[key] = source
+            planned.append((source, key))
+    # Validate the entire source tree before returning even the first upload.
+    # Otherwise a late collision could leave a partially migrated destination.
+    return planned
 
 
 def digest(stream):
