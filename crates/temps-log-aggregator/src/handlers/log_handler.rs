@@ -1125,7 +1125,11 @@ mod tests {
             }))
             .await;
         let before_body: serde_json::Value = before_purge.json();
-        assert_eq!(before_body["lines"].as_array().map(Vec::len), Some(2));
+        // All 3 lines are unsealed in the live head buffer, within the search
+        // window, and no level filter is set on the request (an empty
+        // `levels` means "all levels" — see `level_mask_for`), so all 3 are
+        // expected back, not a subset.
+        assert_eq!(before_body["lines"].as_array().map(Vec::len), Some(3));
         assert!(before_body["lines"]
             .as_array()
             .expect("lines")

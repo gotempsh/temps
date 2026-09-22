@@ -217,6 +217,15 @@ struct HeadBuffer {
     /// when nothing is sealing.
     sealing_stats: Option<BufferStats>,
     wal: Option<WalHandle>,
+    /// Notified whenever `sealing` transitions from `Some` back to `None`
+    /// (both on success and on every failure path via [`drop_sealing`]).
+    /// Callers that need to wait for an in-flight seal to finish — notably
+    /// [`ChunkWriterService::seal_inner`] and
+    /// [`ChunkWriterService::remove_container`] — subscribe to this before
+    /// releasing the buffer lock and then `.await` the notification, so a
+    /// cancellation of an outer `write_line` task can never leave
+    /// `sealing = Some(...)` permanently stuck.
+    sealing_notify: Arc<tokio::sync::Notify>,
 }
 
 /// The writer's own thin wrapper around [`crate::chunk::wal::StreamWal`] so a
@@ -239,6 +248,7 @@ impl HeadBuffer {
             stats: BufferStats::default(),
             sealing_stats: None,
             wal: wal.map(|stream| WalHandle { stream }),
+            sealing_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -547,7 +557,13 @@ impl ChunkWriterService {
 
     /// Append one line to its container's head buffer, sealing immediately
     /// if the buffer just crossed `head_max_bytes`.
-    pub async fn write_line(&self, line: LogLine) -> Result<(), LogAggregatorError> {
+    ///
+    /// Takes `self: &Arc<Self>` so threshold-triggered seals can be spawned as
+    /// detached [`tokio::spawn`] tasks.  This is the cancellation-safety fix:
+    /// if the caller's task is aborted while a threshold seal is in flight, the
+    /// detached task continues to completion and clears `buffer.sealing`,
+    /// instead of leaving it permanently stuck `Some(...)`.
+    pub async fn write_line(self: &Arc<Self>, line: LogLine) -> Result<(), LogAggregatorError> {
         let project_gate = {
             let mut gates = self.project_gates.lock().await;
             gates
@@ -587,7 +603,44 @@ impl ChunkWriterService {
         };
 
         if should_seal {
-            self.seal_inner(&container_id, false).await?;
+            // Spawn a detached task and then await its JoinHandle.
+            //
+            // Why spawn at all instead of calling seal() inline?
+            // The collector's per-container streaming task is `.abort()`-ed by
+            // `CollectorService::stop_streaming` immediately before calling
+            // `remove_container`. If we called `seal()` inline here, the
+            // abort could land mid-seal and leave `buffer.sealing` stuck
+            // forever — no task would be left to clear it, and every later
+            // call to `remove_container`/`seal_inner` for this container
+            // would find an in-flight sealing slot and wait forever on
+            // `sealing_notify`, which nothing would ever fire.
+            //
+            // Why await the JoinHandle here?
+            // Spawning alone (fire-and-forget) breaks the synchronous-completion
+            // contract: callers like `size_threshold_triggers_an_immediate_seal`
+            // and the search endpoint assume that if `write_line` returned Ok,
+            // data that crossed the threshold has been committed to the manifest,
+            // not merely queued. The `.await` here preserves that contract for
+            // the normal (non-aborted) path.
+            //
+            // Why is this cancellation-safe?
+            // `tokio::spawn` fully detaches the inner task from this future's
+            // cancellation scope. If the caller task is `.abort()`-ed while we
+            // are `.await`-ing the JoinHandle, only the JoinHandle await is
+            // dropped — the spawned task itself continues running to completion
+            // inside the runtime, clears `buffer.sealing`, and fires
+            // `sealing_notify`. A subsequent `remove_container` call on the same
+            // container will then block in `seal_inner`'s wait loop until the
+            // detached task finishes, then complete normally.
+            let writer = self.clone();
+            let seal_container_id = container_id.clone();
+            tokio::spawn(async move { writer.seal(&seal_container_id).await })
+                .await
+                .map_err(|join_error| LogAggregatorError::Validation {
+                    message: format!(
+                        "threshold seal task for '{container_id}' panicked: {join_error}"
+                    ),
+                })??;
         }
         Ok(())
     }
@@ -658,13 +711,30 @@ impl ChunkWriterService {
         gate.write_owned().await
     }
 
+    /// Seal every head buffer for `project_id` that holds lines not yet
+    /// committed to the manifest — either because they are still in
+    /// `segments`/`active` (`!buffer.is_empty()`) **or** because a seal is
+    /// already in flight (`buffer.sealing.is_some()`).
+    ///
+    /// The in-flight case matters: when the background flush ticker kicks off
+    /// a seal, `segments` is moved into `sealing` and `is_empty()` returns
+    /// `true`, but the manifest row doesn't exist yet — a purge that ran right
+    /// then would skip those lines entirely.  Including buffers where
+    /// `sealing.is_some()` and then calling `seal_inner` (which waits for the
+    /// in-flight seal via `sealing_notify` before doing its own work) ensures
+    /// we block until every pre-existing seal has committed, then reseal any
+    /// lines that arrived in `active` during that wait.
+    ///
+    /// Failures are propagated: a purge must never report success while
+    /// matching lines remain searchable in an unsealed head buffer.
     pub async fn flush_project_for_purge(&self, project_id: i32) -> Result<(), LogAggregatorError> {
         let ids: Vec<String> = {
             let buffers = self.buffers.lock().await;
             buffers
                 .iter()
                 .filter(|(_, buffer)| {
-                    buffer.identity.project_id == project_id && !buffer.is_empty()
+                    buffer.identity.project_id == project_id
+                        && (!buffer.is_empty() || buffer.sealing.is_some())
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -677,7 +747,15 @@ impl ChunkWriterService {
 
     /// Seal then drop a container's buffer and WAL file (call when a
     /// container stops).
-    pub async fn remove_container(&self, container_id: &str) -> Result<(), LogAggregatorError> {
+    ///
+    /// Takes `self: &Arc<Self>` for symmetry with [`Self::write_line`].  When
+    /// called after a streaming task has been `.abort()`ed, `seal_inner` will
+    /// wait for the detached threshold-seal task (if any) to finish before
+    /// starting a new seal, so no lines are silently dropped.
+    pub async fn remove_container(
+        self: &Arc<Self>,
+        container_id: &str,
+    ) -> Result<(), LogAggregatorError> {
         self.seal(container_id).await?;
         {
             let mut buffers = self.buffers.lock().await;
@@ -706,11 +784,23 @@ impl ChunkWriterService {
     /// every failure path so the lines remain recoverable from disk (and
     /// stop counting toward the buffer's [`HeadSummary`], since they are
     /// dropped from memory).
+    ///
+    /// Notifies [`HeadBuffer::sealing_notify`] after clearing so that any
+    /// waiter in [`Self::seal_inner`] or [`Self::remove_container`] is
+    /// unblocked and can re-evaluate.
     async fn drop_sealing(&self, container_id: &str) {
-        let mut buffers = self.buffers.lock().await;
-        if let Some(buffer) = buffers.get_mut(container_id) {
-            buffer.sealing = None;
-            buffer.sealing_stats = None;
+        let notify = {
+            let mut buffers = self.buffers.lock().await;
+            if let Some(buffer) = buffers.get_mut(container_id) {
+                buffer.sealing = None;
+                buffer.sealing_stats = None;
+                Some(buffer.sealing_notify.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(n) = notify {
+            n.notify_waiters();
         }
     }
 
@@ -744,31 +834,46 @@ impl ChunkWriterService {
         container_id: &str,
         fail_on_persistence_error: bool,
     ) -> Result<(), LogAggregatorError> {
-        let (identity, sealing_segments) = {
-            let mut buffers = self.buffers.lock().await;
-            let Some(buffer) = buffers.get_mut(container_id) else {
-                return Ok(());
+        // Cancellation-safety loop: if a prior `write_line` threshold-seal was
+        // spawned as a detached task and is still in flight, we must wait for
+        // it to finish before we can take the `sealing` slot ourselves.
+        // Waiting here (rather than returning early) is what prevents
+        // `remove_container` from silently no-oping while lines are stranded
+        // in `sealing` by an aborted caller.
+        let (identity, sealing_segments) = loop {
+            let maybe_notify = {
+                let mut buffers = self.buffers.lock().await;
+                let Some(buffer) = buffers.get_mut(container_id) else {
+                    return Ok(());
+                };
+                if buffer.sealing.is_some() {
+                    // A seal is already in flight. Subscribe to the
+                    // completion notifier and wait for it to clear, then
+                    // re-check.  We clone the Arc while the lock is held so
+                    // we don't miss a notification that fires between the
+                    // lock drop and the `.notified().await`.
+                    Some(buffer.sealing_notify.clone())
+                } else {
+                    // Freeze any unfrozen tail so every line about to be sealed
+                    // is captured in an immutable segment before we release the
+                    // lock.
+                    buffer.freeze_active();
+                    if buffer.segments.is_empty() {
+                        return Ok(());
+                    }
+                    let sealing_segments = std::mem::take(&mut buffer.segments);
+                    buffer.bytes = 0;
+                    buffer.opened_at = Instant::now();
+                    buffer.sealing = Some(sealing_segments.clone());
+                    buffer.sealing_stats = Some(buffer.stats);
+                    buffer.stats = BufferStats::default();
+                    break (buffer.identity.clone(), sealing_segments);
+                }
             };
-            if buffer.sealing.is_some() {
-                // A seal for this container is already in flight (or a prior
-                // seal failed without clearing `sealing`, which cannot
-                // happen — every failure path clears it). Skip rather than
-                // double-seal.
-                return Ok(());
+            // Lock is released here before awaiting.
+            if let Some(notify) = maybe_notify {
+                notify.notified().await;
             }
-            // Freeze any unfrozen tail so every line about to be sealed is
-            // captured in an immutable segment before we release the lock.
-            buffer.freeze_active();
-            if buffer.segments.is_empty() {
-                return Ok(());
-            }
-            let sealing_segments = std::mem::take(&mut buffer.segments);
-            buffer.bytes = 0;
-            buffer.opened_at = Instant::now();
-            buffer.sealing = Some(sealing_segments.clone());
-            buffer.sealing_stats = Some(buffer.stats);
-            buffer.stats = BufferStats::default();
-            (buffer.identity.clone(), sealing_segments)
         };
 
         let with_bloom = !self.shed_bloom.load(Ordering::Relaxed);
@@ -873,7 +978,7 @@ impl ChunkWriterService {
                 .await;
         }
 
-        {
+        let notify = {
             let mut buffers = self.buffers.lock().await;
             if let Some(buffer) = buffers.get_mut(container_id) {
                 buffer.sealing = None;
@@ -881,7 +986,15 @@ impl ChunkWriterService {
                 if let Some(wal) = buffer.wal.as_mut() {
                     wal.stream.truncate().await?;
                 }
+                Some(buffer.sealing_notify.clone())
+            } else {
+                None
             }
+        };
+        // Notify outside the lock so waiters in seal_inner or remove_container
+        // can re-acquire it immediately.
+        if let Some(n) = notify {
+            n.notify_waiters();
         }
 
         Ok(())
@@ -1035,6 +1148,26 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
             Ok(1)
+        }
+    }
+
+    /// A sink that pauses at the manifest insert point and records what was
+    /// inserted. Used to gate a seal mid-flight: `entered` fires when the
+    /// seal reaches the manifest insert; `release` unblocks it; `rows` holds
+    /// every chunk that was committed.
+    #[derive(Default)]
+    struct GatedSink {
+        rows: VecSink,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ManifestSink for GatedSink {
+        async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.rows.insert(meta).await
         }
     }
 
@@ -1521,6 +1654,73 @@ mod tests {
         drop(guard);
     }
 
+    /// Regression: when a background seal is in flight (`sealing.is_some()`),
+    /// `is_empty()` returns `true` because `segments` has been moved into
+    /// `sealing`. Before this fix, `flush_project_for_purge` only checked
+    /// `!buffer.is_empty()` and would skip the container entirely, letting the
+    /// purge proceed before the in-flight seal committed its manifest row.
+    ///
+    /// The fix: also include `sealing.is_some()` in the filter so `seal_inner`
+    /// is called for the container; it then waits (via `sealing_notify`) for
+    /// the existing seal to finish before doing its own work.
+    #[tokio::test]
+    async fn flush_project_for_purge_waits_for_in_flight_background_seal() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let sink = Arc::new(GatedSink::default());
+            let writer = ChunkWriterService::open(
+                Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+                sink.clone() as Arc<dyn ManifestSink>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            writer
+                .write_line(make_line("cnt-bg-seal", LogLevel::Info, "will be sealed"))
+                .await
+                .unwrap();
+
+            // Start a background seal; wait until it enters the manifest insert
+            // so `sealing.is_some()` and `is_empty()` are both true.
+            let bg_writer = writer.clone();
+            let bg_flush = tokio::spawn(async move { bg_writer.flush_all().await });
+            sink.entered.notified().await;
+
+            // Now call flush_project_for_purge — it must wait for the in-flight
+            // seal to finish, not skip the container and return immediately.
+            let purge_writer = writer.clone();
+            let purge_flush =
+                tokio::spawn(async move { purge_writer.flush_project_for_purge(1).await });
+
+            // Give the purge flush task a moment to start and hit the wait.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert!(
+                !purge_flush.is_finished(),
+                "flush_project_for_purge must wait for the in-flight seal, not return early"
+            );
+
+            // Release the in-flight seal.
+            sink.release.notify_one();
+            bg_flush.await.expect("background flush");
+
+            // Now flush_project_for_purge must complete.
+            purge_flush
+                .await
+                .expect("purge flush task")
+                .expect("flush_project_for_purge ok");
+
+            // The manifest must have a row for the originally-in-flight lines.
+            assert_eq!(
+                sink.rows.all().await.len(),
+                1,
+                "the in-flight seal's lines must be committed before flush_project_for_purge returns"
+            );
+        })
+        .await
+        .expect("flush_project_for_purge_waits_for_in_flight_background_seal timed out");
+    }
+
     #[tokio::test]
     async fn manifest_failure_drops_lines_but_keeps_the_wal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1606,6 +1806,92 @@ mod tests {
         let key1 = sink1.all().await[0].storage_key.clone();
         let key2 = sink2.all().await[0].storage_key.clone();
         assert_eq!(key1, key2, "same content must produce the same storage key");
+    }
+
+    /// Regression: a collector calls `.abort()` on its per-container streaming
+    /// task and then calls `remove_container`. Before this fix, if the abort
+    /// landed while `write_line`'s threshold-triggered seal was awaited inline,
+    /// `buffer.sealing` was left stuck forever — the seal pipeline was killed
+    /// mid-flight with no path left to clear it, so every subsequent call to
+    /// `seal_inner`/`remove_container` would wait on `sealing_notify` forever.
+    ///
+    /// The fix: `write_line` spawns the threshold seal as an independent
+    /// `tokio::spawn` task and then awaits the `JoinHandle`. If the caller is
+    /// aborted, only the `JoinHandle` await is dropped; the spawned task itself
+    /// continues running to completion in the runtime, clears `sealing`, and
+    /// fires `sealing_notify`. A subsequent `remove_container` call then
+    /// unblocks, seals the data, and returns normally.
+    ///
+    /// To confirm the test exercises the real fix: temporarily comment out the
+    /// `notify.notified().await` wait in `seal_inner` (or the `n.notify_waiters()`
+    /// call in `drop_sealing`) and the test will hang in `remove_container`,
+    /// proving the `sealing_notify` mechanism is load-bearing.
+    #[tokio::test]
+    async fn write_line_threshold_seal_survives_the_caller_being_aborted() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let sink = Arc::new(GatedSink::default());
+            let writer = ChunkWriterService::open(
+                Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+                sink.clone() as Arc<dyn ManifestSink>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            // A threshold of 1 byte means the first write_line call will
+            // immediately try to seal its buffer.
+            writer.set_head_max_bytes(1);
+
+            // Simulate a collector's per-container streaming task: write one
+            // line that crosses the byte threshold (triggering a seal) and get
+            // aborted mid-seal, exactly as `CollectorService::stop_streaming`
+            // does before calling `remove_container`.
+            let ingest_writer = writer.clone();
+            let ingest_task = tokio::spawn(async move {
+                ingest_writer
+                    .write_line(make_line(
+                        "aborted-mid-seal",
+                        LogLevel::Info,
+                        "trigger seal",
+                    ))
+                    .await
+            });
+
+            // Wait for the seal to enter the manifest insert (proving the seal
+            // task is live inside `GatedSink::insert`), then abort the caller.
+            sink.entered.notified().await;
+            ingest_task.abort();
+            assert!(
+                ingest_task.await.unwrap_err().is_cancelled(),
+                "ingest task must be cancelled"
+            );
+
+            // The detached seal task is still running inside `GatedSink::insert`,
+            // waiting on `release`. Release it — the task should clear `sealing`
+            // and fire `sealing_notify` as part of its normal completion path.
+            sink.release.notify_one();
+
+            // `remove_container` must not hang waiting on a stuck `sealing`
+            // slot. Without the fix it would block here forever because the
+            // abort killed the only task that could have cleared `sealing`.
+            writer
+                .remove_container("aborted-mid-seal")
+                .await
+                .expect("remove_container must converge after caller abort");
+
+            assert_eq!(
+                sink.rows.all().await.len(),
+                1,
+                "sealed chunk must have been committed despite caller abort"
+            );
+            assert!(
+                writer.snapshot("aborted-mid-seal").await.is_none(),
+                "buffer must be removed after remove_container"
+            );
+        })
+        .await
+        .expect("write_line_threshold_seal_survives_the_caller_being_aborted timed out");
     }
 
     #[tokio::test]
