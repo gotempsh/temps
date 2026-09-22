@@ -11667,6 +11667,7 @@ dependencies = [
  "jsonwebtoken 11.1.0",
  "log",
  "mockito",
+ "nix 0.31.3",
  "octocrab",
  "rand 0.10.2",
  "regex",

@@ -12,6 +12,9 @@ use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
 
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+
 #[derive(Error, Debug)]
 pub enum GitOpsError {
     #[error("Failed to clone repository from {url}: {reason}")]
@@ -458,10 +461,16 @@ fn apply_git_http_credentials(
 }
 
 async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(), String> {
-    let output = command
-        .output()
-        .await
+    let child = command
+        .spawn()
         .map_err(|e| format!("failed to run git ({action}): {e}"))?;
+    #[cfg(unix)]
+    let output = ProcessGroupOutput::new(child, action)?
+        .wait_with_output()
+        .await;
+    #[cfg(not(unix))]
+    let output = child.wait_with_output().await;
+    let output = output.map_err(|e| format!("failed to run git ({action}): {e}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -475,6 +484,69 @@ async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(
         format!("git exited {}", output.status)
     };
     Err(format!("{action}: {detail}"))
+}
+
+/// Owns both process-group cleanup and Tokio's child handle.
+///
+/// On cancellation, `Drop` signals the group before the `Child` field is
+/// dropped. This prevents transport subprocesses from surviving while
+/// retaining Tokio's normal child reaping.
+#[cfg(unix)]
+struct ProcessGroupOutput {
+    child: tokio::process::Child,
+    process_group: nix::unistd::Pid,
+}
+
+#[cfg(unix)]
+impl ProcessGroupOutput {
+    fn new(child: tokio::process::Child, action: &str) -> Result<Self, String> {
+        let child_id = child
+            .id()
+            .ok_or_else(|| format!("failed to track git process group ({action}): missing PID"))?;
+        let process_group = i32::try_from(child_id).map_err(|_| {
+            format!("failed to track git process group ({action}): invalid PID {child_id}")
+        })?;
+        Ok(Self {
+            child,
+            process_group: nix::unistd::Pid::from_raw(process_group),
+        })
+    }
+
+    async fn wait_with_output(mut self) -> Result<std::process::Output, std::io::Error> {
+        let mut stdout = self.child.stdout.take().ok_or_else(|| {
+            std::io::Error::other("git stdout was not configured for process cleanup")
+        })?;
+        let mut stderr = self.child.stderr.take().ok_or_else(|| {
+            std::io::Error::other("git stderr was not configured for process cleanup")
+        })?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        tokio::try_join!(
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes)
+        )?;
+
+        // Reap only after every group member has closed the inherited pipes.
+        // Until then the unreaped leader reserves its PID, making it safe for
+        // Drop to use that PID as the process-group ID during cancellation.
+        let status = self.child.wait().await?;
+        Ok(std::process::Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupOutput {
+    fn drop(&mut self) {
+        // Once Tokio reaps the child, its PID may be reused. Avoid signalling
+        // the numeric process-group ID after that point.
+        if self.child.id().is_some() {
+            let _ = nix::sys::signal::killpg(self.process_group, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
 }
 
 /// Checkout a specific ref (branch, tag, or commit SHA) in an existing repository.
@@ -876,5 +948,65 @@ mod tests {
             !target_dir.path().join("apps/web/index.html").exists(),
             "unescaped [b] would match apps/web"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_git_command_kills_transport_process_group() {
+        let temp_dir = TempDir::new().unwrap();
+        let ready_path = temp_dir.path().join("ready");
+        let survivor_path = temp_dir.path().join("survivor");
+
+        let fake_git = temp_dir.path().join("git");
+        std::os::unix::fs::symlink("/bin/sh", &fake_git).unwrap();
+        let mut command = tokio::process::Command::new(&fake_git);
+        command
+            .kill_on_drop(true)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("-c")
+            .arg("(sleep 1; echo survived > \"$2\") & echo ready > \"$1\"; wait")
+            .arg("git")
+            .arg(&ready_path)
+            .arg(&survivor_path);
+
+        let mut operation = Box::pin(run_git(command, "test cancellation"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if ready_path.exists() {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut operation => panic!("test command exited early: {result:?}"),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(operation);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        assert!(
+            !survivor_path.exists(),
+            "a transport subprocess survived cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_preserves_action_and_stderr_on_failure() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .kill_on_drop(true)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("-c")
+            .arg("echo transport-failed >&2; exit 7");
+
+        let error = run_git(command, "clone test repository").await.unwrap_err();
+        assert_eq!(error, "clone test repository: transport-failed");
     }
 }
