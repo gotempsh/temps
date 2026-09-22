@@ -86,6 +86,10 @@ pub struct EnrollResponse {
     /// Absent for ordinary enrollments and older managed backends.
     #[serde(default)]
     pub instance_id: Option<Uuid>,
+    /// Whether Cloud resolved a targeted reconnect code to an existing
+    /// instance, including when the returned identity equals the request.
+    #[serde(default)]
+    pub reconnected: bool,
     /// Human-readable Cloud account identity for the local connection UI.
     /// Optional for compatibility with older managed backends.
     #[serde(default)]
@@ -108,6 +112,7 @@ impl std::fmt::Debug for EnrollResponse {
         f.debug_struct("EnrollResponse")
             .field("tenant_id", &self.tenant_id)
             .field("instance_id", &self.instance_id)
+            .field("reconnected", &self.reconnected)
             .field("account_email", &self.account_email)
             .field("instance_token", &"[REDACTED]")
             .field("capabilities", &self.capabilities)
@@ -1481,6 +1486,7 @@ mod tests {
         let response = EnrollResponse {
             tenant_id: Uuid::new_v4(),
             instance_id: None,
+            reconnected: false,
             account_email: Some("owner@example.com".into()),
             instance_token: "inst_secret".into(),
             capabilities: vec![],
@@ -1620,6 +1626,7 @@ mod tests {
 
         assert_eq!(response.tenant_id, tenant_id);
         assert!(response.instance_id.is_none());
+        assert!(!response.reconnected);
         assert!(response.account_email.is_none());
         assert!(response.capabilities.is_empty());
     }

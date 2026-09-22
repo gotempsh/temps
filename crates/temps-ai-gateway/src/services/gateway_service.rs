@@ -580,6 +580,7 @@ mod tests {
         Json(EnrollResponse {
             tenant_id: uuid::Uuid::new_v4(),
             instance_id: None,
+            reconnected: false,
             account_email: Some("operator@example.com".into()),
             instance_token: "instance-token".into(),
             capabilities: Vec::new(),

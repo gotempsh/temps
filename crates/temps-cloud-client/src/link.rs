@@ -194,15 +194,17 @@ pub struct SubmissionScopeBusy;
 /// after the first activation — a decision they made once and cannot see being
 /// undone.
 ///
-/// The distinction is drawn on the **tenant**, not on the token, because that is
-/// what "a link that did not exist before" actually means. A fresh token for the
-/// same tenant is the same customer proving themselves again. A different tenant
-/// is a different customer, and binding to one is a new link no matter what
-/// stale credential happened to be on disk.
+/// Ordinary enrollment distinguishes links by **tenant**, not token. Targeted
+/// reconnect is explicit because a replacement installation has no local token
+/// or tenant even though Cloud already holds the instance and its history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentKind {
     /// No credential was held before this call: the link is new.
     First,
+    /// A targeted code reattached this installation to an existing Cloud
+    /// identity. Cloud already holds this instance's history, so purchase-time
+    /// activation must not run again.
+    Reconnected { instance_id: Uuid },
     /// A credential was already held, and it was for a *different* tenant than
     /// the one just enrolled — or for no recorded tenant at all, which a
     /// half-written legacy state can produce and which cannot be shown to be
@@ -217,7 +219,21 @@ pub enum EnrollmentKind {
 }
 
 impl EnrollmentKind {
-    fn classify(was_linked: bool, previous_tenant_id: Option<Uuid>, new_tenant_id: Uuid) -> Self {
+    fn classify(
+        was_linked: bool,
+        previous_tenant_id: Option<Uuid>,
+        new_tenant_id: Uuid,
+        requested_instance_id: Uuid,
+        returned_instance_id: Option<Uuid>,
+        reconnected: bool,
+    ) -> Self {
+        if reconnected
+            || returned_instance_id.is_some_and(|instance_id| instance_id != requested_instance_id)
+        {
+            return Self::Reconnected {
+                instance_id: returned_instance_id.unwrap_or(requested_instance_id),
+            };
+        }
         if !was_linked {
             return Self::First;
         }
@@ -245,6 +261,7 @@ impl EnrollmentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::First => "first",
+            Self::Reconnected { .. } => "reconnected",
             Self::ReboundToNewTenant { .. } => "rebound_to_new_tenant",
             Self::ReEnrolled { .. } => "re_enrolled",
         }
@@ -258,9 +275,8 @@ impl EnrollmentKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstLinkEnrollment {
     /// No credential was held; the code was redeemed and this instance now
-    /// holds the resulting link. Always [`EnrollmentKind::First`] in practice —
-    /// carried so callers log and audit with the same vocabulary as
-    /// [`CloudLink::enroll`].
+    /// holds the resulting link. Carries the kind so callers can distinguish a
+    /// genuinely fresh link from a targeted reconnect.
     Established(EnrollmentKind),
     /// A credential was already held when the call started. The code was
     /// **not** sent to the backend; nothing changed anywhere.
@@ -1269,7 +1285,14 @@ impl CloudLink {
         // Read *before* the overwrite below: after it, there is no record on
         // this instance that a different credential was ever held, and a caller
         // asking "did this call establish the link?" would have to guess.
-        let kind = EnrollmentKind::classify(current.is_linked(), current.tenant_id, res.tenant_id);
+        let kind = EnrollmentKind::classify(
+            current.is_linked(),
+            current.tenant_id,
+            res.tenant_id,
+            instance_id,
+            res.instance_id,
+            res.reconnected,
+        );
 
         let mut next = current.clone();
         next.instance_id = res.instance_id.unwrap_or(instance_id);
@@ -2411,7 +2434,8 @@ mod enrollment_kind_tests {
     #[test]
     fn an_instance_with_no_credential_is_a_first_enrollment() {
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(false, None, tenant);
+        let instance = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(false, None, tenant, instance, None, false);
 
         assert_eq!(kind, EnrollmentKind::First);
         assert!(kind.establishes_new_link());
@@ -2425,7 +2449,9 @@ mod enrollment_kind_tests {
         // Nothing about the link is new, so nothing that belongs to linking —
         // least of all a spend — may fire again.
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, Some(tenant), tenant);
+        let instance = Uuid::new_v4();
+        let kind =
+            EnrollmentKind::classify(true, Some(tenant), tenant, instance, Some(instance), false);
 
         assert_eq!(kind, EnrollmentKind::ReEnrolled { tenant_id: tenant });
         assert!(!kind.establishes_new_link());
@@ -2439,7 +2465,9 @@ mod enrollment_kind_tests {
         // a genuinely new link the side effects it is entitled to.
         let previous = Uuid::new_v4();
         let next = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, Some(previous), next);
+        let instance = Uuid::new_v4();
+        let kind =
+            EnrollmentKind::classify(true, Some(previous), next, instance, Some(instance), false);
 
         assert_eq!(
             kind,
@@ -2459,7 +2487,8 @@ mod enrollment_kind_tests {
         // can cancel, treating it as the same silently withholds one from a
         // customer who just paid.
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, None, tenant);
+        let instance = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(true, None, tenant, instance, None, false);
 
         assert_eq!(
             kind,
@@ -2468,6 +2497,45 @@ mod enrollment_kind_tests {
             }
         );
         assert!(kind.establishes_new_link());
+    }
+
+    #[test]
+    fn a_targeted_reconnect_does_not_establish_a_new_link() {
+        let requested_instance_id = Uuid::new_v4();
+        let historical_instance_id = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(
+            false,
+            None,
+            Uuid::new_v4(),
+            requested_instance_id,
+            Some(historical_instance_id),
+            true,
+        );
+
+        assert_eq!(
+            kind,
+            EnrollmentKind::Reconnected {
+                instance_id: historical_instance_id
+            }
+        );
+        assert!(!kind.establishes_new_link());
+        assert_eq!(kind.as_str(), "reconnected");
+    }
+
+    #[test]
+    fn a_same_identity_targeted_reconnect_uses_the_explicit_marker() {
+        let instance_id = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(
+            false,
+            None,
+            Uuid::new_v4(),
+            instance_id,
+            Some(instance_id),
+            true,
+        );
+
+        assert_eq!(kind, EnrollmentKind::Reconnected { instance_id });
+        assert!(!kind.establishes_new_link());
     }
 }
 
@@ -2902,6 +2970,7 @@ mod first_link_enrollment_tests {
                         Json(serde_json::json!({
                             "tenant_id": tenant_for(&request.enrollment_code),
                             "instance_id": reassigned_instance_id,
+                            "reconnected": request.enrollment_code.starts_with("RECONNECT-"),
                             "instance_token": format!("inst_{}", request.enrollment_code),
                         }))
                     },
@@ -3006,10 +3075,18 @@ mod first_link_enrollment_tests {
         let generated_instance_id = link.instance_id().expect("configured instance identity");
         let historical_instance_id = tenant_for("historical-instance");
 
-        link.enroll("reconnect-abcd-efgh")
+        let kind = link
+            .enroll("reconnect-abcd-efgh")
             .await
             .expect("targeted enrollment must succeed");
 
+        assert_eq!(
+            kind,
+            EnrollmentKind::Reconnected {
+                instance_id: historical_instance_id
+            }
+        );
+        assert!(!kind.establishes_new_link());
         assert_ne!(generated_instance_id, historical_instance_id);
         assert_eq!(link.instance_id(), Some(historical_instance_id));
         assert_eq!(
