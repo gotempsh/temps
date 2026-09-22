@@ -135,6 +135,11 @@ import {
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
 
+function isRepositoryRootDirectory(directory: string | undefined | null): boolean {
+  const normalized = (directory ?? '').trim()
+  return normalized === '' || normalized === '.' || normalized === './'
+}
+
 interface GitSettingsProps {
   project: ProjectResponse
   refetch: () => void
@@ -348,6 +353,7 @@ function GitSettingsInline({
       main_branch: string
       preset: string
       directory: string
+      pull_only_root_directory: boolean
       preset_config: any
       repo_owner: string
       repo_name: string
@@ -380,10 +386,16 @@ function GitSettingsInline({
       await refetch()
       return
     }
+    const nextDirectory = overrides.directory ?? project.directory ?? './'
     const body: Record<string, unknown> = {
       main_branch: overrides.main_branch ?? project.main_branch,
       preset: selectedPreset,
-      directory: overrides.directory ?? project.directory ?? './',
+      directory: nextDirectory,
+      pull_only_root_directory: isRepositoryRootDirectory(nextDirectory)
+        ? false
+        : (overrides.pull_only_root_directory ??
+          project.pull_only_root_directory ??
+          false),
       repo_owner: overrides.repo_owner ?? project.repo_owner!,
       repo_name: overrides.repo_name ?? project.repo_name!,
       preset_config: selectedPresetConfig,
@@ -1047,6 +1059,62 @@ function GitSettingsInline({
                       />
                     }
                   />
+                  <div className="flex items-start gap-2 px-1">
+                    <Checkbox
+                      id="pull-only-root-directory"
+                      checked={
+                        !isRepositoryRootDirectory(
+                          editing === 'directory'
+                            ? directoryDraft
+                            : project.directory
+                        ) && !!project.pull_only_root_directory
+                      }
+                      disabled={
+                        isRepositoryRootDirectory(
+                          editing === 'directory'
+                            ? directoryDraft
+                            : project.directory
+                        ) || updateGitSettings.isPending
+                      }
+                      onCheckedChange={async (checked) => {
+                        await saveGitField({
+                          pull_only_root_directory: checked === true,
+                          ...(editing === 'directory'
+                            ? { directory: directoryDraft || './' }
+                            : {}),
+                        })
+                        if (editing === 'directory') {
+                          close()
+                        }
+                        toast.success(
+                          checked === true
+                            ? 'Deploy will pull only the root directory'
+                            : 'Deploy will pull the full repository'
+                        )
+                      }}
+                    />
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="pull-only-root-directory"
+                        className={cn(
+                          'text-sm leading-none',
+                          isRepositoryRootDirectory(
+                            editing === 'directory'
+                              ? directoryDraft
+                              : project.directory
+                          )
+                            ? 'text-muted-foreground'
+                            : 'cursor-pointer'
+                        )}
+                      >
+                        Pull only the root directory
+                      </label>
+                      <p className="text-xs text-muted-foreground">
+                        Clone only this subdirectory instead of the whole
+                        repository.
+                      </p>
+                    </div>
+                  </div>
 
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (
@@ -2483,6 +2551,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   // selector never carries a branch name over from an unrelated repo.
   const [branch, setBranch] = useState<string>(project.main_branch || '')
   const [directory, setDirectory] = useState(project.directory || './')
+  const [pullOnlyRootDirectory, setPullOnlyRootDirectory] = useState(
+    !!project.pull_only_root_directory &&
+      !isRepositoryRootDirectory(project.directory)
+  )
   // Holds the selector's composite `slug::path` key, not a bare slug — a
   // monorepo can expose the same preset at several paths, and a bare slug
   // makes every card sharing it render as selected. Split via
@@ -2501,7 +2573,11 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
    */
   const selectPreset = (value: string) => {
     setPreset(value)
-    setDirectory(splitPresetSelection(value).directory)
+    const nextDirectory = splitPresetSelection(value).directory
+    setDirectory(nextDirectory)
+    if (isRepositoryRootDirectory(nextDirectory)) {
+      setPullOnlyRootDirectory(false)
+    }
   }
 
   // Detect frameworks/presets for the chosen connected repo.
@@ -2617,6 +2693,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       repo_owner: repoToConnect.owner,
       repo_name: repoToConnect.name,
       directory: directory || './',
+      pull_only_root_directory:
+        !isRepositoryRootDirectory(directory) && pullOnlyRootDirectory,
       // The selector's value is a `slug::path` key; the API takes the slug
       // only. Submitting the key verbatim was rejected as "Unknown preset:
       // dockerfile::examples/go-error-tracking".
@@ -2945,13 +3023,49 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               <Input
                 id="root-dir"
                 value={directory}
-                onChange={(e) => setDirectory(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value
+                  setDirectory(next)
+                  if (isRepositoryRootDirectory(next)) {
+                    setPullOnlyRootDirectory(false)
+                  }
+                }}
                 placeholder="./"
               />
               <p className="text-xs text-muted-foreground">
                 Subdirectory to build from (for monorepos). Defaults to the
                 repository root.
               </p>
+              <div className="flex items-start gap-2 pt-1">
+                <Checkbox
+                  id="connect-pull-only-root-directory"
+                  checked={
+                    !isRepositoryRootDirectory(directory) &&
+                    pullOnlyRootDirectory
+                  }
+                  disabled={isRepositoryRootDirectory(directory)}
+                  onCheckedChange={(checked) =>
+                    setPullOnlyRootDirectory(checked === true)
+                  }
+                />
+                <div className="space-y-1">
+                  <label
+                    htmlFor="connect-pull-only-root-directory"
+                    className={cn(
+                      'text-sm leading-none',
+                      isRepositoryRootDirectory(directory)
+                        ? 'text-muted-foreground'
+                        : 'cursor-pointer'
+                    )}
+                  >
+                    Pull only the root directory
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    Clone only this subdirectory instead of the whole
+                    repository.
+                  </p>
+                </div>
+              </div>
             </div>
           </CardContent>
         </Card>

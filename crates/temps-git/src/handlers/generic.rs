@@ -361,6 +361,7 @@ mod tests {
             repo_name: repo_name.to_string(),
             repo_owner: repo_owner.to_string(),
             directory: "/".to_string(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::Vite,
             preset_config: None,

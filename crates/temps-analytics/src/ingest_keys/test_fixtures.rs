@@ -41,6 +41,7 @@ pub fn project_model(id: i32) -> projects::Model {
         repo_name: "test-repo".to_string(),
         repo_owner: "test-owner".to_string(),
         directory: String::new(),
+        pull_only_root_directory: false,
         main_branch: "main".to_string(),
         preset: temps_entities::preset::Preset::NextJs,
         preset_config: None,

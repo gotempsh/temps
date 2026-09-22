@@ -163,6 +163,8 @@ pub struct DownloadRepoJob {
     tag_ref: Option<String>,
     commit_sha: Option<String>,
     project_directory: Option<String>,
+    /// When true and `project_directory` is a subdirectory, clone only that path.
+    pull_only_root_directory: bool,
     git_provider_manager: Arc<dyn GitProviderManagerTrait>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -185,6 +187,7 @@ impl std::fmt::Debug for DownloadRepoJob {
             .field("tag_ref", &self.tag_ref)
             .field("commit_sha", &self.commit_sha)
             .field("project_directory", &self.project_directory)
+            .field("pull_only_root_directory", &self.pull_only_root_directory)
             .finish()
     }
 }
@@ -209,6 +212,7 @@ impl DownloadRepoJob {
             tag_ref: None,
             commit_sha: None,
             project_directory: None,
+            pull_only_root_directory: false,
             git_provider_manager,
             log_id: None,
             log_service: None,
@@ -234,6 +238,7 @@ impl DownloadRepoJob {
             tag_ref: None,
             commit_sha: None,
             project_directory: None,
+            pull_only_root_directory: false,
             git_provider_manager,
             log_id: None,
             log_service: None,
@@ -259,6 +264,22 @@ impl DownloadRepoJob {
     pub fn with_project_directory(mut self, project_directory: String) -> Self {
         self.project_directory = Some(project_directory);
         self
+    }
+
+    pub fn with_pull_only_root_directory(mut self, pull_only_root_directory: bool) -> Self {
+        self.pull_only_root_directory = pull_only_root_directory;
+        self
+    }
+
+    /// Subdirectory to sparse-checkout, when the flag is on and the path is not root.
+    fn sparse_subdirectory(&self) -> Option<String> {
+        if !self.pull_only_root_directory {
+            return None;
+        }
+        temps_git::services::git_ops::validate_sparse_subdirectory(
+            self.project_directory.as_deref()?,
+        )
+        .ok()
     }
 
     pub fn with_log_id(mut self, log_id: String) -> Self {
@@ -364,6 +385,52 @@ impl DownloadRepoJob {
             format!("Cloning public repository from: {}", git_url),
         )
         .await?;
+
+        if let Some(subdirectory) = self.sparse_subdirectory() {
+            let checkout_ref = self.get_checkout_ref(context);
+            self.log(
+                context,
+                format!(
+                    "Sparse-checking out directory '{}' at {}",
+                    subdirectory, checkout_ref
+                ),
+            )
+            .await?;
+
+            const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            tokio::time::timeout(
+                CLONE_TIMEOUT,
+                temps_git::services::git_ops::sparse_clone_repo(
+                    git_url,
+                    repo_dir,
+                    &subdirectory,
+                    Some(&checkout_ref),
+                    None,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Git sparse clone of {}/{} timed out after {}s",
+                    self.repo_owner,
+                    self.repo_name,
+                    CLONE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to sparse-clone public repository {}/{}: {}",
+                    self.repo_owner, self.repo_name, e
+                ))
+            })?;
+
+            self.log(
+                context,
+                format!("Successfully sparse-cloned at ref: {}", checkout_ref),
+            )
+            .await?;
+            return Ok(());
+        }
 
         // A verified commit always requires a full clone + immutable checkout,
         // even when a tag is also retained for display and audit metadata.
@@ -526,6 +593,64 @@ impl DownloadRepoJob {
                 "Private repository requires git_provider_connection_id".to_string(),
             )
         })?;
+
+        // Archive download always fetches the whole tree. Skip it when the
+        // project asked to clone only the configured subdirectory.
+        if let Some(subdirectory) = self.sparse_subdirectory() {
+            self.log(
+                context,
+                format!(
+                    "Sparse-checking out directory '{}' at {}",
+                    subdirectory, checkout_ref
+                ),
+            )
+            .await?;
+
+            std::fs::remove_dir_all(&repo_dir).map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to remove directory for sparse clone: {}",
+                    e
+                ))
+            })?;
+
+            self.git_provider_manager
+                .clone_sparse_subdirectory(
+                    connection_id,
+                    &self.repo_owner,
+                    &self.repo_name,
+                    &repo_dir,
+                    &subdirectory,
+                    Some(&checkout_ref),
+                )
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to sparse-clone repository: {}",
+                        e
+                    ))
+                })?;
+
+            self.log(
+                context,
+                format!("Successfully sparse-cloned directory '{}'", subdirectory),
+            )
+            .await?;
+
+            if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Repository directory '{}' is empty after sparse-checking out '{}' for {}/{}",
+                    repo_dir.display(),
+                    subdirectory,
+                    self.repo_owner,
+                    self.repo_name
+                )));
+            }
+
+            self.log(context, "Repository validation passed".to_string())
+                .await?;
+            temp_dir_guard.disarm();
+            return Ok(repo_dir);
+        }
 
         // Try download archive first (faster). Wire a progress channel so the
         // download — which can take minutes on a slow link for a large repo —
@@ -812,6 +937,7 @@ pub struct DownloadRepoBuilder {
     tag_ref: Option<String>,
     commit_sha: Option<String>,
     project_directory: Option<String>,
+    pull_only_root_directory: bool,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
 }
@@ -829,6 +955,7 @@ impl DownloadRepoBuilder {
             tag_ref: None,
             commit_sha: None,
             project_directory: None,
+            pull_only_root_directory: false,
             log_id: None,
             log_service: None,
         }
@@ -881,6 +1008,11 @@ impl DownloadRepoBuilder {
 
     pub fn project_directory(mut self, project_directory: String) -> Self {
         self.project_directory = Some(project_directory);
+        self
+    }
+
+    pub fn pull_only_root_directory(mut self, pull_only_root_directory: bool) -> Self {
+        self.pull_only_root_directory = pull_only_root_directory;
         self
     }
 
@@ -948,6 +1080,9 @@ impl DownloadRepoBuilder {
         }
         if let Some(project_directory) = self.project_directory {
             job = job.with_project_directory(project_directory);
+        }
+        if self.pull_only_root_directory {
+            job = job.with_pull_only_root_directory(true);
         }
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);

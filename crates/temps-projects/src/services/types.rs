@@ -49,6 +49,8 @@ pub struct Project {
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory` (git sparse-checkout).
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     pub preset: Option<String>,
     /// Bundled template provenance persisted on the project row.

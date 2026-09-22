@@ -1347,6 +1347,7 @@ mod tests {
             repo_name: "repo".into(),
             repo_owner: "owner".into(),
             directory: ".".into(),
+            pull_only_root_directory: false,
             main_branch: "main".into(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,

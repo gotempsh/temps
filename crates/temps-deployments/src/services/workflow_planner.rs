@@ -1653,7 +1653,8 @@ impl WorkflowPlanner {
                     "git_provider_connection_id": project.git_provider_connection_id,
                     "git_url": project.git_url,
                     "is_public_repo": project.is_public_repo,
-                    "directory": project.directory
+                    "directory": project.directory,
+                    "pull_only_root_directory": project.pull_only_root_directory
                 })),
                 required_for_completion: true, // Core deployment job
             });
@@ -2324,7 +2325,8 @@ impl WorkflowPlanner {
                     "git_provider_connection_id": project.git_provider_connection_id,
                     "git_url": project.git_url,
                     "is_public_repo": project.is_public_repo,
-                    "directory": project.directory
+                    "directory": project.directory,
+                    "pull_only_root_directory": project.pull_only_root_directory
                 })),
                 required_for_completion: true,
             });

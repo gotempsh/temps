@@ -14993,6 +14993,7 @@ mod tests {
             repo_name: "preview-project".to_string(),
             repo_owner: "test".to_string(),
             directory: String::new(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,

@@ -804,6 +804,7 @@ mod tests {
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),
             directory: ".".to_string(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::Static,
             preset_config: None,

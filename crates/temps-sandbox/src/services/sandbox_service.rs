@@ -5969,6 +5969,7 @@ mod storage_cleanup_tests {
             repo_name: "api".into(),
             repo_owner: "acme".into(),
             directory: String::new(),
+            pull_only_root_directory: false,
             main_branch: "main".into(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,

@@ -2078,6 +2078,15 @@ impl GitProviderManager {
         Arc::new(self.clone())
     }
 
+    /// HTTPS clone username for a stored provider type.
+    fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
+        match provider_type {
+            "gitlab" => "oauth2",
+            "bitbucket" => "x-token-auth",
+            _ => "x-access-token",
+        }
+    }
+
     async fn sync_repositories_internal(
         &self,
         connection_id: i32,
@@ -5550,6 +5559,184 @@ impl GitProviderManagerTrait for GitProviderManager {
                 .map_err(|e| {
                     TraitError::CloneError(format!("Git checkout task failed: {}", e))
                 })??;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn clone_sparse_subdirectory(
+        &self,
+        connection_id: i32,
+        repo_owner: &str,
+        repo_name: &str,
+        target_dir: &Path,
+        subdirectory: &str,
+        branch_or_ref: Option<&str>,
+    ) -> Result<(), super::git_provider_manager_trait::GitProviderManagerError> {
+        use super::git_provider_manager_trait::GitProviderManagerError as TraitError;
+
+        let subdirectory = super::git_ops::validate_sparse_subdirectory(subdirectory)
+            .map_err(|e| TraitError::CloneError(e.to_string()))?;
+
+        if target_dir.exists() {
+            let is_empty = std::fs::read_dir(target_dir)
+                .map_err(|e| TraitError::CloneError(format!("Failed to read directory: {}", e)))?
+                .next()
+                .is_none();
+
+            if !is_empty {
+                return Err(TraitError::DirectoryNotEmpty(
+                    target_dir.display().to_string(),
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(target_dir).map_err(|e| {
+                TraitError::CloneError(format!("Failed to create directory: {}", e))
+            })?;
+        }
+
+        let connection = self
+            .get_connection(connection_id)
+            .await
+            .map_err(|_| TraitError::ConnectionNotFound(connection_id))?;
+
+        let provider = self
+            .get_provider(connection.provider_id)
+            .await
+            .map_err(|_| TraitError::ProviderNotFound(connection.provider_id))?;
+
+        let provider_service = self
+            .get_provider_service(connection.provider_id)
+            .await
+            .map_err(|_| TraitError::ProviderNotFound(connection.provider_id))?;
+
+        let access_token = self
+            .validate_and_refresh_connection_token(connection_id)
+            .await
+            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+
+        let repo = match provider_service
+            .get_repository(&access_token, repo_owner, repo_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if Self::is_auth_failure(&e.to_string()) => {
+                tracing::warn!(
+                    connection_id,
+                    "get_repository hit auth failure ({}); force-refreshing token and retrying",
+                    e
+                );
+                let refreshed = self
+                    .force_refresh_connection_token(connection_id)
+                    .await
+                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                provider_service
+                    .get_repository(&refreshed, repo_owner, repo_name)
+                    .await
+                    .map_err(|err| {
+                        TraitError::CloneError(format!(
+                            "Failed to get repository after token refresh: {}",
+                            err
+                        ))
+                    })?
+            }
+            Err(e) => {
+                return Err(TraitError::CloneError(format!(
+                    "Failed to get repository: {}",
+                    e
+                )))
+            }
+        };
+
+        let username = Self::clone_username_for_provider_type(&provider.provider_type).to_string();
+        let clone_url = repo.clone_url.clone();
+        let target_dir_owned = target_dir.to_path_buf();
+        let subdirectory_owned = subdirectory.clone();
+        let checkout_ref = branch_or_ref.map(|value| value.to_string());
+
+        const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let run_sparse_clone = |token: String| {
+            let clone_url = clone_url.clone();
+            let target_dir_owned = target_dir_owned.clone();
+            let subdirectory_owned = subdirectory_owned.clone();
+            let checkout_ref = checkout_ref.clone();
+            let username = username.clone();
+            async move {
+                super::git_ops::sparse_clone_repo(
+                    &clone_url,
+                    &target_dir_owned,
+                    &subdirectory_owned,
+                    checkout_ref.as_deref(),
+                    Some((username.as_str(), token.as_str())),
+                )
+                .await
+            }
+        };
+
+        let clone_result =
+            match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(access_token.clone())).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(TraitError::CloneError(format!(
+                        "Git sparse clone timed out after {}s",
+                        CLONE_TIMEOUT.as_secs()
+                    )))
+                }
+            };
+
+        if let Err(e) = clone_result {
+            if Self::is_auth_failure(&e.to_string()) {
+                tracing::warn!(
+                    connection_id,
+                    "clone_sparse_subdirectory hit auth failure ({}); force-refreshing token and retrying once",
+                    e
+                );
+
+                if target_dir.exists() {
+                    if let Err(rm) = std::fs::remove_dir_all(target_dir) {
+                        return Err(TraitError::CloneError(format!(
+                            "Auth retry: failed to clean partial clone at {}: {}",
+                            target_dir.display(),
+                            rm
+                        )));
+                    }
+                    std::fs::create_dir_all(target_dir).map_err(|err| {
+                        TraitError::CloneError(format!(
+                            "Auth retry: failed to recreate target directory: {}",
+                            err
+                        ))
+                    })?;
+                }
+
+                let refreshed = self
+                    .force_refresh_connection_token(connection_id)
+                    .await
+                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+
+                match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(refreshed)).await {
+                    Ok(result) => {
+                        result.map_err(|err| {
+                            TraitError::CloneError(format!(
+                                "Failed to sparse clone after refresh: {}",
+                                err
+                            ))
+                        })?;
+                    }
+                    Err(_) => {
+                        return Err(TraitError::CloneError(format!(
+                            "Git sparse clone retry timed out after {}s",
+                            CLONE_TIMEOUT.as_secs()
+                        )))
+                    }
+                }
+            } else {
+                return Err(TraitError::CloneError(format!(
+                    "Failed to sparse clone: {}",
+                    e
+                )));
             }
         }
 

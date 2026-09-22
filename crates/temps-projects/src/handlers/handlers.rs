@@ -1839,6 +1839,7 @@ pub async fn update_git_settings(
             settings.preset_config.clone(),
             settings.git_url.clone(),
             settings.is_public_repo,
+            settings.pull_only_root_directory,
             // ADR 045: repointing a declared project's repository and pushing
             // runs the caller's source as host root, without any HTTP deploy
             // request for the deploy guard to refuse.

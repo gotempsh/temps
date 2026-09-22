@@ -54,7 +54,7 @@ graph LR
 
 ### 1. Clone repository
 
-Temps clones your Git repository at the specified commit. For monorepos, only the configured app directory is relevant to the build.
+Temps clones your Git repository at the specified commit. For monorepos, the build runs from the configured root directory. If **Pull only the root directory** is enabled on Git settings, the clone fetches that subdirectory only — not repository-root files and not sibling trees.
 
 ### 2. Build image
 

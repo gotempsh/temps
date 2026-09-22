@@ -534,6 +534,18 @@ fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> 
     Ok(normalized.trim_start_matches("./").to_string())
 }
 
+/// Root checkout (`.`) cannot use sparse clone — there is no subdirectory.
+fn pull_only_root_directory_value(
+    normalized_directory: &str,
+    requested: Option<bool>,
+    existing: bool,
+) -> bool {
+    if normalized_directory == "." {
+        return false;
+    }
+    requested.unwrap_or(existing)
+}
+
 /// Resolve an explicit catalog selection for create/update.
 ///
 /// Existing config is retained when it belongs to the same canonical preset.
@@ -2902,6 +2914,7 @@ impl ProjectService {
         preset_config: Option<serde_json::Value>,
         git_url: Option<String>,
         is_public_repo: Option<bool>,
+        pull_only_root_directory: Option<bool>,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         // Get the current project (includes the old gitlab_webhook_id / signing_token)
@@ -2982,13 +2995,20 @@ impl ProjectService {
         let project_preset = project.preset;
         let existing_preset_config = project.preset_config.clone();
         let previous_public_ports = compose_public_ports(existing_preset_config.as_ref());
+        let existing_pull_only_root_directory = project.pull_only_root_directory;
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
         active_project.main_branch = Set(main_branch.clone());
         active_project.repo_owner = Set(repo_owner.clone());
         active_project.repo_name = Set(repo_name.clone());
-        active_project.directory = Set(normalize_project_directory(&directory)?);
+        let normalized_directory = normalize_project_directory(&directory)?;
+        active_project.directory = Set(normalized_directory.clone());
+        active_project.pull_only_root_directory = Set(pull_only_root_directory_value(
+            &normalized_directory,
+            pull_only_root_directory,
+            existing_pull_only_root_directory,
+        ));
         // Configuring a Git repository makes this a Git-source project — this is
         // how a docker_image / static_files project is converted to Git (the
         // reverse conversion goes through `set_source_type`).
@@ -5188,6 +5208,7 @@ impl ProjectService {
             repo_name,
             repo_owner,
             directory: db_project.directory,
+            pull_only_root_directory: db_project.pull_only_root_directory,
             main_branch: db_project.main_branch,
             preset: Some(preset_str),
             template_slug: db_project.template_slug,
@@ -10096,6 +10117,7 @@ mod tests {
                 Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
                 None,
                 None,
+                None,
                 DeployCaller::Platform,
             )
             .await;
@@ -10217,6 +10239,7 @@ mod tests {
                 })),
                 None,
                 None,
+                None,
                 DeployCaller::Platform,
             )
             .await
@@ -10316,6 +10339,7 @@ mod tests {
                 Some("nixpacks".to_string()),
                 ".".to_string(),
                 Some(serde_json::json!({ "providers": ["...", "python"] })),
+                None,
                 None,
                 None,
                 DeployCaller::Platform,
@@ -10660,6 +10684,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 DeployCaller::Platform,
             )
             .await;
@@ -10825,6 +10850,7 @@ mod tests {
                 None,
                 Some("https://github.com/test-owner/blank-git-dir-repo".to_string()),
                 Some(true),
+                None,
                 DeployCaller::Platform,
             )
             .await
@@ -10836,6 +10862,110 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.directory, ".");
+        assert!(
+            !stored.pull_only_root_directory,
+            "root directory must clear the sparse-checkout flag"
+        );
+    }
+
+    #[test]
+    fn pull_only_root_directory_is_forced_off_at_repository_root() {
+        assert!(!pull_only_root_directory_value(".", Some(true), true));
+        assert!(!pull_only_root_directory_value(".", None, true));
+    }
+
+    #[test]
+    fn pull_only_root_directory_keeps_existing_when_omitted() {
+        assert!(pull_only_root_directory_value("apps/web", None, true));
+        assert!(!pull_only_root_directory_value("apps/web", None, false));
+        assert!(pull_only_root_directory_value(
+            "apps/web",
+            Some(true),
+            false
+        ));
+        assert!(!pull_only_root_directory_value(
+            "apps/web",
+            Some(false),
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_git_settings_persists_pull_only_root_directory() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Sparse Git Dir Project".to_string()),
+            slug: Set("sparse-git-dir-project".to_string()),
+            repo_name: Set("sparse-git-dir-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                None,
+                "main".to_string(),
+                "test-owner".to_string(),
+                "sparse-git-dir-repo".to_string(),
+                None,
+                "apps/web".to_string(),
+                None,
+                Some("https://github.com/test-owner/sparse-git-dir-repo".to_string()),
+                Some(true),
+                Some(true),
+                DeployCaller::Platform,
+            )
+            .await
+            .expect("update_git_settings should persist the sparse-checkout flag");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.directory, "apps/web");
+        assert!(stored.pull_only_root_directory);
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                None,
+                "main".to_string(),
+                "test-owner".to_string(),
+                "sparse-git-dir-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                Some("https://github.com/test-owner/sparse-git-dir-repo".to_string()),
+                Some(true),
+                Some(true),
+                DeployCaller::Platform,
+            )
+            .await
+            .expect("resetting directory to root should succeed");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.directory, ".");
+        assert!(
+            !stored.pull_only_root_directory,
+            "checking the box at repository root must not persist"
+        );
     }
 
     #[tokio::test]
@@ -10886,6 +11016,7 @@ mod tests {
                 Some(serde_json::json!({
                     "publicPorts": [{ "service": "web", "port": 8080 }]
                 })),
+                None,
                 None,
                 None,
                 DeployCaller::Platform,

@@ -1267,6 +1267,17 @@ impl WorkflowExecutionService {
                     builder = builder.commit_sha(commit);
                 }
 
+                if let Some(directory) = config.get("directory").and_then(|v| v.as_str()) {
+                    builder = builder.project_directory(directory.to_string());
+                }
+                if config
+                    .get("pull_only_root_directory")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    builder = builder.pull_only_root_directory(true);
+                }
+
                 let job = builder.build(self.git_provider.clone())?;
 
                 Ok(Arc::new(job))

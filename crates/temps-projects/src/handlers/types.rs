@@ -331,6 +331,8 @@ pub struct ProjectResponse {
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory` via git sparse-checkout.
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     pub preset: Option<String>,
     /// Product lifecycle classification. `service` projects are tied to a
@@ -460,6 +462,7 @@ impl ProjectResponse {
             repo_name: project.repo_name,
             repo_owner: project.repo_owner,
             directory: project.directory,
+            pull_only_root_directory: project.pull_only_root_directory,
             main_branch: project.main_branch,
             preset: project.preset,
             project_type: project.project_type,
@@ -991,6 +994,9 @@ pub struct UpdateGitSettingsRequest {
     pub repo_name: String,
     pub preset: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory`. Ignored when directory is the repo root.
+    #[serde(default)]
+    pub pull_only_root_directory: Option<bool>,
     /// Git clone URL for public repositories
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,

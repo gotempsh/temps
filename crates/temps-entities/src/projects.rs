@@ -26,6 +26,10 @@ pub struct Model {
     /// Repository owner/namespace (required)
     pub repo_owner: String,
     pub directory: String,
+    /// When true, deploy clones only `directory` via git sparse-checkout.
+    /// Ignored when `directory` is the repository root. Off by default.
+    #[sea_orm(default_value = "false")]
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     /// Preset/framework type (required - every project must have a preset)
     pub preset: Preset,
