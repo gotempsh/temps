@@ -2,13 +2,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use aws_sdk_s3::Client as S3Client;
-use serde_json::Value;
+use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
 use temps_backup_core::engine_v2::BackupError;
 
 const WROTE_BACKUP_MARKER: &str = "Wrote backup with name ";
 const MAX_SENTINEL_SIZE_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+struct WalgStopSentinel {
+    #[serde(rename = "CompressedSize")]
+    compressed_size: i64,
+    #[serde(rename = "UserData")]
+    user_data: WalgSentinelUserData,
+}
+
+#[derive(Deserialize)]
+struct WalgSentinelUserData {
+    temps_backup_id: String,
+}
 
 /// Read the compressed size WAL-G recorded for the backup that just finished.
 ///
@@ -89,18 +102,12 @@ fn size_from_sentinel(
     backup_uuid: &str,
     location: &str,
 ) -> Result<i64, BackupError> {
-    let sentinel: Value =
+    let sentinel: WalgStopSentinel =
         serde_json::from_slice(sentinel_bytes).map_err(|error| BackupError::Failed {
             reason: format!("WAL-G stop-sentinel {location} is invalid JSON: {error}"),
         })?;
 
-    let sentinel_backup_uuid = sentinel
-        .get("UserData")
-        .and_then(|user_data| user_data.get("temps_backup_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| BackupError::Failed {
-            reason: format!("WAL-G stop-sentinel {location} has no Temps backup identity"),
-        })?;
+    let sentinel_backup_uuid = sentinel.user_data.temps_backup_id;
     if sentinel_backup_uuid != backup_uuid {
         return Err(BackupError::Failed {
             reason: format!(
@@ -110,13 +117,13 @@ fn size_from_sentinel(
         });
     }
 
-    sentinel
-        .get("CompressedSize")
-        .and_then(Value::as_i64)
-        .filter(|size| *size >= 0)
-        .ok_or_else(|| BackupError::Failed {
+    if sentinel.compressed_size < 0 {
+        Err(BackupError::Failed {
             reason: format!("WAL-G stop-sentinel {location} has no valid CompressedSize"),
         })
+    } else {
+        Ok(sentinel.compressed_size)
+    }
 }
 
 fn backup_name_from_push_output<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
