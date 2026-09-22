@@ -371,6 +371,20 @@ impl JobProcessorService {
                     let newer_generation = deployments::Entity::find()
                         .filter(deployments::Column::ProjectId.eq(project_id))
                         .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                        // Active work, successful generations, and an
+                        // operator-paused healthy generation all supersede an
+                        // older command. Failed/cancelled/stopped attempts do
+                        // not prove that the newer requested state was applied.
+                        .filter(deployments::Column::State.is_in(vec![
+                            "pending",
+                            "running",
+                            "deploying",
+                            "built",
+                            "ready",
+                            "completed",
+                            "deployed",
+                            "paused",
+                        ]))
                         .filter(
                             Condition::any()
                                 .add(deployments::Column::CreatedAt.gt(existing.created_at))
@@ -3424,80 +3438,174 @@ mod tests {
         let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
             .await
             .expect("seed project and environment");
-        let durable_job_id = uuid::Uuid::new_v4();
-        let now = Utc::now();
-        let mut interrupted = generation_model(
-            project_id,
-            environment_id,
-            "interrupted-old-command",
-            "cancelled",
-            "old-command",
-            now,
-        );
-        interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
-        interrupted.context_vars = Set(Some(serde_json::json!({
-            "durable_job_id": durable_job_id,
-        })));
-        interrupted
+        // `paused` is an operator-controlled healthy generation and must be
+        // preserved just like active or successfully completed work.
+        for blocking_state in ["pending", "completed", "deployed", "paused"] {
+            deployments::Entity::delete_many()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .expect("clear prior blocking-state fixture");
+            let durable_job_id = uuid::Uuid::new_v4();
+            let now = Utc::now();
+            let mut interrupted = generation_model(
+                project_id,
+                environment_id,
+                "interrupted-old-command",
+                "cancelled",
+                "old-command",
+                now,
+            );
+            interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+            interrupted.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+            interrupted
+                .insert(db.as_ref())
+                .await
+                .expect("insert interrupted old command");
+            let newer = generation_model(
+                project_id,
+                environment_id,
+                "newer-manual-generation",
+                blocking_state,
+                "newer-command",
+                now + chrono::Duration::seconds(1),
+            )
             .insert(db.as_ref())
             .await
-            .expect("insert interrupted old command");
-        let newer = generation_model(
-            project_id,
-            environment_id,
-            "newer-manual-generation",
-            "pending",
-            "newer-command",
-            now + chrono::Duration::seconds(1),
-        )
-        .insert(db.as_ref())
-        .await
-        .expect("insert newer manual generation");
-        let mut replay = generation_model(
-            project_id,
-            environment_id,
-            "stale-command-replay",
-            "pending",
-            "old-command",
-            now,
-        );
-        replay.context_vars = Set(Some(serde_json::json!({
-            "durable_job_id": durable_job_id,
-        })));
+            .expect("insert newer generation");
+            let mut replay = generation_model(
+                project_id,
+                environment_id,
+                "stale-command-replay",
+                "pending",
+                "old-command",
+                now,
+            );
+            replay.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
 
-        let outcome = JobProcessorService::create_deployment_with_generation_fence(
-            db.as_ref(),
-            project_id,
-            environment_id,
-            None,
-            DeploymentDuplicateKey::DurableCommand(durable_job_id),
-            replay,
-        )
-        .await
-        .expect("reject stale durable replay");
+            let outcome = JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(durable_job_id),
+                replay,
+            )
+            .await
+            .expect("reject stale durable replay");
 
-        match outcome {
-            DeploymentCreationOutcome::Duplicate {
-                deployment_id,
-                state,
-            } => {
-                assert_eq!(deployment_id, newer.id);
-                assert_eq!(state, "pending");
-            }
-            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
-                "stale durable command must not supersede newer generation {}, created {}",
-                newer.id, deployment.id
-            ),
-            DeploymentCreationOutcome::StaleRecovery { .. } => {
-                panic!("ordinary durable replay cannot be failover recovery")
+            match outcome {
+                DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                } => {
+                    assert_eq!(deployment_id, newer.id);
+                    assert_eq!(state, blocking_state);
+                }
+                DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                    "stale durable command must not supersede newer {blocking_state} generation {}, created {}",
+                    newer.id, deployment.id
+                ),
+                DeploymentCreationOutcome::StaleRecovery { .. } => {
+                    panic!("ordinary durable replay cannot be failover recovery")
+                }
             }
         }
-        let newer = deployments::Entity::find_by_id(newer.id)
-            .one(db.as_ref())
+    }
+
+    #[tokio::test]
+    async fn test_terminal_newer_generation_does_not_consume_interrupted_replay() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping terminal generation replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
             .await
-            .expect("reload newer generation")
-            .expect("newer generation remains");
-        assert_eq!(newer.state, "pending");
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+
+        for terminal_state in ["failed", "cancelled", "stopped"] {
+            deployments::Entity::delete_many()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .expect("clear prior terminal-state fixture");
+            let durable_job_id = uuid::Uuid::new_v4();
+            let now = Utc::now();
+            let mut interrupted = generation_model(
+                project_id,
+                environment_id,
+                "interrupted-old-command",
+                "cancelled",
+                "old-command",
+                now,
+            );
+            interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+            interrupted.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+            let interrupted = interrupted
+                .insert(db.as_ref())
+                .await
+                .expect("insert interrupted old command");
+            generation_model(
+                project_id,
+                environment_id,
+                "newer-terminal-generation",
+                terminal_state,
+                "newer-command",
+                now + chrono::Duration::seconds(1),
+            )
+            .insert(db.as_ref())
+            .await
+            .expect("insert newer terminal generation");
+            let mut replay = generation_model(
+                project_id,
+                environment_id,
+                "resumed-old-command",
+                "pending",
+                "old-command",
+                now,
+            );
+            replay.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+
+            let outcome = JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(durable_job_id),
+                replay,
+            )
+            .await
+            .expect("resume interrupted command past terminal newer generation");
+
+            match outcome {
+                DeploymentCreationOutcome::Created { deployment, .. } => {
+                    assert_ne!(deployment.id, interrupted.id);
+                    assert_eq!(deployment.state, "pending");
+                }
+                DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                } => panic!(
+                    "newer {terminal_state} deployment {deployment_id} in {state} must not consume interrupted replay"
+                ),
+                DeploymentCreationOutcome::StaleRecovery { .. } => {
+                    panic!("ordinary durable replay cannot be failover recovery")
+                }
+            }
+        }
     }
 
     #[tokio::test]

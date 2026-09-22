@@ -809,7 +809,7 @@ async fn load_postgres_checkpoint(
     let row = db
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT window_from, window_to, cursor FROM stateless_cloud_backfill_checkpoints WHERE project_id = $1",
+            "SELECT window_from, window_to, cursor::TEXT AS cursor_json FROM stateless_cloud_backfill_checkpoints WHERE project_id = $1",
             [args.project.into()],
         ))
         .await
@@ -829,8 +829,8 @@ async fn load_postgres_checkpoint(
         );
         return Ok(CloudBackfillCursor::default());
     }
-    let cursor: serde_json::Value = row.try_get("", "cursor")?;
-    let file: CheckpointFile = serde_json::from_value(cursor).map_err(|error| {
+    let cursor: String = row.try_get("", "cursor_json")?;
+    let file: CheckpointFile = serde_json::from_str(&cursor).map_err(|error| {
         anyhow::anyhow!(
             "Durable Cloud backfill checkpoint for project {} is corrupt: {error}",
             args.project
@@ -861,7 +861,7 @@ async fn persist_postgres_checkpoint(
     window_to: DBDateTime,
     cursor: &CloudBackfillCursor,
 ) -> anyhow::Result<()> {
-    let cursor = serde_json::to_value(CheckpointFile {
+    let cursor = serde_json::to_string(&CheckpointFile {
         last_start_time: cursor
             .last_start_time
             .map(|timestamp| timestamp.to_rfc3339()),
@@ -873,7 +873,7 @@ async fn persist_postgres_checkpoint(
     })?;
     db.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "INSERT INTO stateless_cloud_backfill_checkpoints (project_id, window_from, window_to, cursor, updated_at) VALUES ($1, $2, $3, $4, now()) ON CONFLICT (project_id) DO UPDATE SET window_from = EXCLUDED.window_from, window_to = EXCLUDED.window_to, cursor = EXCLUDED.cursor, updated_at = EXCLUDED.updated_at",
+        "INSERT INTO stateless_cloud_backfill_checkpoints (project_id, window_from, window_to, cursor, updated_at) VALUES ($1, $2, $3, $4::jsonb, now()) ON CONFLICT (project_id) DO UPDATE SET window_from = EXCLUDED.window_from, window_to = EXCLUDED.window_to, cursor = EXCLUDED.cursor, updated_at = EXCLUDED.updated_at",
         [
             args.project.into(),
             window_from.into(),
@@ -1141,6 +1141,25 @@ mod tests {
                 .await
                 .expect("checkpoint cleared"),
             CloudBackfillCursor::default()
+        );
+
+        database
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO stateless_cloud_backfill_checkpoints (project_id, window_from, window_to, cursor) VALUES ($1, $2, $3, '[]'::jsonb)",
+                [arguments.project.into(), from.into(), to.into()],
+            ))
+            .await
+            .expect("insert malformed typed checkpoint");
+        let error = load_postgres_checkpoint(&database.db, &arguments, from, to)
+            .await
+            .expect_err("a checkpoint with the wrong JSON shape must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint for project 7 is corrupt"),
+            "unexpected malformed checkpoint error: {error}"
         );
     }
 
