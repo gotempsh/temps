@@ -79,6 +79,8 @@ use crate::store::chunk_store::{HeadSnapshot, HeadSource, HeadSummary};
 use crate::store::manifest::ManifestRepo;
 use crate::types::{ChunkMeta, LogLevel, LogLine};
 
+type PurgeGuard = tokio::sync::OwnedRwLockWriteGuard<Option<DateTime<Utc>>>;
+
 type ProjectPurgeGate = Arc<tokio::sync::RwLock<Option<DateTime<Utc>>>>;
 
 /// Estimated per-line overhead (framing, columnar arrays) added to `msg.len()`
@@ -252,6 +254,10 @@ impl HeadBuffer {
         }
     }
 
+    fn seal_completion(&self) -> tokio::sync::futures::OwnedNotified {
+        self.sealing_notify.clone().notified_owned()
+    }
+
     fn is_empty(&self) -> bool {
         self.segments.is_empty() && self.active.is_empty()
     }
@@ -383,6 +389,7 @@ pub struct ChunkWriterService {
     buffers: Mutex<HashMap<String, HeadBuffer>>,
     project_gates: Mutex<HashMap<i32, ProjectPurgeGate>>,
     thresholds: Thresholds,
+    wait_timeout: Duration,
     /// Per-container unsealed buffer cap (Settings → Monitoring → container
     /// logs); a setting, so it can change while the writer runs.
     head_max_bytes: AtomicUsize,
@@ -460,6 +467,7 @@ impl ChunkWriterService {
             project_gates: Mutex::new(HashMap::new()),
             head_max_bytes: AtomicUsize::new(thresholds.head_max_bytes),
             thresholds,
+            wait_timeout: Duration::from_secs(30),
             shed_bloom: AtomicBool::new(false),
             dropped_chunks: AtomicU64::new(0),
             unindexed_chunks: AtomicU64::new(0),
@@ -571,7 +579,7 @@ impl ChunkWriterService {
                 .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
                 .clone()
         };
-        let ingest_guard = project_gate.read().await;
+        let ingest_guard = project_gate.read_owned().await;
         if ingest_guard.is_some_and(|purged_before| line.ts < purged_before) {
             return Ok(());
         }
@@ -603,44 +611,20 @@ impl ChunkWriterService {
         };
 
         if should_seal {
-            // Spawn a detached task and then await its JoinHandle.
-            //
-            // Why spawn at all instead of calling seal() inline?
-            // The collector's per-container streaming task is `.abort()`-ed by
-            // `CollectorService::stop_streaming` immediately before calling
-            // `remove_container`. If we called `seal()` inline here, the
-            // abort could land mid-seal and leave `buffer.sealing` stuck
-            // forever — no task would be left to clear it, and every later
-            // call to `remove_container`/`seal_inner` for this container
-            // would find an in-flight sealing slot and wait forever on
-            // `sealing_notify`, which nothing would ever fire.
-            //
-            // Why await the JoinHandle here?
-            // Spawning alone (fire-and-forget) breaks the synchronous-completion
-            // contract: callers like `size_threshold_triggers_an_immediate_seal`
-            // and the search endpoint assume that if `write_line` returned Ok,
-            // data that crossed the threshold has been committed to the manifest,
-            // not merely queued. The `.await` here preserves that contract for
-            // the normal (non-aborted) path.
-            //
-            // Why is this cancellation-safe?
-            // `tokio::spawn` fully detaches the inner task from this future's
-            // cancellation scope. If the caller task is `.abort()`-ed while we
-            // are `.await`-ing the JoinHandle, only the JoinHandle await is
-            // dropped — the spawned task itself continues running to completion
-            // inside the runtime, clears `buffer.sealing`, and fires
-            // `sealing_notify`. A subsequent `remove_container` call on the same
-            // container will then block in `seal_inner`'s wait loop until the
-            // detached task finishes, then complete normally.
+            // Transfer the existing read permit: reacquiring behind a queued
+            // purge writer deadlocks Tokio's fair RwLock. The detached seal
+            // retains this permit even if the ingest caller is cancelled.
             let writer = self.clone();
             let seal_container_id = container_id.clone();
-            tokio::spawn(async move { writer.seal(&seal_container_id).await })
-                .await
-                .map_err(|join_error| LogAggregatorError::Validation {
-                    message: format!(
-                        "threshold seal task for '{container_id}' panicked: {join_error}"
-                    ),
-                })??;
+            self.await_task(
+                "threshold seal",
+                container_id,
+                tokio::spawn(async move {
+                    let _ingest_guard = ingest_guard;
+                    writer.seal_inner(&seal_container_id, false).await
+                }),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -657,7 +641,7 @@ impl ChunkWriterService {
     }
 
     /// Seal every head buffer whose flush policy (ADR-046 §1) says it's due.
-    pub async fn flush_expired(&self) {
+    pub async fn flush_expired(self: &Arc<Self>) {
         let head_max_bytes = self.head_max_bytes();
         let due: Vec<String> = {
             let buffers = self.buffers.lock().await;
@@ -677,7 +661,7 @@ impl ChunkWriterService {
     }
 
     /// Seal every non-empty head buffer — called on graceful shutdown.
-    pub async fn flush_all(&self) {
+    pub async fn flush_all(self: &Arc<Self>) {
         let ids: Vec<String> = {
             let buffers = self.buffers.lock().await;
             buffers
@@ -700,7 +684,7 @@ impl ChunkWriterService {
     pub async fn lock_project_for_purge(
         &self,
         project_id: i32,
-    ) -> tokio::sync::OwnedRwLockWriteGuard<Option<DateTime<Utc>>> {
+    ) -> Result<PurgeGuard, LogAggregatorError> {
         let gate = {
             let mut gates = self.project_gates.lock().await;
             gates
@@ -708,7 +692,48 @@ impl ChunkWriterService {
                 .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
                 .clone()
         };
-        gate.write_owned().await
+        tokio::time::timeout(self.wait_timeout, gate.write_owned())
+            .await
+            .map_err(|_| LogAggregatorError::OperationTimedOut {
+                operation: "acquire purge barrier",
+                target: format!("project {project_id}"),
+            })
+    }
+
+    /// Keep the exclusive barrier in the detached task until every pending
+    /// manifest write finishes, even when the request times out or is cancelled.
+    pub async fn prepare_project_for_purge(
+        self: &Arc<Self>,
+        project_id: i32,
+    ) -> Result<PurgeGuard, LogAggregatorError> {
+        let writer = self.clone();
+        self.await_task(
+            "prepare purge",
+            format!("project {project_id}"),
+            tokio::spawn(async move {
+                let guard = writer.lock_project_for_purge(project_id).await?;
+                writer.flush_project_for_purge(project_id).await?;
+                Ok(guard)
+            }),
+        )
+        .await
+    }
+
+    async fn await_task<T>(
+        &self,
+        operation: &'static str,
+        target: String,
+        task: tokio::task::JoinHandle<Result<T, LogAggregatorError>>,
+    ) -> Result<T, LogAggregatorError> {
+        tokio::time::timeout(self.wait_timeout, task)
+            .await
+            .map_err(|_| LogAggregatorError::OperationTimedOut {
+                operation,
+                target: target.clone(),
+            })?
+            .map_err(|error| LogAggregatorError::Validation {
+                message: format!("{operation} task for {target} failed: {error}"),
+            })?
     }
 
     /// Seal every head buffer for `project_id` that holds lines not yet
@@ -727,7 +752,7 @@ impl ChunkWriterService {
     ///
     /// Failures are propagated: a purge must never report success while
     /// matching lines remain searchable in an unsealed head buffer.
-    pub async fn flush_project_for_purge(&self, project_id: i32) -> Result<(), LogAggregatorError> {
+    async fn flush_project_for_purge(&self, project_id: i32) -> Result<(), LogAggregatorError> {
         let ids: Vec<String> = {
             let buffers = self.buffers.lock().await;
             buffers
@@ -756,15 +781,31 @@ impl ChunkWriterService {
         self: &Arc<Self>,
         container_id: &str,
     ) -> Result<(), LogAggregatorError> {
-        self.seal(container_id).await?;
-        {
-            let mut buffers = self.buffers.lock().await;
-            buffers.remove(container_id);
-        }
-        if let Some(wal_dir) = &self.wal_dir {
-            wal_dir.remove(container_id).await?;
-        }
-        Ok(())
+        let writer = self.clone();
+        let id = container_id.to_owned();
+        self.await_task(
+            "remove container",
+            id.clone(),
+            tokio::spawn(async move {
+                // Await the underlying seal, not its timeout wrapper: removal must
+                // never discard the buffer/WAL while a detached seal still uses it.
+                let project_id = {
+                    let buffers = writer.buffers.lock().await;
+                    let Some(buffer) = buffers.get(&id) else {
+                        return Ok(());
+                    };
+                    buffer.identity.project_id
+                };
+                let _guard = writer.lock_project_for_purge(project_id).await?;
+                writer.seal_inner(&id, true).await?;
+                writer.buffers.lock().await.remove(&id);
+                if let Some(wal_dir) = &writer.wal_dir {
+                    wal_dir.remove(&id).await?;
+                }
+                Ok(())
+            }),
+        )
+        .await
     }
 
     /// Flush and fsync every open WAL file. The plugin calls this on a 1 s
@@ -810,7 +851,18 @@ impl ChunkWriterService {
     /// propagated, so a single bad object store doesn't take down ingest.
     /// Only encode failures (a bug, not an operational fault) and WAL IO
     /// errors propagate.
-    async fn seal(&self, container_id: &str) -> Result<(), LogAggregatorError> {
+    async fn seal(self: &Arc<Self>, container_id: &str) -> Result<(), LogAggregatorError> {
+        let writer = self.clone();
+        let id = container_id.to_owned();
+        self.await_task(
+            "seal",
+            id.clone(),
+            tokio::spawn(async move { writer.seal_guarded(&id).await }),
+        )
+        .await
+    }
+
+    async fn seal_guarded(&self, container_id: &str) -> Result<(), LogAggregatorError> {
         let project_id = {
             let buffers = self.buffers.lock().await;
             let Some(buffer) = buffers.get(container_id) else {
@@ -848,11 +900,10 @@ impl ChunkWriterService {
                 };
                 if buffer.sealing.is_some() {
                     // A seal is already in flight. Subscribe to the
-                    // completion notifier and wait for it to clear, then
-                    // re-check.  We clone the Arc while the lock is held so
-                    // we don't miss a notification that fires between the
-                    // lock drop and the `.notified().await`.
-                    Some(buffer.sealing_notify.clone())
+                    // completion notifier while holding the lock. Creating
+                    // the future here observes notify_waiters even before its
+                    // first poll; cloning the Arc alone does not subscribe.
+                    Some(buffer.seal_completion())
                 } else {
                     // Freeze any unfrozen tail so every line about to be sealed
                     // is captured in an immutable segment before we release the
@@ -872,7 +923,7 @@ impl ChunkWriterService {
             };
             // Lock is released here before awaiting.
             if let Some(notify) = maybe_notify {
-                notify.notified().await;
+                notify.await;
             }
         };
 
@@ -978,26 +1029,33 @@ impl ChunkWriterService {
                 .await;
         }
 
-        let notify = {
+        let (notify, wal_result) = {
             let mut buffers = self.buffers.lock().await;
             if let Some(buffer) = buffers.get_mut(container_id) {
                 buffer.sealing = None;
                 buffer.sealing_stats = None;
-                if let Some(wal) = buffer.wal.as_mut() {
-                    wal.stream.truncate().await?;
-                }
-                Some(buffer.sealing_notify.clone())
+                // Lines appended during I/O still depend on the WAL. Retain
+                // the full log until the next seal drains the current head.
+                let result = if buffer.is_empty() {
+                    if let Some(wal) = buffer.wal.as_mut() {
+                        wal.stream.truncate().await
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                };
+                (Some(buffer.sealing_notify.clone()), result)
             } else {
-                None
+                (None, Ok(()))
             }
         };
-        // Notify outside the lock so waiters in seal_inner or remove_container
-        // can re-acquire it immediately.
-        if let Some(n) = notify {
-            n.notify_waiters();
+        // Completion is a state transition, including WAL failure. Always
+        // wake subscribers before propagating the truncate error.
+        if let Some(notify) = notify {
+            notify.notify_waiters();
         }
-
-        Ok(())
+        wal_result
     }
 }
 
@@ -1239,6 +1297,208 @@ mod tests {
         .await
         .unwrap();
         (writer, sink, tmp)
+    }
+
+    #[tokio::test]
+    async fn threshold_seal_does_not_reacquire_a_read_permit_behind_purge() {
+        let (writer, sink, _tmp) = writer_with_defaults().await;
+        writer.set_head_max_bytes(1);
+        let buffers = writer.buffers.lock().await;
+        let ingest = writer.write_line(make_line("threshold-purge", LogLevel::Info, "line"));
+        tokio::pin!(ingest);
+        assert!(futures::poll!(&mut ingest).is_pending()); // owns the read permit
+        let purge = writer.lock_project_for_purge(1);
+        tokio::pin!(purge);
+        assert!(futures::poll!(&mut purge).is_pending()); // writer queued first
+        drop(buffers);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (ingest, purge) = tokio::join!(ingest, purge);
+            ingest.unwrap();
+            drop(purge.unwrap());
+        })
+        .await
+        .expect("threshold seal and purge must both complete");
+        assert_eq!(sink.all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn seal_completion_is_observed_before_waiter_first_poll() {
+        let buffer = HeadBuffer::new(
+            identity_from_line(&make_line("notify", LogLevel::Info, "line")),
+            None,
+        );
+        let first = buffer.seal_completion();
+        let second = buffer.seal_completion();
+        buffer.sealing_notify.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(first, second);
+        })
+        .await
+        .expect("all unpolled subscribers must observe completion");
+    }
+
+    #[tokio::test]
+    async fn wal_truncate_error_wakes_all_seal_waiters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GatedSink::default());
+        let writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(tmp.path().join("wal")),
+            None,
+        )
+        .await
+        .unwrap();
+        writer
+            .write_line(make_line("wal-error", LogLevel::Info, "line"))
+            .await
+            .unwrap();
+        let seal_writer = writer.clone();
+        let seal = tokio::spawn(async move { seal_writer.seal("wal-error").await });
+        sink.entered.notified().await;
+        let (first, second) = {
+            let mut buffers = writer.buffers.lock().await;
+            let buffer = buffers.get_mut("wal-error").unwrap();
+            buffer.wal = Some(WalHandle {
+                stream: crate::chunk::wal::StreamWal::read_only_for_test(
+                    tmp.path().join("wal/wal-error.wal"),
+                )
+                .await,
+            });
+            (buffer.seal_completion(), buffer.seal_completion())
+        };
+        sink.release.notify_one();
+        assert!(matches!(
+            seal.await.unwrap(),
+            Err(LogAggregatorError::Io(_))
+        ));
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(first, second);
+        })
+        .await
+        .expect("WAL errors must wake every waiter");
+        assert!(writer
+            .buffers
+            .lock()
+            .await
+            .get("wal-error")
+            .unwrap()
+            .sealing
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn timed_out_purge_keeps_its_barrier_until_detached_io_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GatedSink::default());
+        let mut writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_millis(100);
+        writer
+            .write_line(make_line("purge-timeout", LogLevel::Info, "line"))
+            .await
+            .unwrap();
+        let purge_writer = writer.clone();
+        let purge = tokio::spawn(async move { purge_writer.prepare_project_for_purge(1).await });
+        sink.entered.notified().await;
+        assert!(matches!(
+            purge.await.unwrap(),
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        assert!(matches!(
+            writer.lock_project_for_purge(1).await,
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        let mut other = make_line("other-project", LogLevel::Info, "unrelated");
+        other.project_id = 2;
+        tokio::time::timeout(Duration::from_millis(100), writer.write_line(other))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(
+            writer
+                .prepare_project_for_purge(3)
+                .await
+                .expect("unrelated purge must complete while project 1 is sealing"),
+        );
+        sink.release.notify_one();
+        drop(writer.lock_project_for_purge(1).await.unwrap());
+        assert_eq!(sink.rows.all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn removal_timeout_preserves_the_wal_until_seal_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GatedSink::default());
+        let mut writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(tmp.path().join("wal")),
+            None,
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_millis(100);
+        writer
+            .write_line(make_line("remove-timeout", LogLevel::Info, "line"))
+            .await
+            .unwrap();
+        let remove_writer = writer.clone();
+        let remove =
+            tokio::spawn(async move { remove_writer.remove_container("remove-timeout").await });
+        sink.entered.notified().await;
+        assert!(matches!(
+            remove.await.unwrap(),
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        assert!(tmp.path().join("wal/remove-timeout.wal").exists());
+        assert!(writer.snapshot("remove-timeout").await.is_some());
+        sink.release.notify_one();
+        drop(writer.lock_project_for_purge(1).await.unwrap());
+        assert!(!tmp.path().join("wal/remove-timeout.wal").exists());
+        assert!(writer.snapshot("remove-timeout").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn seal_preserves_wal_for_lines_appended_during_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GatedSink::default());
+        let wal_root = tmp.path().join("wal");
+        let writer = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        writer
+            .write_line(make_line("wal-tail", LogLevel::Info, "first"))
+            .await
+            .unwrap();
+        let seal_writer = writer.clone();
+        let seal = tokio::spawn(async move { seal_writer.seal("wal-tail").await });
+        sink.entered.notified().await;
+        writer
+            .write_line(make_line("wal-tail", LogLevel::Info, "tail"))
+            .await
+            .unwrap();
+        writer.sync_wals().await;
+        sink.release.notify_one();
+        seal.await.unwrap().unwrap();
+        let recovered = WalDir::open(wal_root)
+            .await
+            .unwrap()
+            .recover()
+            .await
+            .unwrap();
+        assert!(recovered[0].lines.iter().any(|line| line.msg == "tail"));
     }
 
     #[tokio::test]
@@ -1569,7 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn project_purge_gate_blocks_concurrent_ingest_until_the_boundary_closes() {
         let (writer, _sink, _tmp) = writer_with_defaults().await;
-        let mut purge_guard = writer.lock_project_for_purge(1).await;
+        let mut purge_guard = writer.lock_project_for_purge(1).await.unwrap();
         let ingest_writer = writer.clone();
         let ingest = tokio::spawn(async move {
             ingest_writer
@@ -1602,7 +1862,7 @@ mod tests {
             .write_line(make_line("cnt-background", LogLevel::Info, "before purge"))
             .await
             .unwrap();
-        let purge_guard = writer.lock_project_for_purge(1).await;
+        let purge_guard = writer.lock_project_for_purge(1).await.unwrap();
         let flush_writer = writer.clone();
         let flush = tokio::spawn(async move {
             flush_writer.flush_all().await;

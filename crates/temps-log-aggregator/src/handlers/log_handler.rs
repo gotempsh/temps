@@ -47,6 +47,11 @@ use crate::types::*;
 impl From<LogAggregatorError> for Problem {
     fn from(error: LogAggregatorError) -> Self {
         match error {
+            LogAggregatorError::OperationTimedOut { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Log Operation Timed Out")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::ChunkNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Chunk Not Found")
                 .with_detail(error.to_string()),
@@ -805,6 +810,27 @@ async fn purge_project_logs(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn operation_timeout_returns_service_unavailable_problem() {
+        use axum::response::IntoResponse;
+        let problem: Problem = LogAggregatorError::OperationTimedOut {
+            operation: "prepare purge",
+            target: "project 7".to_owned(),
+        }
+        .into();
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(detail["detail"].as_str().unwrap().contains("project 7"));
+    }
+
     use super::*;
     use async_trait::async_trait;
     use axum::extract::Request;

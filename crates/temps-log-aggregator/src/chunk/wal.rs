@@ -108,6 +108,15 @@ pub struct StreamWal {
 }
 
 impl StreamWal {
+    #[cfg(test)]
+    pub(crate) async fn read_only_for_test(path: PathBuf) -> Self {
+        Self {
+            writer: BufWriter::new(File::open(&path).await.unwrap()),
+            path,
+            bytes_written: 0,
+        }
+    }
+
     /// Append one record. Buffered — no fsync; call [`Self::sync`]
     /// periodically (the writer does this on a 1 s tick) for durability.
     pub async fn append(&mut self, line: &LogLine) -> Result<(), LogAggregatorError> {

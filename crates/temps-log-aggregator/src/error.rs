@@ -8,6 +8,12 @@ use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum LogAggregatorError {
+    #[error("Timed out waiting to {operation} for {target}; in-flight I/O continues safely")]
+    OperationTimedOut {
+        operation: &'static str,
+        target: String,
+    },
+
     // ── Storage errors ──────────────────────────────────────────────────
     #[error("Failed to write chunk {chunk_id} for service '{service}' in project {project_id}: {reason}")]
     ChunkWriteFailed {
