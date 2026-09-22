@@ -54,7 +54,7 @@ impl TempsPlugin for CloudPlugin {
             let config = context.require_service::<ConfigService>();
             let encryption = context.require_service::<temps_core::EncryptionService>();
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let stateless = temps_config::stateless_mode_enabled().map_err(|error| {
+            let stateless = config.is_stateless_installation().await.map_err(|error| {
                 PluginError::PluginRegistrationFailed {
                     plugin_name: "cloud".to_string(),
                     error: error.to_string(),

@@ -496,7 +496,8 @@ impl BackupCommand {
         let encryption_key = Self::extract_encryption_key(&server_config)?;
         let auth_secret = Self::extract_auth_secret(&server_config)?;
         let data_dir = Self::resolve_data_dir(args.data_dir.as_deref())?;
-        if temps_config::stateless_mode_enabled()? {
+        let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+        if bootstrap_stateless {
             let injected = temps_config::resolve_installation_secrets(&data_dir)?;
             Self::validate_injected_recovery_secrets(
                 &injected.encryption_key,
@@ -707,7 +708,27 @@ impl BackupCommand {
         Self::restore_postgres(&args.database_url, &final_backup_path, is_plain_sql)?;
         drop(decompressed_backup);
 
-        // Restore external services
+        // The PostgreSQL restore is the primary mutation the operator
+        // requested. Inspect its durable binding before any ancillary restore
+        // or local-secret write so a mode mismatch cannot affect external
+        // services or materialize secrets in the wrong storage model.
+        let restored_db = rt
+            .block_on(sea_orm::Database::connect(&args.database_url))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to inspect the restored installation mode: {}",
+                    error
+                )
+            })?;
+        let restored_mode = rt.block_on(temps_config::installation_mode(&restored_db))?;
+        if restored_mode.is_stateless() && !bootstrap_stateless {
+            return Err(anyhow::anyhow!(
+                "The restored database belongs to a stateless control plane. Re-run recovery with TEMPS_STATELESS=true and the original injected secrets; no local secret files were written."
+            ));
+        }
+
+        // Restore external services only after the restored database's durable
+        // installation mode has accepted this recovery configuration.
         rt.block_on(Self::restore_external_services(
             &args.database_url,
             &s3_client,
@@ -715,7 +736,7 @@ impl BackupCommand {
             &metadata,
             &encryption_key,
         ))?;
-        if !temps_config::stateless_mode_enabled()? {
+        if !restored_mode.is_stateless() && !bootstrap_stateless {
             Self::install_recovery_secrets(&data_dir, &encryption_key, &auth_secret)?;
         }
 

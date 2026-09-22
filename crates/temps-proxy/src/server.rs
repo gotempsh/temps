@@ -369,6 +369,7 @@ pub fn setup_proxy_server(
     route_table: Arc<CachedPeerTable>,
     shutdown_signal: Box<dyn ProxyShutdownSignal>,
     config: Arc<ServerConfig>,
+    stateless_storage: temps_file_store::s3_config::StatelessStorage,
     on_demand_manager: Option<Arc<crate::on_demand::OnDemandManager>>,
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
     // Passed in directly rather than looked up via `context.get_service`:
@@ -506,10 +507,11 @@ pub fn setup_proxy_server(
     // request to a deployed site, so a warm key must never re-hit S3. See
     // `temps_file_store::cache` for why a plain size-bounded LRU with no TTL
     // is safe for this content (immutable once written under a given key).
-    let static_storage_backend = temps_file_store::s3_config::resolve_static_storage_backend()
-        .map_err(|error| {
-            anyhow::anyhow!("❌ Static-site/CAS storage configuration is invalid\n\n{error}")
-        })?;
+    let static_storage_backend =
+        temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless_storage)
+            .map_err(|error| {
+                anyhow::anyhow!("❌ Static-site/CAS storage configuration is invalid\n\n{error}")
+            })?;
     let (cas_file_store, static_object_store): (
         Arc<dyn temps_file_store::FileStore>,
         Option<Arc<dyn temps_file_store::FileStore>>,

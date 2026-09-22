@@ -626,6 +626,14 @@ impl ProxyCommand {
             db.clone(),
             data_dir.clone(),
         )) as Box<dyn ProxyShutdownSignal>;
+        let stateless_instance_id =
+            rt.block_on(temps_config::stateless_instance_id(db.as_ref()))?;
+        let stateless_storage = temps_file_store::s3_config::resolve_stateless_storage_for(
+            stateless_instance_id.as_deref(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("❌ Stateless storage configuration is invalid\n\n{error}")
+        })?;
 
         match temps_proxy::setup_proxy_server(
             db,
@@ -635,6 +643,7 @@ impl ProxyCommand {
             route_table,
             shutdown_signal,
             config.clone(),
+            stateless_storage,
             on_demand_manager, // wired in split mode (ADR-017 Phase 2); None if Docker unavailable
             admin_gate_handle,
             // This standalone `temps proxy` process never loads a console or

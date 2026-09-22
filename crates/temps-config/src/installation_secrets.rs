@@ -32,7 +32,11 @@ impl std::fmt::Debug for InstallationSecrets {
     }
 }
 
-pub fn stateless_mode_enabled() -> Result<bool, ConfigServiceError> {
+/// Read the process environment's requested installation mode during startup.
+///
+/// This is a bootstrap assertion, not the authoritative runtime mode. Once a
+/// database is connected, callers must use the persisted installation mode.
+pub fn bootstrap_stateless_requested() -> Result<bool, ConfigServiceError> {
     parse_stateless(read_environment(STATELESS_ENV)?.as_deref())
 }
 

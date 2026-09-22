@@ -161,9 +161,9 @@ impl SourceDropService {
         workflow_executor: Arc<WorkflowExecutionService>,
         queue: Arc<dyn JobQueue>,
         deployment_gate: DeploymentGateSlot,
-    ) -> Result<Self, temps_config::ConfigServiceError> {
-        let stateless = temps_config::stateless_mode_enabled()?;
-        Ok(Self {
+        stateless: bool,
+    ) -> Self {
+        Self {
             db,
             data_dir,
             workflow_planner,
@@ -171,7 +171,7 @@ impl SourceDropService {
             queue,
             deployment_gate,
             stateless,
-        })
+        }
     }
 
     async fn compensate(

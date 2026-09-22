@@ -12111,6 +12111,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "temps-config",
  "temps-core",
  "temps-file-store",
  "thiserror 2.0.20",

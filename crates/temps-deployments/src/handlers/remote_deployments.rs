@@ -112,14 +112,18 @@ impl Drop for ArchiveUploadPermit {
     }
 }
 
-fn ensure_local_archive_deployments_supported() -> Result<(), Problem> {
-    let stateless = temps_config::stateless_mode_enabled().map_err(|error| {
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Invalid Stateless Configuration")
-            .with_detail(format!(
-                "Could not determine whether local archive deployments are supported: {error}"
-            ))
-    })?;
+async fn ensure_local_archive_deployments_supported(state: &AppState) -> Result<(), Problem> {
+    let stateless = state
+        .config_service
+        .is_stateless_installation()
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Stateless Configuration")
+                .with_detail(format!(
+                    "Could not determine whether local archive deployments are supported: {error}"
+                ))
+        })?;
     ensure_local_archive_deployments_supported_for_mode(stateless)
 }
 
@@ -216,7 +220,7 @@ pub async fn deploy_from_uploaded_source(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    ensure_local_archive_deployments_supported()?;
+    ensure_local_archive_deployments_supported(&state).await?;
     let upload_permit = ArchiveUploadPermit::acquire()?;
 
     let project = projects::Entity::find_by_id(project_id)
@@ -1407,7 +1411,7 @@ pub async fn deploy_from_static(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    ensure_local_archive_deployments_supported()?;
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -1688,7 +1692,7 @@ pub async fn deploy_from_image_upload(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    ensure_local_archive_deployments_supported()?;
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -2265,7 +2269,7 @@ pub async fn upload_static_bundle(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    ensure_local_archive_deployments_supported()?;
+    ensure_local_archive_deployments_supported(&state).await?;
     let _static_upload_permit = ArchiveUploadPermit::acquire()?;
 
     debug!("Uploading static bundle for project {}", project_id);
@@ -3225,7 +3229,7 @@ mod tests {
             let end = tail.find("pub async fn").unwrap_or(tail.len());
             let body = &source[start..start + 1 + end];
             let guard = body
-                .find("ensure_local_archive_deployments_supported()?")
+                .find("ensure_local_archive_deployments_supported(&state).await?")
                 .unwrap_or_else(|| panic!("handler {handler_name} must reject stateless mode"));
             let first_database_or_storage_work = [
                 body.find("Entity::find"),

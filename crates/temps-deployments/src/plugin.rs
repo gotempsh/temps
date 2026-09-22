@@ -231,13 +231,27 @@ impl TempsPlugin for DeploymentsPlugin {
             // the same `FsFileStore` under `TEMPS_DATA_DIR/cas` as before this change.
             // No byte cache here: caching only matters for the proxy's *read* path
             // (see `temps-proxy/src/server.rs`), never for these write-side uses.
-            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
-                match temps_file_store::s3_config::resolve_static_storage_backend().map_err(
-                    |error| PluginError::PluginRegistrationFailed {
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("Could not read persisted installation mode: {error}"),
+                })?;
+            let stateless_storage =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::PluginRegistrationFailed {
                         plugin_name: "deployments".to_string(),
-                        error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
-                    },
-                )? {
+                        error: error.to_string(),
+                    })?;
+            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
+                match temps_file_store::s3_config::resolve_static_storage_backend_for(
+                    &stateless_storage,
+                )
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
+                })? {
                     temps_file_store::s3_config::StaticStorageBackend::Filesystem => {
                         let cas_dir = config_service.data_dir().join("cas");
                         Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir))
@@ -482,21 +496,22 @@ impl TempsPlugin for DeploymentsPlugin {
                     "deployment gate slot was not initialized for source Drop".to_string(),
                 )
             })?;
-            let source_drop_service = Arc::new(
-                crate::services::SourceDropService::new(
-                    db.clone(),
-                    config_service.data_dir(),
-                    source_drop_planner,
-                    workflow_execution_service.clone(),
-                    queue_service.clone(),
-                    deployment_gate,
-                )
-                .map_err(|error| {
-                    PluginError::InitializationFailed(format!(
-                    "could not resolve stateless configuration for source Drop service: {error}"
-                ))
-                })?,
-            );
+            let source_drop_service = Arc::new(crate::services::SourceDropService::new(
+                db.clone(),
+                config_service.data_dir(),
+                source_drop_planner,
+                workflow_execution_service.clone(),
+                queue_service.clone(),
+                deployment_gate,
+                config_service
+                    .is_stateless_installation()
+                    .await
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                        "could not resolve stateless configuration for source Drop service: {error}"
+                    ))
+                    })?,
+            ));
             context.register_service(source_drop_service.clone());
             let source_drop_deployer =
                 source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;

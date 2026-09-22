@@ -7,7 +7,7 @@
 
 use std::path::{Component, Path};
 use std::sync::Arc;
-use temps_file_store::s3_config::{resolve_static_storage_backend, StaticStorageBackend};
+use temps_file_store::s3_config::StaticStorageBackend;
 use temps_file_store::s3_store::S3FileStore;
 use temps_file_store::FileStore;
 use tokio::fs;
@@ -38,13 +38,15 @@ impl FileService {
 
     pub fn from_config(
         config_service: Arc<temps_config::ConfigService>,
+        stateless: &temps_file_store::s3_config::StatelessStorage,
     ) -> Result<Self, temps_file_store::s3_config::StaticStorageConfigError> {
-        let durable_store = match resolve_static_storage_backend()? {
-            StaticStorageBackend::Filesystem => None,
-            StaticStorageBackend::S3(config) => {
-                Some(Arc::new(S3FileStore::new(config)) as Arc<dyn FileStore>)
-            }
-        };
+        let durable_store =
+            match temps_file_store::s3_config::resolve_static_storage_backend_for(stateless)? {
+                StaticStorageBackend::Filesystem => None,
+                StaticStorageBackend::S3(config) => {
+                    Some(Arc::new(S3FileStore::new(config)) as Arc<dyn FileStore>)
+                }
+            };
         Ok(Self {
             config_service,
             durable_store,

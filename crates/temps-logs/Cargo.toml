@@ -27,6 +27,7 @@ aws-sdk-s3 = { workspace = true }
 hex = { workspace = true }
 # Plugin dependencies
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-file-store = { path = "../temps-file-store" }
 utoipa = { workspace = true }
 

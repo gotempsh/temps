@@ -155,8 +155,8 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     let (from, to) = parse_window(&args)?;
     let data_dir = resolve_data_dir(args.data_dir.clone())?;
 
-    let stateless = temps_config::stateless_mode_enabled()?;
-    let _control_plane_owner = if stateless {
+    let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+    let _control_plane_owner = if bootstrap_stateless {
         Some(
             super::serve::stateless::ControlPlaneOwner::acquire(&args.database_url)
                 .await
@@ -169,11 +169,22 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    let db = if stateless {
-        temps_database::connect_without_migrations(&args.database_url).await?
-    } else {
-        temps_database::establish_connection(&args.database_url).await?
-    };
+    let db = temps_database::connect_without_migrations(&args.database_url).await?;
+    let persisted_mode = temps_config::installation_mode(db.as_ref()).await?;
+    if persisted_mode.is_stateless() && !bootstrap_stateless {
+        return Err(anyhow::anyhow!(
+            "This database belongs to a stateless control plane. Re-run the Cloud telemetry backfill with TEMPS_STATELESS=true and the original injected configuration."
+        ));
+    }
+    if bootstrap_stateless && !persisted_mode.is_stateless() {
+        return Err(anyhow::anyhow!(
+            "Cloud telemetry backfill requires a database already bound to a stateless control plane; complete stateless adoption with `temps serve` first."
+        ));
+    }
+    let stateless = persisted_mode.is_stateless();
+    if !stateless {
+        temps_database::run_migrations(db.as_ref()).await?;
+    }
     let link = load_cloud_link(&data_dir, db.clone(), &args.database_url, stateless).await?;
     let source = build_source(&args, db.clone())?;
 

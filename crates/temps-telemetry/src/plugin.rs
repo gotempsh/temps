@@ -46,33 +46,36 @@ impl TempsPlugin for TelemetryPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
             // Telemetry must never block startup. If the reporter can't be
             // built (e.g. the anonymous-id file can't be written), fall back to
             // a no-op reporter and log, rather than failing the server.
-            let reporter: Arc<dyn TelemetryReporter> = match TelemetryService::new(
-                &self.server_config.data_dir,
-                self.temps_version.clone(),
-            ) {
-                Ok(svc) => {
-                    // Wire the DB so once-per-instance milestones
-                    // (report_once) are durable across restarts and across the
-                    // split proxy/console processes. The DB service is registered
-                    // before this plugin; if it's somehow absent, report_once
-                    // degrades to a per-process in-memory guard.
-                    if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+            let reporter: Arc<dyn TelemetryReporter> = match temps_config::stateless_instance_id(
+                db.as_ref(),
+            )
+            .await
+            {
+                Ok(stateless_instance_id) => match TelemetryService::new_for_installation(
+                    &self.server_config.data_dir,
+                    self.temps_version.clone(),
+                    stateless_instance_id.as_deref(),
+                ) {
+                    Ok(svc) => {
                         svc.set_db(db);
-                    } else {
-                        tracing::warn!(
-                            "Telemetry: database service not available; once-per-instance \
-                             milestones will be guarded per-process only (not durable)"
-                        );
+                        Arc::new(svc)
                     }
-                    Arc::new(svc)
-                }
-                Err(e) => {
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to initialize telemetry reporter; telemetry disabled for this run"
+                        );
+                        Arc::new(NoopTelemetryReporter)
+                    }
+                },
+                Err(error) => {
                     tracing::warn!(
-                        error = %e,
-                        "Failed to initialize telemetry reporter; telemetry disabled for this run"
+                        error = %error,
+                        "Failed to resolve persisted telemetry identity; telemetry disabled for this run"
                     );
                     Arc::new(NoopTelemetryReporter)
                 }

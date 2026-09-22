@@ -18,7 +18,7 @@ use crate::{
     static_deployer::{FilesystemStaticDeployer, StaticDeployer},
     ContainerDeployer,
 };
-use temps_file_store::s3_config::{resolve_static_storage_backend, StaticStorageBackend};
+use temps_file_store::s3_config::StaticStorageBackend;
 
 /// Deployer Plugin for managing container deployment operations
 pub struct DeployerPlugin;
@@ -470,11 +470,24 @@ impl TempsPlugin for DeployerPlugin {
             // is unset for every existing self-hosted install, so this resolves
             // to `StaticStorageBackend::Filesystem` and reproduces today's
             // behavior exactly (local disk under `TEMPS_DATA_DIR/static`).
-            let static_storage_backend = resolve_static_storage_backend().map_err(|error| {
-                PluginError::InitializationFailed(format!(
-                    "❌ Static-site storage configuration is invalid\n\n{error}"
-                ))
-            })?;
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "Could not read persisted installation mode: {error}"
+                    ))
+                })?;
+            let stateless =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            let static_storage_backend =
+                temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                            "❌ Static-site storage configuration is invalid\n\n{error}"
+                        ))
+                    })?;
             let static_deployer: Arc<dyn StaticDeployer> = match static_storage_backend {
                 StaticStorageBackend::Filesystem => {
                     let static_files_dir =

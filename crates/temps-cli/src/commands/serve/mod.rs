@@ -324,8 +324,8 @@ impl ServeCommand {
         // detached plugin tasks) shuts down before the ownership guard drops.
         let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
-        let stateless_mode = temps_config::stateless_mode_enabled()?;
-        _control_plane_owner = if stateless_mode {
+        let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+        _control_plane_owner = if bootstrap_stateless {
             stateless::validate_profile(self.profile, self.role)?;
             stateless::validate_scratch_directory(&serve_config.data_dir)?;
             Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
@@ -335,6 +335,13 @@ impl ServeCommand {
         let db = rt.block_on(temps_database::connect_without_migrations(
             &self.database_url,
         ))?;
+        let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
+        if persisted_mode.is_stateless() && !bootstrap_stateless {
+            rt.block_on(stateless::reject_local_mode_for_managed_database(
+                db.as_ref(),
+            ))?;
+        }
+        let stateless_mode = bootstrap_stateless || persisted_mode.is_stateless();
         let storage_identity = if stateless_mode {
             Some(stateless::storage_identity()?)
         } else {
@@ -366,6 +373,17 @@ impl ServeCommand {
                 &instance_id,
                 &storage_identity,
             ))?;
+        }
+        // From this point onward runtime behavior follows only the durable
+        // database binding. The environment value above was consumed solely
+        // to bootstrap or authenticate adoption/replacement.
+        let stateless_mode = rt
+            .block_on(temps_config::installation_mode(db.as_ref()))?
+            .is_stateless();
+        if bootstrap_stateless && !stateless_mode {
+            anyhow::bail!(
+                "Stateless bootstrap completed without a persisted installation identity"
+            );
         }
 
         // Update private address setting from CLI flag

@@ -105,6 +105,13 @@ pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to determine persisted installation mode while {operation}: {source}")]
+    InstallationModeDatabase {
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("AI provider '{provider_id}' credential changed during verification")]
     ProviderCredentialChanged { provider_id: String },
 
@@ -633,6 +640,102 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallationMode {
+    Local,
+    Stateless,
+}
+
+impl InstallationMode {
+    pub const fn is_stateless(self) -> bool {
+        matches!(self, Self::Stateless)
+    }
+}
+
+/// Read the installation mode persisted in PostgreSQL.
+///
+/// A missing table or singleton row means the installation has not been bound
+/// to stateless mode. `TEMPS_STATELESS` is deliberately not consulted here:
+/// it is only a bootstrap request and must not change runtime behavior.
+pub async fn installation_mode(db: &DbConnection) -> Result<InstallationMode, ConfigServiceError> {
+    let table = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('stateless_control_plane') IS NOT NULL AS present".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "checking the installation identity table",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while checking installation mode".to_string(),
+        })?;
+    if !table.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the installation identity table status",
+            source,
+        }
+    })? {
+        return Ok(InstallationMode::Local);
+    }
+
+    let identity = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM stateless_control_plane WHERE id = 1) AS present"
+                .to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted installation identity",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while reading installation identity".to_string(),
+        })?;
+    let present = identity.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted installation identity",
+            source,
+        }
+    })?;
+    Ok(if present {
+        InstallationMode::Stateless
+    } else {
+        InstallationMode::Local
+    })
+}
+
+/// Return the stable instance identifier for a stateless installation.
+pub async fn stateless_instance_id(
+    db: &DbConnection,
+) -> Result<Option<String>, ConfigServiceError> {
+    if !installation_mode(db).await?.is_stateless() {
+        return Ok(None);
+    }
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT instance_id FROM stateless_control_plane WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted stateless instance ID",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "stateless installation identity disappeared while it was being read"
+                .to_string(),
+        })?;
+    row.try_get::<String>("", "instance_id")
+        .map(Some)
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted stateless instance ID",
+            source,
+        })
+}
+
 #[derive(Default)]
 struct SettingsCacheState {
     snapshot: Option<(AppSettings, std::time::Instant)>,
@@ -670,6 +773,19 @@ impl ConfigService {
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Return the durable installation mode recorded in PostgreSQL.
+    pub async fn installation_mode(&self) -> Result<InstallationMode, ConfigServiceError> {
+        installation_mode(self.db.as_ref()).await
+    }
+
+    pub async fn is_stateless_installation(&self) -> Result<bool, ConfigServiceError> {
+        Ok(self.installation_mode().await?.is_stateless())
+    }
+
+    pub async fn stateless_instance_id(&self) -> Result<Option<String>, ConfigServiceError> {
+        stateless_instance_id(self.db.as_ref()).await
     }
 
     /// Get the base data directory path
@@ -2197,6 +2313,79 @@ mod tests {
     }
 
     impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[tokio::test]
+    async fn persisted_installation_mode_is_authoritative() {
+        let database = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping installation mode test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("installation mode test database failed: {error}"),
+        };
+
+        assert_eq!(
+            installation_mode(&database.db).await.expect("fresh mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "CREATE TABLE stateless_control_plane (id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL)".to_string(),
+            ))
+            .await
+            .expect("create identity table");
+        assert_eq!(
+            installation_mode(&database.db).await.expect("unbound mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "INSERT INTO stateless_control_plane (id, instance_id) VALUES (1, 'durable-instance')".to_string(),
+            ))
+            .await
+            .expect("bind stateless identity");
+        assert_eq!(
+            installation_mode(&database.db)
+                .await
+                .expect("persisted mode"),
+            InstallationMode::Stateless
+        );
+        assert_eq!(
+            stateless_instance_id(&database.db)
+                .await
+                .expect("persisted instance ID")
+                .as_deref(),
+            Some("durable-instance")
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_mode_preserves_database_failure_context() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "identity database unavailable".to_string(),
+            )])
+            .into_connection();
+
+        let error = installation_mode(&db)
+            .await
+            .expect_err("database lookup must fail closed");
+        assert!(matches!(
+            error,
+            ConfigServiceError::InstallationModeDatabase { operation, source }
+                if operation == "checking the installation identity table"
+                    && source.to_string().contains("identity database unavailable")
+        ));
+    }
 
     #[test]
     fn randomness_failure_preserves_config_operation_context() {

@@ -44,12 +44,25 @@ impl temps_core::plugin::TempsPlugin for StaticFilesPlugin {
     > {
         Box::pin(async move {
             let config_service = context.require_service::<ConfigService>();
-            let file_service = Arc::new(FileService::from_config(config_service.clone()).map_err(
-                |error| PluginError::PluginRegistrationFailed {
-                    plugin_name: "static-files".to_string(),
-                    error: format!("Failed to configure static file storage: {error}"),
-                },
-            )?);
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "Could not read persisted installation mode: {error}"
+                    ))
+                })?;
+            let stateless =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            let file_service = Arc::new(
+                FileService::from_config(config_service.clone(), &stateless).map_err(|error| {
+                    PluginError::PluginRegistrationFailed {
+                        plugin_name: "static-files".to_string(),
+                        error: format!("Failed to configure static file storage: {error}"),
+                    }
+                })?,
+            );
             context.register_service(file_service);
             Ok(())
         })

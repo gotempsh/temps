@@ -129,11 +129,14 @@ impl TempsPlugin for AiChatPlugin {
             ];
 
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let stateless = temps_config::stateless_mode_enabled().map_err(|error| {
-                PluginError::InitializationFailed(format!(
-                    "AI workspace storage configuration: {error}"
-                ))
-            })?;
+            let stateless = config_service
+                .is_stateless_installation()
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "AI workspace storage configuration: {error}"
+                    ))
+                })?;
             let application_workspaces = Arc::new(
                 crate::ApplicationWorkspaceService::new(config_service.data_dir())
                     .with_local_workspaces_enabled(!stateless),

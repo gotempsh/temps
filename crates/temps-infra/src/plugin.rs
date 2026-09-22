@@ -140,12 +140,16 @@ impl TempsPlugin for InfraPlugin {
                 )
             };
 
+            let config_service = context.require_service::<temps_config::ConfigService>();
             let features = features.with_stateless_mode(
-                temps_config::stateless_mode_enabled().map_err(|error| {
-                    PluginError::InitializationFailed(format!(
-                        "Platform stateless configuration: {error}"
-                    ))
-                })?,
+                config_service
+                    .is_stateless_installation()
+                    .await
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                            "Platform stateless configuration: {error}"
+                        ))
+                    })?,
             );
 
             // Create PlatformInfoService

@@ -181,15 +181,29 @@ pub fn resolve_stateless_storage() -> Result<StatelessStorage, StaticStorageConf
             _ => return Err(StaticStorageConfigError::InvalidStatelessFlag { value }),
         },
     };
-    if !enabled {
-        return Ok(StatelessStorage::Disabled);
-    }
+    let instance_id = enabled
+        .then(|| {
+            std::env::var("TEMPS_INSTANCE_ID")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or(StaticStorageConfigError::MissingInstanceId)
+        })
+        .transpose()?;
+    resolve_stateless_storage_for(instance_id.as_deref())
+}
 
-    let instance_id = std::env::var("TEMPS_INSTANCE_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or(StaticStorageConfigError::MissingInstanceId)?;
+/// Resolve stateless storage from the database-backed installation identity.
+pub fn resolve_stateless_storage_for(
+    instance_id: Option<&str>,
+) -> Result<StatelessStorage, StaticStorageConfigError> {
+    let Some(instance_id) = instance_id else {
+        return Ok(StatelessStorage::Disabled);
+    };
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty() {
+        return Err(StaticStorageConfigError::MissingInstanceId);
+    }
     if matches!(instance_id.as_str(), "." | "..")
         || instance_id.len() > 64
         || !instance_id
@@ -215,6 +229,13 @@ pub fn resolve_stateless_storage() -> Result<StatelessStorage, StaticStorageConf
 /// and the deployments plugin's CAS write path) so they always agree on which
 /// backend and bucket are in use.
 pub fn resolve_static_storage_backend() -> Result<StaticStorageBackend, StaticStorageConfigError> {
+    let stateless = resolve_stateless_storage()?;
+    resolve_static_storage_backend_for(&stateless)
+}
+
+pub fn resolve_static_storage_backend_for(
+    stateless: &StatelessStorage,
+) -> Result<StaticStorageBackend, StaticStorageConfigError> {
     fn required(variable: &'static str) -> Result<String, StaticStorageConfigError> {
         std::env::var(variable)
             .ok()
@@ -222,10 +243,9 @@ pub fn resolve_static_storage_backend() -> Result<StaticStorageBackend, StaticSt
             .ok_or(StaticStorageConfigError::MissingS3Variable { variable })
     }
 
-    let stateless = resolve_stateless_storage()?;
     let backend =
         std::env::var("TEMPS_STATIC_STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into());
-    if backend != "s3" && stateless == StatelessStorage::Disabled {
+    if backend != "s3" && *stateless == StatelessStorage::Disabled {
         return Ok(StaticStorageBackend::Filesystem);
     }
 
@@ -285,6 +305,33 @@ mod tests {
             resolve_static_storage_backend().unwrap(),
             StaticStorageBackend::Filesystem
         ));
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn persisted_local_mode_ignores_true_bootstrap_environment() {
+        clear_env();
+        std::env::set_var("TEMPS_STATELESS", "true");
+        std::env::set_var("TEMPS_INSTANCE_ID", "environment-instance");
+        assert_eq!(
+            resolve_stateless_storage_for(None).unwrap(),
+            StatelessStorage::Disabled
+        );
+        clear_env();
+    }
+
+    #[test]
+    #[serial(temps_static_storage_env)]
+    fn persisted_stateless_identity_ignores_false_bootstrap_environment() {
+        clear_env();
+        std::env::set_var("TEMPS_STATELESS", "false");
+        assert_eq!(
+            resolve_stateless_storage_for(Some("durable-instance")).unwrap(),
+            StatelessStorage::Enabled {
+                instance_id: "durable-instance".to_string()
+            }
+        );
+        clear_env();
     }
 
     #[test]

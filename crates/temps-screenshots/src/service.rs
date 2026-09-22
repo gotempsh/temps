@@ -12,7 +12,7 @@ use tokio::fs;
 use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
-use temps_file_store::s3_config::{resolve_static_storage_backend, StaticStorageBackend};
+use temps_file_store::s3_config::StaticStorageBackend;
 use temps_file_store::{s3_store::S3FileStore, FileStore};
 
 use crate::error::{ScreenshotError, ScreenshotResult};
@@ -111,14 +111,33 @@ impl ScreenshotService {
             });
         }
 
-        let durable_store = match resolve_static_storage_backend().map_err(|error| {
-            ScreenshotError::ConfigError(format!("Failed to resolve screenshot storage: {error}"))
-        })? {
-            StaticStorageBackend::Filesystem => None,
-            StaticStorageBackend::S3(config) => {
-                Some(Arc::new(S3FileStore::new(config)) as Arc<dyn FileStore>)
-            }
-        };
+        let instance_id = config_service
+            .stateless_instance_id()
+            .await
+            .map_err(|error| {
+                ScreenshotError::ConfigError(format!(
+                    "Failed to read persisted installation mode: {error}"
+                ))
+            })?;
+        let stateless =
+            temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                .map_err(|error| {
+                    ScreenshotError::ConfigError(format!(
+                        "Failed to resolve screenshot storage: {error}"
+                    ))
+                })?;
+        let durable_store =
+            match temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)
+                .map_err(|error| {
+                    ScreenshotError::ConfigError(format!(
+                        "Failed to resolve screenshot storage: {error}"
+                    ))
+                })? {
+                StaticStorageBackend::Filesystem => None,
+                StaticStorageBackend::S3(config) => {
+                    Some(Arc::new(S3FileStore::new(config)) as Arc<dyn FileStore>)
+                }
+            };
 
         Ok(Self {
             config_service,
