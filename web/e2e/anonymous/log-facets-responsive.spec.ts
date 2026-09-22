@@ -15,7 +15,7 @@ test.beforeEach(async ({ page }) => {
         email: 'operator@example.com',
         role: 'admin',
       }
-    } else if (path === '/api/logs/search') {
+    } else if (path === '/api/logs/global/search') {
       json = {
         lines: [
           {
@@ -31,6 +31,8 @@ test.beforeEach(async ({ page }) => {
         ],
         scan_limit_reached: false,
       }
+    } else if (path === '/api/logs/global/facets') {
+      json = { facets: {}, partial: false }
     }
     await route.fulfill({ json })
   })
@@ -44,7 +46,7 @@ async function expectFacets(page: Page, visible: boolean) {
   if (visible) {
     await expect(panel).toBeVisible()
     await expect(
-      panel.getByText('Counts from this page only.', { exact: false })
+      panel.getByText('Counts across the whole time range', { exact: false })
     ).toBeVisible()
   } else {
     await expect(panel).toHaveCount(0)

@@ -308,6 +308,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                     Arc::new(ManifestRepo::new(db.clone())),
                     metadata_service.clone(),
                 )
+                .with_chunk_writer(chunk_writer.clone())
                 .with_line_index(line_index.clone()),
             );
             context.register_service(retention_service.clone());

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::error::LogAggregatorError;
 use crate::index::{LineIndexSink, NoLineIndex};
-use crate::services::LogMetadataService;
+use crate::services::{ChunkWriterService, LogMetadataService};
 use crate::store::manifest::ManifestRepo;
 use crate::types::{ChunkMeta, RetentionConfig};
 
@@ -39,6 +39,7 @@ pub struct RetentionService {
     /// ADR-047: rows of expired chunks are forgotten in the line index, and
     /// the index TTL is kept equal to the retention window.
     line_index: Arc<dyn LineIndexSink>,
+    chunk_writer: Option<Arc<ChunkWriterService>>,
 }
 
 impl RetentionService {
@@ -47,7 +48,13 @@ impl RetentionService {
             manifests,
             metadata_service,
             line_index: Arc::new(NoLineIndex::default()),
+            chunk_writer: None,
         }
+    }
+
+    pub fn with_chunk_writer(mut self, chunk_writer: Arc<ChunkWriterService>) -> Self {
+        self.chunk_writer = Some(chunk_writer);
+        self
     }
 
     pub fn with_line_index(mut self, line_index: Arc<dyn LineIndexSink>) -> Self {
@@ -176,12 +183,28 @@ impl RetentionService {
             "Starting manual purge"
         );
 
+        // Search includes the writer's unsealed heads. Seal them before
+        // selecting manifests so a successful purge cannot leave live-tail
+        // lines visible with synthetic HEAD_LINE_ID_BASE identifiers.
+        let mut project_purge_guard = if let Some(writer) = &self.chunk_writer {
+            let guard = writer.lock_project_for_purge(project_id).await;
+            writer.flush_project_for_purge(project_id).await?;
+            Some(guard)
+        } else {
+            None
+        };
+
         let chunks = self
             .metadata_service
             .find_expired_chunks(project_id, before)
             .await?;
 
         let (deleted, failed, bytes) = self.tombstone(&chunks).await;
+
+        if let Some(guard) = project_purge_guard.as_mut() {
+            let cutoff = (**guard).map_or(before, |previous| previous.max(before));
+            **guard = Some(cutoff);
+        }
 
         info!(
             project_id = %project_id,

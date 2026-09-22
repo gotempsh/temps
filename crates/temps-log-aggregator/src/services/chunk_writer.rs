@@ -79,6 +79,8 @@ use crate::store::chunk_store::{HeadSnapshot, HeadSource, HeadSummary};
 use crate::store::manifest::ManifestRepo;
 use crate::types::{ChunkMeta, LogLevel, LogLine};
 
+type ProjectPurgeGate = Arc<tokio::sync::RwLock<Option<DateTime<Utc>>>>;
+
 /// Estimated per-line overhead (framing, columnar arrays) added to `msg.len()`
 /// when tracking a head buffer's uncompressed byte estimate.
 const LINE_OVERHEAD_BYTES: usize = 64;
@@ -369,6 +371,7 @@ pub struct ChunkWriterService {
     cache: Option<ChunkCache>,
     wal_dir: Option<WalDir>,
     buffers: Mutex<HashMap<String, HeadBuffer>>,
+    project_gates: Mutex<HashMap<i32, ProjectPurgeGate>>,
     thresholds: Thresholds,
     /// Per-container unsealed buffer cap (Settings → Monitoring → container
     /// logs); a setting, so it can change while the writer runs.
@@ -444,6 +447,7 @@ impl ChunkWriterService {
             cache,
             wal_dir,
             buffers: Mutex::new(HashMap::new()),
+            project_gates: Mutex::new(HashMap::new()),
             head_max_bytes: AtomicUsize::new(thresholds.head_max_bytes),
             thresholds,
             shed_bloom: AtomicBool::new(false),
@@ -538,12 +542,23 @@ impl ChunkWriterService {
             let mut buffers = self.buffers.lock().await;
             buffers.insert(stream.container_id.clone(), buffer);
         }
-        self.seal(&stream.container_id).await
+        self.seal_inner(&stream.container_id, false).await
     }
 
     /// Append one line to its container's head buffer, sealing immediately
     /// if the buffer just crossed `head_max_bytes`.
     pub async fn write_line(&self, line: LogLine) -> Result<(), LogAggregatorError> {
+        let project_gate = {
+            let mut gates = self.project_gates.lock().await;
+            gates
+                .entry(line.project_id)
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
+                .clone()
+        };
+        let ingest_guard = project_gate.read().await;
+        if ingest_guard.is_some_and(|purged_before| line.ts < purged_before) {
+            return Ok(());
+        }
         let container_id = line.container_id.clone();
         let should_seal = {
             let mut buffers = self.buffers.lock().await;
@@ -572,7 +587,7 @@ impl ChunkWriterService {
         };
 
         if should_seal {
-            self.seal(&container_id).await?;
+            self.seal_inner(&container_id, false).await?;
         }
         Ok(())
     }
@@ -625,6 +640,41 @@ impl ChunkWriterService {
         }
     }
 
+    /// Seal every visible head before a destructive operation selects chunk
+    /// manifests. Unlike the shutdown helper, failures are propagated: a
+    /// purge must never report success while matching lines remain searchable
+    /// in an unsealed head buffer.
+    pub async fn lock_project_for_purge(
+        &self,
+        project_id: i32,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<Option<DateTime<Utc>>> {
+        let gate = {
+            let mut gates = self.project_gates.lock().await;
+            gates
+                .entry(project_id)
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
+                .clone()
+        };
+        gate.write_owned().await
+    }
+
+    pub async fn flush_project_for_purge(&self, project_id: i32) -> Result<(), LogAggregatorError> {
+        let ids: Vec<String> = {
+            let buffers = self.buffers.lock().await;
+            buffers
+                .iter()
+                .filter(|(_, buffer)| {
+                    buffer.identity.project_id == project_id && !buffer.is_empty()
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for container_id in ids {
+            self.seal_inner(&container_id, true).await?;
+        }
+        Ok(())
+    }
+
     /// Seal then drop a container's buffer and WAL file (call when a
     /// container stops).
     pub async fn remove_container(&self, container_id: &str) -> Result<(), LogAggregatorError> {
@@ -671,6 +721,29 @@ impl ChunkWriterService {
     /// Only encode failures (a bug, not an operational fault) and WAL IO
     /// errors propagate.
     async fn seal(&self, container_id: &str) -> Result<(), LogAggregatorError> {
+        let project_id = {
+            let buffers = self.buffers.lock().await;
+            let Some(buffer) = buffers.get(container_id) else {
+                return Ok(());
+            };
+            buffer.identity.project_id
+        };
+        let project_gate = {
+            let mut gates = self.project_gates.lock().await;
+            gates
+                .entry(project_id)
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
+                .clone()
+        };
+        let _seal_guard = project_gate.read().await;
+        self.seal_inner(container_id, false).await
+    }
+
+    async fn seal_inner(
+        &self,
+        container_id: &str,
+        fail_on_persistence_error: bool,
+    ) -> Result<(), LogAggregatorError> {
         let (identity, sealing_segments) = {
             let mut buffers = self.buffers.lock().await;
             let Some(buffer) = buffers.get_mut(container_id) else {
@@ -736,6 +809,9 @@ impl ChunkWriterService {
                 );
                 self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
                 self.drop_sealing(container_id).await;
+                if fail_on_persistence_error {
+                    return Err(e);
+                }
                 return Ok(());
             }
         };
@@ -753,6 +829,9 @@ impl ChunkWriterService {
                      the reconcile sweep to re-adopt it"
                 );
                 self.drop_sealing(container_id).await;
+                if fail_on_persistence_error {
+                    return Err(e);
+                }
                 return Ok(());
             }
         };
@@ -942,6 +1021,20 @@ mod tests {
             Err(LogAggregatorError::Validation {
                 message: "manifest insert always fails in this test".to_string(),
             })
+        }
+    }
+
+    struct BlockingSink {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ManifestSink for BlockingSink {
+        async fn insert(&self, _meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(1)
         }
     }
 
@@ -1314,6 +1407,118 @@ mod tests {
             1,
             "WAL must still hold the line so a working writer can recover it"
         );
+    }
+
+    #[tokio::test]
+    async fn purge_flush_fails_closed_when_storage_cannot_commit_the_head() {
+        let storage: Arc<dyn LogStorage> = Arc::new(FailingStorage);
+        let sink = Arc::new(VecSink::default());
+        let writer =
+            ChunkWriterService::open(storage, sink.clone() as Arc<dyn ManifestSink>, None, None)
+                .await
+                .unwrap();
+        writer
+            .write_line(make_line("cnt-purge-fail", LogLevel::Error, "sensitive"))
+            .await
+            .unwrap();
+
+        let error = writer
+            .flush_project_for_purge(1)
+            .await
+            .expect_err("purge must fail when its head cannot become a manifest");
+        assert!(matches!(
+            error,
+            LogAggregatorError::StorageConfiguration { .. }
+        ));
+        assert!(sink.all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_purge_gate_blocks_concurrent_ingest_until_the_boundary_closes() {
+        let (writer, _sink, _tmp) = writer_with_defaults().await;
+        let mut purge_guard = writer.lock_project_for_purge(1).await;
+        let ingest_writer = writer.clone();
+        let ingest = tokio::spawn(async move {
+            ingest_writer
+                .write_line(make_line(
+                    "cnt-race",
+                    LogLevel::Info,
+                    "arrived during purge",
+                ))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !ingest.is_finished(),
+            "same-project ingest must wait until purge releases its write barrier"
+        );
+        *purge_guard = Some(Utc::now() + chrono::Duration::seconds(1));
+        drop(purge_guard);
+        ingest.await.expect("ingest task").expect("ingest succeeds");
+        assert!(
+            writer.snapshot("cnt-race").await.is_none(),
+            "a delayed line older than the committed purge boundary must not reappear"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_seal_cannot_cross_an_active_project_purge_boundary() {
+        let (writer, sink, _tmp) = writer_with_defaults().await;
+        writer
+            .write_line(make_line("cnt-background", LogLevel::Info, "before purge"))
+            .await
+            .unwrap();
+        let purge_guard = writer.lock_project_for_purge(1).await;
+        let flush_writer = writer.clone();
+        let flush = tokio::spawn(async move {
+            flush_writer.flush_all().await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !flush.is_finished(),
+            "timer/shutdown sealing must participate in the project purge barrier"
+        );
+        drop(purge_guard);
+        flush.await.expect("background flush task");
+        assert_eq!(sink.all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_waits_for_an_inflight_background_manifest_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let sink = Arc::new(BlockingSink {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let writer =
+            ChunkWriterService::open(storage, sink.clone() as Arc<dyn ManifestSink>, None, None)
+                .await
+                .unwrap();
+        writer
+            .write_line(make_line("cnt-inflight", LogLevel::Info, "before purge"))
+            .await
+            .unwrap();
+
+        let entered = sink.entered.notified();
+        let flush_writer = writer.clone();
+        let flush = tokio::spawn(async move { flush_writer.flush_all().await });
+        entered.await;
+        let purge_writer = writer.clone();
+        let purge = tokio::spawn(async move { purge_writer.lock_project_for_purge(1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !purge.is_finished(),
+            "purge must wait until an in-flight manifest commit finishes"
+        );
+
+        sink.release.notify_waiters();
+        flush.await.expect("background flush task");
+        let guard = purge.await.expect("purge lock task");
+        drop(guard);
     }
 
     #[tokio::test]

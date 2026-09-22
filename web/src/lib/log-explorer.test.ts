@@ -3,7 +3,12 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { GlobalLogLine } from '@/api/client/types.gen'
-import { groupLogLines, logLineKey, logVolume } from './log-explorer'
+import {
+  groupLogLines,
+  logLineKey,
+  logVolume,
+  uniqueLogLines,
+} from './log-explorer'
 const line: GlobalLogLine = {
   timestamp: '2026-09-09T12:00:00Z',
   level: 'ERROR',
@@ -56,5 +61,9 @@ describe('loaded log aggregates', () => {
     expect(logLineKey({ ...line, timestamp: '2026-09-09T12:00:01Z' })).not.toBe(
       logLineKey(line)
     )
+  })
+  test('deduplicates overlapping cursor pages without collapsing sibling lines', () => {
+    const sibling = { ...line, line_id: '1757419200000000002' }
+    expect(uniqueLogLines([line, line, sibling])).toEqual([line, sibling])
   })
 })

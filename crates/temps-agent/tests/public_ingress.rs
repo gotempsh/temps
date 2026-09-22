@@ -566,7 +566,11 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
                 domain: "app.example.test".to_string(),
                 ciphertext: encrypted.ciphertext,
                 nonce: encrypted.nonce,
-                fingerprint: temps_core::ecies::cert_fingerprint(signed.cert_pem.trim()),
+                // The fingerprint covers the certificate bytes exactly as they
+                // appear in the encrypted payload. rcgen includes a trailing
+                // newline in the PEM, and `decrypt_certified_key` preserves it
+                // while removing only the separator before the private key.
+                fingerprint: temps_core::ecies::cert_fingerprint(&signed.cert_pem),
             }],
         }),
         unsupported_route_count: 0,

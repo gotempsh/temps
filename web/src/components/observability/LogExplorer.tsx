@@ -29,7 +29,14 @@ import {
   TableHead,
   TableCell,
 } from '@/components/ui/table'
-import { Download, WrapText, X, Columns3, ListFilter, Loader2 } from 'lucide-react'
+import {
+  Download,
+  WrapText,
+  X,
+  Columns3,
+  ListFilter,
+  Loader2,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { logEnvironmentLabel } from '@/lib/log-environment'
 import { LogLevelBadge } from '@temps-sdk/ds'
@@ -89,6 +96,7 @@ export function LogExplorer({
   status,
   onInspect,
   onLoadMore,
+  autoLoadMore = true,
   hasMore,
   isLoadingMore,
   histogram,
@@ -106,6 +114,8 @@ export function LogExplorer({
   status?: ReactNode
   onInspect?: () => void
   onLoadMore?: () => void
+  /** Partial searches pause at their budget boundary until the user resumes. */
+  autoLoadMore?: boolean
   hasMore?: boolean
   isLoadingMore?: boolean
   /** Line-count histogram (ADR-047 §5), rendered above the toolbar. */
@@ -279,9 +289,17 @@ export function LogExplorer({
     ? virtualRows[virtualRows.length - 1].index
     : -1
   useEffect(() => {
-    if (mode !== 'list' || !hasMore || isLoadingMore) return
+    if (mode !== 'list' || !autoLoadMore || !hasMore || isLoadingMore) return
     if (lines.length > 0 && lastIndex >= lines.length - 1) onLoadMore?.()
-  }, [mode, hasMore, isLoadingMore, lastIndex, lines.length, onLoadMore])
+  }, [
+    mode,
+    autoLoadMore,
+    hasMore,
+    isLoadingMore,
+    lastIndex,
+    lines.length,
+    onLoadMore,
+  ])
 
   return (
     <div className="space-y-4">

@@ -208,6 +208,7 @@ export default function GlobalLogs() {
         onFilter={filter}
         onInspect={() => setFollow(false)}
         onLoadMore={search.loadMore}
+        autoLoadMore={!search.partial}
         hasMore={!!search.hasMore}
         isLoadingMore={search.isLoadingMore}
         status={status}

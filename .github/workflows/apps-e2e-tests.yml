@@ -127,7 +127,7 @@ jobs:
       - name: Test recovery scenario contracts
         if: matrix.shard == 'recovery'
         working-directory: apps/temps-e2e
-        run: bun test src/lib/mariadb-image.test.ts
+        run: bun test src/lib/mariadb-image.test.ts src/lib/mongosh.test.ts
 
       - name: Prepare Temps instance
         # Authenticate public GitHub API requests made by the git-deploy

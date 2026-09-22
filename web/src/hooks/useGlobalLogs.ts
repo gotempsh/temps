@@ -25,7 +25,7 @@ import type {
   GlobalLogSearchRequest,
   HistogramResponse,
 } from '@/api/client/types.gen'
-import { logLineKey } from '@/lib/log-explorer'
+import { logLineKey, uniqueLogLines } from '@/lib/log-explorer'
 
 /**
  * The filter body shared by `/logs/global/search` and `/logs/global/facets` —
@@ -99,7 +99,8 @@ export function useGlobalLogSearch(filters: GlobalLogFilters, follow: boolean) {
   })
 
   const paged = useMemo(
-    () => (query.data?.pages ?? []).flatMap((page) => page.lines),
+    () =>
+      uniqueLogLines((query.data?.pages ?? []).flatMap((page) => page.lines)),
     [query.data]
   )
 

@@ -210,6 +210,11 @@ jobs:
           echo "host.docker.internal -> $HOST_IP (pre-flight OK)"
 
       - name: Run temps setup
+        # Public GitHub discovery otherwise shares the runner IP's anonymous
+        # quota and can return 429 before the real project-creation flow starts.
+        # Setup stores this job-scoped, read-only token for the test admin.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           "$TEMPS_BIN" setup --non-interactive \
             --database-url "$DATABASE_URL" \
@@ -220,7 +225,6 @@ jobs:
             --wildcard-domain-cert localho.st.crt \
             --wildcard-domain-key localho.st.key \
             --skip-dns-records \
-            --skip-git \
             --skip-geolite2-download \
             --output-format json
 

@@ -25,6 +25,21 @@ export const logLineKey = (line: {
   line_id: string
 }) => `${line.timestamp}|${line.container_id ?? ''}|${line.line_id}`
 
+/**
+ * A retry or stale cursor can replay the inclusive keyset boundary. Keep the
+ * first occurrence so the explorer never renders or counts one stored line
+ * twice when pages overlap.
+ */
+export function uniqueLogLines(lines: GlobalLogLine[]): GlobalLogLine[] {
+  const seen = new Set<string>()
+  return lines.filter((line) => {
+    const key = logLineKey(line)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 export function logVolume(lines: GlobalLogLine[]) {
   const timestamps = lines
     .map((line) => Date.parse(line.timestamp))

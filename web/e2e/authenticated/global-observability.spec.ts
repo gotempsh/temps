@@ -367,11 +367,14 @@ for (const width of [1440, 390]) {
       name: 'Keep searching',
     })
     await expect(keepSearching).toBeEnabled()
+    const checkoutLine = page.getByRole('button', {
+      name: 'Inspect log: Checkout request failed',
+      exact: true,
+    })
+    await expect(checkoutLine).toHaveCount(1)
+    await expect(checkoutLine).toBeVisible()
     await expect(
-      page.getByRole('cell', { name: 'Checkout request failed', exact: false })
-    ).toBeVisible()
-    await expect(
-      page.getByText('1 loaded line · newest first', { exact: false })
+      page.getByText('1 loaded line · newest first', { exact: false }).first()
     ).toBeVisible()
     // A partial page must not disable the normal "keep paging" affordance —
     // pressing Next/Load older is exactly how the user resumes the search.
@@ -403,6 +406,7 @@ for (const width of [1440, 390]) {
       await page.addInitScript(() => localStorage.setItem('theme', 'dark'))
     await mock(page, 'logs')
     await page.goto('/logs')
+    await expect(page).toHaveURL(/[?&]range=1d(?:&|$)/)
     const before = page.url()
     await page
       .getByRole('button', { name: 'Custom time range', exact: true })

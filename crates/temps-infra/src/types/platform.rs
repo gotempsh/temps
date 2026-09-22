@@ -274,12 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn platform_features_serialises_all_twelve_fields() {
+    fn platform_features_serialises_all_capability_fields() {
         let features = PlatformFeatures::full(true);
         let json = serde_json::to_value(&features).expect("serialisation must not fail");
         let obj = json.as_object().expect("must be a JSON object");
 
-        for field in &[
+        let expected_fields = [
+            "stateless",
+            "persistent_workspaces",
+            "external_plugins",
             "profile",
             "docker",
             "deployments_local",
@@ -292,9 +295,14 @@ mod tests {
             "imports",
             "log_aggregation",
             "vulnerability_scanning",
-        ] {
+        ];
+        for field in &expected_fields {
             assert!(obj.contains_key(*field), "missing field: {field}");
         }
-        assert_eq!(obj.len(), 12, "unexpected extra or missing fields: {obj:?}");
+        assert_eq!(
+            obj.len(),
+            expected_fields.len(),
+            "unexpected extra or missing fields: {obj:?}"
+        );
     }
 }
