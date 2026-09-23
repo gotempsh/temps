@@ -110,6 +110,13 @@ pub enum LogAggregatorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Failed to recover WAL '{path}' at byte offset {offset}: {reason}")]
+    WalRecoveryReadFailed {
+        path: String,
+        offset: u64,
+        reason: String,
+    },
+
     // ── Serialization errors ────────────────────────────────────────────
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

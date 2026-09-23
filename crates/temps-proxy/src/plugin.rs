@@ -176,18 +176,21 @@ impl TempsPlugin for ProxyPlugin {
                     if slot.set(gate) {
                         tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
                     } else {
-                        tracing::warn!(
-                            "proxy: ProjectIpGate slot was already claimed; \
-                             this plugin's gate was NOT installed. \
-                             Check plugin registration order."
+                        tracing::debug!(
+                            "proxy: ProjectIpGate slot already contains the authoritative \
+                             gate constructed by the proxy bootstrap"
                         );
                     }
                 }
+                slot.finish_registration();
             }
             if let Some(slot) = self.request_policy_gate_slot.get() {
                 if let Some(gate) = context.get_service::<dyn temps_core::RequestPolicyGate>() {
                     if !slot.set(gate) {
-                        tracing::warn!("proxy: RequestPolicyGate slot already claimed; provider was not installed");
+                        tracing::debug!(
+                            "proxy: RequestPolicyGate slot already contains the authoritative \
+                             gate constructed by the proxy bootstrap"
+                        );
                     }
                 }
                 slot.finish_registration();

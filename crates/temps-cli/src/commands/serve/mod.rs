@@ -22,12 +22,58 @@ pub use proxy::start_proxy_server;
 const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Bound on how long single-binary proxy startup waits for console plugin
-/// initialization (specifically, for a licensed plugin to claim
-/// `project_ip_gate_slot`) before starting to serve traffic anyway. See the
-/// comment at the call site for why this exists and why it is bounded
-/// rather than an unconditional wait.
+/// Compatibility bound for extra-plugin callers that have not migrated to
+/// independent proxy gate builders. Pending slots deny traffic after this
+/// interval rather than delaying the proxy indefinitely or becoming open.
 const PROJECT_IP_GATE_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+type ResolvedProxyGates = (
+    Option<Arc<dyn temps_core::ProjectIpGate>>,
+    Option<Arc<dyn temps_core::RequestPolicyGate>>,
+);
+
+fn independent_proxy_gate_mode(
+    has_extra_plugins: bool,
+    has_ip_gate_builder: bool,
+    has_request_policy_gate_builder: bool,
+) -> anyhow::Result<bool> {
+    if has_extra_plugins && has_ip_gate_builder != has_request_policy_gate_builder {
+        anyhow::bail!(
+            "Combined serve startup with extra plugins requires both proxy security gate \
+             builders or neither; provide an explicit open builder for an unsupported gate"
+        );
+    }
+    Ok(!has_extra_plugins || (has_ip_gate_builder && has_request_policy_gate_builder))
+}
+
+fn resolve_independent_proxy_gates(
+    db: Arc<temps_database::DbConnection>,
+    runtime: &tokio::runtime::Handle,
+    use_independent_proxy_gates: bool,
+    ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
+    request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
+) -> anyhow::Result<ResolvedProxyGates> {
+    let project_ip_gate = match ip_gate_builder {
+        Some(build) => Some(build(db.clone(), runtime).map_err(|error| {
+            anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+        })?),
+        None if use_independent_proxy_gates => {
+            Some(Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>)
+        }
+        None => None,
+    };
+    let request_policy_gate = match request_policy_gate_builder {
+        Some(build) => Some(build(db, runtime).map_err(|error| {
+            anyhow::anyhow!("Failed to initialize the proxy request policy gate: {error}")
+        })?),
+        None if use_independent_proxy_gates => {
+            Some(Arc::new(temps_core::OpenRequestPolicyGate)
+                as Arc<dyn temps_core::RequestPolicyGate>)
+        }
+        None => None,
+    };
+    Ok((project_ip_gate, request_policy_gate))
+}
 
 fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
     current
@@ -220,7 +266,7 @@ pub struct ServeCommand {
 impl ServeCommand {
     /// Run `temps serve` with the OSS-only plugin set.
     pub fn execute(self) -> anyhow::Result<()> {
-        self.execute_with_extra_plugins(Vec::new())
+        self.execute_with_gates(Vec::new(), None, None)
     }
 
     /// Run `temps serve` with additional plugins registered alongside the
@@ -233,6 +279,32 @@ impl ServeCommand {
         self,
         extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ) -> anyhow::Result<()> {
+        self.execute_with_gates(extra_plugins, None, None)
+    }
+
+    /// Run `temps serve` with proxy security gates constructed independently
+    /// of console plugin initialization.
+    ///
+    /// A bundled binary should pass builders for every gate supplied by its
+    /// extra plugins. The builders run on the proxy's long-lived runtime before
+    /// the console task is spawned, so a slow or failed console cannot delay
+    /// deployed application traffic or leave a protected application open.
+    /// Existing extra-plugin callers that do not yet pass builders retain the
+    /// legacy, fail-closed console handoff until they migrate.
+    pub fn execute_with_gates(
+        self,
+        extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+        ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
+        request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
+    ) -> anyhow::Result<()> {
+        let has_extra_plugins = !extra_plugins.is_empty();
+        let has_ip_gate_builder = ip_gate_builder.is_some();
+        let has_request_policy_gate_builder = request_policy_gate_builder.is_some();
+        let use_independent_proxy_gates = independent_proxy_gate_mode(
+            has_extra_plugins,
+            has_ip_gate_builder,
+            has_request_policy_gate_builder,
+        )?;
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
             warn!(
@@ -894,6 +966,36 @@ impl ServeCommand {
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
 
+        // Resolve proxy enforcement before console startup. These builders are
+        // the same extension boundary used by standalone `temps proxy`; they
+        // may hydrate caches and start refresh loops on this long-lived
+        // runtime. Any hydration failure aborts startup instead of serving a
+        // protected application with an open/default gate.
+        let (independent_project_ip_gate, independent_request_policy_gate) =
+            resolve_independent_proxy_gates(
+                db.clone(),
+                rt.handle(),
+                use_independent_proxy_gates,
+                ip_gate_builder,
+                request_policy_gate_builder,
+            )?;
+        if use_independent_proxy_gates {
+            if has_ip_gate_builder {
+                if let Some(gate) = independent_project_ip_gate.as_ref() {
+                    let _ = project_ip_gate_slot.set(Arc::clone(gate));
+                }
+            } else {
+                project_ip_gate_slot.finish_registration();
+            }
+            if has_request_policy_gate_builder {
+                if let Some(gate) = independent_request_policy_gate.as_ref() {
+                    let _ = request_policy_gate_slot.set(Arc::clone(gate));
+                }
+            } else {
+                request_policy_gate_slot.finish_registration();
+            }
+        }
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -972,72 +1074,41 @@ impl ServeCommand {
             }
         });
 
-        // Wait for the console's plugin two-phase init to finish before the
-        // proxy starts serving traffic — this is deliberately NOT the same
-        // thing as waiting for the console to be fully healthy (routers,
-        // middleware, admin gate, listener bind), which could take much
-        // longer or hang on something unrelated (Docker check, GeoIP
-        // validation, etc.) — exactly the "proxied traffic goes down because
-        // of a console problem" failure mode the comment above exists to
-        // avoid.
-        //
-        // The reason this wait exists at all: `project_ip_gate_slot` (see
-        // the security guardrail comment above) starts as `OpenIpGate`
-        // (allow everything) and is only claimed once plugin two-phase init
-        // completes — `ProxyPlugin::initialize` claims it from whatever
-        // `Arc<dyn ProjectIpGate>` an EE plugin registered, and that runs
-        // inside `initialize_plugins()`, nothing later. `console.rs` fires
-        // `ready_signal` (see its call site, right after "All plugins
-        // initialized successfully") at exactly that point — not at the end
-        // of `start_console_api` like it used to. Before that change
-        // (P1 security finding on PR #725), this wait was tied to the FULL
-        // console being ready, so every IP-restricted project was reachable
-        // by any client for however long the rest of console startup took,
-        // on every single boot. Now the wait resolves as soon as the one
-        // thing it actually depends on is done — deterministically, since
-        // plugin registration+init is in-memory service wiring with no
-        // listener bind, no HTTP router construction, and (bar a
-        // pathological plugin) no long-running I/O. The timeout below is a
-        // backstop against a genuinely hung plugin `initialize()`, not the
-        // expected path.
-        // `tokio::time::timeout(..)` must be constructed *inside* the
-        // runtime context `block_on` establishes, not as a bare argument
-        // evaluated on this plain sync thread before `block_on` starts --
-        // it eagerly builds a `Sleep` that registers with the current
-        // runtime's timer driver via `Handle::current()`, which panics
-        // ("there is no reactor running") if called with no ambient
-        // runtime. Wrapping it in an `async` block defers construction
-        // until `block_on` is already polling it.
-        match rt
-            .block_on(async { tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await })
-        {
-            Ok(Ok(())) => {
-                info!(
-                    "✅ Plugin init complete — any project IP gate a licensed plugin \
+        // Legacy extra-plugin callers without explicit builders still rely on
+        // console plugin discovery to fill the slots. Keep that compatibility
+        // wait bounded. Both slots remain fail-closed if discovery fails or
+        // hangs, so the timeout cannot turn a protected application public.
+        if !use_independent_proxy_gates {
+            match rt.block_on(async {
+                tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await
+            }) {
+                Ok(Ok(())) => {
+                    info!(
+                        "✅ Plugin init complete — any project IP gate a policy plugin \
                      installed is in place before the proxy starts serving"
-                );
-            }
-            Ok(Err(_)) => {
-                tracing::error!(
-                    "❌ Console plugin initialization failed — check error logs above. \
+                    );
+                }
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        "❌ Console plugin initialization failed — check error logs above. \
                      Starting the proxy anyway (proxied traffic to deployed applications \
-                     is not held hostage by a console failure), but note: any \
-                     project-scoped IP restriction will NOT be enforced until the console \
-                     problem is resolved and the process is restarted."
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "⏳ Console plugin initialization did not complete within {:?} — this \
+                     is not held hostage by a console failure). Security policy discovery \
+                     remains pending and therefore fails closed."
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "⏳ Console plugin initialization did not complete within {:?} — this \
                      should not happen in normal operation (it means a plugin's own \
                      initialize() is hung, not merely that console startup is slow). \
-                     Starting the proxy anyway rather than blocking indefinitely. Any \
-                     project-scoped IP restriction will not be enforced until plugin \
-                     initialization finishes; this is a bounded, logged exposure window, \
-                     not the unbounded one this wait exists to close.",
-                    PROJECT_IP_GATE_STARTUP_GRACE
-                );
+                     Starting the proxy anyway rather than blocking indefinitely. Security \
+                     policy discovery remains pending and therefore fails closed.",
+                        PROJECT_IP_GATE_STARTUP_GRACE
+                    );
+                }
             }
+        } else {
+            debug!("Proxy security gates initialized independently of console plugins");
         }
 
         info!("Starting proxy server...");
@@ -1066,6 +1137,7 @@ impl ServeCommand {
 mod serve_profile_tests {
     use super::*;
     use clap::Parser;
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     #[derive(Parser)]
     struct TestCli {
@@ -1079,6 +1151,141 @@ mod serve_profile_tests {
         TestCli::try_parse_from(argv)
             .expect("serve arguments should parse")
             .serve
+    }
+
+    #[test]
+    fn independent_gate_builder_failure_aborts_before_console_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let error = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            Some(Box::new(|_, _| {
+                Err(anyhow::anyhow!("protected policy snapshot unavailable"))
+            })),
+            None,
+        )
+        .err()
+        .expect("a failed gate hydration must abort startup");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("proxy project IP gate"), "{rendered}");
+        assert!(rendered.contains("snapshot unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn extra_plugins_reject_each_partial_gate_builder_combination() {
+        for (has_ip_gate, has_request_gate) in [(true, false), (false, true)] {
+            let error = independent_proxy_gate_mode(true, has_ip_gate, has_request_gate)
+                .expect_err("partial security gate builders must be rejected");
+            assert!(error.to_string().contains("requires both"), "{error}");
+        }
+    }
+
+    #[test]
+    fn request_policy_builder_failure_aborts_before_console_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let error = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            None,
+            Some(Box::new(|_, _| {
+                Err(anyhow::anyhow!("firewall snapshot unavailable"))
+            })),
+        )
+        .err()
+        .expect("a failed request gate hydration must abort startup");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("proxy request policy gate"), "{rendered}");
+        assert!(rendered.contains("snapshot unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn oss_proxy_gates_are_ready_without_console_initialization() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let (ip_gate, request_gate) =
+            resolve_independent_proxy_gates(db, runtime.handle(), true, None, None)
+                .expect("OSS gates should resolve synchronously");
+
+        assert!(ip_gate.expect("OSS IP gate should be present").is_allowed(
+            1,
+            1,
+            "203.0.113.10".parse().expect("valid test IP")
+        ));
+        let context = temps_core::RequestPolicyContext {
+            project_id: 1,
+            environment_id: 1,
+            method: "GET",
+            path: "/",
+            host: "app.example.test",
+            client_ip: None,
+        };
+        assert!(matches!(
+            request_gate
+                .expect("OSS request gate should be present")
+                .evaluate(&context),
+            temps_core::RequestPolicyDecision::Continue
+        ));
+    }
+
+    struct DenyRequests;
+
+    impl temps_core::RequestPolicyGate for DenyRequests {
+        fn evaluate(
+            &self,
+            _context: &temps_core::RequestPolicyContext<'_>,
+        ) -> temps_core::RequestPolicyDecision {
+            temps_core::RequestPolicyDecision::Deny {
+                reason: "test policy",
+                rule_id: Some(7),
+                revision: Some(3),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_request_policy_remains_enforced_without_console_initialization() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let (_, request_gate) = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            None,
+            Some(Box::new(|_, _| Ok(Arc::new(DenyRequests)))),
+        )
+        .expect("custom gate should initialize");
+        let slot = temps_core::RequestPolicyGateSlot::new_default();
+        assert!(slot.set(request_gate.expect("custom request gate should be present")));
+        let context = temps_core::RequestPolicyContext {
+            path: "/private",
+            method: "GET",
+            host: "app.example.test",
+            project_id: 1,
+            environment_id: 1,
+            client_ip: None,
+        };
+
+        assert!(matches!(
+            temps_core::RequestPolicyGate::evaluate(&slot, &context),
+            temps_core::RequestPolicyDecision::Deny {
+                rule_id: Some(7),
+                ..
+            }
+        ));
+        assert!(!slot.supports_worker_ingress());
+    }
+
+    #[test]
+    fn finalized_open_policy_supports_worker_ingress() {
+        let slot = temps_core::RequestPolicyGateSlot::new_default();
+        slot.finish_registration();
+        assert!(slot.supports_worker_ingress());
     }
 
     #[test]

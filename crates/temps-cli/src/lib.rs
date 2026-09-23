@@ -302,7 +302,11 @@ pub fn dispatch_with_request_policy_gate(
 ) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
-        Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
+        Commands::Serve(serve_cmd) => serve_cmd.execute_with_gates(
+            extra_plugins,
+            ip_gate_builder,
+            request_policy_gate_builder,
+        ),
         Commands::Proxy(proxy_cmd) => {
             proxy_cmd.execute_with_gates(ip_gate_builder, request_policy_gate_builder)
         }

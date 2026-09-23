@@ -124,6 +124,9 @@ pub struct ProjectIpGateSlot {
     gate: arc_swap::ArcSwap<std::sync::Arc<dyn ProjectIpGate>>,
     /// Flipped to `true` by the first successful [`Self::set`] call.
     claimed: std::sync::atomic::AtomicBool,
+    /// Remains false until plugin discovery has completed. Pending discovery
+    /// must deny rather than expose a project that may have a configured gate.
+    ready: std::sync::atomic::AtomicBool,
 }
 
 impl ProjectIpGateSlot {
@@ -134,6 +137,7 @@ impl ProjectIpGateSlot {
                 std::sync::Arc::new(OpenIpGate) as std::sync::Arc<dyn ProjectIpGate>
             )),
             claimed: std::sync::atomic::AtomicBool::new(false),
+            ready: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -153,19 +157,32 @@ impl ProjectIpGateSlot {
             .is_ok()
         {
             self.gate.store(std::sync::Arc::new(gate));
+            self.ready.store(true, std::sync::atomic::Ordering::Release);
             true
         } else {
             false
         }
     }
+
+    /// Complete plugin discovery, making the open default authoritative when
+    /// no provider registered a gate.
+    pub fn finish_registration(&self) {
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ProjectIpGate for ProjectIpGateSlot {
     fn is_allowed(&self, project_id: i32, environment_id: i32, ip: IpAddr) -> bool {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         self.gate.load().is_allowed(project_id, environment_id, ip)
     }
 
     fn has_active_policy(&self, project_id: i32, environment_id: i32) -> bool {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
         self.gate
             .load()
             .has_active_policy(project_id, environment_id)
@@ -177,6 +194,9 @@ impl ProjectIpGate for ProjectIpGateSlot {
         environment_id: i32,
         ip: Option<IpAddr>,
     ) -> bool {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
         self.gate
             .load()
             .is_explicitly_denied(project_id, environment_id, ip)
@@ -196,8 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn slot_defaults_to_open() {
+    fn slot_is_fail_closed_until_registration_finishes() {
         let slot = ProjectIpGateSlot::new_default();
+        assert!(!slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        assert!(slot.has_active_policy(1, 1));
+        assert!(slot.is_explicitly_denied(1, 1, None));
+        slot.finish_registration();
         assert!(slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
     }
 
@@ -235,6 +259,7 @@ mod tests {
     #[test]
     fn slot_delegates_has_active_policy_to_the_installed_gate() {
         let slot = ProjectIpGateSlot::new_default();
+        slot.finish_registration();
         assert!(!slot.has_active_policy(1, 1));
         assert!(slot.set(std::sync::Arc::new(DenyAll)));
         assert!(slot.has_active_policy(1, 1));
