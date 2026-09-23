@@ -58,8 +58,14 @@ const EXTRA_COLUMNS = ['deployment', 'node', 'environment']
 
 // Keep the default panel visibility aligned with the two-column layout.
 const desktopQuery = '(min-width: 1280px)'
+const mobileQuery = '(max-width: 1023px)'
 function subscribeDesktop(onChange: () => void) {
   const query = window.matchMedia(desktopQuery)
+  query.addEventListener('change', onChange)
+  return () => query.removeEventListener('change', onChange)
+}
+function subscribeMobile(onChange: () => void) {
+  const query = window.matchMedia(mobileQuery)
   query.addEventListener('change', onChange)
   return () => query.removeEventListener('change', onChange)
 }
@@ -68,6 +74,11 @@ const desktopSnapshot = () =>
     ? window.matchMedia(desktopQuery).matches
     : true
 const serverDesktopSnapshot = () => true
+const mobileSnapshot = () =>
+  typeof window.matchMedia === 'function'
+    ? window.matchMedia(mobileQuery).matches
+    : false
+const serverMobileSnapshot = () => false
 /** Row height guess for the virtualizer; real heights are measured on mount. */
 const ROW_ESTIMATE = 29
 
@@ -151,12 +162,19 @@ export function LogExplorer({
   const inspector = useRef<HTMLHeadingElement>(null)
   const opener = useRef<HTMLButtonElement | null>(null)
   const [selected, setSelected] = useState<string>()
-  const wrap = params.get('wrap') === '1'
   const isDesktop = useSyncExternalStore(
     subscribeDesktop,
     desktopSnapshot,
     serverDesktopSnapshot
   )
+  const isMobile = useSyncExternalStore(
+    subscribeMobile,
+    mobileSnapshot,
+    serverMobileSnapshot
+  )
+  const wrapPreference = params.get('wrap')
+  const wrap =
+    wrapPreference === '1' || (wrapPreference !== '0' && isMobile)
   const facetPreference = params.get('facets')
   const showFacets =
     facetPreference === '1' || (facetPreference !== '0' && isDesktop)
@@ -468,14 +486,14 @@ export function LogExplorer({
                 // can own it; neutralize the overflow the Table primitive adds.
                 className="max-h-[62vh] overflow-auto rounded-md border [&>div]:overflow-visible"
               >
-                <Table className="table-fixed">
-                  <TableHeader className="sticky top-0 z-10 bg-muted [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
+                <Table className="block w-full lg:table lg:table-fixed">
+                  <TableHeader className="hidden bg-muted lg:sticky lg:top-0 lg:z-10 lg:table-header-group [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
                     <TableRow>
-                      <TableHead className="hidden w-24 md:table-cell">
+                      <TableHead className="hidden w-24 lg:table-cell">
                         Time
                       </TableHead>
                       <TableHead className="w-16">Level</TableHead>
-                      <TableHead className="hidden w-32 md:table-cell">
+                      <TableHead className="hidden w-32 lg:table-cell">
                         Project / service
                       </TableHead>
                       <TableHead>Message</TableHead>
@@ -489,10 +507,11 @@ export function LogExplorer({
                       ))}
                     </TableRow>
                   </TableHeader>
-                  <TableBody>
+                  <TableBody className="block lg:table-row-group">
                     {paddingTop > 0 && (
-                      <tr aria-hidden="true">
+                      <tr aria-hidden="true" className="block lg:table-row">
                         <td
+                          className="block lg:table-cell"
                           colSpan={4 + visibleColumns.length}
                           style={{ height: paddingTop, padding: 0 }}
                         />
@@ -505,12 +524,13 @@ export function LogExplorer({
                       return (
                         <TableRow
                           key={key}
+                          className="block px-3 py-2 lg:table-row lg:px-0 lg:py-0"
                           data-index={virtualRow.index}
                           ref={virtualizer.measureElement}
                           data-state={selected === key ? 'selected' : undefined}
                         >
                           <TableCell
-                            className="hidden py-1.5 font-mono text-[11px] tabular-nums md:table-cell"
+                            className="hidden py-1.5 font-mono text-[11px] tabular-nums lg:table-cell"
                             title={new Date(entry.timestamp).toLocaleString()}
                           >
                             {new Date(entry.timestamp).toLocaleTimeString(
@@ -518,10 +538,14 @@ export function LogExplorer({
                               { hour12: false, timeZone: 'UTC' }
                             )}
                           </TableCell>
-                          <TableCell className="py-1.5 font-mono text-[11px]">
+                          <TableCell className="flex min-w-0 items-center gap-2 p-0 font-mono text-xs lg:table-cell lg:px-4 lg:py-1.5 lg:text-[11px]">
                             <LogLevelBadge level={entry.level} />
+                            <span className="min-w-0 truncate text-muted-foreground lg:hidden">
+                              {entry.owner} ·{' '}
+                              {new Date(entry.timestamp).toLocaleTimeString()}
+                            </span>
                           </TableCell>
-                          <TableCell className="hidden py-1.5 md:table-cell">
+                          <TableCell className="hidden py-1.5 lg:table-cell">
                             <p
                               className="truncate text-xs"
                               title={`${entry.owner} / ${entry.service}`}
@@ -529,11 +553,7 @@ export function LogExplorer({
                               {entry.owner} / {entry.service}
                             </p>
                           </TableCell>
-                          <TableCell className="py-0.5">
-                            <p className="truncate text-xs text-muted-foreground md:hidden">
-                              {entry.owner} ·{' '}
-                              {new Date(entry.timestamp).toLocaleTimeString()}
-                            </p>
+                          <TableCell className="block min-w-0 p-0 lg:table-cell lg:px-4 lg:py-0.5">
                             <button
                               type="button"
                               aria-label={`Inspect log: ${entry.message}`}
@@ -544,9 +564,9 @@ export function LogExplorer({
                                 setSelected(key)
                               }}
                               className={cn(
-                                'block w-full rounded py-1 text-left font-mono text-[11px] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring',
+                                'block w-full rounded py-1 text-left font-mono text-base leading-6 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring lg:text-[11px] lg:leading-normal',
                                 wrap
-                                  ? 'whitespace-pre-wrap break-all'
+                                  ? 'whitespace-pre-wrap break-words'
                                   : 'truncate'
                               )}
                             >
@@ -572,8 +592,9 @@ export function LogExplorer({
                       )
                     })}
                     {paddingBottom > 0 && (
-                      <tr aria-hidden="true">
+                      <tr aria-hidden="true" className="block lg:table-row">
                         <td
+                          className="block lg:table-cell"
                           colSpan={4 + visibleColumns.length}
                           style={{ height: paddingBottom, padding: 0 }}
                         />

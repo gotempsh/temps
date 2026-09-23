@@ -48,6 +48,7 @@ import {
 } from 'lucide-react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { FilterBar } from './filter-bar'
+import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 
 // History-viewer-style row primitives. Duplicated locally (rather than
 // imported from useLogStream / history-log-viewer) because this viewer holds
@@ -64,7 +65,6 @@ const LEVEL_OPTIONS: LiveLogLevel[] = [
   'DEBUG',
   'TRACE',
 ]
-
 
 // Leading ISO timestamp the server prepends when ?timestamps=true is on.
 // Docker emits RFC 3339 with nano precision (`2025-05-30T10:40:00.123456789Z`).
@@ -189,33 +189,28 @@ const LiveLogRow = memo(function LiveLogRow({
   }, [parsed.message, searchTerm])
 
   return (
-    <div
-      className={cn(
-        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs select-text hover:bg-muted/50',
-        isHighlighted && 'bg-accent'
-      )}
-    >
-      {columns.timestamp && (
-        <span className="text-muted-foreground shrink-0 tabular-nums w-[85px]">
-          {formatTimestamp(parsed.timestamp)}
-        </span>
-      )}
-      {columns.level && (
-        <LogLevelBadge level={parsed.level} />
-      )}
-      {columns.service && serviceLabel && (
-        <span
-          className="text-muted-foreground shrink-0 w-[120px] truncate"
-          title={serviceLabel}
-        >
-          {serviceLabel}
-        </span>
-      )}
-      <span
-        className="whitespace-pre-wrap break-all min-w-0 flex-1"
-        dangerouslySetInnerHTML={{ __html: messageHtml }}
-      />
-    </div>
+    <RuntimeLogRowLayout
+      className={cn('select-text', isHighlighted && 'bg-accent')}
+      metadata={
+        <>
+          {columns.timestamp && (
+            <span className="text-muted-foreground shrink-0 tabular-nums sm:w-[85px]">
+              {formatTimestamp(parsed.timestamp)}
+            </span>
+          )}
+          {columns.level && <LogLevelBadge level={parsed.level} />}
+          {columns.service && serviceLabel && (
+            <span
+              className="text-muted-foreground min-w-0 max-w-full truncate sm:w-[120px] sm:shrink-0"
+              title={serviceLabel}
+            >
+              {serviceLabel}
+            </span>
+          )}
+        </>
+      }
+      messageHtml={messageHtml}
+    />
   )
 })
 
@@ -1666,8 +1661,14 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               the filteredLogs memo above. Layout intentionally lives between
               the source-picker row and the mode-segmented control so it's
               always visible regardless of Advanced Options state. */}
-          <div className="flex gap-1.5 flex-wrap items-center" role="group" aria-label="Log levels">
-            <span className="text-xs font-medium text-muted-foreground mr-0.5">Levels</span>
+          <div
+            className="flex gap-1.5 flex-wrap items-center"
+            role="group"
+            aria-label="Log levels"
+          >
+            <span className="text-xs font-medium text-muted-foreground mr-0.5">
+              Levels
+            </span>
             {LEVEL_OPTIONS.map((level) => (
               <button
                 type="button"
