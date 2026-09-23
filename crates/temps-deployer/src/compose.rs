@@ -576,6 +576,67 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
     sanitized
 }
 
+/// Compose can echo values from repository and included env files in stderr.
+/// Classify its diagnostic instead of copying untrusted text into a deployment
+/// error, where readers may not have permission to view those values.
+fn safe_compose_config_failure(stderr: &[u8]) -> String {
+    let diagnostic = String::from_utf8_lossy(stderr);
+    let lower = diagnostic.to_ascii_lowercase();
+    let cause = if lower.contains("required variable") && lower.contains("missing a value") {
+        let variable =
+            Regex::new(r"(?i)\brequired variable ([a-z_][a-z0-9_]{0,63}) is missing a value")
+                .ok()
+                .and_then(|pattern| pattern.captures(&diagnostic))
+                .and_then(|captures| captures.get(1).map(|name| name.as_str().to_string()));
+        match variable {
+            Some(variable) => format!("Required Compose variable {variable} has no value. Set it in the project environment or .env file."),
+            None => "A required Compose variable has no value. Set it in the project environment or .env file.".to_string(),
+        }
+    } else if lower.contains("cannot extend service") && lower.contains("not found") {
+        "An extends reference names a service missing from its referenced Compose file. Check the extends.file and extends.service settings.".to_string()
+    } else if (lower.contains("env_file") || lower.contains("env file"))
+        && (lower.contains("not found") || lower.contains("no such file"))
+    {
+        "A required env_file is missing. Check its path relative to the Compose project directory."
+            .to_string()
+    } else if lower.contains("no such file") || lower.contains("file not found") {
+        "A referenced file is missing. Check Compose file, include, and extends paths.".to_string()
+    } else if lower.contains("validating ")
+        || lower.contains("additional properties are not allowed")
+        || lower.contains("must be a ")
+    {
+        let field = Regex::new(r"(?i)\bservices\.([a-z0-9_-]{1,64})\.([a-z_]+) must be a[n]? (array|object|boolean|string|integer|number)\b")
+            .ok()
+            .and_then(|pattern| pattern.captures(&diagnostic))
+            .and_then(|captures| {
+                let service = captures.get(1)?.as_str();
+                let field = captures.get(2)?.as_str();
+                let expected = captures.get(3)?.as_str();
+                matches!(field, "ports" | "environment" | "env_file" | "volumes" | "networks" | "depends_on" | "healthcheck" | "build" | "image" | "secrets" | "configs" | "labels" | "command" | "entrypoint")
+                    .then(|| format!("services.{service}.{field} expects a value of type {expected}."))
+            });
+        field.unwrap_or_else(|| "The Compose model has an invalid field or value type. Check the source file and project override.".to_string())
+    } else if lower.contains("yaml:")
+        || lower.contains("did not find expected key")
+        || lower.contains("mapping values are not allowed")
+    {
+        "A Compose file contains invalid YAML. Check its syntax and indentation.".to_string()
+    } else {
+        "Compose rejected the source files or project override.".to_string()
+    };
+
+    // Only numeric locations are copied from stderr. File names, field values,
+    // and quoted YAML can contain secrets from sources outside Temps' redaction set.
+    let line = Regex::new(r"(?i)\bline\s+([1-9][0-9]{0,5})\b")
+        .ok()
+        .and_then(|pattern| pattern.captures(&diagnostic))
+        .and_then(|captures| captures.get(1).map(|line| line.as_str().to_string()));
+    match line {
+        Some(line) => format!("{cause} Compose reported line {line}."),
+        None => cause.to_string(),
+    }
+}
+
 /// Request to deploy a Docker Compose stack.
 #[derive(Debug, Clone)]
 pub struct ComposeDeployRequest {
@@ -2761,9 +2822,14 @@ impl ComposeExecutor {
         )
         .await?;
         if !output.status.success() {
-            // Compose may echo values from repository/include env files in diagnostics.
-            // Those are not necessarily in the platform environment redaction set.
-            return Err(ComposeError::CommandFailed { project: project_name.to_string(), reason: format!("Compose configuration resolution failed ({}). Validate the source files with docker compose config; diagnostic output is omitted because it may contain environment-file secrets.", output.status) });
+            let cause = safe_compose_config_failure(&output.stderr);
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "Compose configuration resolution failed ({}). {cause} Run docker compose config against the same source files, override, and environment for the full diagnostic.",
+                    output.status
+                ),
+            });
         }
         let resolved =
             String::from_utf8(output.stdout).map_err(|error| ComposeError::InvalidComposeYaml {
@@ -12497,6 +12563,75 @@ services:
 
         assert!(sanitized.len() < diagnostic.len());
         assert!(sanitized.contains("diagnostic truncated"));
+    }
+
+    #[test]
+    fn compose_config_failures_keep_actionable_cause_without_echoing_secrets() {
+        let cases = [
+            (
+                "validating /checkout/secret.env: services.web.ports must be a array; token=repo-only-secret",
+                "services.web.ports expects a value of type array",
+            ),
+            (
+                "cannot extend service \"web\": service \"repo-only-secret\" not found in private.yaml",
+                "extends reference names a service missing",
+            ),
+            (
+                "error while interpolating services.web.image: required variable TOKEN is missing a value: repo-only-secret",
+                "Required Compose variable TOKEN has no value",
+            ),
+            (
+                "yaml: line 12: mapping values are not allowed here: repo-only-secret",
+                "invalid YAML",
+            ),
+            (
+                "failed to load env_file /checkout/repo-only-secret.env: no such file or directory",
+                "required env_file is missing",
+            ),
+            (
+                "unexpected Compose error: repo-only-secret",
+                "Compose rejected the source files",
+            ),
+        ];
+        for (diagnostic, expected) in cases {
+            let safe = safe_compose_config_failure(diagnostic.as_bytes());
+            assert!(safe.contains(expected), "{safe}");
+            assert!(!safe.contains("repo-only-secret"), "{safe}");
+            assert!(!safe.contains("/checkout/"), "{safe}");
+        }
+        assert!(safe_compose_config_failure(b"yaml: line 12: bad secret")
+            .contains("Compose reported line 12"));
+    }
+
+    #[tokio::test]
+    async fn compose_config_failure_reports_safe_validation_cause() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let error = executor
+            .resolve_security_configuration(
+                "temps-config-diagnostic-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {web: {image: nginx, ports: not-a-list}}",
+                Some("services: {web: {environment: {TOKEN: repo-only-secret}}}"),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("services.web.ports expects a value of type array"),
+            "{error}"
+        );
+        assert!(error.contains("docker compose config"), "{error}");
+        assert!(!error.contains("repo-only-secret"), "{error}");
     }
 
     #[test]
