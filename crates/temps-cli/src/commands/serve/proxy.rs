@@ -146,7 +146,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
                         snapshot_dir,
                         overlay_dns_slot,
                     );
-                    break;
+                    return;
                 }
                 Ok(Err(error)) => warn!(error = %error, attempt, "Proxy cluster DNS Docker discovery failed; retrying"),
                 Err(_) => warn!(attempt, "Proxy cluster DNS Docker discovery timed out; retrying"),
