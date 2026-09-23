@@ -50,6 +50,19 @@ pub trait RequestPolicyGate: Send + Sync {
     /// Implementations must apply any normalization or ambiguity rejection
     /// required by their own path policy before returning `Allow`.
     fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision;
+
+    /// Attest that this provider requires no additional request-policy
+    /// enforcement on worker public ingress.
+    ///
+    /// Providers run in-process and are trusted, but must opt in explicitly:
+    /// worker snapshots do not carry provider-specific policy. The fail-closed
+    /// default keeps arbitrary providers on control-plane ingress until the
+    /// snapshot protocol can carry and enforce their policy. The slot caches
+    /// this value at registration, so the attestation must remain valid for
+    /// the provider's entire lifetime.
+    fn supports_worker_ingress(&self) -> bool {
+        false
+    }
 }
 
 /// OSS default: no request policy is configured.
@@ -59,38 +72,54 @@ impl RequestPolicyGate for OpenRequestPolicyGate {
     fn evaluate(&self, _context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
         RequestPolicyDecision::Continue
     }
+
+    fn supports_worker_ingress(&self) -> bool {
+        true
+    }
 }
+
+const REGISTRATION_PENDING: u8 = 0;
+const REGISTRATION_PUBLISHING: u8 = 1;
+const REGISTRATION_READY_OPEN: u8 = 2;
+const REGISTRATION_READY_WORKER: u8 = 3;
+const REGISTRATION_READY_CONTROL_PLANE: u8 = 4;
 
 /// Write-once handoff from plugin registration to the live proxy.
 pub struct RequestPolicyGateSlot {
     gate: arc_swap::ArcSwap<Arc<dyn RequestPolicyGate>>,
-    claimed: std::sync::atomic::AtomicBool,
-    ready: std::sync::atomic::AtomicBool,
+    registration: std::sync::atomic::AtomicU8,
 }
 
 impl RequestPolicyGateSlot {
     pub fn new_default() -> Self {
         Self {
             gate: arc_swap::ArcSwap::new(Arc::new(Arc::new(OpenRequestPolicyGate))),
-            claimed: std::sync::atomic::AtomicBool::new(false),
-            ready: std::sync::atomic::AtomicBool::new(false),
+            registration: std::sync::atomic::AtomicU8::new(REGISTRATION_PENDING),
         }
     }
 
-    /// Returns false if another provider already claimed the slot.
+    /// Returns false if registration already completed or another provider
+    /// claimed the slot. The gate and its worker capability are published
+    /// together before readers can observe a ready state.
     pub fn set(&self, gate: Arc<dyn RequestPolicyGate>) -> bool {
         if self
-            .claimed
+            .registration
             .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
+                REGISTRATION_PENDING,
+                REGISTRATION_PUBLISHING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
         {
+            let ready_state = if gate.supports_worker_ingress() {
+                REGISTRATION_READY_WORKER
+            } else {
+                REGISTRATION_READY_CONTROL_PLANE
+            };
             self.gate.store(Arc::new(gate));
-            self.ready.store(true, std::sync::atomic::Ordering::Release);
+            self.registration
+                .store(ready_state, std::sync::atomic::Ordering::Release);
             true
         } else {
             false
@@ -98,20 +127,28 @@ impl RequestPolicyGateSlot {
     }
 
     /// Complete plugin discovery. If no provider claimed the slot, the open
-    /// default may now safely delegate to the legacy project IP gate.
+    /// default may now safely delegate to the legacy project IP gate. A claim
+    /// already being published remains unavailable until publication finishes.
     pub fn finish_registration(&self) {
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.registration.compare_exchange(
+            REGISTRATION_PENDING,
+            REGISTRATION_READY_OPEN,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+        );
     }
 
     /// Whether worker ingress can preserve the configured request policy.
     ///
-    /// Worker snapshots currently support only the built-in open policy. A
-    /// claimed provider may make path- or method-dependent decisions that
-    /// cannot safely be reconstructed on another node, so route export must
-    /// fail closed whenever one is registered (or discovery is incomplete).
+    /// The built-in open policy supports worker snapshots. Other providers
+    /// fail closed unless they explicitly attest that they require no
+    /// additional worker-side enforcement. Discovery and provider publication
+    /// also fail closed.
     pub fn supports_worker_ingress(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Acquire)
-            && !self.claimed.load(std::sync::atomic::Ordering::Acquire)
+        matches!(
+            self.registration.load(std::sync::atomic::Ordering::Acquire),
+            REGISTRATION_READY_OPEN | REGISTRATION_READY_WORKER
+        )
     }
 }
 
@@ -123,7 +160,10 @@ impl Default for RequestPolicyGateSlot {
 
 impl RequestPolicyGate for RequestPolicyGateSlot {
     fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
-        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+        if !matches!(
+            self.registration.load(std::sync::atomic::Ordering::Acquire),
+            REGISTRATION_READY_OPEN | REGISTRATION_READY_WORKER | REGISTRATION_READY_CONTROL_PLANE
+        ) {
             return RequestPolicyDecision::Unavailable {
                 reason: "request policy registration pending",
             };
@@ -237,5 +277,71 @@ mod tests {
         let slot = RequestPolicyGateSlot::new_default();
         assert!(slot.set(Arc::new(DenyAll)));
         assert!(!slot.supports_worker_ingress());
+    }
+
+    #[test]
+    fn explicitly_registered_open_provider_supports_worker_ingress_export() {
+        let slot = RequestPolicyGateSlot::new_default();
+        assert!(slot.set(Arc::new(OpenRequestPolicyGate)));
+        assert!(slot.supports_worker_ingress());
+    }
+
+    #[test]
+    fn registration_race_never_exposes_default_gate_after_custom_provider_claims_slot() {
+        struct BlockingCapability {
+            publication_barrier: Arc<std::sync::Barrier>,
+        }
+
+        impl RequestPolicyGate for BlockingCapability {
+            fn evaluate(&self, _context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
+                RequestPolicyDecision::Deny {
+                    reason: "test",
+                    rule_id: None,
+                    revision: None,
+                }
+            }
+
+            fn supports_worker_ingress(&self) -> bool {
+                self.publication_barrier.wait();
+                self.publication_barrier.wait();
+                false
+            }
+        }
+
+        let slot = Arc::new(RequestPolicyGateSlot::new_default());
+        let publication_barrier = Arc::new(std::sync::Barrier::new(2));
+        let setter_slot = Arc::clone(&slot);
+        let setter_barrier = Arc::clone(&publication_barrier);
+        let setter = std::thread::spawn(move || {
+            setter_slot.set(Arc::new(BlockingCapability {
+                publication_barrier: setter_barrier,
+            }))
+        });
+
+        publication_barrier.wait();
+        slot.finish_registration();
+        let context = RequestPolicyContext {
+            path: "/private",
+            method: "GET",
+            host: "app.example.test",
+            project_id: 1,
+            environment_id: 2,
+            client_ip: None,
+        };
+        assert_eq!(
+            slot.evaluate(&context),
+            RequestPolicyDecision::Unavailable {
+                reason: "request policy registration pending"
+            }
+        );
+        assert!(!slot.supports_worker_ingress());
+
+        publication_barrier.wait();
+        assert!(setter.join().expect("setter thread should complete"));
+        assert!(!slot.supports_worker_ingress());
+        assert!(matches!(
+            slot.evaluate(&context),
+            RequestPolicyDecision::Deny { .. }
+        ));
     }
 }
