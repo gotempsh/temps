@@ -2073,7 +2073,11 @@ impl CachedPeerTable {
         // cover an unbounded number of subdomains, while its certificate is
         // provisioned separately through DNS-01 and found by the TLS loader.
         let mut legacy_wildcards_matcher = WildcardMatcher::new();
-        for (host, route) in routes.iter().filter(|(host, _)| host.starts_with("*.")) {
+        for (host, route) in routes.iter().filter(|(host, _)| {
+            host.starts_with("*.")
+                && !http_wildcards_matcher.contains_pattern(host)
+                && !tls_wildcards_matcher.contains_pattern(host)
+        }) {
             let mut wildcard_route = route.clone();
             wildcard_route.cert_eligible = false;
             legacy_wildcards_matcher.insert(host, wildcard_route);

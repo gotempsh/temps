@@ -116,6 +116,14 @@ impl WildcardMatcher {
         self.patterns.remove(&reversed_key)
     }
 
+    /// Return whether this exact wildcard pattern is present.
+    pub fn contains_pattern(&self, pattern: &str) -> bool {
+        let Some(base_domain) = pattern.strip_prefix("*.") else {
+            return false;
+        };
+        self.patterns.contains_key(&reverse_domain(base_domain))
+    }
+
     /// Check if the matcher is empty
     pub fn is_empty(&self) -> bool {
         self.patterns.is_empty()
@@ -217,6 +225,7 @@ mod tests {
 
         matcher.insert("*.example.com", route);
         assert_eq!(matcher.len(), 1);
+        assert!(matcher.contains_pattern("*.example.com"));
 
         // Remove the pattern
         let removed = matcher.remove("*.example.com");
