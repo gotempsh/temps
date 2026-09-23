@@ -1,35 +1,37 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-FROM alpine:3.22
-
-# `apk add` only installs the packages listed below -- it does not touch
-# packages already present in the base image (busybox, musl, ssl_client),
-# so those stay at whatever patch level was current the day this tag was
-# pulled. Upgrading them explicitly here means a base image security patch
-# (e.g. a musl or busybox CVE fix) lands on the next build, not only on the
-# next manual Alpine version bump.
-RUN apk update && apk upgrade --no-cache
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 # Install runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
-    libgcc \
-    libstdc++
+    wget \
+    zlib1g \
+    libgcc-s1 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN addgroup -g 1000 temps && \
-    adduser -D -u 1000 -G temps temps
+RUN groupadd --gid 1000 temps && \
+    useradd --uid 1000 --gid temps --create-home --shell /usr/sbin/nologin temps
 
 # Copy pre-built binary
 COPY artifacts/temps /usr/local/bin/temps
 
-# Set permissions
-RUN chmod +x /usr/local/bin/temps
+# Fail the image build if the injected release artifact cannot execute in the
+# selected libc/runtime environment.
+RUN chmod +x /usr/local/bin/temps && /usr/local/bin/temps --version
+
+# The city database is tracked in the repository and required by the proxy.
+# Keep it outside /app/data so a persistent data volume cannot mask it.
+COPY crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
 
 # Create data directory
-RUN mkdir -p /app/data && chown -R temps:temps /app
+RUN mkdir -p /app/data && \
+    chown -R temps:temps /app && \
+    chmod 644 /usr/share/temps/GeoLite2-City.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
 
 # Switch to non-root user
 USER temps
