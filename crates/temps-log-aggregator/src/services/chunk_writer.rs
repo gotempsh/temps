@@ -67,6 +67,8 @@ use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use temps_core::retry::RetryConfig;
+
 use crate::chunk::cache::{CacheTier, ChunkCache};
 use crate::chunk::format::{ChunkEncoder, ChunkIdentity};
 use crate::chunk::wal::{WalDir, WalGeneration};
@@ -74,7 +76,7 @@ use crate::chunk::{
     level_bit, ChunkLabels, DEFAULT_HEAD_MAX_BYTES, FLUSH_AGE_SECS, MAX_FLUSH_AGE_SECS,
     MIN_FLUSH_BYTES,
 };
-use crate::error::LogAggregatorError;
+use crate::error::{LogAggregatorError, RetryClass};
 use crate::index::{IndexOutcome, LineIndexSink, NoLineIndex};
 use crate::storage::traits::build_storage_key_v2;
 use crate::storage::LogStorage;
@@ -554,6 +556,10 @@ impl ChunkWriterService {
         let writer = self.clone();
         tokio::spawn(async move {
             let started = Instant::now();
+            let retry = RetryConfig::default()
+                .with_base_delay(Duration::from_secs(30))
+                .with_max_delay(Duration::from_secs(600));
+            let mut retry_attempt = 0u32;
             tracing::info!("Background log WAL recovery started; console startup continues");
             loop {
                 let result = async {
@@ -574,15 +580,35 @@ impl ChunkWriterService {
                         break;
                     }
                     Err(error) => {
-                        // Damaged/deferred generations need operator repair.
-                        // Avoid re-encoding their valid prefix every 30 seconds.
-                        let retry_seconds = match &error {
-                            LogAggregatorError::WalRecoveryIncomplete { .. } => 600,
-                            _ => 30,
-                        };
-                        tracing::error!(%error, retry_seconds,
-                            "Background log WAL recovery failed; WAL retained, log collection paused; retrying");
-                        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
+                        match error.retry_class() {
+                            RetryClass::Transient => {
+                                // RetryConfig performs `1 << attempt`; clamp
+                                // before calling it so a service left down for
+                                // months cannot overflow the shift.
+                                let delay = retry.compute_delay(retry_attempt.min(31));
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                tracing::error!(
+                                    %error,
+                                    retry_seconds = delay.as_secs(),
+                                    "Background log WAL recovery hit a transient failure; WAL retained, log collection paused; retrying"
+                                );
+                                tokio::time::sleep(delay).await;
+                            }
+                            RetryClass::RepairRequired => {
+                                tracing::error!(
+                                    %error,
+                                    "Background log WAL recovery requires operator repair; WAL retained and log collection remains paused; restart after repairing the WAL"
+                                );
+                                break;
+                            }
+                            RetryClass::Permanent => {
+                                tracing::error!(
+                                    %error,
+                                    "Background log WAL recovery cannot continue with the current data or configuration; WAL retained and log collection remains paused; correct the reported error and restart"
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1129,8 +1155,10 @@ impl ChunkWriterService {
             Some(&content_hash),
         );
 
-        let write_result =
-            retry_with_backoff(|| self.storage.write_chunk(&storage_key, &encoded.bytes)).await;
+        let write_result = retry_log_operation_with_backoff(|| {
+            self.storage.write_chunk(&storage_key, &encoded.bytes)
+        })
+        .await;
         let compressed_size = match write_result {
             Ok(size) => size,
             Err(e) => {
@@ -1151,7 +1179,7 @@ impl ChunkWriterService {
 
         let meta = build_chunk_meta(&encoded, &storage_key, compressed_size);
         let manifests = &self.manifests;
-        let seq = match retry_with_backoff(|| manifests.insert(&meta)).await {
+        let seq = match retry_log_operation_with_backoff(|| manifests.insert(&meta)).await {
             Ok(seq) => seq,
             Err(e) => {
                 error!(
@@ -1174,7 +1202,11 @@ impl ChunkWriterService {
         // index failure never blocks sealing — the manifest simply stays
         // unmarked and the reindexer retries it from the chunk later.
         let line_index = &self.line_index;
-        match retry_with_backoff(|| line_index.index_chunk(seq, labels, &sealing_segments)).await {
+        match retry_log_operation_with_backoff(|| {
+            line_index.index_chunk(seq, labels, &sealing_segments)
+        })
+        .await
+        {
             Ok(IndexOutcome::Indexed) => {
                 if let Err(e) = manifests.mark_indexed(seq).await {
                     warn!(seq, error = %e, "could not mark chunk as indexed; reindexer will redo it");
@@ -1317,6 +1349,26 @@ where
             Err(e) => {
                 if attempt >= RETRY_DELAYS.len() {
                     return Err(e);
+                }
+                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+async fn retry_log_operation_with_backoff<T, F, Fut>(mut f: F) -> Result<T, LogAggregatorError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LogAggregatorError>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if error.retry_class() != RetryClass::Transient || attempt >= RETRY_DELAYS.len() {
+                    return Err(error);
                 }
                 tokio::time::sleep(RETRY_DELAYS[attempt]).await;
                 attempt += 1;
@@ -1474,18 +1526,37 @@ mod tests {
     #[derive(Default)]
     struct RetryRecoverySink {
         fail: AtomicBool,
+        attempts: AtomicU64,
         rows: VecSink,
     }
 
     #[async_trait]
     impl ManifestSink for RetryRecoverySink {
         async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
             if self.fail.load(Ordering::Relaxed) {
-                return Err(LogAggregatorError::Validation {
-                    message: "injected manifest outage".into(),
-                });
+                return Err(LogAggregatorError::Database(
+                    sea_orm::DbErr::ConnectionAcquire(
+                        sea_orm::error::ConnAcquireErr::ConnectionClosed,
+                    ),
+                ));
             }
             self.rows.insert(meta).await
+        }
+    }
+
+    #[derive(Default)]
+    struct PermanentRecoverySink {
+        attempts: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ManifestSink for PermanentRecoverySink {
+        async fn insert(&self, _meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            Err(LogAggregatorError::Validation {
+                message: "injected invalid recovered manifest".into(),
+            })
         }
     }
 
@@ -1524,6 +1595,50 @@ mod tests {
             .unwrap();
         assert_eq!(sink.rows.all().await.len(), 1);
         assert!(!has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_recovery_stops_after_one_permanent_failure_and_retains_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let sink = Arc::new(PermanentRecoverySink::default());
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+
+        writer.start_background_recovery();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sink.attempts.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("permanent recovery failure should be observed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&writer) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("terminal recovery task should exit and release its writer clone");
+        // Cross both the former 30-second general retry and the former
+        // 600-second damaged-WAL retry. This catches regressions in either
+        // the inner persistence retry or the outer recovery-pass loop.
+        tokio::time::advance(Duration::from_secs(601)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(sink.attempts.load(Ordering::Relaxed), 1);
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
     }
 
     #[tokio::test]
