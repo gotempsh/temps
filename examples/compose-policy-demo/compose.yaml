@@ -5,4 +5,4 @@ services:
   web:
     image: traefik/whoami:latest
     ports:
-      - "80"
+      - "127.0.0.1::80"
