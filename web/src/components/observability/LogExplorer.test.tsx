@@ -61,9 +61,13 @@ for (const mode of ['list', 'patterns', 'service']) {
             />
           </MemoryRouter>
         )
-        expect(html.includes('whitespace-pre-wrap break-all')).toBe(
-          wrap === '1'
-        )
+        expect(
+          html.includes(
+            mode === 'list'
+              ? 'whitespace-pre-wrap break-words'
+              : 'whitespace-pre-wrap break-all'
+          )
+        ).toBe(wrap === '1')
       }
     } finally {
       if (previousWindow)
@@ -72,6 +76,46 @@ for (const mode of ['list', 'patterns', 'service']) {
     }
   })
 }
+
+test('the log list stacks metadata above a full-width message on narrow screens', () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { location: { href: 'http://localhost/logs' } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <MemoryRouter initialEntries={['/logs?wrap=1']}>
+        <LogExplorer
+          lines={[
+            {
+              container_id: 'sample',
+              line_id: '1',
+              stream: 'stdout',
+              timestamp: '2026-09-18T12:00:00Z',
+              level: 'INFO',
+              owner: 'sample',
+              service: 'web',
+              env: 'production',
+              message: 'relay connection started',
+            },
+          ]}
+          onFilter={() => {}}
+        />
+      </MemoryRouter>
+    )
+    expect(html).toContain('block w-full lg:table lg:table-fixed')
+    expect(html).toContain('block lg:table-row-group')
+    expect(html).toContain('block px-3 py-2 lg:table-row lg:px-0 lg:py-0')
+    expect(html).toContain('block min-w-0 p-0 lg:table-cell lg:px-4 lg:py-0.5')
+    expect(html).toContain('whitespace-pre-wrap break-words')
+    expect(html).toContain('relay connection started')
+  } finally {
+    if (previousWindow)
+      Object.defineProperty(globalThis, 'window', previousWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
 
 for (const [query, visible] of [
   ['', true],

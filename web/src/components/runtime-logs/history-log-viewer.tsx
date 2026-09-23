@@ -48,6 +48,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useSearchParams } from 'react-router'
 import AnsiToHtml from 'ansi-to-html'
+import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 import {
   AlertCircle,
   AlignVerticalSpaceAround,
@@ -86,7 +87,6 @@ const LOG_LEVEL_OPTIONS: LogLevel[] = [
   'DEBUG',
   'TRACE',
 ]
-
 
 // Server enforces a 24h cap on full-text search (MAX_FULLTEXT_HOURS in
 // search.rs). The 7d/30d presets and any custom range over 24h are fine for
@@ -313,9 +313,8 @@ function HistoryLogRow({
   const ts = formatTs(timestamp, showDate)
 
   return (
-    <div
+    <RuntimeLogRowLayout
       className={cn(
-        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs hover:bg-muted/50',
         // Datadog-style, in our visual language: the matched search term is
         // highlighted inline via <mark> (renderMessageHtml), so the message
         // itself shows why a line matched. The match ("origin") row gets only a
@@ -324,40 +323,36 @@ function HistoryLogRow({
         isContext && 'opacity-60',
         isMatch && 'border-l-2 border-l-primary/70 bg-primary/[0.04] pl-[6px]'
       )}
-    >
-      {columns.timestamp && (
-        <span
-          className={cn(
-            'text-muted-foreground shrink-0 tabular-nums whitespace-nowrap',
-            showDate ? 'w-[180px]' : 'w-[85px]'
+      metadata={
+        <>
+          {columns.timestamp && (
+            <span
+              className={cn(
+                'text-muted-foreground shrink-0 tabular-nums whitespace-nowrap',
+                showDate ? 'sm:w-[180px]' : 'sm:w-[85px]'
+              )}
+            >
+              {ts}
+            </span>
           )}
-        >
-          {ts}
-        </span>
-      )}
-      {columns.level && (
-        <LogLevelBadge level={level} />
-      )}
-      {columns.service && (
-        <span className="text-muted-foreground shrink-0 w-[70px] truncate">
-          {service}
-        </span>
-      )}
-      {columns.source && (
-        <span
-          className="text-muted-foreground/80 shrink-0 w-[150px] truncate tabular-nums"
-          title={sourceLabel(containerId, nodeName)}
-        >
-          {sourceLabel(containerId, nodeName)}
-        </span>
-      )}
-      <span
-        className="whitespace-pre-wrap break-all min-w-0 flex-1"
-        dangerouslySetInnerHTML={{
-          __html: renderMessageHtml(message, searchTerm),
-        }}
-      />
-    </div>
+          {columns.level && <LogLevelBadge level={level} />}
+          {columns.service && (
+            <span className="text-muted-foreground min-w-0 max-w-full truncate sm:w-[70px] sm:shrink-0">
+              {service}
+            </span>
+          )}
+          {columns.source && (
+            <span
+              className="text-muted-foreground/80 min-w-0 max-w-full truncate tabular-nums sm:w-[150px] sm:shrink-0"
+              title={sourceLabel(containerId, nodeName)}
+            >
+              {sourceLabel(containerId, nodeName)}
+            </span>
+          )}
+        </>
+      }
+      messageHtml={renderMessageHtml(message, searchTerm)}
+    />
   )
 }
 
