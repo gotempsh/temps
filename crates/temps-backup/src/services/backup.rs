@@ -13,6 +13,7 @@ use sea_orm::{
     FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     Statement, TransactionTrait, Value,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -668,51 +669,55 @@ impl WalgDeletionEngine {
     }
 }
 
+/// The complete user data WAL-G writes into a snapshot sentinel.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WalgTargetUserData {
+    temps_backup_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalgIdentityMetadata {
+    walg_identity_version: u8,
+    walg_target_user_data: WalgTargetUserData,
+    walg_full_backup: Option<bool>,
+}
+
 fn validated_walg_target(
     metadata: &serde_json::Value,
     backup_id: &str,
-) -> Result<serde_json::Value, BackupError> {
+) -> Result<WalgTargetUserData, BackupError> {
     let parsed_id = Uuid::parse_str(backup_id).map_err(|_| {
         BackupError::Validation(format!(
             "Backup {backup_id} has an invalid WAL-G backup UUID; refusing deletion"
         ))
     })?;
-    let expected = json!({ "temps_backup_id": parsed_id.to_string() });
+    let identity: WalgIdentityMetadata = serde_json::from_value(metadata.clone()).map_err(|error| {
+        BackupError::Unsupported(format!(
+            "Backup {backup_id} has no verified exact WAL-G identity ({error}); retain it until a read-only repository inventory proves which snapshot belongs to this backup"
+        ))
+    })?;
     if parsed_id.to_string() != backup_id
-        || metadata
-            .get("walg_identity_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(1)
-        || metadata.get("walg_target_user_data") != Some(&expected)
+        || identity.walg_identity_version != 1
+        || identity.walg_target_user_data.temps_backup_id != backup_id
     {
         return Err(BackupError::Unsupported(format!(
             "Backup {backup_id} has no verified exact WAL-G identity; retain it until a read-only repository inventory proves which snapshot belongs to this backup"
         )));
     }
-    if metadata
-        .get("walg_full_backup")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
+    if identity.walg_full_backup != Some(true) {
         return Err(BackupError::Validation(format!(
             "Backup {backup_id} lacks proof of an independent full WAL-G snapshot; refusing deletion that could affect dependent backups"
         )));
     }
-    metadata
-        .get("walg_target_user_data")
-        .cloned()
-        .ok_or_else(|| {
-            BackupError::Validation(format!(
-                "Backup {backup_id} is missing verified WAL-G target data"
-            ))
-        })
+    Ok(identity.walg_target_user_data)
 }
 
 /// Redis/MongoDB inventories use top-level sentinel objects. Never recursively
 /// infer a target name from arbitrary nested metadata or from backup timestamps.
 fn stream_walg_target_name(
     repository: &serde_json::Value,
-    target: &serde_json::Value,
+    target: &WalgTargetUserData,
 ) -> Result<Option<String>, BackupError> {
     let entries = repository.as_array().ok_or_else(|| {
         BackupError::Validation(
@@ -726,15 +731,21 @@ fn stream_walg_target_name(
         let Some(user_data) = entry.get("UserData") else {
             continue;
         };
-        if user_data != target {
-            if user_data.get("temps_backup_id").is_some()
-                && user_data.get("temps_backup_id") == target.get("temps_backup_id")
-            {
-                return Err(BackupError::Validation(
+        if user_data
+            .get("temps_backup_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(target.temps_backup_id.as_str())
+        {
+            continue;
+        }
+        let exact: WalgTargetUserData =
+            serde_json::from_value(user_data.clone()).map_err(|_| {
+                BackupError::Validation(
                     "WAL-G stream identity has unexpected additional fields; refusing deletion"
                         .to_string(),
-                ));
-            }
+                )
+            })?;
+        if exact != *target {
             continue;
         }
         if name.len() != 23
@@ -4779,7 +4790,7 @@ SELECT cp.id
         source: &S3Source,
         service: &temps_entities::external_services::Model,
         container: &str,
-        target_user_data: &serde_json::Value,
+        target_user_data: &WalgTargetUserData,
         engine: WalgDeletionEngine,
     ) -> Result<(), BackupError> {
         engine.validate_repository(
@@ -4838,7 +4849,10 @@ SELECT cp.id
                 "WALG_S3_PREFIX={}",
                 backup.s3_location.trim_end_matches('/')
             ),
-            format!("WALG_TARGET_USER_DATA={}", target_user_data),
+            format!(
+                "WALG_TARGET_USER_DATA={}",
+                serde_json::to_string(target_user_data)?
+            ),
             format!("AWS_ACCESS_KEY_ID={}", access_key),
             format!("AWS_SECRET_ACCESS_KEY={}", secret_key),
             format!("AWS_REGION={}", source.region),
@@ -10386,7 +10400,9 @@ mod tests {
 
     #[test]
     fn walg_deletion_stream_inventory_is_exact_unique_and_path_safe() {
-        let target = json!({"temps_backup_id":"00000000-0000-4000-8000-000000000001"});
+        let target = WalgTargetUserData {
+            temps_backup_id: "00000000-0000-4000-8000-000000000001".to_string(),
+        };
         let entry = json!({"BackupName":"stream_20260923T120000Z", "UserData":target});
         assert_eq!(
             stream_walg_target_name(&json!([entry.clone()]), &target).unwrap(),
@@ -10438,7 +10454,9 @@ mod tests {
         let metadata = json!({"walg_identity_version":1, "walg_target_user_data":{"temps_backup_id":"00000000-0000-4000-8000-000000000001"}, "walg_full_backup":true});
         assert_eq!(
             validated_walg_target(&metadata, "00000000-0000-4000-8000-000000000001").unwrap(),
-            json!({"temps_backup_id":"00000000-0000-4000-8000-000000000001"})
+            WalgTargetUserData {
+                temps_backup_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            }
         );
         assert!(validated_walg_target(&metadata, "00000000-0000-4000-8000-000000000002").is_err());
         for field in [
