@@ -2894,7 +2894,29 @@ impl ComposeExecutor {
                 reason: error.to_string(),
             })?;
         if let Some(services) = yaml.get_mut("services").and_then(Value::as_mapping_mut) {
-            for definition in services.values_mut() {
+            for (name, definition) in services.iter_mut() {
+                // Some Compose versions read inherited env_file values even
+                // with --no-env-resolution. Check every existing path prefix
+                // before config can consume a symlink and erase its origin.
+                if self.enforced(PolicyCheck::EnvFiles) {
+                    if let Some(env) = definition.get("env_file") {
+                        for file in env.as_str().into_iter().chain(
+                            env.as_sequence().into_iter().flatten().filter_map(|entry| {
+                                entry
+                                    .as_str()
+                                    .or_else(|| entry.get("path").and_then(Value::as_str))
+                            }),
+                        ) {
+                            Self::validate_confined_bind_path(
+                                scope,
+                                base,
+                                file,
+                                name.as_str().unwrap_or("<source>"),
+                                "env_file",
+                            )?;
+                        }
+                    }
+                }
                 if let Some(file) = definition
                     .get_mut("extends")
                     .and_then(|v| v.get_mut("file"))
@@ -13022,6 +13044,59 @@ services:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn compose_snapshots_confine_inherited_env_files_before_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.env"), "SECRET=private\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            root.path().join("vars.env"),
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let source = "services: {app: {extends: {file: common.yml, service: base}}}";
+        for env_file in [
+            "vars.env",
+            "[vars.env]",
+            "[{path: vars.env, required: false}]",
+        ] {
+            std::fs::write(
+                root.path().join("common.yml"),
+                format!("services: {{base: {{image: alpine, env_file: {env_file}}}}}"),
+            )
+            .unwrap();
+            let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+            let error = executor
+                .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ComposeError::SecurityPolicyViolation { field, reason, .. } if field == "env_file" && reason.contains("outside")),
+                "{env_file}"
+            );
+        }
+        std::fs::write(root.path().join("common.yml"), "services: {base: {image: alpine, env_file: [{path: optional/missing.env, required: false}]}}").unwrap();
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(executor
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, env_file: vars.env}}",
+        )
+        .unwrap();
+        let permitted =
+            executor_with_checks_disabled(&[PolicyCheck::Extends, PolicyCheck::EnvFiles]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(permitted
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn compose_include_uses_effective_project_directory_for_nested_env_guards() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -13094,9 +13169,20 @@ services:
             .output()
             .is_ok_and(|result| result.status.success())
         {
+            let compose_base = std::fs::canonicalize(root.path()).unwrap();
+            // Match the resolver's working directory: Compose versions that
+            // check relative env files during config resolve them against cwd.
             let output = std::process::Command::new("docker")
-                .args(["compose", "-p", "temps-remote-snapshot-test", "-f"])
+                .args([
+                    "compose",
+                    "-p",
+                    "temps-remote-snapshot-test",
+                    "--project-directory",
+                ])
+                .arg(&compose_base)
+                .arg("-f")
                 .arg(&input)
+                .current_dir(&compose_base)
                 .args([
                     "config",
                     "--no-normalize",
@@ -13111,13 +13197,16 @@ services:
                 String::from_utf8_lossy(&output.stderr)
             );
             let yaml: Value = serde_yaml::from_slice(&output.stdout).unwrap();
-            let env_path = yaml["services"]["app"]["env_file"][0]["path"]
-                .as_str()
-                .unwrap();
-            assert_eq!(
-                std::fs::canonicalize(root.path().join(env_path)).unwrap(),
-                std::fs::canonicalize(remote.join("vars.env")).unwrap()
-            );
+            if let Some(env_path) = yaml["services"]["app"]["env_file"][0]["path"].as_str() {
+                assert_eq!(
+                    std::fs::canonicalize(compose_base.join(env_path)).unwrap(),
+                    std::fs::canonicalize(remote.join("vars.env")).unwrap()
+                );
+            } else {
+                // Older Compose versions eagerly resolve inherited env files
+                // even with --no-env-resolution; assert the same effective data.
+                assert_eq!(yaml["services"]["app"]["environment"]["SETTING"], "value");
+            }
         }
         std::fs::write(
             root.path().join("private.yml"),

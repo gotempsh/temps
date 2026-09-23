@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 use crate::compose::ComposeError;
 
@@ -102,18 +103,205 @@ fn parse_reference(reference: &str) -> Result<GitSource, ComposeError> {
 /// cache directory lifetime, which must extend through deployment of relative assets.
 pub(super) async fn materialize(
     reference: &str,
-    cache_root: &Path,
+    cache: &Path,
 ) -> Result<(PathBuf, PathBuf), ComposeError> {
     let source = parse_reference(reference)?;
     let bytes = tokio::time::timeout(FETCH_TIMEOUT, download_archive(&source.archive_url))
         .await
         .map_err(|_| rejected("remote Compose archive download exceeded 60 seconds"))??;
-    let cache_root = cache_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        extract_archive(&bytes, &cache_root, source.compose_path.as_deref())
+    receive_extraction(cache, move |snapshot, cancellation| {
+        extract_archive_contents(
+            bytes.as_slice(),
+            snapshot,
+            source.compose_path.as_deref(),
+            cancellation,
+        )
     })
     .await
-    .map_err(|_| rejected("remote Compose archive extraction task failed"))?
+}
+
+struct ExtractedArchive {
+    snapshot: tempfile::TempDir,
+    selected: PathBuf,
+    root: PathBuf,
+}
+
+impl ExtractedArchive {
+    #[cfg(test)]
+    fn persist(self) -> (PathBuf, PathBuf) {
+        let _ = self.snapshot.keep();
+        (self.selected, self.root)
+    }
+}
+
+async fn receive_extraction<F>(cache: &Path, extract: F) -> Result<(PathBuf, PathBuf), ComposeError>
+where
+    F: FnOnce(tempfile::TempDir, &CancellationToken) -> Result<ExtractedArchive, ComposeError>
+        + Send
+        + 'static,
+{
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let result = tokio::task::spawn_blocking(move || {
+        check_cancelled(&cancellation).map_err(|e| rejected(e.to_string()))?;
+        let snapshot = tempfile::Builder::new()
+            .prefix("temps-compose-staging-")
+            .tempdir()
+            .map_err(|e| rejected(format!("could not create remote Compose snapshot: {e}")))?;
+        let archive = extract(snapshot, &cancellation)?;
+        check_cancelled(&cancellation).map_err(|e| rejected(e.to_string()))?;
+        Ok::<_, ComposeError>(archive)
+    })
+    .await
+    .map_err(|_| rejected("remote Compose archive extraction task failed"))??;
+    // No await separates accepting the result from persistence: cancellation can
+    // never detach a worker that already disarmed its snapshot's cleanup guard.
+    adopt_archive(result, cache, |source, destination| {
+        std::fs::rename(source, destination)
+    })
+}
+
+/// Adoption intentionally has no async suspension point. The worker writes only
+/// system-temporary staging, so cancellation and checkout cleanup cannot race it.
+/// The uncommon cross-filesystem copy is bounded by the same archive limits.
+fn adopt_archive(
+    archive: ExtractedArchive,
+    cache: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(PathBuf, PathBuf), ComposeError> {
+    let staging_root = archive.snapshot.path().canonicalize().map_err(|e| {
+        rejected(format!(
+            "could not resolve remote Compose staging directory: {e}"
+        ))
+    })?;
+    let selected = archive
+        .selected
+        .strip_prefix(&staging_root)
+        .map_err(|_| rejected("selected Compose file escaped archive staging"))?
+        .to_path_buf();
+    let root = archive
+        .root
+        .strip_prefix(&staging_root)
+        .map_err(|_| rejected("Compose repository root escaped archive staging"))?
+        .to_path_buf();
+    let adopted = tempfile::Builder::new()
+        .prefix("repository-")
+        .tempdir_in(cache)
+        .map_err(|e| {
+            rejected(format!(
+                "could not create remote Compose adoption directory: {e}"
+            ))
+        })?;
+    let destination = adopted.path().join("snapshot");
+    match rename(archive.snapshot.path(), &destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_snapshot(archive.snapshot.path(), &destination).map_err(|e| {
+                rejected(format!(
+                    "could not adopt remote Compose archive across filesystems: {e}"
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(rejected(format!(
+                "could not adopt remote Compose archive: {error}"
+            )))
+        }
+    }
+    let selected = destination
+        .join(selected)
+        .canonicalize()
+        .map_err(|e| rejected(format!("could not resolve adopted Compose file: {e}")))?;
+    let root = destination
+        .join(root)
+        .canonicalize()
+        .map_err(|e| rejected(format!("could not resolve adopted Compose root: {e}")))?;
+    let _ = adopted.keep();
+    Ok((selected, root))
+}
+
+fn copy_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let started = Instant::now();
+    let cancellation = CancellationToken::new();
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let mut entries = 0_usize;
+    let mut remaining = MAX_EXTRACTED_BYTES;
+    while let Some((source, destination)) = pending.pop() {
+        if started.elapsed() > FETCH_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "remote Compose adoption exceeded 60 seconds",
+            ));
+        }
+        std::fs::create_dir(&destination)?;
+        for entry in std::fs::read_dir(&source)? {
+            if started.elapsed() > FETCH_TIMEOUT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "remote Compose adoption exceeded 60 seconds",
+                ));
+            }
+            entries += 1;
+            // Include directories implicitly created for archives that omit them.
+            if entries > MAX_ARCHIVE_ENTRIES * 2 {
+                return Err(std::io::Error::other(
+                    "remote Compose adoption exceeds its file-count limit",
+                ));
+            }
+            let entry = entry?;
+            let path = entry.path();
+            let target = destination.join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((path, target));
+            } else if kind.is_file() {
+                let input = std::fs::File::open(&path)?;
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)?;
+                let copied = copy_with_deadline(
+                    &mut input.take(remaining + 1),
+                    &mut output,
+                    started,
+                    &cancellation,
+                )?;
+                remaining = remaining.checked_sub(copied).ok_or_else(|| {
+                    std::io::Error::other("remote Compose adoption exceeds the 64 MiB limit")
+                })?;
+                std::fs::set_permissions(&target, entry.metadata()?.permissions())?;
+            } else {
+                return Err(std::io::Error::other(
+                    "remote Compose adoption encountered a link or special file",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_cancelled(cancellation: &CancellationToken) -> std::io::Result<()> {
+    if cancellation.is_cancelled() {
+        Err(std::io::Error::other(
+            "remote Compose archive extraction cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+struct CancellableReader<'a, R> {
+    inner: R,
+    cancellation: &'a CancellationToken,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        check_cancelled(self.cancellation)?;
+        let count = self.inner.read(buffer)?;
+        check_cancelled(self.cancellation)?;
+        Ok(count)
+    }
 }
 
 async fn download_archive(url: &reqwest::Url) -> Result<Vec<u8>, ComposeError> {
@@ -166,9 +354,12 @@ fn copy_with_deadline(
     input: &mut impl Read,
     output: &mut impl Write,
     started: Instant,
-) -> std::io::Result<()> {
+    cancellation: &CancellationToken,
+) -> std::io::Result<u64> {
+    let mut copied = 0;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        check_cancelled(cancellation)?;
         if started.elapsed() > FETCH_TIMEOUT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -177,23 +368,28 @@ fn copy_with_deadline(
         }
         let count = input.read(&mut buffer)?;
         if count == 0 {
-            return Ok(());
+            return Ok(copied);
         }
+        check_cancelled(cancellation)?;
         output.write_all(&buffer[..count])?;
+        copied += count as u64;
     }
 }
 
-fn extract_archive(
-    bytes: &[u8],
-    cache_root: &Path,
+fn extract_archive_contents(
+    input: impl Read,
+    snapshot: tempfile::TempDir,
     compose_path: Option<&Path>,
-) -> Result<(PathBuf, PathBuf), ComposeError> {
-    let snapshot = tempfile::Builder::new()
-        .prefix("repository-")
-        .tempdir_in(cache_root)
-        .map_err(|e| rejected(format!("could not create remote Compose snapshot: {e}")))?;
+    cancellation: &CancellationToken,
+) -> Result<ExtractedArchive, ComposeError> {
+    check_cancelled(cancellation).map_err(|e| rejected(e.to_string()))?;
+    // Check every underlying read, including metadata tar consumes internally.
+    let input = CancellableReader {
+        inner: input,
+        cancellation,
+    };
     // Limit the whole decompressed stream, including metadata and padding, not just file sizes.
-    let decoder = flate2::read::GzDecoder::new(bytes).take(MAX_EXTRACTED_BYTES + 1);
+    let decoder = flate2::read::GzDecoder::new(input).take(MAX_EXTRACTED_BYTES + 1);
     let mut archive = tar::Archive::new(decoder);
     let started = Instant::now();
     let mut total_size = 0_u64;
@@ -203,6 +399,7 @@ fn extract_archive(
         .map_err(|e| rejected(format!("invalid remote Compose archive: {e}")))?
         .enumerate()
     {
+        check_cancelled(cancellation).map_err(|e| rejected(e.to_string()))?;
         if index >= MAX_ARCHIVE_ENTRIES || started.elapsed() > FETCH_TIMEOUT {
             return Err(rejected(
                 "remote Compose archive exceeds the file-count or extraction-time limit",
@@ -254,6 +451,7 @@ fn extract_archive(
             .ok_or_else(|| {
                 rejected("remote Compose archive exceeds the 64 MiB extraction limit")
             })?;
+        check_cancelled(cancellation).map_err(|e| rejected(e.to_string()))?;
         let destination = snapshot.path().join(&path);
         if entry_type.is_dir() {
             std::fs::create_dir_all(&destination).map_err(|e| {
@@ -276,7 +474,7 @@ fn extract_archive(
                 .map_err(|e| {
                     rejected(format!("could not create remote Compose archive file: {e}"))
                 })?;
-            copy_with_deadline(&mut entry, &mut output, started).map_err(|e| {
+            copy_with_deadline(&mut entry, &mut output, started, cancellation).map_err(|e| {
                 rejected(format!(
                     "could not extract remote Compose archive file: {e}"
                 ))
@@ -304,7 +502,7 @@ fn extract_archive(
         }
     }
     let mut decoder = archive.into_inner();
-    copy_with_deadline(&mut decoder, &mut std::io::sink(), started)
+    copy_with_deadline(&mut decoder, &mut std::io::sink(), started, cancellation)
         .map_err(|e| rejected(format!("invalid compressed remote Compose archive: {e}")))?;
     if decoder.limit() == 0 {
         return Err(rejected(
@@ -349,13 +547,28 @@ fn extract_archive(
             "selected Compose file escapes its remote repository",
         ));
     }
-    let _ = snapshot.keep();
-    Ok((selected, root))
+    check_cancelled(cancellation).map_err(|e| rejected(e.to_string()))?;
+    Ok(ExtractedArchive {
+        snapshot,
+        selected,
+        root,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn extract_archive(
+        bytes: &[u8],
+        cache_root: &Path,
+        compose_path: Option<&Path>,
+    ) -> Result<(PathBuf, PathBuf), ComposeError> {
+        let snapshot = tempfile::tempdir_in(cache_root).unwrap();
+        extract_archive_contents(bytes, snapshot, compose_path, &CancellationToken::new())
+            .map(ExtractedArchive::persist)
+    }
 
     fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -377,6 +590,214 @@ mod tests {
             archive.append_data(&mut header, path, *bytes).unwrap();
         }
         archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn extraction_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    struct PausedReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for PausedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.bytes.read(buffer)
+        }
+    }
+
+    #[test]
+    fn cancellation_during_header_read_cleans_detached_staging() {
+        extraction_runtime().block_on(async {
+            let cache = Arc::new(tempfile::tempdir().unwrap());
+            let cache_path = cache.path().to_path_buf();
+            let weak = Arc::downgrade(&cache);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let input = PausedReader {
+                bytes: std::io::Cursor::new(archive(&[("root/compose.yaml", b"services: {}")])),
+                entered: Some(entered_tx),
+                resume: resume_rx,
+            };
+            let mut future = Box::pin(receive_extraction(cache.path(), move |snapshot, token| {
+                let result = extract_archive_contents(input, snapshot, None, token);
+                result_tx
+                    .send(result.as_ref().err().map(ToString::to_string))
+                    .unwrap();
+                result
+            }));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(future);
+            drop(cache);
+            // Checkout cleanup is immediate; the worker only touches external staging.
+            assert!(!cache_path.exists());
+            assert!(weak.upgrade().is_none());
+            resume_tx.send(()).unwrap();
+            // A single blocking thread makes this a deterministic completion fence.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .contains("cancelled"));
+            assert!(weak.upgrade().is_none());
+            assert!(!cache_path.exists());
+        });
+    }
+
+    #[test]
+    fn cancelled_worker_never_recreates_deleted_checkout_ancestor() {
+        extraction_runtime().block_on(async {
+            let checkout = tempfile::tempdir().unwrap();
+            let checkout_path = checkout.path().to_path_buf();
+            let cache = Arc::new(tempfile::tempdir_in(&checkout_path).unwrap());
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (staging_tx, staging_rx) = std::sync::mpsc::channel();
+            let input = PausedReader {
+                bytes: std::io::Cursor::new(archive(&[("root/compose.yaml", b"services: {}")])),
+                entered: Some(entered_tx),
+                resume: resume_rx,
+            };
+            let mut future = Box::pin(receive_extraction(cache.path(), move |snapshot, token| {
+                staging_tx.send(snapshot.path().to_path_buf()).unwrap();
+                extract_archive_contents(input, snapshot, None, token)
+            }));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let staging = staging_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!staging.starts_with(&checkout_path));
+            // Mirrors independent deployment cleanup, which can bypass Arc leases.
+            std::fs::remove_dir_all(&checkout_path).unwrap();
+            drop(future);
+            drop(cache);
+            resume_tx.send(()).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!checkout_path.exists());
+            assert!(!staging.exists());
+        });
+    }
+
+    #[test]
+    fn adoption_handles_rename_cross_device_copy_and_failed_copy_cleanup() {
+        for cross_device in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let snapshot = tempfile::tempdir().unwrap();
+            let staging = snapshot.path().to_path_buf();
+            let bytes = archive(&[
+                ("root/docker/compose.yaml", b"services: {}"),
+                ("root/docker/asset.txt", b"asset"),
+            ]);
+            let archive = extract_archive_contents(
+                bytes.as_slice(),
+                snapshot,
+                Some(Path::new("docker/compose.yaml")),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            let (selected, root) = adopt_archive(archive, cache.path(), |source, target| {
+                if cross_device {
+                    Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                } else {
+                    std::fs::rename(source, target)
+                }
+            })
+            .unwrap();
+            assert!(selected.starts_with(cache.path().canonicalize().unwrap()));
+            assert_eq!(
+                std::fs::read(root.join("docker/asset.txt")).unwrap(),
+                b"asset"
+            );
+            assert!(!staging.exists());
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        let staging = snapshot.path().to_path_buf();
+        let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
+        let archive =
+            extract_archive_contents(bytes.as_slice(), snapshot, None, &CancellationToken::new())
+                .unwrap();
+        // Force a bounded-copy error without allocating a large buffer.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive.selected)
+            .unwrap()
+            .set_len(MAX_EXTRACTED_BYTES + 1)
+            .unwrap();
+        assert!(
+            adopt_archive(archive, cache.path(), |_, _| Err(std::io::Error::from(
+                std::io::ErrorKind::CrossesDevices
+            )))
+            .is_err()
+        );
+        assert!(!staging.exists());
+        assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn cancelled_queued_extraction_never_runs_or_recreates_cache() {
+        extraction_runtime().block_on(async {
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cache = Arc::new(tempfile::tempdir().unwrap());
+            let cache_path = cache.path().to_path_buf();
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_called = Arc::clone(&called);
+            let mut future = Box::pin(receive_extraction(cache.path(), move |_, _| {
+                worker_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(rejected("queued extraction should not run"))
+            }));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            drop(future);
+            drop(cache);
+            assert!(!cache_path.exists());
+            resume_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!cache_path.exists());
+        });
+    }
+
+    #[test]
+    fn completed_unreceived_extraction_retains_cleanup_guards() {
+        extraction_runtime().block_on(async {
+            let cache = Arc::new(tempfile::tempdir().unwrap());
+            let cache_path = cache.path().to_path_buf();
+            let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
+            let (staging_tx, staging_rx) = std::sync::mpsc::channel();
+            let mut future = Box::pin(receive_extraction(cache.path(), move |snapshot, token| {
+                staging_tx.send(snapshot.path().to_path_buf()).unwrap();
+                extract_archive_contents(bytes.as_slice(), snapshot, None, token)
+            }));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            // Complete the worker without ever polling its owning future again.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let staging = staging_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(staging.is_dir());
+            assert!(std::fs::read_dir(&cache_path).unwrap().next().is_none());
+            drop(future);
+            drop(cache);
+            assert!(!cache_path.exists());
+            assert!(!staging.exists());
+        });
     }
 
     #[test]
