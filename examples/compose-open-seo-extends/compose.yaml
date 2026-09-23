@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+services:
+  open-seo:
+    extends:
+      file: common.yaml
+      service: open-seo-base
+    ports:
+      - "127.0.0.1::3001"
