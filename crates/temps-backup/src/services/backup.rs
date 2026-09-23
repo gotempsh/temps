@@ -609,6 +609,149 @@ fn retention_expiry(
     started_at.checked_add_signed(Duration::days(i64::from(retention_period_days)))
 }
 
+/// A validated engine selection, never inferred from an operator-controlled S3 path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalgDeletionEngine {
+    Postgres,
+    PostgresCluster,
+    Redis,
+    MongoDb,
+    MariaDb,
+}
+
+impl WalgDeletionEngine {
+    fn resolve(engine: &str, service_type: &str, backup_id: &str) -> Result<Self, BackupError> {
+        let selected = match (engine, service_type) {
+            ("postgres_walg", "postgres" | "postgresql" | "timescale" | "timescaledb") => Self::Postgres,
+            ("postgres_cluster", "postgres" | "postgresql" | "timescale" | "timescaledb") => Self::PostgresCluster,
+            ("redis", "redis") => Self::Redis,
+            ("mongodb", "mongodb" | "mongo") => Self::MongoDb,
+            ("mariadb_physical", "mariadb") => Self::MariaDb,
+            _ => return Err(BackupError::Validation(format!(
+                "Backup {backup_id} WAL-G engine '{engine}' is unsupported or incompatible with service type '{service_type}'; refusing deletion"
+            ))),
+        };
+        Ok(selected)
+    }
+
+    fn namespace(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::PostgresCluster => "postgres",
+            Self::Redis => "redis",
+            Self::MongoDb => "mongodb",
+            Self::MariaDb => "mariadb",
+        }
+    }
+
+    fn archives(self) -> bool {
+        matches!(self, Self::Postgres | Self::PostgresCluster | Self::MariaDb)
+    }
+
+    fn validate_repository(
+        self,
+        location: &str,
+        bucket: &str,
+        bucket_path: &str,
+        service_name: &str,
+    ) -> Result<(), BackupError> {
+        let key = s3_key_from_location(location, bucket)?;
+        let expected = build_s3_key(
+            bucket_path,
+            &format!("external_services/{}/{service_name}/walg", self.namespace()),
+        );
+        if key.trim_end_matches('/') != expected {
+            return Err(BackupError::Validation(format!(
+                "Refusing WAL-G deletion for unexpected repository '{location}' (expected s3://{bucket}/{expected})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validated_walg_target(
+    metadata: &serde_json::Value,
+    backup_id: &str,
+) -> Result<serde_json::Value, BackupError> {
+    let parsed_id = Uuid::parse_str(backup_id).map_err(|_| {
+        BackupError::Validation(format!(
+            "Backup {backup_id} has an invalid WAL-G backup UUID; refusing deletion"
+        ))
+    })?;
+    let expected = json!({ "temps_backup_id": parsed_id.to_string() });
+    if parsed_id.to_string() != backup_id
+        || metadata
+            .get("walg_identity_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || metadata.get("walg_target_user_data") != Some(&expected)
+    {
+        return Err(BackupError::Unsupported(format!(
+            "Backup {backup_id} has no verified exact WAL-G identity; retain it until a read-only repository inventory proves which snapshot belongs to this backup"
+        )));
+    }
+    if metadata
+        .get("walg_full_backup")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(BackupError::Validation(format!(
+            "Backup {backup_id} lacks proof of an independent full WAL-G snapshot; refusing deletion that could affect dependent backups"
+        )));
+    }
+    metadata
+        .get("walg_target_user_data")
+        .cloned()
+        .ok_or_else(|| {
+            BackupError::Validation(format!(
+                "Backup {backup_id} is missing verified WAL-G target data"
+            ))
+        })
+}
+
+/// Redis/MongoDB inventories use top-level sentinel objects. Never recursively
+/// infer a target name from arbitrary nested metadata or from backup timestamps.
+fn stream_walg_target_name(
+    repository: &serde_json::Value,
+    target: &serde_json::Value,
+) -> Result<Option<String>, BackupError> {
+    let entries = repository.as_array().ok_or_else(|| {
+        BackupError::Validation(
+            "WAL-G stream inventory is not an array; refusing deletion".to_string(),
+        )
+    })?;
+    let mut found = None;
+    for entry in entries {
+        let name = entry.get("BackupName").and_then(serde_json::Value::as_str)
+            .ok_or_else(|| BackupError::Validation("WAL-G stream inventory contains an entry without BackupName; refusing deletion".to_string()))?;
+        let Some(user_data) = entry.get("UserData") else {
+            continue;
+        };
+        if user_data != target {
+            if user_data.get("temps_backup_id").is_some()
+                && user_data.get("temps_backup_id") == target.get("temps_backup_id")
+            {
+                return Err(BackupError::Validation(
+                    "WAL-G stream identity has unexpected additional fields; refusing deletion"
+                        .to_string(),
+                ));
+            }
+            continue;
+        }
+        if name.len() != 23
+            || !name.starts_with("stream_")
+            || chrono::NaiveDateTime::parse_from_str(&name[7..], "%Y%m%dT%H%M%SZ").is_err()
+        {
+            return Err(BackupError::Validation(format!(
+                "WAL-G stream inventory contains unsafe backup name '{name}'; refusing deletion"
+            )));
+        }
+        if found.replace(name.to_string()).is_some() {
+            return Err(BackupError::Validation("Multiple WAL-G stream snapshots match the selected backup UUID; refusing ambiguous deletion".to_string()));
+        }
+    }
+    Ok(found)
+}
+
 fn json_contains_backup_identity(value: &serde_json::Value, backup_id: &str) -> bool {
     match value {
         serde_json::Value::Object(object) => {
@@ -4306,22 +4449,7 @@ SELECT cp.id
                 .any(|child| child.s3_location.trim_end_matches('/').ends_with("/walg"));
         let mut prefixes = HashSet::new();
         let walg_plan = if is_walg {
-            let version = metadata
-                .get("walg_identity_version")
-                .and_then(serde_json::Value::as_u64);
-            let target = metadata.get("walg_target_user_data").cloned();
-            if version != Some(1)
-                || target
-                    .as_ref()
-                    .and_then(|value| value.get("temps_backup_id"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some(backup.backup_id.as_str())
-            {
-                return Err(BackupError::Unsupported(format!(
-                    "Backup {} predates exact WAL-G identity tracking and cannot be safely deleted",
-                    backup.backup_id
-                )));
-            }
+            let target = validated_walg_target(&metadata, &backup.backup_id)?;
             let service_id = metadata
                 .get("external_service_id")
                 .or_else(|| metadata.get("service_id"))
@@ -4340,7 +4468,15 @@ SELECT cp.id
                     resource: "ExternalService".to_string(),
                     detail: format!("service id {} for backup {}", service_id, backup.backup_id),
                 })?;
-            let container = if engine == "postgres_cluster" {
+            let deletion_engine =
+                WalgDeletionEngine::resolve(engine, &service.service_type, &backup.backup_id)?;
+            deletion_engine.validate_repository(
+                &backup.s3_location,
+                &s3_source.bucket_name,
+                &s3_source.bucket_path,
+                &service.name,
+            )?;
+            let container = if deletion_engine == WalgDeletionEngine::PostgresCluster {
                 temps_entities::service_members::Entity::find()
                     .filter(temps_entities::service_members::Column::ServiceId.eq(service_id))
                     .filter(temps_entities::service_members::Column::Role.eq("primary"))
@@ -4355,15 +4491,9 @@ SELECT cp.id
                     })?
                     .container_name
             } else {
-                format!("postgres-{}", service.name)
+                crate::engines::dispatch::service_container_name(&service)
             };
-            let target = target.ok_or_else(|| {
-                BackupError::Validation(format!(
-                    "WAL-G backup {} has no target user data",
-                    backup.backup_id
-                ))
-            })?;
-            Some((service, container, target))
+            Some((service, container, target, deletion_engine))
         } else {
             for location in std::iter::once(backup.s3_location.as_str())
                 .chain(children.iter().map(|child| child.s3_location.as_str()))
@@ -4419,10 +4549,17 @@ SELECT cp.id
             relative.starts_with("backups/")
         });
         let mut deleted_objects = 0_u64;
-        if let Some((service, container, target)) = walg_plan {
+        if let Some((service, container, target, deletion_engine)) = walg_plan {
             time::timeout_at(
                 remote_deadline,
-                self.delete_walg_target(&backup, &s3_source, &service, &container, &target),
+                self.delete_walg_target(
+                    &backup,
+                    &s3_source,
+                    &service,
+                    &container,
+                    &target,
+                    deletion_engine,
+                ),
             )
             .await
             .map_err(|_| BackupError::PartialDeletion {
@@ -4643,18 +4780,14 @@ SELECT cp.id
         service: &temps_entities::external_services::Model,
         container: &str,
         target_user_data: &serde_json::Value,
+        engine: WalgDeletionEngine,
     ) -> Result<(), BackupError> {
-        let key = s3_key_from_location(&backup.s3_location, &source.bucket_name)?;
-        let expected_root = build_s3_key(
+        engine.validate_repository(
+            &backup.s3_location,
+            &source.bucket_name,
             &source.bucket_path,
-            &format!("external_services/postgres/{}/walg", service.name),
-        );
-        if key.trim_end_matches('/') != expected_root {
-            return Err(BackupError::Validation(format!(
-                "Refusing WAL-G deletion for unexpected repository '{}' (expected s3://{}/{})",
-                backup.s3_location, source.bucket_name, expected_root
-            )));
-        }
+            &service.name,
+        )?;
 
         let access_key = self
             .encryption_service
@@ -4731,11 +4864,56 @@ SELECT cp.id
         let mut identity_remains = true;
         let mut last_delete_detail = String::new();
         for attempt in 1..=3 {
+            let mut attempt_env = env.clone();
+            let delete_command = if engine.archives() {
+                "timeout -k 5s 35s wal-g delete target --target-user-data \"$WALG_TARGET_USER_DATA\" --confirm"
+            } else {
+                let inventory = crate::engines::postgres_walg::run_walg_exec(
+                    &docker,
+                    container,
+                    "timeout -k 5s 35s wal-g backup-list --json --detail",
+                    &env,
+                    &cancellation,
+                )
+                .await
+                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                if inventory.exit_code != 0 {
+                    return Err(BackupError::ExternalService(format!(
+                        "Backup {} WAL-G stream inventory failed before deletion: {}",
+                        backup.backup_id, inventory.stderr
+                    )));
+                }
+                let repository: serde_json::Value = serde_json::from_str(&inventory.stdout)?;
+                let Some(name) = stream_walg_target_name(&repository, target_user_data)? else {
+                    // A successful complete inventory also makes retries after a
+                    // committed remote delete safe: no matching snapshot remains.
+                    return Ok(());
+                };
+                let recheck = crate::engines::postgres_walg::run_walg_exec(
+                    &docker,
+                    container,
+                    "timeout -k 5s 35s wal-g backup-list --json --detail",
+                    &env,
+                    &cancellation,
+                )
+                .await
+                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                if recheck.exit_code != 0
+                    || stream_walg_target_name(
+                        &serde_json::from_str::<serde_json::Value>(&recheck.stdout)?,
+                        target_user_data,
+                    )? != Some(name.clone())
+                {
+                    return Err(BackupError::Validation(format!("Backup {} WAL-G stream inventory changed before deletion; retry with a fresh inventory", backup.backup_id)));
+                }
+                attempt_env.push(format!("WALG_DELETE_BACKUP_NAME={name}"));
+                "timeout -k 5s 35s wal-g backup-delete \"$WALG_DELETE_BACKUP_NAME\" --confirm"
+            };
             let result = crate::engines::postgres_walg::run_walg_exec(
                 &docker,
                 container,
-                "timeout -k 5s 35s wal-g delete target --target-user-data \"$WALG_TARGET_USER_DATA\" --confirm",
-                &env,
+                delete_command,
+                &attempt_env,
                 &cancellation,
             )
             .await
@@ -4790,7 +4968,17 @@ SELECT cp.id
                     ),
                 }
             })?;
-            identity_remains = json_contains_backup_identity(&repository, &backup.backup_id);
+            identity_remains = if engine.archives() {
+                json_contains_backup_identity(&repository, &backup.backup_id)
+            } else {
+                stream_walg_target_name(&repository, target_user_data)
+                    .map_err(|error| BackupError::PartialDeletion {
+                        backup_id: backup.backup_id.clone(),
+                        deleted_objects: 0,
+                        reason: format!("WAL-G stream inventory could not verify deletion after {last_delete_detail}: {error}"),
+                    })?
+                    .is_some()
+            };
             if !identity_remains {
                 break;
             }
@@ -4804,6 +4992,10 @@ SELECT cp.id
                     last_delete_detail
                 ),
             });
+        }
+        // Stream backups have no PostgreSQL WAL/MySQL binlog archive to collect.
+        if !engine.archives() {
+            return Ok(());
         }
         let garbage = crate::engines::postgres_walg::run_walg_exec(
             &docker,
@@ -10134,6 +10326,147 @@ mod tests {
             id,
         )
         .is_err());
+    }
+
+    #[test]
+    fn walg_deletion_preserves_engine_repository_and_managed_prefix() {
+        for (engine, service_type, namespace, archives) in [
+            ("postgres_walg", "postgres", "postgres", true),
+            ("postgres_cluster", "timescaledb", "postgres", true),
+            ("redis", "redis", "redis", false),
+            ("mongodb", "mongo", "mongodb", false),
+            ("mariadb_physical", "mariadb", "mariadb", true),
+        ] {
+            let plan = WalgDeletionEngine::resolve(engine, service_type, "backup-fixture").unwrap();
+            assert_eq!(plan.archives(), archives);
+            for prefix in ["", "tenant/managed-backups"] {
+                let root = build_s3_key(
+                    prefix,
+                    &format!("external_services/{namespace}/fixture/walg"),
+                );
+                assert!(plan
+                    .validate_repository(
+                        &format!("s3://bucket/{root}"),
+                        "bucket",
+                        prefix,
+                        "fixture"
+                    )
+                    .is_ok());
+                assert!(plan
+                    .validate_repository(&format!("s3://other/{root}"), "bucket", prefix, "fixture")
+                    .is_err());
+                assert!(plan
+                    .validate_repository(
+                        &format!("s3://bucket/{root}/another"),
+                        "bucket",
+                        prefix,
+                        "fixture"
+                    )
+                    .is_err());
+                assert!(plan
+                    .validate_repository(
+                        &format!("s3://bucket/{root}"),
+                        "bucket",
+                        prefix,
+                        "other-service"
+                    )
+                    .is_err());
+            }
+        }
+        let redis = WalgDeletionEngine::resolve("redis", "redis", "backup-fixture").unwrap();
+        assert!(redis
+            .validate_repository(
+                "s3://bucket/external_services/postgres/fixture/walg",
+                "bucket",
+                "",
+                "fixture"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn walg_deletion_stream_inventory_is_exact_unique_and_path_safe() {
+        let target = json!({"temps_backup_id":"00000000-0000-4000-8000-000000000001"});
+        let entry = json!({"BackupName":"stream_20260923T120000Z", "UserData":target});
+        assert_eq!(
+            stream_walg_target_name(&json!([entry.clone()]), &target).unwrap(),
+            Some("stream_20260923T120000Z".to_string())
+        );
+        assert!(stream_walg_target_name(&json!([entry.clone(), entry.clone()]), &target).is_err());
+        assert_eq!(stream_walg_target_name(&json!([]), &target).unwrap(), None);
+        assert!(stream_walg_target_name(&json!({}), &target).is_err());
+        assert!(stream_walg_target_name(&json!([{}]), &target).is_err());
+        for name in [
+            "../other",
+            "--all",
+            "stream_20269999T999999Z",
+            "stream_20260923T120000Z/",
+            "stream_20260923T120000Z;rm",
+        ] {
+            let mut unsafe_entry = entry.clone();
+            unsafe_entry["BackupName"] = json!(name);
+            assert!(stream_walg_target_name(&json!([unsafe_entry]), &target).is_err());
+        }
+        let mut other = entry.clone();
+        other["UserData"]["temps_backup_id"] = json!("00000000-0000-4000-8000-000000000002");
+        assert_eq!(
+            stream_walg_target_name(&json!([other, entry.clone()]), &target).unwrap(),
+            Some("stream_20260923T120000Z".to_string())
+        );
+        let mut augmented = entry;
+        augmented["UserData"]["extra"] = json!(true);
+        assert!(stream_walg_target_name(&json!([augmented]), &target).is_err());
+    }
+
+    #[test]
+    fn walg_deletion_rejects_unknown_or_mismatched_engine() {
+        for (engine, service_type) in [
+            ("unknown", "redis"),
+            ("redis", "postgres"),
+            ("postgres_walg", "redis"),
+            ("mariadb_dump", "mariadb"),
+        ] {
+            assert!(matches!(
+                WalgDeletionEngine::resolve(engine, service_type, "backup-fixture"),
+                Err(BackupError::Validation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn walg_deletion_requires_exact_identity_and_independent_full_snapshot() {
+        let metadata = json!({"walg_identity_version":1, "walg_target_user_data":{"temps_backup_id":"00000000-0000-4000-8000-000000000001"}, "walg_full_backup":true});
+        assert_eq!(
+            validated_walg_target(&metadata, "00000000-0000-4000-8000-000000000001").unwrap(),
+            json!({"temps_backup_id":"00000000-0000-4000-8000-000000000001"})
+        );
+        assert!(validated_walg_target(&metadata, "00000000-0000-4000-8000-000000000002").is_err());
+        for field in [
+            "walg_identity_version",
+            "walg_target_user_data",
+            "walg_full_backup",
+        ] {
+            let mut incomplete = metadata.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                validated_walg_target(&incomplete, "00000000-0000-4000-8000-000000000001").is_err(),
+                "{field}"
+            );
+        }
+        assert!(matches!(
+            validated_walg_target(&metadata, "not-a-uuid"),
+            Err(BackupError::Validation(_))
+        ));
+        let mut augmented = metadata.clone();
+        augmented["walg_target_user_data"]["unexpected"] = json!(true);
+        assert!(validated_walg_target(&augmented, "00000000-0000-4000-8000-000000000001").is_err());
+        let mut delta = metadata.clone();
+        delta["walg_full_backup"] = json!(false);
+        assert!(validated_walg_target(&delta, "00000000-0000-4000-8000-000000000001").is_err());
+        assert!(matches!(
+            validated_walg_target(&json!({}), "00000000-0000-4000-8000-000000000003"),
+            Err(BackupError::Unsupported(_))
+        ));
     }
 
     #[test]
