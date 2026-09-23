@@ -94,6 +94,7 @@ export function CloudSettingsPage() {
   usePageTitle('Temps Cloud')
 
   const connected = status.data?.status === 'linked'
+  const credentialRejected = status.data?.status === 'credential_rejected'
   const stateUnreadable = status.data?.status === 'state_unreadable'
   const degraded = connected && status.data?.health !== 'healthy'
   const cloudConsoleUrl = status.data?.backend_url ?? 'https://app.temps.sh'
@@ -460,6 +461,63 @@ export function CloudSettingsPage() {
             </CardContent>
           </Card>
         </div>
+      ) : credentialRejected ? (
+        <Card className="border-destructive/40 shadow-none">
+          <CardContent className="space-y-5 p-6 md:p-8">
+            <Alert
+              variant="destructive"
+              className="border-0 p-0 [&>svg]:left-0 [&>svg]:top-0"
+            >
+              <AlertCircle className="size-4" />
+              <AlertTitle>Connection lost</AlertTitle>
+              <AlertDescription className="space-y-3">
+                <p>
+                  Temps Cloud rejected this installation’s saved credential. The
+                  previous link is still stored on this instance.
+                </p>
+                {status.data?.account_email && (
+                  <p>Cloud account: {status.data.account_email}</p>
+                )}
+                <p>
+                  Disconnect the previous link, then paste a reconnect code from
+                  the existing instance in Temps Cloud.
+                </p>
+                <p>
+                  Disconnecting disables Cloud exports, removes managed backup
+                  schedules, and revokes Cloud console access and its sessions.
+                  It removes the saved Cloud credential. Local projects and
+                  deployments remain available. After reconnecting, review your
+                  Cloud exports and backup schedule.
+                </p>
+                <p>{status.data?.health_message}</p>
+              </AlertDescription>
+            </Alert>
+            {disconnect.isError && (
+              <Alert variant="destructive">
+                <AlertTitle>Could not disconnect this instance</AlertTitle>
+                <AlertDescription>
+                  {getErrorMessage(
+                    disconnect.error,
+                    'The previous Cloud link could not be removed. Try again.'
+                  )}
+                </AlertDescription>
+              </Alert>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void remove()}
+              disabled={disconnect.isPending}
+            >
+              {disconnect.isPending ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Unplug />
+              )}
+              Disconnect
+            </Button>
+          </CardContent>
+        </Card>
       ) : stateUnreadable ? (
         <Card className="border-destructive/40 shadow-none">
           <CardContent className="p-6 md:p-8">
