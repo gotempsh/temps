@@ -20,8 +20,9 @@ const cloudStatus = (linked: boolean) => ({
   notifications_enabled: false,
 })
 
-const routeCloudLifecycle = async (page: Page) => {
-  let linked = false
+const routeCloudLifecycle = async (page: Page, rejected = false) => {
+  let linked = rejected
+  const operations: string[] = []
   const enrollmentCodes: string[] = []
   let featureState = {
     telemetry_enabled: false,
@@ -45,10 +46,27 @@ const routeCloudLifecycle = async (page: Page) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ ...cloudStatus(linked), ...featureState }),
+      body: JSON.stringify({
+        ...cloudStatus(linked),
+        ...featureState,
+        ...(rejected
+          ? {
+              status: 'credential_rejected',
+              health: 'dropping',
+              health_message:
+                'Local buffer is full: 54 spans discarded, 520 still queued.',
+              spooled_spans: 520,
+            }
+          : {}),
+      }),
     })
   })
   await page.route('**/cloud/enroll', async (route) => {
+    operations.push('enroll')
+    expect(
+      rejected,
+      'the retained credential must be disconnected before enrollment'
+    ).toBe(false)
     enrollmentCodes.push(route.request().postDataJSON().enrollment_code)
     linked = true
     await route.fulfill({
@@ -71,6 +89,8 @@ const routeCloudLifecycle = async (page: Page) => {
       await route.fallback()
       return
     }
+    operations.push('disconnect')
+    rejected = false
     linked = false
     await route.fulfill({
       status: 200,
@@ -79,7 +99,7 @@ const routeCloudLifecycle = async (page: Page) => {
     })
   })
 
-  return { enrollmentCodes, featureUpdates }
+  return { enrollmentCodes, featureUpdates, operations }
 }
 
 test.describe('Temps Cloud activation onboarding', () => {
@@ -154,6 +174,165 @@ test.describe('Temps Cloud activation onboarding', () => {
     await expect(page.getByRole('heading', { name: 'Connected' })).toBeVisible()
     expect(cloud.enrollmentCodes).toEqual(['ABCD-EFGH', 'WXYZ-IJKL'])
     expect(consoleErrors).toEqual([])
+  })
+
+  test('recovers a rejected credential by disconnecting before reconnecting', async ({
+    page,
+    consoleErrors,
+  }, testInfo) => {
+    const cloud = await routeCloudLifecycle(page, true)
+    let failDisconnect = true
+    await page.route('**/cloud', async (route) => {
+      if (route.request().method() === 'DELETE' && failDisconnect) {
+        await route.fulfill({
+          status: 503,
+          contentType: 'application/problem+json',
+          body: JSON.stringify({
+            title: 'Disconnect failed',
+            status: 503,
+            detail: 'Could not save Cloud link state. Try again.',
+          }),
+        })
+        return
+      }
+      await route.fallback()
+    })
+    await page.goto('/settings/cloud')
+    await expectAppMounted(page)
+    await expect(
+      page.getByText('Connection lost', { exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByText('Cloud account: owner@example.com')
+    ).toBeVisible()
+    await expect(
+      page.getByText(/54 spans discarded, 520 still queued/)
+    ).toBeVisible()
+    await expect(page.getByLabel('1. Paste enrollment code')).toHaveCount(0)
+    await expect(
+      page.getByRole('heading', { name: 'Connected', exact: true })
+    ).toHaveCount(0)
+    await expect(
+      page.getByText(/removes managed backup schedules/)
+    ).toContainText('revokes Cloud console access and its sessions')
+    expect(cloud.operations).toEqual([])
+    const screenshot = testInfo.outputPath('rejected-credential-recovery.png')
+    await page.screenshot({ path: screenshot, fullPage: true })
+    await testInfo.attach('rejected-credential-recovery', {
+      path: screenshot,
+      contentType: 'image/png',
+    })
+
+    await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await expect(
+      page
+        .getByRole('alert')
+        .filter({ hasText: 'Could not disconnect this instance' })
+    ).toContainText('Could not save Cloud link state. Try again.')
+    await expect(
+      page.getByText('Connection lost', { exact: true })
+    ).toBeVisible()
+    await expect(page.getByLabel('1. Paste enrollment code')).toHaveCount(0)
+    expect(cloud.enrollmentCodes).toEqual([])
+
+    failDisconnect = false
+    await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await expect(
+      page.getByRole('heading', { name: 'Connect this instance' })
+    ).toBeVisible()
+    await expect(
+      page.getByText('Connection lost', { exact: true })
+    ).toHaveCount(0)
+    await page
+      .getByLabel('1. Paste enrollment code')
+      .fill('RECONNECT-ABCD-EFGH')
+    await page.getByRole('button', { name: '2. Connect' }).click()
+    await expect(
+      page.getByRole('heading', { name: 'Connected', exact: true })
+    ).toBeVisible()
+    expect(cloud.operations).toEqual(['disconnect', 'enroll'])
+    expect(cloud.enrollmentCodes).toEqual(['RECONNECT-ABCD-EFGH'])
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('keeps rejected-credential recovery available while capability is pending or failed', async ({
+    page,
+    consoleErrors,
+  }) => {
+    const cloud = await routeCloudLifecycle(page, true)
+    let capabilityAvailable = false
+    let releaseCapability = () => {}
+    const pendingCapability = new Promise<void>((resolve) => {
+      releaseCapability = resolve
+    })
+    await page.route('**/cloud/capability', async (route) => {
+      await pendingCapability
+      await route.fulfill({
+        status: capabilityAvailable ? 200 : 503,
+        contentType: 'application/json',
+        body: JSON.stringify(
+          capabilityAvailable
+            ? { configured: true, reason: null, setup_path: '/settings/cloud' }
+            : { status: 503, detail: 'Cloud capability checks timed out.' }
+        ),
+      })
+    })
+
+    try {
+      await page.goto('/settings/cloud')
+      await expectAppMounted(page)
+      await expect(
+        page.getByText('Connection lost', { exact: true })
+      ).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: 'Disconnect', exact: true })
+      ).toBeEnabled()
+      await expect(
+        page.getByText('Cloud connection needs configuration')
+      ).toHaveCount(0)
+      releaseCapability()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toBeVisible()
+      await expect(
+        page.getByText('Connection lost', { exact: true })
+      ).toBeVisible()
+      await expect(page.getByLabel('1. Paste enrollment code')).toHaveCount(0)
+
+      await page
+        .getByRole('button', { name: 'Disconnect', exact: true })
+        .click()
+      await expect(
+        page.getByRole('heading', { name: 'Connect this instance' })
+      ).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: '2. Connect' })
+      ).toBeDisabled()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toBeVisible()
+      expect(cloud.operations).toEqual(['disconnect'])
+
+      capabilityAvailable = true
+      await page.getByRole('button', { name: 'Try again', exact: true }).click()
+      await expect(
+        page.getByRole('button', { name: '2. Connect' })
+      ).toBeEnabled()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toHaveCount(0)
+      await page
+        .getByLabel('1. Paste enrollment code')
+        .fill('RECONNECT-ABCD-EFGH')
+      await page.getByRole('button', { name: '2. Connect' }).click()
+      await expect(
+        page.getByRole('heading', { name: 'Connected', exact: true })
+      ).toBeVisible()
+      expect(cloud.operations).toEqual(['disconnect', 'enroll'])
+      expect(consoleErrors).toEqual([])
+    } finally {
+      releaseCapability()
+    }
   })
 
   test('shows an actionable capability error and recovers on retry', async ({

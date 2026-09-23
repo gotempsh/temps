@@ -94,6 +94,7 @@ export function CloudSettingsPage() {
   usePageTitle('Temps Cloud')
 
   const connected = status.data?.status === 'linked'
+  const credentialRejected = status.data?.status === 'credential_rejected'
   const stateUnreadable = status.data?.status === 'state_unreadable'
   const degraded = connected && status.data?.health !== 'healthy'
   const cloudConsoleUrl = status.data?.backend_url ?? 'https://app.temps.sh'
@@ -222,7 +223,7 @@ export function CloudSettingsPage() {
     }
   }
 
-  if (status.isLoading || capability.isLoading) {
+  if (status.isLoading) {
     return (
       <div className="w-full space-y-6 pb-12">
         <Skeleton className="h-24 w-full" />
@@ -231,20 +232,16 @@ export function CloudSettingsPage() {
     )
   }
 
-  if (status.isError || capability.isError) {
-    const failedQuery = status.isError ? status : capability
-    const title = status.isError
-      ? 'Temps Cloud status unavailable'
-      : 'Temps Cloud capability unavailable'
+  if (status.isError) {
     return (
       <div className="w-full pb-12">
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
-          <AlertTitle>{title}</AlertTitle>
+          <AlertTitle>Temps Cloud status unavailable</AlertTitle>
           <AlertDescription className="space-y-3">
             <p>
               {getErrorMessage(
-                failedQuery.error,
+                status.error,
                 'The server could not report whether Temps Cloud is available.'
               )}
             </p>
@@ -252,12 +249,10 @@ export function CloudSettingsPage() {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void failedQuery.refetch()}
-              disabled={failedQuery.isFetching}
+              onClick={() => void status.refetch()}
+              disabled={status.isFetching}
             >
-              {failedQuery.isFetching ? (
-                <Loader2 className="animate-spin" />
-              ) : null}
+              {status.isFetching ? <Loader2 className="animate-spin" /> : null}
               Try again
             </Button>
           </AlertDescription>
@@ -281,7 +276,34 @@ export function CloudSettingsPage() {
         </p>
       </header>
 
-      {!capability.data?.configured && (
+      {capability.isError && (
+        <Alert variant="destructive">
+          <AlertCircle className="size-4" />
+          <AlertTitle>Temps Cloud capability unavailable</AlertTitle>
+          <AlertDescription className="space-y-3">
+            <p>
+              {getErrorMessage(
+                capability.error,
+                'The server could not check whether new Cloud connections are available.'
+              )}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void capability.refetch()}
+              disabled={capability.isFetching}
+            >
+              {capability.isFetching ? (
+                <Loader2 className="animate-spin" />
+              ) : null}
+              Try again
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {capability.isSuccess && !capability.data.configured && (
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
           <AlertTitle>Cloud connection needs configuration</AlertTitle>
@@ -460,6 +482,63 @@ export function CloudSettingsPage() {
             </CardContent>
           </Card>
         </div>
+      ) : credentialRejected ? (
+        <Card className="border-destructive/40 shadow-none">
+          <CardContent className="space-y-5 p-6 md:p-8">
+            <Alert
+              variant="destructive"
+              className="border-0 p-0 [&>svg]:left-0 [&>svg]:top-0"
+            >
+              <AlertCircle className="size-4" />
+              <AlertTitle>Connection lost</AlertTitle>
+              <AlertDescription className="space-y-3">
+                <p>
+                  Temps Cloud rejected this installation’s saved credential. The
+                  previous link is still stored on this instance.
+                </p>
+                {status.data?.account_email && (
+                  <p>Cloud account: {status.data.account_email}</p>
+                )}
+                <p>
+                  Disconnect the previous link, then paste a reconnect code from
+                  the existing instance in Temps Cloud.
+                </p>
+                <p>
+                  Disconnecting disables Cloud exports, removes managed backup
+                  schedules, and revokes Cloud console access and its sessions.
+                  It removes the saved Cloud credential. Local projects and
+                  deployments remain available. After reconnecting, review your
+                  Cloud exports and backup schedule.
+                </p>
+                <p>{status.data?.health_message}</p>
+              </AlertDescription>
+            </Alert>
+            {disconnect.isError && (
+              <Alert variant="destructive">
+                <AlertTitle>Could not disconnect this instance</AlertTitle>
+                <AlertDescription>
+                  {getErrorMessage(
+                    disconnect.error,
+                    'The previous Cloud link could not be removed. Try again.'
+                  )}
+                </AlertDescription>
+              </Alert>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void remove()}
+              disabled={disconnect.isPending}
+            >
+              {disconnect.isPending ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Unplug />
+              )}
+              Disconnect
+            </Button>
+          </CardContent>
+        </Card>
       ) : stateUnreadable ? (
         <Card className="border-destructive/40 shadow-none">
           <CardContent className="p-6 md:p-8">
@@ -526,7 +605,11 @@ export function CloudSettingsPage() {
                 <Button
                   type="submit"
                   className="h-11 w-full"
-                  disabled={enroll.isPending || !capability.data?.configured}
+                  disabled={
+                    enroll.isPending ||
+                    !capability.isSuccess ||
+                    !capability.data.configured
+                  }
                 >
                   {enroll.isPending ? (
                     <Loader2 className="animate-spin" />
