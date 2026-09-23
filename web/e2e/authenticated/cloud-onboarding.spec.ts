@@ -255,6 +255,86 @@ test.describe('Temps Cloud activation onboarding', () => {
     expect(consoleErrors).toEqual([])
   })
 
+  test('keeps rejected-credential recovery available while capability is pending or failed', async ({
+    page,
+    consoleErrors,
+  }) => {
+    const cloud = await routeCloudLifecycle(page, true)
+    let capabilityAvailable = false
+    let releaseCapability = () => {}
+    const pendingCapability = new Promise<void>((resolve) => {
+      releaseCapability = resolve
+    })
+    await page.route('**/cloud/capability', async (route) => {
+      await pendingCapability
+      await route.fulfill({
+        status: capabilityAvailable ? 200 : 503,
+        contentType: 'application/json',
+        body: JSON.stringify(
+          capabilityAvailable
+            ? { configured: true, reason: null, setup_path: '/settings/cloud' }
+            : { status: 503, detail: 'Cloud capability checks timed out.' }
+        ),
+      })
+    })
+
+    try {
+      await page.goto('/settings/cloud')
+      await expectAppMounted(page)
+      await expect(
+        page.getByText('Connection lost', { exact: true })
+      ).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: 'Disconnect', exact: true })
+      ).toBeEnabled()
+      await expect(
+        page.getByText('Cloud connection needs configuration')
+      ).toHaveCount(0)
+      releaseCapability()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toBeVisible()
+      await expect(
+        page.getByText('Connection lost', { exact: true })
+      ).toBeVisible()
+      await expect(page.getByLabel('1. Paste enrollment code')).toHaveCount(0)
+
+      await page
+        .getByRole('button', { name: 'Disconnect', exact: true })
+        .click()
+      await expect(
+        page.getByRole('heading', { name: 'Connect this instance' })
+      ).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: '2. Connect' })
+      ).toBeDisabled()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toBeVisible()
+      expect(cloud.operations).toEqual(['disconnect'])
+
+      capabilityAvailable = true
+      await page.getByRole('button', { name: 'Try again', exact: true }).click()
+      await expect(
+        page.getByRole('button', { name: '2. Connect' })
+      ).toBeEnabled()
+      await expect(
+        page.getByText('Temps Cloud capability unavailable')
+      ).toHaveCount(0)
+      await page
+        .getByLabel('1. Paste enrollment code')
+        .fill('RECONNECT-ABCD-EFGH')
+      await page.getByRole('button', { name: '2. Connect' }).click()
+      await expect(
+        page.getByRole('heading', { name: 'Connected', exact: true })
+      ).toBeVisible()
+      expect(cloud.operations).toEqual(['disconnect', 'enroll'])
+      expect(consoleErrors).toEqual([])
+    } finally {
+      releaseCapability()
+    }
+  })
+
   test('shows an actionable capability error and recovers on retry', async ({
     page,
     consoleErrors,

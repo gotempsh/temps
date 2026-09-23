@@ -223,7 +223,7 @@ export function CloudSettingsPage() {
     }
   }
 
-  if (status.isLoading || capability.isLoading) {
+  if (status.isLoading) {
     return (
       <div className="w-full space-y-6 pb-12">
         <Skeleton className="h-24 w-full" />
@@ -232,20 +232,16 @@ export function CloudSettingsPage() {
     )
   }
 
-  if (status.isError || capability.isError) {
-    const failedQuery = status.isError ? status : capability
-    const title = status.isError
-      ? 'Temps Cloud status unavailable'
-      : 'Temps Cloud capability unavailable'
+  if (status.isError) {
     return (
       <div className="w-full pb-12">
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
-          <AlertTitle>{title}</AlertTitle>
+          <AlertTitle>Temps Cloud status unavailable</AlertTitle>
           <AlertDescription className="space-y-3">
             <p>
               {getErrorMessage(
-                failedQuery.error,
+                status.error,
                 'The server could not report whether Temps Cloud is available.'
               )}
             </p>
@@ -253,12 +249,10 @@ export function CloudSettingsPage() {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void failedQuery.refetch()}
-              disabled={failedQuery.isFetching}
+              onClick={() => void status.refetch()}
+              disabled={status.isFetching}
             >
-              {failedQuery.isFetching ? (
-                <Loader2 className="animate-spin" />
-              ) : null}
+              {status.isFetching ? <Loader2 className="animate-spin" /> : null}
               Try again
             </Button>
           </AlertDescription>
@@ -282,7 +276,34 @@ export function CloudSettingsPage() {
         </p>
       </header>
 
-      {!capability.data?.configured && (
+      {capability.isError && (
+        <Alert variant="destructive">
+          <AlertCircle className="size-4" />
+          <AlertTitle>Temps Cloud capability unavailable</AlertTitle>
+          <AlertDescription className="space-y-3">
+            <p>
+              {getErrorMessage(
+                capability.error,
+                'The server could not check whether new Cloud connections are available.'
+              )}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void capability.refetch()}
+              disabled={capability.isFetching}
+            >
+              {capability.isFetching ? (
+                <Loader2 className="animate-spin" />
+              ) : null}
+              Try again
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {capability.isSuccess && !capability.data.configured && (
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
           <AlertTitle>Cloud connection needs configuration</AlertTitle>
@@ -584,7 +605,11 @@ export function CloudSettingsPage() {
                 <Button
                   type="submit"
                   className="h-11 w-full"
-                  disabled={enroll.isPending || !capability.data?.configured}
+                  disabled={
+                    enroll.isPending ||
+                    !capability.isSuccess ||
+                    !capability.data.configured
+                  }
                 >
                   {enroll.isPending ? (
                     <Loader2 className="animate-spin" />
