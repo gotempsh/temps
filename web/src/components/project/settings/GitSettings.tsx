@@ -93,6 +93,7 @@ import {
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
+import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -134,13 +135,6 @@ import {
   repositoryConnectionPath,
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
-
-function isRepositoryRootDirectory(
-  directory: string | undefined | null
-): boolean {
-  const normalized = (directory ?? '').trim()
-  return normalized === '' || normalized === '.' || normalized === './'
-}
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -1061,45 +1055,50 @@ function GitSettingsInline({
                       />
                     }
                   />
-                  {!isRepositoryRootDirectory(
-                    editing === 'directory' ? directoryDraft : project.directory
-                  ) && (
-                    <div className="flex items-start gap-2 px-1">
-                      <Checkbox
-                        id="pull-only-root-directory"
-                        checked={!!project.pull_only_root_directory}
-                        disabled={updateGitSettings.isPending}
-                        onCheckedChange={async (checked) => {
-                          await saveGitField({
-                            pull_only_root_directory: checked === true,
-                            ...(editing === 'directory'
-                              ? { directory: directoryDraft || './' }
-                              : {}),
-                          })
-                          if (editing === 'directory') {
-                            close()
-                          }
-                          toast.success(
-                            checked === true
-                              ? 'Deploy will pull only the root directory'
-                              : 'Deploy will pull the full repository'
-                          )
-                        }}
-                      />
-                      <div className="space-y-1">
-                        <label
-                          htmlFor="pull-only-root-directory"
-                          className="text-sm leading-none cursor-pointer"
-                        >
-                          Pull only the root directory
-                        </label>
-                        <p className="text-xs text-muted-foreground">
-                          Clone only this subdirectory instead of the whole
-                          repository.
-                        </p>
-                      </div>
+                  <div
+                    className={cn(
+                      'flex items-start gap-2 px-1',
+                      isRepositoryRootDirectory(
+                        editing === 'directory'
+                          ? directoryDraft
+                          : project.directory
+                      ) && 'hidden'
+                    )}
+                  >
+                    <Checkbox
+                      id="pull-only-root-directory"
+                      checked={!!project.pull_only_root_directory}
+                      disabled={updateGitSettings.isPending}
+                      onCheckedChange={async (checked) => {
+                        await saveGitField({
+                          pull_only_root_directory: checked === true,
+                          ...(editing === 'directory'
+                            ? { directory: directoryDraft || './' }
+                            : {}),
+                        })
+                        if (editing === 'directory') {
+                          close()
+                        }
+                        toast.success(
+                          checked === true
+                            ? 'Deploy will pull only the root directory'
+                            : 'Deploy will pull the full repository'
+                        )
+                      }}
+                    />
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="pull-only-root-directory"
+                        className="text-sm leading-none cursor-pointer"
+                      >
+                        Pull only the root directory
+                      </label>
+                      <p className="text-xs text-muted-foreground">
+                        Clone only this subdirectory instead of the whole
+                        repository.
+                      </p>
                     </div>
-                  )}
+                  </div>
 
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (
@@ -3021,29 +3020,32 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 Subdirectory to build from (for monorepos). Defaults to the
                 repository root.
               </p>
-              {!isRepositoryRootDirectory(directory) && (
-                <div className="flex items-start gap-2 pt-1">
-                  <Checkbox
-                    id="connect-pull-only-root-directory"
-                    checked={pullOnlyRootDirectory}
-                    onCheckedChange={(checked) =>
-                      setPullOnlyRootDirectory(checked === true)
-                    }
-                  />
-                  <div className="space-y-1">
-                    <label
-                      htmlFor="connect-pull-only-root-directory"
-                      className="text-sm leading-none cursor-pointer"
-                    >
-                      Pull only the root directory
-                    </label>
-                    <p className="text-xs text-muted-foreground">
-                      Clone only this subdirectory instead of the whole
-                      repository.
-                    </p>
-                  </div>
+              <div
+                className={cn(
+                  'flex items-start gap-2 pt-1',
+                  isRepositoryRootDirectory(directory) && 'hidden'
+                )}
+              >
+                <Checkbox
+                  id="connect-pull-only-root-directory"
+                  checked={pullOnlyRootDirectory}
+                  onCheckedChange={(checked) =>
+                    setPullOnlyRootDirectory(checked === true)
+                  }
+                />
+                <div className="space-y-1">
+                  <label
+                    htmlFor="connect-pull-only-root-directory"
+                    className="text-sm leading-none cursor-pointer"
+                  >
+                    Pull only the root directory
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    Clone only this subdirectory instead of the whole
+                    repository.
+                  </p>
                 </div>
-              )}
+              </div>
             </div>
           </CardContent>
         </Card>
