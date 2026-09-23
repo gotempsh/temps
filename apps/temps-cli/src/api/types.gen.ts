@@ -3918,6 +3918,15 @@ export type ComposePortMapping = {
     target: number;
 };
 
+/**
+ * Problem Details returned when a Compose preview cannot be rendered.
+ */
+export type ComposePreviewProblemResponse = {
+    detail: string;
+    policy_check?: null | ComposeSecurityCheck;
+    title: string;
+};
+
 export type ComposePreviewRequest = {
     branch?: string | null;
     composeOverride?: string | null;
@@ -39983,7 +39992,7 @@ export type GetPublicComposePreviewErrors = {
     /**
      * Compose file or override is invalid
      */
-    400: unknown;
+    400: ComposePreviewProblemResponse;
     /**
      * Authentication required for custom GitLab origins
      */
@@ -39997,6 +40006,8 @@ export type GetPublicComposePreviewErrors = {
      */
     404: unknown;
 };
+
+export type GetPublicComposePreviewError = GetPublicComposePreviewErrors[keyof GetPublicComposePreviewErrors];
 
 export type GetPublicComposePreviewResponses = {
     /**
@@ -59237,7 +59248,7 @@ export type GetRepositoryComposePreviewErrors = {
     /**
      * Compose file or override is invalid
      */
-    400: unknown;
+    400: ComposePreviewProblemResponse;
     /**
      * Authentication required
      */
@@ -59247,6 +59258,8 @@ export type GetRepositoryComposePreviewErrors = {
      */
     404: unknown;
 };
+
+export type GetRepositoryComposePreviewError = GetRepositoryComposePreviewErrors[keyof GetRepositoryComposePreviewErrors];
 
 export type GetRepositoryComposePreviewResponses = {
     /**

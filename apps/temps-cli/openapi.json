@@ -8385,6 +8385,33 @@
         ],
         "type": "object"
       },
+      "ComposePreviewProblemResponse": {
+        "description": "Problem Details returned when a Compose preview cannot be rendered.",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "policy_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeSecurityCheck",
+                "description": "The individual project security check an administrator may review."
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "detail"
+        ],
+        "type": "object"
+      },
       "ComposePreviewRequest": {
         "properties": {
           "branch": {
@@ -80039,6 +80066,13 @@
             "description": "Effective Compose preview rendered"
           },
           "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePreviewProblemResponse"
+                }
+              }
+            },
             "description": "Compose file or override is invalid"
           },
           "401": {
@@ -112196,6 +112230,13 @@
             "description": "Effective Compose preview rendered"
           },
           "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePreviewProblemResponse"
+                }
+              }
+            },
             "description": "Compose file or override is invalid"
           },
           "401": {
