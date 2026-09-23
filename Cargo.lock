@@ -12784,6 +12784,7 @@ name = "temps-routes"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "chrono",

@@ -694,18 +694,17 @@ impl ServeCommand {
         if let Some(ref on_demand_manager) = on_demand_manager {
             let on_demand_for_callback = Arc::clone(on_demand_manager);
             route_table.set_on_sleeping_callback(Arc::new(move |entries, on_demand_configs| {
-                on_demand_for_callback.clear_sleeping_domains();
-                for entry in entries {
-                    on_demand_for_callback.register_sleeping_domain(
-                        entry.domain.clone(),
+                on_demand_for_callback.replace_sleeping_domains(entries.into_iter().map(|entry| {
+                    (
+                        entry.domain,
                         temps_proxy::on_demand::SleepingEnvironmentInfo {
                             environment_id: entry.environment_id,
                             project_id: entry.project_id,
                             deployment_id: entry.deployment_id,
                             wake_timeout_seconds: entry.wake_timeout_seconds,
                         },
-                    );
-                }
+                    )
+                }));
                 // Register on-demand configs so the idle sweep can track awake environments
                 for config in on_demand_configs {
                     on_demand_for_callback.register_on_demand_environment(

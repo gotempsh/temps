@@ -21,7 +21,7 @@ use std::collections::HashMap;
 ///   1. Reverse: `com.example.api`
 ///   2. Strip first label: `com.example`
 ///   3. Lookup in HashMap → O(1)
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WildcardMatcher {
     /// Map of reversed base domain (without `*.` prefix) -> RouteInfo
     /// e.g., `*.example.com` → key = `com.example`

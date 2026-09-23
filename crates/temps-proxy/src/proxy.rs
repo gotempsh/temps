@@ -402,9 +402,7 @@ fn should_lookup_sleeping_environment(
     route_table: Option<&temps_routes::CachedPeerTable>,
     host: &str,
 ) -> bool {
-    !route_table.is_some_and(|routes| {
-        routes.is_reserved_hostname(host) || routes.resolve_route_for_sni(host).is_some()
-    })
+    !route_table.is_some_and(|routes| routes.owns_hostname(host))
 }
 
 /// Decide whether a request on the plain-HTTP listener should be answered with

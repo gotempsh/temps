@@ -22,10 +22,11 @@
 //! - `*.example.com` does NOT match `example.com` ✗
 
 use crate::wildcard_matcher::WildcardMatcher;
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sqlx::postgres::{PgListener, PgPool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_core::public_hostname_resolver::match_strategy;
@@ -461,11 +462,21 @@ pub type OnCertEligibleCallback = Arc<
         + Sync,
 >;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
     wildcards: WildcardMatcher,
     reserved_console_host: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteTableSnapshot {
+    http_routes: HashMap<String, RouteInfo>,
+    tls_routes: HashMap<String, RouteInfo>,
+    http_wildcards: WildcardMatcher,
+    tls_wildcards: WildcardMatcher,
+    legacy: LegacyRouteTable,
+    ownership: RouteOwnershipSnapshot,
 }
 
 impl LegacyRouteTable {
@@ -479,24 +490,66 @@ impl LegacyRouteTable {
     }
 }
 
+/// Minimal, immutable hostname ownership index for wake-on-request gating.
+/// It deliberately stores no `RouteInfo`, so hot-path existence checks neither
+/// take route-table locks nor clone backend/project models.
+#[derive(Clone, Debug, Default)]
+struct RouteOwnershipSnapshot {
+    exact: HashSet<String>,
+    wildcard_bases: HashSet<String>,
+    reserved_hosts: HashSet<String>,
+}
+
+impl RouteOwnershipSnapshot {
+    fn owns(&self, host: &str) -> bool {
+        if self.reserved_hosts.contains(host) || self.exact.contains(host) {
+            return true;
+        }
+        let Some((label, base)) = host.split_once('.') else {
+            return false;
+        };
+        !label.is_empty() && !base.is_empty() && self.wildcard_bases.contains(base)
+    }
+
+    fn include(&mut self, other: &Self) {
+        self.exact.extend(other.exact.iter().cloned());
+        self.wildcard_bases
+            .extend(other.wildcard_bases.iter().cloned());
+        self.reserved_hosts
+            .extend(other.reserved_hosts.iter().cloned());
+    }
+}
+
+fn build_route_ownership_snapshot<'a>(
+    legacy_hosts: impl IntoIterator<Item = &'a String>,
+    http_hosts: impl IntoIterator<Item = &'a String>,
+    tls_hosts: impl IntoIterator<Item = &'a String>,
+    reserved_console_host: Option<String>,
+) -> RouteOwnershipSnapshot {
+    let mut snapshot = RouteOwnershipSnapshot::default();
+    if let Some(host) = reserved_console_host {
+        snapshot.reserved_hosts.insert(host);
+    }
+    for host in legacy_hosts.into_iter().chain(http_hosts).chain(tls_hosts) {
+        if let Some(base) = host.strip_prefix("*.") {
+            if !base.is_empty() {
+                snapshot.wildcard_bases.insert(base.to_string());
+            }
+        } else {
+            snapshot.exact.insert(host.clone());
+        }
+    }
+    snapshot
+}
+
 pub struct CachedPeerTable {
-    /// Exact hostname -> RouteInfo for HTTP routes (route_type = 'http')
-    /// Used for matching on HTTP Host header (Layer 7)
-    http_routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+    /// All route indexes and wake-gate ownership published as one immutable,
+    /// lock-free snapshot. A reload can never expose mismatched generations.
+    route_snapshot: ArcSwap<RouteTableSnapshot>,
 
-    /// Exact hostname -> RouteInfo for TLS routes (route_type = 'tls')
-    /// Used for matching on TLS SNI hostname (Layer 4/5)
-    tls_routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
-
-    /// Wildcard patterns for HTTP routes
-    http_wildcards: Arc<RwLock<WildcardMatcher>>,
-
-    /// Wildcard patterns for TLS routes
-    tls_wildcards: Arc<RwLock<WildcardMatcher>>,
-
-    /// Legacy routes map (for backward compatibility during transition)
-    /// Contains all environment domains, project custom domains, etc.
-    routes: Arc<RwLock<LegacyRouteTable>>,
+    /// Serializes reloads so their three-phase snapshot publication cannot
+    /// interleave, even when manual refresh and database notification race.
+    route_reload_lock: tokio::sync::Mutex<()>,
 
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
@@ -558,11 +611,8 @@ impl CachedPeerTable {
         runtime_context: Arc<RuntimeContext>,
     ) -> Self {
         Self {
-            http_routes: Arc::new(RwLock::new(HashMap::new())),
-            tls_routes: Arc::new(RwLock::new(HashMap::new())),
-            http_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
-            tls_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
-            routes: Arc::new(RwLock::new(LegacyRouteTable::default())),
+            route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
+            route_reload_lock: tokio::sync::Mutex::new(()),
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
@@ -674,8 +724,9 @@ impl CachedPeerTable {
     /// Used for an immediate one-time provisioning pass after the cert manager
     /// is wired up (covers domains already in the table from the initial load).
     pub fn cert_eligible_hosts(&self) -> Vec<String> {
-        self.routes
-            .read()
+        self.route_snapshot
+            .load()
+            .legacy
             .exact
             .iter()
             .filter(|(host, r)| r.cert_eligible && !host.starts_with("*."))
@@ -688,31 +739,29 @@ impl CachedPeerTable {
     /// Used for route_type = 'http' routes.
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
-        if self.routes.read().reserved_console_host.as_deref() == Some(host) {
+        let snapshot = self.route_snapshot.load();
+        if snapshot.legacy.reserved_console_host.as_deref() == Some(host) {
             return None;
         }
 
         // 1. Try exact match in HTTP routes
-        if let Some(route) = self.http_routes.read().get(host) {
+        if let Some(route) = snapshot.http_routes.get(host) {
             return Some(route.clone());
         }
 
         // 2. Exact project/environment domains take precedence over every
         // wildcard route, including operator-configured custom wildcards.
-        {
-            let legacy = self.routes.read();
-            if let Some(route) = legacy.exact.get(host) {
-                return Some(route.clone());
-            }
+        if let Some(route) = snapshot.legacy.exact.get(host) {
+            return Some(route.clone());
         }
 
         // 3. Try wildcard match in HTTP wildcards
-        if let Some(route) = self.http_wildcards.read().match_domain(host) {
+        if let Some(route) = snapshot.http_wildcards.match_domain(host) {
             return Some(route.clone());
         }
 
         // 4. Fall back to project/environment wildcard routes.
-        self.routes.read().wildcards.match_domain(host).cloned()
+        snapshot.legacy.wildcards.match_domain(host).cloned()
     }
 
     /// Get route by TLS SNI hostname
@@ -720,17 +769,18 @@ impl CachedPeerTable {
     /// Used for route_type = 'tls' routes.
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
-        if self.routes.read().reserved_console_host.as_deref() == Some(sni) {
+        let snapshot = self.route_snapshot.load();
+        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
             return None;
         }
 
         // 1. Try exact match in TLS routes
-        if let Some(route) = self.tls_routes.read().get(sni) {
+        if let Some(route) = snapshot.tls_routes.get(sni) {
             return Some(route.clone());
         }
 
         // 2. Try wildcard match in TLS wildcards
-        if let Some(route) = self.tls_wildcards.read().match_domain(sni) {
+        if let Some(route) = snapshot.tls_wildcards.match_domain(sni) {
             return Some(route.clone());
         }
 
@@ -744,8 +794,19 @@ impl CachedPeerTable {
     /// MUST consult all three — checking only `get_route_by_sni` would miss them
     /// and reject every certable host. O(1) per map, no I/O.
     pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
-        self.get_route_by_sni(sni)
-            .or_else(|| self.get_route_by_host(sni))
+        let snapshot = self.route_snapshot.load();
+        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+            return None;
+        }
+        snapshot
+            .tls_routes
+            .get(sni)
+            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
+            .or_else(|| snapshot.http_routes.get(sni))
+            .or_else(|| snapshot.legacy.exact.get(sni))
+            .or_else(|| snapshot.http_wildcards.match_domain(sni))
+            .or_else(|| snapshot.legacy.wildcards.match_domain(sni))
+            .cloned()
     }
 
     /// Insert a route directly into the legacy routes map. Test/seed support for
@@ -754,31 +815,45 @@ impl CachedPeerTable {
     /// the production load path — `load_routes` owns that.
     #[doc(hidden)]
     pub fn insert_route_for_test(&self, host: &str, route: RouteInfo) {
-        let mut routes = self.routes.write();
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
         if host.starts_with("*.") {
             let mut wildcard_route = route.clone();
             wildcard_route.cert_eligible = false;
-            routes.wildcards.insert(host, wildcard_route);
+            snapshot.legacy.wildcards.insert(host, wildcard_route);
         }
-        routes.exact.insert(host.to_string(), route);
+        snapshot.legacy.exact.insert(host.to_string(), route);
+        snapshot.ownership = build_route_ownership_snapshot(
+            snapshot.legacy.exact.keys(),
+            snapshot.http_routes.keys(),
+            snapshot.tls_routes.keys(),
+            snapshot.legacy.reserved_console_host.clone(),
+        );
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Insert a TLS route for cross-crate tests without database setup.
     #[doc(hidden)]
     pub fn insert_tls_route_for_test(&self, host: &str, route: RouteInfo) {
-        self.tls_routes.write().insert(host.to_string(), route);
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.tls_routes.insert(host.to_string(), route);
+        snapshot.ownership.exact.insert(host.to_string());
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Reserve the console hostname for cross-crate tests without database setup.
     #[doc(hidden)]
     pub fn reserve_hostname_for_test(&self, host: &str) {
-        self.routes.write().reserved_console_host = Some(host.to_string());
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.reserved_console_host = Some(host.to_string());
+        snapshot.ownership.reserved_hosts.insert(host.to_string());
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Load all routes from the database into the cache with full models.
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
     pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, sea_orm::DbErr> {
+        let _reload_guard = self.route_reload_lock.lock().await;
         use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
         use temps_entities::{
             custom_routes, deployments, environment_domains, environments, project_custom_domains,
@@ -2083,6 +2158,13 @@ impl CachedPeerTable {
             legacy_wildcards_matcher.insert(host, wildcard_route);
         }
 
+        let route_ownership = build_route_ownership_snapshot(
+            routes.keys(),
+            http_routes_map.keys(),
+            tls_routes_map.keys(),
+            app_settings.console_hostname(),
+        );
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();
@@ -2091,31 +2173,19 @@ impl CachedPeerTable {
         let tls_wildcards_count = tls_wildcards_matcher.len();
         let legacy_wildcards_count = legacy_wildcards_matcher.len();
 
-        // Publish exact routes, wildcard index, and the reserved hostname as
-        // one snapshot so readers never observe a partially refreshed policy.
-        *self.routes.write() = LegacyRouteTable {
-            exact: routes,
-            wildcards: legacy_wildcards_matcher,
-            reserved_console_host: app_settings.console_hostname(),
-        };
+        let new_snapshot = Arc::new(RouteTableSnapshot {
+            http_routes: http_routes_map,
+            tls_routes: tls_routes_map,
+            http_wildcards: http_wildcards_matcher,
+            tls_wildcards: tls_wildcards_matcher,
+            legacy: LegacyRouteTable {
+                exact: routes,
+                wildcards: legacy_wildcards_matcher,
+                reserved_console_host: app_settings.console_hostname(),
+            },
+            ownership: route_ownership,
+        });
 
-        // Replace HTTP and TLS route caches
-        *self.http_routes.write() = http_routes_map;
-        *self.tls_routes.write() = tls_routes_map;
-        *self.http_wildcards.write() = http_wildcards_matcher;
-        *self.tls_wildcards.write() = tls_wildcards_matcher;
-
-        if !sleeping_environments.is_empty() {
-            info!(
-                "Route table: {} sleeping on-demand environments skipped",
-                sleeping_environments.len()
-            );
-        }
-
-        info!(
-            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards",
-            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count
-        );
         // Collect on-demand configs for awake environments so the idle sweep can track them.
         let on_demand_configs: Vec<OnDemandConfigEntry> = environments_cache
             .values()
@@ -2134,15 +2204,45 @@ impl CachedPeerTable {
             })
             .collect();
 
-        debug!(
-            "Found {} on-demand configs for idle tracking",
-            on_demand_configs.len()
-        );
+        // Three-phase publication keeps route ownership conservative while
+        // the separate sleeping-domain snapshot changes:
+        // old routes/old sleeping -> old routes/(old ∪ new) ownership/new sleeping
+        // -> new routes/new ownership/new sleeping. Thus a transition can only
+        // suppress a wake briefly; it can never wake the wrong environment.
+        let old_snapshot = self.route_snapshot.load_full();
+        let mut transition = (*old_snapshot).clone();
+        transition.ownership.include(&new_snapshot.ownership);
+        self.route_snapshot.store(Arc::new(transition));
 
-        // Notify callback with sleeping environments and on-demand configs
-        if let Some(callback) = self.on_sleeping_callback.lock().as_ref() {
+        let on_sleeping = self.on_sleeping_callback.lock().as_ref().cloned();
+        if let Some(callback) = on_sleeping {
             callback(sleeping_environments.clone(), on_demand_configs);
         }
+
+        self.route_snapshot.store(new_snapshot);
+
+        if !sleeping_environments.is_empty() {
+            info!(
+                "Route table: {} sleeping on-demand environments skipped",
+                sleeping_environments.len()
+            );
+        }
+
+        info!(
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards",
+            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count
+        );
+        debug!(
+            "Found {} on-demand configs for idle tracking",
+            environments_cache
+                .values()
+                .filter(|environment| !environment.sleeping)
+                .filter(|environment| environment
+                    .deployment_config
+                    .as_ref()
+                    .is_some_and(|config| config.on_demand))
+                .count()
+        );
 
         // Bump the in-memory generation and wake any long-poll waiters
         // on the routes-sync endpoint, plus anything waiting for the first
@@ -2176,8 +2276,9 @@ impl CachedPeerTable {
         let on_cert_eligible = self.on_cert_eligible_callback.lock().as_ref().cloned();
         if let Some(callback) = on_cert_eligible {
             let cert_hosts: Vec<String> = self
-                .routes
-                .read()
+                .route_snapshot
+                .load()
+                .legacy
                 .exact
                 .iter()
                 .filter(|(host, r)| r.cert_eligible && !host.starts_with("*."))
@@ -2211,23 +2312,35 @@ impl CachedPeerTable {
 
     /// Get route information for a host (O(1) lookup)
     pub fn get_route(&self, host: &str) -> Option<RouteInfo> {
-        self.routes.read().get(host).cloned()
+        self.route_snapshot.load().legacy.get(host).cloned()
     }
 
     /// Whether this hostname is reserved for the control-plane console.
     /// Wake-on-request checks this before consulting sleeping wildcards.
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
-        self.routes.read().reserved_console_host.as_deref() == Some(host)
+        self.route_snapshot
+            .load()
+            .legacy
+            .reserved_console_host
+            .as_deref()
+            == Some(host)
+    }
+
+    /// Return whether an active route or reserved control-plane hostname owns
+    /// `host`. This is a single lock-free snapshot load and does not clone a
+    /// `RouteInfo`; it is intended for the per-request wake gate.
+    pub fn owns_hostname(&self, host: &str) -> bool {
+        self.route_snapshot.load().ownership.owns(host)
     }
 
     /// Get current number of routes in the table
     pub fn len(&self) -> usize {
-        self.routes.read().exact.len()
+        self.route_snapshot.load().legacy.exact.len()
     }
 
     /// Check if the route table is empty
     pub fn is_empty(&self) -> bool {
-        self.routes.read().exact.is_empty()
+        self.route_snapshot.load().legacy.exact.is_empty()
     }
 
     /// Check if any route in the table points to a specific deployment.
@@ -2236,8 +2349,8 @@ impl CachedPeerTable {
     /// table has actually loaded the new deployment — not just that the DB row
     /// was written (which would always be true since we just wrote it).
     pub fn has_route_for_deployment(&self, deployment_id: i32) -> bool {
-        let routes = self.routes.read();
-        routes.exact.values().any(|route| {
+        let snapshot = self.route_snapshot.load();
+        snapshot.legacy.exact.values().any(|route| {
             route
                 .deployment
                 .as_ref()
@@ -2247,15 +2360,16 @@ impl CachedPeerTable {
 
     /// Snapshot of every `*.temps.local` route currently in the table.
     /// Returned as a flat `(host, RouteInfo)` vector cloned out of the
-    /// `routes` map under a single read lock. Used by the internal
+    /// current immutable route snapshot. Used by the internal
     /// route-sync endpoint to fan out the worker-side proxy table.
     ///
     /// Filters to the internal zone only. Custom-domain and preview
     /// routes are not part of this contract — workers don't need them
     /// (only the public edge proxy does).
     pub fn snapshot_internal_routes(&self) -> Vec<(String, RouteInfo)> {
-        let routes = self.routes.read();
-        routes
+        let snapshot = self.route_snapshot.load();
+        snapshot
+            .legacy
             .exact
             .iter()
             .filter(|(host, _)| host.ends_with(".temps.local"))
@@ -2268,8 +2382,9 @@ impl CachedPeerTable {
     /// attack-mode, or per-project security processing stay on the control
     /// plane until those policies have a worker-side representation.
     pub fn snapshot_worker_public_routes(&self) -> Vec<(String, RouteInfo)> {
-        let routes = self.routes.read();
-        routes
+        let snapshot = self.route_snapshot.load();
+        snapshot
+            .legacy
             .exact
             .iter()
             .filter(|(host, route)| {
@@ -2299,8 +2414,9 @@ impl CachedPeerTable {
     }
 
     pub fn worker_public_route_count(&self) -> usize {
-        self.routes
-            .read()
+        self.route_snapshot
+            .load()
+            .legacy
             .exact
             .keys()
             .filter(|host| !host.ends_with(".temps.local"))
@@ -2312,7 +2428,9 @@ impl CachedPeerTable {
 impl temps_core::route_table::RouteTableRefresher for CachedPeerTable {
     async fn refresh_routes(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         self.load_routes().await?;
-        let count = self.len() + self.http_routes.read().len() + self.tls_routes.read().len();
+        let snapshot = self.route_snapshot.load();
+        let count =
+            snapshot.legacy.exact.len() + snapshot.http_routes.len() + snapshot.tls_routes.len();
         Ok(count)
     }
 }
@@ -2458,6 +2576,56 @@ impl Drop for RouteTableListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_test_route() -> RouteInfo {
+        RouteInfo {
+            backend: BackendType::StaticDir {
+                path: "/tmp/test-route".to_string(),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    #[test]
+    fn route_and_ownership_indexes_publish_as_one_generation() {
+        let table = Arc::new(CachedPeerTable::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        )));
+        let writer = Arc::clone(&table);
+        let handle = std::thread::spawn(move || {
+            for generation in 0..2_000 {
+                let host = if generation % 2 == 0 {
+                    "blue.example.com"
+                } else {
+                    "green.example.com"
+                };
+                let mut snapshot = RouteTableSnapshot::default();
+                snapshot
+                    .legacy
+                    .exact
+                    .insert(host.to_string(), snapshot_test_route());
+                snapshot.ownership.exact.insert(host.to_string());
+                writer.route_snapshot.store(Arc::new(snapshot));
+            }
+        });
+
+        for _ in 0..10_000 {
+            let snapshot = table.route_snapshot.load();
+            for host in ["blue.example.com", "green.example.com"] {
+                assert_eq!(
+                    snapshot.legacy.exact.contains_key(host),
+                    snapshot.ownership.owns(host),
+                    "one atomic snapshot must never mix route and ownership generations"
+                );
+            }
+        }
+        handle.join().expect("snapshot writer thread panicked");
+    }
 
     /// Create a no-op queue for tests that don't need queue functionality
     fn test_queue() -> Arc<dyn temps_core::JobQueue> {

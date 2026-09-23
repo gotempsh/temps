@@ -202,6 +202,11 @@ mod route_table_tests {
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
 
+        assert!(
+            route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be published with the wildcard route generation"
+        );
+
         for lookup in [
             route_table.get_route("preview.apps.example.com"),
             route_table.get_route_by_host("preview.apps.example.com"),
@@ -252,6 +257,10 @@ mod route_table_tests {
         assert!(
             route_table.get_route("preview.apps.example.com").is_none(),
             "reload must remove stale wildcard index entries"
+        );
+        assert!(
+            !route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be removed in the same snapshot generation"
         );
 
         test_db.cleanup().await?;
