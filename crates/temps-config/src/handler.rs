@@ -2577,6 +2577,23 @@ fn normalize_edge_target(settings: &mut AppSettings) {
 }
 
 /// Update application settings
+/// Fill only absent object fields; arrays, scalars and explicit nulls are
+/// replacement values supplied by the caller, never silently merged.
+fn fill_omitted_settings(submitted: &mut serde_json::Value, stored: serde_json::Value) {
+    if let (Some(submitted), serde_json::Value::Object(stored)) =
+        (submitted.as_object_mut(), stored)
+    {
+        for (key, value) in stored {
+            match submitted.get_mut(&key) {
+                Some(submitted_value) => fill_omitted_settings(submitted_value, value),
+                None => {
+                    submitted.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
 #[utoipa::path(
     tag = "Settings",
     put,
@@ -2610,18 +2627,19 @@ async fn update_settings(
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
     let node_failover_sent =
         SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
-    let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
-        let field = e.path().to_string();
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid Settings Payload")
-            .detail(format!(
-                "The settings document could not be read at `{}`: {}. Nothing was saved.",
-                field,
-                e.into_inner()
-            ))
-            .value("field", field)
-            .build()
-    })?;
+    let mut settings: AppSettings =
+        serde_path_to_error::deserialize(body.clone()).map_err(|e| {
+            let field = e.path().to_string();
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Settings Payload")
+                .detail(format!(
+                    "The settings document could not be read at `{}`: {}. Nothing was saved.",
+                    field,
+                    e.into_inner()
+                ))
+                .value("field", field)
+                .build()
+        })?;
 
     // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
     // authorized and captured here — before any other field is touched — for
@@ -2662,6 +2680,28 @@ async fn update_settings(
                 .build());
         }
     };
+
+    // PUT accepts partial documents: omitted fields retain their stored values,
+    // including nested settings. Explicit nulls still go through typed validation.
+    let stored_body = serde_json::to_value(&stored_settings).map_err(|error| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Settings Save Aborted")
+            .detail(format!(
+                "Could not serialize current settings for a partial update: {error}"
+            ))
+            .build()
+    })?;
+    fill_omitted_settings(&mut body, stored_body);
+    settings = serde_path_to_error::deserialize(body).map_err(|error| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "Could not read merged settings at `{}`: {}. Nothing was saved.",
+                error.path(),
+                error.inner()
+            ))
+            .build()
+    })?;
 
     // Merge the `cloud` block *before* the guard comparison below, not after:
     // a save that never mentioned `cloud` is not a request to widen the spend
@@ -2798,6 +2838,10 @@ async fn update_settings(
                 settings.preview_gateway.shared_secret =
                     current_settings.preview_gateway.shared_secret;
             }
+            settings.multi_node.cluster_ca_cert_pem =
+                current_settings.multi_node.cluster_ca_cert_pem;
+            settings.multi_node.cluster_ca_key_encrypted =
+                current_settings.multi_node.cluster_ca_key_encrypted;
             // Multi-node join token hash (never comes back from the mask response)
             if settings.multi_node.join_token_hash.is_none() {
                 settings.multi_node.join_token_hash = current_settings.multi_node.join_token_hash;
@@ -3336,6 +3380,41 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_settings_updates_preserve_omitted_fields_and_respect_explicit_values() {
+        let mut current = AppSettings {
+            preview_domain: "apps.example.test".into(),
+            ..Default::default()
+        };
+        current.multi_node.cluster_ca_cert_pem = Some("stored-cert".into());
+        current.multi_node.cluster_ca_key_encrypted = Some("stored-encrypted-key".into());
+        current.multi_node.node_failover_after_secs = Some(120);
+        let mut submitted =
+            serde_json::json!({ "multi_node": { "node_failover_after_secs": null } });
+        fill_omitted_settings(&mut submitted, serde_json::to_value(&current).unwrap());
+        let merged: AppSettings = serde_json::from_value(submitted).unwrap();
+        assert_eq!(merged.preview_domain, "apps.example.test");
+        assert_eq!(
+            merged.multi_node.cluster_ca_cert_pem,
+            current.multi_node.cluster_ca_cert_pem
+        );
+        assert_eq!(
+            merged.multi_node.cluster_ca_key_encrypted,
+            current.multi_node.cluster_ca_key_encrypted
+        );
+        assert_eq!(merged.multi_node.node_failover_after_secs, None);
+
+        let mut supplied = serde_json::json!({ "nested": { "value": false }, "list": [] });
+        fill_omitted_settings(
+            &mut supplied,
+            serde_json::json!({ "nested": { "value": true, "keep": 7 }, "list": [1, 2] }),
+        );
+        assert_eq!(
+            supplied,
+            serde_json::json!({ "nested": { "value": false, "keep": 7 }, "list": [] })
+        );
+    }
 
     #[test]
     fn generic_settings_write_cannot_enable_plugin_reporting() {

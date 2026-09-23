@@ -1203,6 +1203,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // settings save must not undo a consent update committed before this lock.
         settings.plugin_installation_reporting_enabled =
             locked_settings.plugin_installation_reporting_enabled;
+        // CA lifecycle and join tokens have dedicated, locked write paths. Generic
+        // settings saves must neither erase them nor revert a concurrent rotation.
+        settings.multi_node.cluster_ca_cert_pem =
+            locked_settings.multi_node.cluster_ca_cert_pem.clone();
+        settings.multi_node.cluster_ca_key_encrypted =
+            locked_settings.multi_node.cluster_ca_key_encrypted.clone();
+        settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -2957,6 +2964,66 @@ mod tests {
             data: app_settings.to_json(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_preserves_authoritative_ca_and_join_token() {
+        for submitted in [None, Some("stale-or-client-supplied")] {
+            let mut locked =
+                settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+            let mut locked_settings = AppSettings::from_json(locked.data.clone());
+            locked_settings.multi_node.join_token_hash = Some("authoritative-token-hash".into());
+            locked.data = locked_settings.to_json();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+            let mut incoming = AppSettings {
+                preview_domain: "updated.example.test".into(),
+                ..Default::default()
+            };
+            incoming.multi_node.cluster_ca_cert_pem = submitted.map(str::to_string);
+            incoming.multi_node.cluster_ca_key_encrypted = submitted.map(str::to_string);
+            incoming.multi_node.join_token_hash = submitted.map(str::to_string);
+            service
+                .update_settings(incoming)
+                .await
+                .expect("unrelated settings save");
+            let saved = service.get_settings().await.unwrap();
+            assert_eq!(saved.preview_domain, "updated.example.test");
+            assert_eq!(
+                saved.multi_node.cluster_ca_cert_pem.as_deref(),
+                Some("authoritative-cert")
+            );
+            assert_eq!(
+                saved.multi_node.cluster_ca_key_encrypted.as_deref(),
+                Some("authoritative-key")
+            );
+            assert_eq!(
+                saved.multi_node.join_token_hash.as_deref(),
+                Some("authoritative-token-hash")
+            );
+            drop(service);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let sql = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .map(ToString::to_string)
+                .find(|sql| sql.starts_with("UPDATE "))
+                .expect("saved settings SQL");
+            assert!(sql.contains("authoritative-cert") && sql.contains("authoritative-key"));
+            assert!(!sql.contains("stale-or-client-supplied"));
         }
     }
 
