@@ -28,6 +28,33 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
 
+/// Owns the inspected local inputs until `compose config` finishes. Remote
+/// archives are retained only after validation, because effective runtime paths
+/// can refer to their assets throughout the deployment.
+struct ComposeReferenceSnapshots {
+    cache: tempfile::TempDir,
+    files: Vec<tempfile::NamedTempFile>,
+    remote: HashMap<String, (PathBuf, PathBuf)>,
+    resolved: HashMap<(PathBuf, PathBuf), PathBuf>,
+    active: HashSet<PathBuf>,
+    bytes: usize,
+}
+
+impl ComposeReferenceSnapshots {
+    fn new(root: &Path) -> Result<Self, ComposeError> {
+        Ok(Self {
+            cache: tempfile::Builder::new()
+                .prefix(".temps-compose-sources-")
+                .tempdir_in(root)?,
+            files: Vec::new(),
+            remote: HashMap::new(),
+            resolved: HashMap::new(),
+            active: HashSet::new(),
+            bytes: 0,
+        })
+    }
+}
+
 /// How long `deploy()` waits for every Compose service to report `running`
 /// (and `healthy`, if it defines a healthcheck) before failing the
 /// deployment. Mirrors the single-container deploy path's
@@ -1447,11 +1474,10 @@ impl ComposeExecutor {
         // workflow to stop the currently-serving stack.
         self.require_compose_v2().await?;
         let resolved_request;
-        let request = if !self.policy.disabled_checks.is_empty()
-            && self.needs_resolution(
-                &request.compose_content,
-                request.compose_override.as_deref(),
-            ) {
+        let request = if self.needs_resolution(
+            &request.compose_content,
+            request.compose_override.as_deref(),
+        ) {
             let (content, overrides) = self
                 .resolve_security_configuration(
                     &request.project_name,
@@ -2611,7 +2637,8 @@ impl ComposeExecutor {
         if root.apply_merge().is_err() {
             return true;
         }
-        root.get("include").is_some()
+        Self::contains_compose_tag(&root)
+            || root.get("include").is_some()
             || root
                 .get("services")
                 .and_then(Value::as_mapping)
@@ -2633,17 +2660,17 @@ impl ComposeExecutor {
         override_content: Option<&str>,
         environment: &HashMap<String, String>,
     ) -> Result<(String, Option<String>), ComposeError> {
-        if self.policy.disabled_checks.is_empty()
-            || !self.needs_resolution(content, override_content)
-        {
+        if !self.needs_resolution(content, override_content) {
             return Ok((content.to_string(), override_content.map(str::to_string)));
         }
-        let temporary_root;
+        let inline_root;
         let root = match project_dir {
             Some(root) => root,
             None => {
-                temporary_root = tempfile::tempdir()?;
-                temporary_root.path()
+                Self::validate_service_dir_name(project_name)?;
+                inline_root = self.project_dir(project_name);
+                std::fs::create_dir_all(&inline_root)?;
+                &inline_root
             }
         };
         Self::validate_relative_path(compose_file, "compose_path")?;
@@ -2660,137 +2687,43 @@ impl ComposeExecutor {
         // File preparation still uses the non-bypassable confined-write guard.
         Self::confined_write_path(&canonical_root, Path::new(compose_file), "compose_path")?;
         let base = std::fs::canonicalize(&base)?;
-        let mut pending = vec![(base.clone(), content.to_string())];
-        if let Some(override_content) = override_content {
+        let mut snapshots = ComposeReferenceSnapshots::new(&canonical_root)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let input = tokio::time::timeout_at(
+            deadline,
+            self.snapshot_compose_document(&canonical_root, &base, content, &mut snapshots),
+        )
+        .await
+        .map_err(|_| ComposeError::CommandFailed {
+            project: project_name.to_string(),
+            reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+        })??;
+        let inline = if let Some(override_content) = override_content {
             Self::validate_compose_override_with_policy(
                 project_name,
                 content,
                 override_content,
                 &self.policy,
             )?;
-            pending.push((base.clone(), override_content.to_string()));
-        }
-        let mut seen = HashSet::new();
-        let mut total_bytes = 0usize;
-        while let Some((document_base, document)) = pending.pop() {
-            total_bytes = total_bytes.saturating_add(document.len());
-            if total_bytes > MAX_RESOLVED_COMPOSE_CONFIG_BYTES || seen.len() > 128 {
-                return Err(ComposeError::CommandFailed {
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    self.snapshot_compose_document(
+                        &canonical_root,
+                        &base,
+                        override_content,
+                        &mut snapshots,
+                    ),
+                )
+                .await
+                .map_err(|_| ComposeError::CommandFailed {
                     project: project_name.to_string(),
-                    reason: "Compose references exceed the resolution size/file limit".to_string(),
-                });
-            }
-            if self.enforced(PolicyCheck::EnvFiles)
-                && document_base.join(".env").symlink_metadata().is_ok()
-            {
-                Self::confined_reference(&canonical_root, &document_base, ".env")?;
-            }
-            self.validate_source_security(&document)?;
-            let mut yaml: Value = serde_yaml::from_str(&document).map_err(|error| {
-                ComposeError::InvalidComposeYaml {
-                    compose_source: "Compose reference".to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
-            yaml.apply_merge()
-                .map_err(|error| ComposeError::InvalidComposeYaml {
-                    compose_source: "Compose reference".to_string(),
-                    reason: error.to_string(),
-                })?;
-            let mut references = Vec::new();
-            if let Some(services) = yaml.get("services").and_then(Value::as_mapping) {
-                for definition in services.values() {
-                    if let Some(file) = definition
-                        .get("extends")
-                        .and_then(|v| v.get("file"))
-                        .and_then(Value::as_str)
-                    {
-                        references.push((document_base.clone(), file.to_string()));
-                    }
-                }
-            }
-            if let Some(includes) = yaml.get("include").and_then(Value::as_sequence) {
-                for include in includes {
-                    if let Some(file) = include.as_str() {
-                        references.push((document_base.clone(), file.to_string()));
-                    } else if let Some(file) = include.get("path") {
-                        // include's project_directory and env_file are filesystem reads by Compose.
-                        // Validate them before config gets a chance to open anything.
-                        if let Some(directory) =
-                            include.get("project_directory").and_then(Value::as_str)
-                        {
-                            let directory = Self::confined_reference(
-                                &canonical_root,
-                                &document_base,
-                                directory,
-                            )?;
-                            if self.enforced(PolicyCheck::EnvFiles)
-                                && directory.join(".env").symlink_metadata().is_ok()
-                            {
-                                Self::confined_reference(&canonical_root, &directory, ".env")?;
-                            }
-                        }
-                        if let Some(env) = include.get("env_file") {
-                            let files: Vec<&str> = env
-                                .as_str()
-                                .into_iter()
-                                .chain(
-                                    env.as_sequence()
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(Value::as_str),
-                                )
-                                .collect();
-                            if self.enforced(PolicyCheck::EnvFiles) {
-                                for file in files {
-                                    Self::confined_reference(
-                                        &canonical_root,
-                                        &document_base,
-                                        file,
-                                    )?;
-                                }
-                            }
-                        }
-                        for file in file.as_str().into_iter().chain(
-                            file.as_sequence()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(Value::as_str),
-                        ) {
-                            references.push((document_base.clone(), file.to_string()));
-                        }
-                    }
-                }
-            }
-            for (reference_base, file) in references {
-                let path = Self::confined_reference(&canonical_root, &reference_base, &file)?;
-                if seen.insert(path.clone()) {
-                    let size = std::fs::metadata(&path)?.len();
-                    if size > MAX_RESOLVED_COMPOSE_CONFIG_BYTES as u64 {
-                        return Err(ComposeError::CommandFailed {
-                            project: project_name.to_string(),
-                            reason: format!(
-                                "Compose reference '{file}' exceeds the file size limit"
-                            ),
-                        });
-                    }
-                    let referenced = std::fs::read_to_string(&path)?;
-                    pending.push((path.parent().unwrap_or(&base).to_path_buf(), referenced));
-                }
-            }
-        }
-        let input = tempfile::Builder::new()
-            .prefix(".temps-compose-resolve-")
-            .suffix(".yml")
-            .tempfile_in(&base)?;
-        std::fs::write(input.path(), content)?;
-        let inline = tempfile::Builder::new()
-            .prefix(".temps-compose-override-")
-            .suffix(".yml")
-            .tempfile_in(&base)?;
-        if let Some(content) = override_content {
-            std::fs::write(inline.path(), content)?;
-        }
+                    reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+                })??,
+            )
+        } else {
+            None
+        };
         let variables = tempfile::Builder::new()
             .prefix(".temps-compose-env-")
             .tempfile_in(&base)?;
@@ -2799,9 +2732,9 @@ impl ComposeExecutor {
         cmd.args(["compose", "-p", project_name, "--project-directory"])
             .arg(&base)
             .arg("-f")
-            .arg(input.path());
-        if override_content.is_some() {
-            cmd.arg("-f").arg(inline.path());
+            .arg(&input);
+        if let Some(inline) = inline {
+            cmd.arg("-f").arg(inline);
         }
         let env = canonical_root.join(".env");
         if env.exists() {
@@ -2842,7 +2775,322 @@ impl ComposeExecutor {
             &resolved,
             &self.policy,
         )?;
+        // Effective file/build paths may point into these archives. Keep them with
+        // the deployment checkout; its lifecycle owns their cleanup.
+        if let Some(cache_name) = snapshots
+            .cache
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            self.validate_remote_runtime_assets(&resolved, cache_name)?;
+            if resolved.contains(cache_name) {
+                if project_dir.is_none() {
+                    return Err(ComposeError::InvalidComposePath {
+                        field: "Compose reference".to_string(), path: "<remote assets>".to_string(),
+                        reason: "remote build contexts and environment files require a repository-backed deployment; vendor these assets into a repository".to_string(),
+                    });
+                }
+                let _ = snapshots.cache.keep();
+            }
+        }
         Ok((resolved, None))
+    }
+
+    /// The workflow removes its checkout after deployment. Image builds and env
+    /// files are consumed before cleanup, but bind/config/secret mounts must live
+    /// for the entire container lifetime and cannot point into fetched archives.
+    fn validate_remote_runtime_assets(
+        &self,
+        content: &str,
+        cache_name: &str,
+    ) -> Result<(), ComposeError> {
+        let yaml: Value =
+            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "resolved Compose configuration".to_string(),
+                reason: error.to_string(),
+            })?;
+        let reject = |service: &str, field: &str, value: &Value| -> Result<(), ComposeError> {
+            if value.as_str().is_some_and(|path| path.contains(cache_name)) {
+                return Err(ComposeError::InvalidComposePath {
+                    field: format!("{service}.{field}"), path: "<remote runtime asset>".to_string(),
+                    reason: "remote Compose bind mounts, config files and secret files cannot outlive the deployment checkout; vendor runtime files locally or use named volumes".to_string(),
+                });
+            }
+            Ok(())
+        };
+        for field in ["configs", "secrets"] {
+            if let Some(definitions) = yaml.get(field).and_then(Value::as_mapping) {
+                for (name, definition) in definitions {
+                    if let Some(file) = definition.get("file") {
+                        reject(name.as_str().unwrap_or("<resource>"), field, file)?;
+                    }
+                }
+            }
+        }
+        if let Some(services) = yaml.get("services").and_then(Value::as_mapping) {
+            for (name, service) in services {
+                if let Some(volumes) = service.get("volumes").and_then(Value::as_sequence) {
+                    for volume in volumes {
+                        reject(
+                            name.as_str().unwrap_or("<service>"),
+                            "volumes",
+                            volume.get("source").unwrap_or(volume),
+                        )?;
+                    }
+                }
+            }
+        }
+        if let Some(volumes) = yaml.get("volumes").and_then(Value::as_mapping) {
+            for (name, volume) in volumes {
+                if let Some(device) = volume
+                    .get("driver_opts")
+                    .and_then(|options| options.get("device"))
+                {
+                    reject(
+                        name.as_str().unwrap_or("<volume>"),
+                        "driver_opts.device",
+                        device,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn snapshot_compose_document(
+        &self,
+        scope: &Path,
+        base: &Path,
+        content: &str,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<PathBuf, ComposeError> {
+        let canonical_scope = std::fs::canonicalize(scope)?;
+        let scope = canonical_scope.as_path();
+        let canonical_base = std::fs::canonicalize(base)?;
+        let base = canonical_base.as_path();
+        snapshots.bytes = snapshots.bytes.saturating_add(content.len());
+        if snapshots.bytes > MAX_RESOLVED_COMPOSE_CONFIG_BYTES
+            || snapshots.files.len() + snapshots.active.len() >= 128
+        {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<references>".to_string(),
+                reason: "Compose references exceed the resolution size/file limit".to_string(),
+            });
+        }
+        self.validate_source_security(content)?;
+        if self.enforced(PolicyCheck::EnvFiles) && base.join(".env").symlink_metadata().is_ok() {
+            Self::confined_reference(scope, base, ".env")?;
+        }
+        let mut yaml: Value =
+            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        yaml.apply_merge()
+            .map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        if let Some(services) = yaml.get_mut("services").and_then(Value::as_mapping_mut) {
+            for (name, definition) in services.iter_mut() {
+                // Some Compose versions read inherited env_file values even
+                // with --no-env-resolution. Check every existing path prefix
+                // before config can consume a symlink and erase its origin.
+                if self.enforced(PolicyCheck::EnvFiles) {
+                    if let Some(env) = definition.get("env_file") {
+                        for file in env.as_str().into_iter().chain(
+                            env.as_sequence().into_iter().flatten().filter_map(|entry| {
+                                entry
+                                    .as_str()
+                                    .or_else(|| entry.get("path").and_then(Value::as_str))
+                            }),
+                        ) {
+                            Self::validate_confined_bind_path(
+                                scope,
+                                base,
+                                file,
+                                name.as_str().unwrap_or("<source>"),
+                                "env_file",
+                            )?;
+                        }
+                    }
+                }
+                if let Some(file) = definition
+                    .get_mut("extends")
+                    .and_then(|v| v.get_mut("file"))
+                {
+                    self.snapshot_compose_reference(scope, base, file, None, snapshots)
+                        .await?;
+                }
+            }
+        }
+        if let Some(includes) = yaml.get_mut("include").and_then(Value::as_sequence_mut) {
+            for include in includes {
+                if include.is_string() {
+                    self.snapshot_compose_reference(scope, base, include, None, snapshots)
+                        .await?;
+                } else {
+                    let project_directory = include
+                        .get("project_directory")
+                        .and_then(Value::as_str)
+                        .map(|directory| Self::confined_reference(scope, base, directory))
+                        .transpose()?;
+                    if let Some(directory) = &project_directory {
+                        if self.enforced(PolicyCheck::EnvFiles)
+                            && directory.join(".env").symlink_metadata().is_ok()
+                        {
+                            Self::confined_reference(scope, directory, ".env")?;
+                        }
+                    }
+                    if self.enforced(PolicyCheck::EnvFiles) {
+                        if let Some(env) = include.get("env_file") {
+                            for file in env.as_str().into_iter().chain(
+                                env.as_sequence()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Value::as_str),
+                            ) {
+                                Self::confined_reference(scope, base, file)?;
+                            }
+                        }
+                    }
+                    if let Some(path) = include.get_mut("path") {
+                        if let Some(paths) = path.as_sequence_mut() {
+                            let mut working_directory = project_directory.clone();
+                            for path in paths {
+                                let snapshot = self
+                                    .snapshot_compose_reference(
+                                        scope,
+                                        base,
+                                        path,
+                                        working_directory.as_deref(),
+                                        snapshots,
+                                    )
+                                    .await?;
+                                if working_directory.is_none() {
+                                    working_directory = snapshot.parent().map(Path::to_path_buf);
+                                }
+                            }
+                        } else {
+                            self.snapshot_compose_reference(
+                                scope,
+                                base,
+                                path,
+                                project_directory.as_deref(),
+                                snapshots,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+        let file = tempfile::Builder::new()
+            .prefix(".temps-compose-resolve-")
+            .suffix(".yml")
+            .tempfile_in(base)?;
+        let path = file.path().to_path_buf();
+        let serialized =
+            serde_yaml::to_string(&yaml).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        std::fs::write(&path, serialized)?;
+        snapshots.files.push(file);
+        Ok(path)
+    }
+
+    async fn snapshot_compose_reference(
+        &self,
+        scope: &Path,
+        base: &Path,
+        reference: &mut Value,
+        working_directory: Option<&Path>,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<PathBuf, ComposeError> {
+        let file = reference
+            .as_str()
+            .ok_or_else(|| ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<reference>".to_string(),
+                reason: "Compose reference must be a literal file path or supported HTTPS Git URL"
+                    .to_string(),
+            })?;
+        if Self::contains_interpolation(file) {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<reference>".to_string(),
+                reason: "Compose reference paths must not contain interpolation".to_string(),
+            });
+        }
+        let (path, scope) = if file.contains("://") || file.starts_with("git@") {
+            if let Some(paths) = snapshots.remote.get(file) {
+                paths.clone()
+            } else {
+                if snapshots.remote.len() >= 4 {
+                    return Err(ComposeError::InvalidComposePath {
+                        field: "Compose reference".to_string(), path: "<remote sources>".to_string(),
+                        reason: "at most four remote Compose sources may be resolved per deployment; vendor additional sources into the checkout".to_string(),
+                    });
+                }
+                let paths =
+                    crate::compose_remote::materialize(file, snapshots.cache.path()).await?;
+                snapshots.remote.insert(file.to_string(), paths.clone());
+                paths
+            }
+        } else {
+            (
+                Self::confined_reference(scope, base, file)?,
+                scope.to_path_buf(),
+            )
+        };
+        let scope = std::fs::canonicalize(scope)?;
+        let directory = working_directory.or_else(|| path.parent()).ok_or_else(|| {
+            ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: file.to_string(),
+                reason: "Compose reference has no working directory".to_string(),
+            }
+        })?;
+        let directory = Self::confined_reference(&scope, &scope, &directory.to_string_lossy())?;
+        let key = (path.clone(), directory.clone());
+        let snapshot = if let Some(snapshot) = snapshots.resolved.get(&key) {
+            snapshot.clone()
+        } else {
+            if !snapshots.active.insert(path.clone()) {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "cyclic Compose reference".to_string(),
+                });
+            }
+            let metadata = std::fs::metadata(&path)?;
+            if !metadata.is_file() {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "Compose references must be regular files".to_string(),
+                });
+            }
+            if metadata.len() > MAX_RESOLVED_COMPOSE_CONFIG_BYTES as u64 {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "Compose reference exceeds the file size limit".to_string(),
+                });
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let snapshot =
+                Box::pin(self.snapshot_compose_document(&scope, &directory, &content, snapshots))
+                    .await?;
+            snapshots.active.remove(&path);
+            snapshots.resolved.insert(key, snapshot.clone());
+            snapshot
+        };
+        *reference = Value::String(snapshot.to_string_lossy().into_owned());
+        Ok(snapshot)
     }
 
     fn confined_reference(root: &Path, base: &Path, file: &str) -> Result<PathBuf, ComposeError> {
@@ -2871,9 +3119,6 @@ impl ComposeExecutor {
     }
 
     fn validate_source_security(&self, content: &str) -> Result<(), ComposeError> {
-        if self.enforced(PolicyCheck::Interpolation) {
-            return self.validate_compose_security_policy("Compose source", content);
-        }
         let mut source: Value =
             serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "Compose source".to_string(),
@@ -2886,26 +3131,24 @@ impl ComposeExecutor {
                 reason: error.to_string(),
             })?;
         if let Some(services) = source.get_mut("services").and_then(Value::as_mapping_mut) {
-            for definition in services.values_mut() {
+            for (name, definition) in services.iter_mut() {
                 if let Some(service) = definition.as_mapping_mut() {
-                    // These are consumed during config itself; they cannot wait for value validation.
-                    self.reject_present(
+                    self.reject_interpolation_in_guarded_fields(
                         service,
-                        "<source>",
-                        "label_file",
-                        "label files require their own exception",
+                        name.as_str().unwrap_or("<source>"),
                     )?;
-                    for field in Self::INTERPOLATION_GUARDED_FIELDS {
-                        if !matches!(*field, "extends" | "label_file")
-                            && service
-                                .get(*field)
-                                .is_some_and(Self::value_contains_interpolation)
-                        {
-                            service.remove(*field);
-                        }
-                    }
+                    // Only read-sensitive fields are consumed by `config` itself.
+                    // Runtime values (including inherited shm_size) must be checked
+                    // after Compose applies extends, overrides and !reset tags.
+                    service.retain(|key, _| {
+                        matches!(key.as_str(), Some("extends" | "label_file" | "env_file"))
+                    });
                 }
             }
+        }
+        if let Some(root) = source.as_mapping_mut() {
+            root.remove("volumes");
+            root.remove("networks");
         }
         let source =
             serde_yaml::to_string(&source).map_err(|error| ComposeError::InvalidComposeYaml {
@@ -2913,6 +3156,15 @@ impl ComposeExecutor {
                 reason: error.to_string(),
             })?;
         self.validate_compose_security_policy("Compose source", &source)
+    }
+
+    fn contains_compose_tag(value: &Value) -> bool {
+        match value {
+            Value::Tagged(_) => true,
+            Value::Sequence(values) => values.iter().any(Self::contains_compose_tag),
+            Value::Mapping(values) => values.values().any(Self::contains_compose_tag),
+            _ => false,
+        }
     }
 
     /// Preflight security validation. Run this BEFORE tearing down the existing
@@ -4144,6 +4396,7 @@ impl ComposeExecutor {
             YamlValue::String(s) => Self::contains_interpolation(s),
             YamlValue::Sequence(seq) => seq.iter().any(Self::value_contains_interpolation),
             YamlValue::Mapping(map) => map.values().any(Self::value_contains_interpolation),
+            YamlValue::Tagged(value) => Self::value_contains_interpolation(&value.value),
             _ => false,
         }
     }
@@ -12701,6 +12954,330 @@ services:
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn remote_runtime_files_are_rejected_but_build_and_env_assets_are_allowed() {
+        let executor = executor_with_checks_disabled(&[]);
+        let cache = ".temps-compose-sources-example";
+        for content in [
+            "services: {app: {volumes: [{type: bind, source: .temps-compose-sources-example/repo/data, target: /data}]}}",
+            "services: {app: {volumes: ['.temps-compose-sources-example/repo/data:/data']}}",
+            "configs: {cfg: {file: .temps-compose-sources-example/repo/config.txt}}",
+            "secrets: {key: {file: .temps-compose-sources-example/repo/key.txt}}",
+            "volumes: {data: {driver_opts: {type: none, device: .temps-compose-sources-example/repo/data}}}",
+        ] {
+            assert!(matches!(executor.validate_remote_runtime_assets(content, cache), Err(ComposeError::InvalidComposePath { reason, .. }) if reason.contains("outlive")), "{content}");
+        }
+        assert!(executor.validate_remote_runtime_assets("services: {app: {build: {context: .temps-compose-sources-example/repo}, env_file: .temps-compose-sources-example/repo/vars.env, volumes: [data:/data]} }", cache).is_ok());
+    }
+
+    #[test]
+    fn reset_tags_require_resolution_without_policy_exceptions() {
+        let executor = executor_with_checks_disabled(&[]);
+        assert!(executor.needs_resolution(
+            "services: {app: {image: alpine, shm_size: !reset null}}",
+            None
+        ));
+        assert!(
+            !executor.needs_resolution("services: {app: {image: alpine, shm_size: 128m}}", None)
+        );
+    }
+
+    #[test]
+    fn source_policy_defers_runtime_values_but_keeps_read_guards() {
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        for value in ["1gb", "!reset null"] {
+            assert!(executor
+                .validate_source_security(&format!(
+                    "services: {{app: {{image: alpine, shm_size: {value}}}}}"
+                ))
+                .is_ok());
+        }
+        assert!(executor
+            .validate_source_security("services: {app: {label_file: /etc/secret}}")
+            .is_err());
+        assert!(executor
+            .validate_source_security("services: {app: {shm_size: !override '${SIZE}'}}")
+            .is_err());
+        assert!(executor
+            .validate_source_security("include: [other.yml]")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn compose_snapshots_reject_cycles_and_do_not_rewrite_repository_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let first = "services: {app: {extends: {file: second.yml, service: base}}}";
+        std::fs::write(root.path().join("first.yml"), first).unwrap();
+        std::fs::write(
+            root.path().join("second.yml"),
+            "services: {base: {extends: {file: first.yml, service: app}}}",
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor
+            .snapshot_compose_document(root.path(), root.path(), first, &mut snapshots)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("cyclic"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("first.yml")).unwrap(),
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_snapshots_reject_remote_urls_before_fetch_when_extends_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor.snapshot_compose_document(root.path(), root.path(), "services: {app: {extends: {file: 'https://example.invalid/repo.git', service: base}}}", &mut snapshots).await.unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "extends")
+        );
+        assert!(snapshots.remote.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_snapshots_confine_inherited_env_files_before_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.env"), "SECRET=private\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            root.path().join("vars.env"),
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let source = "services: {app: {extends: {file: common.yml, service: base}}}";
+        for env_file in [
+            "vars.env",
+            "[vars.env]",
+            "[{path: vars.env, required: false}]",
+        ] {
+            std::fs::write(
+                root.path().join("common.yml"),
+                format!("services: {{base: {{image: alpine, env_file: {env_file}}}}}"),
+            )
+            .unwrap();
+            let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+            let error = executor
+                .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ComposeError::SecurityPolicyViolation { field, reason, .. } if field == "env_file" && reason.contains("outside")),
+                "{env_file}"
+            );
+        }
+        std::fs::write(root.path().join("common.yml"), "services: {base: {image: alpine, env_file: [{path: optional/missing.env, required: false}]}}").unwrap();
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(executor
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, env_file: vars.env}}",
+        )
+        .unwrap();
+        let permitted =
+            executor_with_checks_disabled(&[PolicyCheck::Extends, PolicyCheck::EnvFiles]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(permitted
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_include_uses_effective_project_directory_for_nested_env_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(
+            source.join("child.yml"),
+            "include: [{path: grandchild.yml, env_file: vars.env}]",
+        )
+        .unwrap();
+        std::fs::write(source.join("vars.env"), "VALUE=safe\n").unwrap();
+        std::fs::write(
+            runtime.join("grandchild.yml"),
+            "services: {app: {image: alpine}}",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("secret.env"), "VALUE=private\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.env"), runtime.join("vars.env"))
+            .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor
+            .snapshot_compose_document(
+                root.path(),
+                root.path(),
+                "include: [{path: source/child.yml, project_directory: runtime}]",
+                &mut snapshots,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("inside the project"))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_compose_snapshots_rebase_assets_and_confine_nested_files() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends, PolicyCheck::Include]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let remote = snapshots.cache.path().join("repository");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::write(remote.join("vars.env"), "SETTING=value\n").unwrap();
+        std::fs::write(
+            remote.join("compose.yml"),
+            "services: {base: {image: alpine, env_file: vars.env}}",
+        )
+        .unwrap();
+        let reference = "https://github.com/example/stack.git";
+        snapshots.remote.insert(
+            reference.to_string(),
+            (remote.join("compose.yml"), remote.clone()),
+        );
+        let source =
+            format!("services: {{app: {{extends: {{file: '{reference}', service: base}}}}}}");
+        let input = executor
+            .snapshot_compose_document(root.path(), root.path(), &source, &mut snapshots)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.remote.len(), 1);
+        let original = std::fs::read_to_string(remote.join("compose.yml")).unwrap();
+        assert_eq!(
+            original,
+            "services: {base: {image: alpine, env_file: vars.env}}"
+        );
+        if std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            let compose_base = std::fs::canonicalize(root.path()).unwrap();
+            // Match the resolver's working directory: Compose versions that
+            // check relative env files during config resolve them against cwd.
+            let output = std::process::Command::new("docker")
+                .args([
+                    "compose",
+                    "-p",
+                    "temps-remote-snapshot-test",
+                    "--project-directory",
+                ])
+                .arg(&compose_base)
+                .arg("-f")
+                .arg(&input)
+                .current_dir(&compose_base)
+                .args([
+                    "config",
+                    "--no-normalize",
+                    "--no-path-resolution",
+                    "--no-env-resolution",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let yaml: Value = serde_yaml::from_slice(&output.stdout).unwrap();
+            if let Some(env_path) = yaml["services"]["app"]["env_file"][0]["path"].as_str() {
+                assert_eq!(
+                    std::fs::canonicalize(compose_base.join(env_path)).unwrap(),
+                    std::fs::canonicalize(remote.join("vars.env")).unwrap()
+                );
+            } else {
+                // Older Compose versions eagerly resolve inherited env files
+                // even with --no-env-resolution; assert the same effective data.
+                assert_eq!(yaml["services"]["app"]["environment"]["SETTING"], "value");
+            }
+        }
+        std::fs::write(
+            root.path().join("private.yml"),
+            "services: {private: {image: alpine}}",
+        )
+        .unwrap();
+        let escape = format!("include: ['{}']", root.path().join("private.yml").display());
+        let error = executor
+            .snapshot_compose_document(&remote, &remote, &escape, &mut snapshots)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("inside the project"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_reset_removes_inherited_shm_and_keeps_effective_policy_checks() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("common.yml"), "services: {base: {image: alpine, shm_size: 1gb, mem_limit: 3g}, unused: {image: alpine, privileged: true}}").unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let content = "services: {app: {extends: {file: common.yml, service: base}, shm_size: !reset null, mem_limit: !reset null}}";
+        let (resolved, _) = executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert!(yaml["services"]["app"].get("shm_size").is_none());
+        assert!(yaml["services"]["app"].get("mem_limit").is_none());
+        assert!(yaml["services"].get("unused").is_none());
+        let inherited = "services: {app: {extends: {file: common.yml, service: base}}}";
+        let error = executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                inherited,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "shm_size")
+        );
+        let default_executor = executor_with_checks_disabled(&[]);
+        assert!(default_executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {app: {image: alpine, shm_size: !reset null}}",
+                None,
+                &HashMap::new()
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

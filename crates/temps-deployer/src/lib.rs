@@ -26,6 +26,7 @@ pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
 pub mod compose;
+mod compose_remote;
 
 /// Callback function type for processing build logs in real-time
 pub type LogCallback =
