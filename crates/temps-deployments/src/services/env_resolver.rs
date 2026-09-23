@@ -249,10 +249,14 @@ fn select_effective_environment_variables(
     let mut effective = BTreeMap::<String, env_vars::Model>::new();
     for variable in variables {
         let environment_specific = is_environment_specific(&variable);
-        let global = variable.environment_id.is_none()
-            && !linked_ids.contains(&variable.id)
-            && (!is_preview_environment || variable.include_in_preview);
-        if !environment_specific && !global {
+        let global = variable.environment_id.is_none() && !linked_ids.contains(&variable.id);
+        let preview_inherited = is_preview_environment
+            && variable.include_in_preview
+            && variable.environment_id.is_none();
+        if !environment_specific && !preview_inherited && !global {
+            continue;
+        }
+        if is_preview_environment && global && !variable.include_in_preview {
             continue;
         }
         let replace = effective.get(&variable.key).is_none_or(|current| {
@@ -953,6 +957,63 @@ mod tests {
 
         assert!(!selected.contains_key("PRODUCTION_SECRET"));
         assert_eq!(selected["PREVIEW_ALLOWED"].value, "value");
+    }
+
+    #[test]
+    fn preview_opt_in_inherits_production_linked_variable_and_prefers_preview_override() {
+        let now = chrono::Utc::now();
+        let variable =
+            |id: i32, value: &str, include_in_preview: bool| temps_entities::env_vars::Model {
+                id,
+                project_id: 7,
+                environment_id: None,
+                key: "DATABASE_URL".to_string(),
+                value: value.to_string(),
+                created_at: now,
+                updated_at: now,
+                include_in_preview,
+                is_encrypted: false,
+                is_secret: true,
+            };
+        let production_link = temps_entities::env_var_environments::Model {
+            id: 1,
+            env_var_id: 1,
+            environment_id: 20,
+            created_at: now,
+        };
+        let preview_link = temps_entities::env_var_environments::Model {
+            id: 2,
+            env_var_id: 2,
+            environment_id: 21,
+            created_at: now,
+        };
+
+        let inherited = select_effective_environment_variables(
+            vec![variable(1, "production", true)],
+            std::slice::from_ref(&production_link),
+            22,
+            true,
+        );
+        assert_eq!(inherited["DATABASE_URL"].value, "production");
+
+        let excluded = select_effective_environment_variables(
+            vec![variable(1, "production", false)],
+            std::slice::from_ref(&production_link),
+            22,
+            true,
+        );
+        assert!(!excluded.contains_key("DATABASE_URL"));
+
+        let overridden = select_effective_environment_variables(
+            vec![
+                variable(1, "production", true),
+                variable(2, "preview", false),
+            ],
+            &[production_link, preview_link],
+            21,
+            true,
+        );
+        assert_eq!(overridden["DATABASE_URL"].value, "preview");
     }
 
     #[test]

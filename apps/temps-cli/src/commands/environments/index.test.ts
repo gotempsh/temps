@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
+import { Command } from 'commander'
 import {
+  registerEnvironmentsCommands,
+  resolvePreviewInclusion,
   formatEnvVarValue,
   describeForceHttps,
   formatCpu,
@@ -23,6 +26,31 @@ function makeVar(overrides: Partial<EnvironmentVariableResponse> = {}): Environm
     ...overrides,
   } as EnvironmentVariableResponse
 }
+
+describe('preview variable scope', () => {
+  test('the CLI leaves previews excluded until --preview is explicitly supplied', () => {
+    for (const [args, expected] of [
+      [[], undefined],
+      [['--preview'], true],
+      [['--no-preview'], false],
+    ] as const) {
+      const program = new Command()
+      registerEnvironmentsCommands(program)
+      const set = program.commands.find(command => command.name() === 'environments')!
+        .commands.find(command => command.name() === 'vars')!
+        .commands.find(command => command.name() === 'set')!
+      set.parseOptions([...args])
+      expect(set.opts().preview).toBe(expected)
+    }
+    expect(resolvePreviewInclusion(undefined, false, undefined)).toBe(false)
+  })
+
+  test('an update retains the current preview scope unless the operator changes it', () => {
+    expect(resolvePreviewInclusion(undefined, true, true)).toBe(true)
+    expect(resolvePreviewInclusion(false, true, true)).toBe(false)
+    expect(resolvePreviewInclusion(true, true, false)).toBe(true)
+  })
+})
 
 describe('formatEnvVarValue', () => {
   test('never prints a secret value, even if one somehow arrived on the wire', () => {
