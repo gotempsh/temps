@@ -97,6 +97,10 @@ pub struct OnDemandManager {
     /// Populated during route table reload for environments with sleeping=true.
     sleeping_by_domain: DashMap<String, SleepingEnvironmentInfo>,
 
+    /// Sleeping environments indexed by the base of a single-label wildcard
+    /// (for example, `example.com` for `*.example.com`).
+    sleeping_by_wildcard_base: DashMap<String, SleepingEnvironmentInfo>,
+
     /// Database connection for state transitions.
     db: Arc<DatabaseConnection>,
 
@@ -161,6 +165,7 @@ impl OnDemandManager {
             configs: DashMap::new(),
             wake_states: DashMap::new(),
             sleeping_by_domain: DashMap::new(),
+            sleeping_by_wildcard_base: DashMap::new(),
             db,
             local_node_id,
             container_lifecycle,
@@ -223,19 +228,33 @@ impl OnDemandManager {
     /// Check if a domain maps to a sleeping environment.
     /// Returns wake info if found.
     pub fn get_sleeping_environment(&self, domain: &str) -> Option<SleepingEnvironmentInfo> {
-        self.sleeping_by_domain
-            .get(domain)
-            .map(|r| r.value().clone())
+        if let Some(info) = self.sleeping_by_domain.get(domain) {
+            return Some(info.value().clone());
+        }
+
+        let (label, base) = domain.split_once('.')?;
+        if label.is_empty() || base.is_empty() {
+            return None;
+        }
+        self.sleeping_by_wildcard_base
+            .get(base)
+            .map(|info| info.value().clone())
     }
 
     /// Register a sleeping environment domain for wake-on-request lookup.
     pub fn register_sleeping_domain(&self, domain: String, info: SleepingEnvironmentInfo) {
-        self.sleeping_by_domain.insert(domain, info);
+        if let Some(base) = domain.strip_prefix("*.") {
+            self.sleeping_by_wildcard_base
+                .insert(base.to_string(), info);
+        } else {
+            self.sleeping_by_domain.insert(domain, info);
+        }
     }
 
     /// Clear all sleeping domain mappings (called before route table reload).
     pub fn clear_sleeping_domains(&self) {
         self.sleeping_by_domain.clear();
+        self.sleeping_by_wildcard_base.clear();
     }
 
     /// Signal that the route table has been reloaded.
@@ -1301,6 +1320,45 @@ mod tests {
         assert_eq!(info.environment_id, 1);
         assert_eq!(info.project_id, 10);
         assert_eq!(info.deployment_id, 100);
+    }
+
+    #[test]
+    fn test_sleeping_wildcard_domain_lookup_is_single_label() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
+
+        manager.register_sleeping_domain(
+            "*.apps.example.com".to_string(),
+            SleepingEnvironmentInfo {
+                environment_id: 2,
+                project_id: 20,
+                deployment_id: 200,
+                wake_timeout_seconds: 45,
+            },
+        );
+
+        let info = manager
+            .get_sleeping_environment("preview.apps.example.com")
+            .expect("a direct wildcard child should wake the environment");
+        assert_eq!(info.environment_id, 2);
+        assert!(manager
+            .get_sleeping_environment("apps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment("deep.preview.apps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment("preview.notapps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment(".apps.example.com")
+            .is_none());
+
+        manager.clear_sleeping_domains();
+        assert!(manager
+            .get_sleeping_environment("preview.apps.example.com")
+            .is_none());
     }
 
     #[test]

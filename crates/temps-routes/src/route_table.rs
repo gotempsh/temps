@@ -461,6 +461,24 @@ pub type OnCertEligibleCallback = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Default)]
+struct LegacyRouteTable {
+    exact: HashMap<String, RouteInfo>,
+    wildcards: WildcardMatcher,
+    reserved_console_host: Option<String>,
+}
+
+impl LegacyRouteTable {
+    fn get(&self, host: &str) -> Option<&RouteInfo> {
+        if self.reserved_console_host.as_deref() == Some(host) {
+            return None;
+        }
+        self.exact
+            .get(host)
+            .or_else(|| self.wildcards.match_domain(host))
+    }
+}
+
 pub struct CachedPeerTable {
     /// Exact hostname -> RouteInfo for HTTP routes (route_type = 'http')
     /// Used for matching on HTTP Host header (Layer 7)
@@ -478,7 +496,7 @@ pub struct CachedPeerTable {
 
     /// Legacy routes map (for backward compatibility during transition)
     /// Contains all environment domains, project custom domains, etc.
-    routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+    routes: Arc<RwLock<LegacyRouteTable>>,
 
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
@@ -544,7 +562,7 @@ impl CachedPeerTable {
             tls_routes: Arc::new(RwLock::new(HashMap::new())),
             http_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
             tls_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
-            routes: Arc::new(RwLock::new(HashMap::new())),
+            routes: Arc::new(RwLock::new(LegacyRouteTable::default())),
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
@@ -658,8 +676,9 @@ impl CachedPeerTable {
     pub fn cert_eligible_hosts(&self) -> Vec<String> {
         self.routes
             .read()
+            .exact
             .iter()
-            .filter(|(_, r)| r.cert_eligible)
+            .filter(|(host, r)| r.cert_eligible && !host.starts_with("*."))
             .map(|(host, _)| host.clone())
             .collect()
     }
@@ -669,18 +688,31 @@ impl CachedPeerTable {
     /// Used for route_type = 'http' routes.
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
+        if self.routes.read().reserved_console_host.as_deref() == Some(host) {
+            return None;
+        }
+
         // 1. Try exact match in HTTP routes
         if let Some(route) = self.http_routes.read().get(host) {
             return Some(route.clone());
         }
 
-        // 2. Try wildcard match in HTTP wildcards
+        // 2. Exact project/environment domains take precedence over every
+        // wildcard route, including operator-configured custom wildcards.
+        {
+            let legacy = self.routes.read();
+            if let Some(route) = legacy.exact.get(host) {
+                return Some(route.clone());
+            }
+        }
+
+        // 3. Try wildcard match in HTTP wildcards
         if let Some(route) = self.http_wildcards.read().match_domain(host) {
             return Some(route.clone());
         }
 
-        // 3. Fall back to legacy routes (for non-custom_routes entries)
-        self.routes.read().get(host).cloned()
+        // 4. Fall back to project/environment wildcard routes.
+        self.routes.read().wildcards.match_domain(host).cloned()
     }
 
     /// Get route by TLS SNI hostname
@@ -688,6 +720,10 @@ impl CachedPeerTable {
     /// Used for route_type = 'tls' routes.
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
+        if self.routes.read().reserved_console_host.as_deref() == Some(sni) {
+            return None;
+        }
+
         // 1. Try exact match in TLS routes
         if let Some(route) = self.tls_routes.read().get(sni) {
             return Some(route.clone());
@@ -701,21 +737,15 @@ impl CachedPeerTable {
         None
     }
 
-    /// Resolve a hostname across every lookup strategy in the same order the
-    /// proxy's `UpstreamResolver` uses: TLS/SNI exact+wildcard, then HTTP-host
-    /// exact+wildcard, then the legacy `routes` map. Stable per-environment
+    /// Resolve a hostname across every lookup strategy in proxy order: TLS
+    /// routes first, then HTTP and legacy routes. Stable per-environment
     /// hostnames (env_domains, the env subdomain, the env preview alias) live in
     /// the legacy map, so the on-demand TLS gate (ADR-018 §2 second/third check)
     /// MUST consult all three — checking only `get_route_by_sni` would miss them
     /// and reject every certable host. O(1) per map, no I/O.
     pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
-        if let Some(route) = self.get_route_by_sni(sni) {
-            return Some(route);
-        }
-        // get_route_by_host covers http_routes exact, http_wildcards, and the
-        // legacy routes map (its step 3), which together hold the stable env
-        // hostnames the on-demand gate cares about.
-        self.get_route_by_host(sni)
+        self.get_route_by_sni(sni)
+            .or_else(|| self.get_route_by_host(sni))
     }
 
     /// Insert a route directly into the legacy routes map. Test/seed support for
@@ -724,7 +754,25 @@ impl CachedPeerTable {
     /// the production load path — `load_routes` owns that.
     #[doc(hidden)]
     pub fn insert_route_for_test(&self, host: &str, route: RouteInfo) {
-        self.routes.write().insert(host.to_string(), route);
+        let mut routes = self.routes.write();
+        if host.starts_with("*.") {
+            let mut wildcard_route = route.clone();
+            wildcard_route.cert_eligible = false;
+            routes.wildcards.insert(host, wildcard_route);
+        }
+        routes.exact.insert(host.to_string(), route);
+    }
+
+    /// Insert a TLS route for cross-crate tests without database setup.
+    #[doc(hidden)]
+    pub fn insert_tls_route_for_test(&self, host: &str, route: RouteInfo) {
+        self.tls_routes.write().insert(host.to_string(), route);
+    }
+
+    /// Reserve the console hostname for cross-crate tests without database setup.
+    #[doc(hidden)]
+    pub fn reserve_hostname_for_test(&self, host: &str) {
+        self.routes.write().reserved_console_host = Some(host.to_string());
     }
 
     /// Load all routes from the database into the cache with full models.
@@ -2019,15 +2067,33 @@ impl CachedPeerTable {
             }
         }
 
+        // Build the wildcard index for legacy project/environment routes. A
+        // concrete hostname resolved through a wildcard is deliberately not
+        // eligible for on-demand HTTP-01 issuance: one stored wildcard may
+        // cover an unbounded number of subdomains, while its certificate is
+        // provisioned separately through DNS-01 and found by the TLS loader.
+        let mut legacy_wildcards_matcher = WildcardMatcher::new();
+        for (host, route) in routes.iter().filter(|(host, _)| host.starts_with("*.")) {
+            let mut wildcard_route = route.clone();
+            wildcard_route.cert_eligible = false;
+            legacy_wildcards_matcher.insert(host, wildcard_route);
+        }
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();
         let tls_routes_count = tls_routes_map.len();
         let http_wildcards_count = http_wildcards_matcher.len();
         let tls_wildcards_count = tls_wildcards_matcher.len();
+        let legacy_wildcards_count = legacy_wildcards_matcher.len();
 
-        // Replace legacy routes
-        *self.routes.write() = routes;
+        // Publish exact routes, wildcard index, and the reserved hostname as
+        // one snapshot so readers never observe a partially refreshed policy.
+        *self.routes.write() = LegacyRouteTable {
+            exact: routes,
+            wildcards: legacy_wildcards_matcher,
+            reserved_console_host: app_settings.console_hostname(),
+        };
 
         // Replace HTTP and TLS route caches
         *self.http_routes.write() = http_routes_map;
@@ -2043,8 +2109,8 @@ impl CachedPeerTable {
         }
 
         info!(
-            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards",
-            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards",
+            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count
         );
         // Collect on-demand configs for awake environments so the idle sweep can track them.
         let on_demand_configs: Vec<OnDemandConfigEntry> = environments_cache
@@ -2108,8 +2174,9 @@ impl CachedPeerTable {
             let cert_hosts: Vec<String> = self
                 .routes
                 .read()
+                .exact
                 .iter()
-                .filter(|(_, r)| r.cert_eligible)
+                .filter(|(host, r)| r.cert_eligible && !host.starts_with("*."))
                 .map(|(host, _)| host.clone())
                 .collect();
             if !cert_hosts.is_empty() {
@@ -2143,14 +2210,20 @@ impl CachedPeerTable {
         self.routes.read().get(host).cloned()
     }
 
+    /// Whether this hostname is reserved for the control-plane console.
+    /// Wake-on-request checks this before consulting sleeping wildcards.
+    pub fn is_reserved_hostname(&self, host: &str) -> bool {
+        self.routes.read().reserved_console_host.as_deref() == Some(host)
+    }
+
     /// Get current number of routes in the table
     pub fn len(&self) -> usize {
-        self.routes.read().len()
+        self.routes.read().exact.len()
     }
 
     /// Check if the route table is empty
     pub fn is_empty(&self) -> bool {
-        self.routes.read().is_empty()
+        self.routes.read().exact.is_empty()
     }
 
     /// Check if any route in the table points to a specific deployment.
@@ -2160,7 +2233,7 @@ impl CachedPeerTable {
     /// was written (which would always be true since we just wrote it).
     pub fn has_route_for_deployment(&self, deployment_id: i32) -> bool {
         let routes = self.routes.read();
-        routes.values().any(|route| {
+        routes.exact.values().any(|route| {
             route
                 .deployment
                 .as_ref()
@@ -2179,6 +2252,7 @@ impl CachedPeerTable {
     pub fn snapshot_internal_routes(&self) -> Vec<(String, RouteInfo)> {
         let routes = self.routes.read();
         routes
+            .exact
             .iter()
             .filter(|(host, _)| host.ends_with(".temps.local"))
             .map(|(h, r)| (h.clone(), r.clone()))
@@ -2192,6 +2266,7 @@ impl CachedPeerTable {
     pub fn snapshot_worker_public_routes(&self) -> Vec<(String, RouteInfo)> {
         let routes = self.routes.read();
         routes
+            .exact
             .iter()
             .filter(|(host, route)| {
                 !host.ends_with(".temps.local")
@@ -2222,6 +2297,7 @@ impl CachedPeerTable {
     pub fn worker_public_route_count(&self) -> usize {
         self.routes
             .read()
+            .exact
             .keys()
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
