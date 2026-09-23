@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Create non-root user
 RUN groupadd --gid 1000 temps && \
-    useradd --uid 1000 --gid temps --no-create-home --shell /usr/sbin/nologin temps
+    useradd --uid 1000 --gid temps --create-home --shell /usr/sbin/nologin temps
 
 # Copy pre-built binary
 COPY artifacts/temps /usr/local/bin/temps

@@ -11,7 +11,7 @@ grep -Fqx 'FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e
 grep -Fq 'RUN chmod +x /usr/local/bin/temps && /usr/local/bin/temps --version' "$dockerfile"
 grep -Fq 'COPY crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb' "$dockerfile"
 grep -Fq 'ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb' "$dockerfile"
-grep -Fq 'useradd --uid 1000 --gid temps' "$dockerfile"
+grep -Fq 'useradd --uid 1000 --gid temps --create-home' "$dockerfile"
 
 if grep -Eq 'FROM alpine|\bapk (add|update|upgrade)' "$dockerfile"; then
     echo 'Dockerfile.release must not use a musl/Alpine runtime for glibc release artifacts' >&2
