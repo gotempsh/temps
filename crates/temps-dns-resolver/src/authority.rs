@@ -23,7 +23,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hickory_proto::op::{Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A as RDataA, AAAA as RDataAAAA, CNAME as RDataCNAME};
+use hickory_proto::rr::rdata::{
+    A as RDataA, AAAA as RDataAAAA, CNAME as RDataCNAME, TXT as RDataTXT,
+};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::net::runtime::Time;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -40,6 +42,8 @@ use crate::zone_store::ZoneStore;
 /// (case-insensitive, with or without trailing dot) is answered from the
 /// `ZoneStore`; everything else is forwarded upstream.
 const TEMPS_ZONE_SUFFIX: &str = "temps.local";
+pub const RESOLVER_MARKER_NAME: &str = "_temps-resolver.temps.local";
+pub const RESOLVER_MARKER_VALUE: &str = "temps-dns-resolver-v1";
 
 pub struct ZoneAuthority {
     zone: Arc<ZoneStore>,
@@ -96,6 +100,35 @@ impl RequestHandler for ZoneAuthority {
         let qtype = info.query.query_type();
         let qname_str = qname.to_utf8();
         let in_zone = is_internal_zone(&qname_str);
+
+        let is_marker = qname_str
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(RESOLVER_MARKER_NAME);
+        if is_marker && matches!(qtype, RecordType::TXT | RecordType::ANY) {
+            let answer = Record::from_rdata(
+                qname.clone(),
+                0,
+                RData::TXT(RDataTXT::new(vec![RESOLVER_MARKER_VALUE.to_string()])),
+            );
+            let mut metadata = Metadata::response_from_request(info.metadata);
+            metadata.authoritative = true;
+            metadata.response_code = ResponseCode::NoError;
+            let builder = MessageResponseBuilder::from_message_request(request);
+            let response = builder.build(
+                metadata,
+                std::iter::once(&answer),
+                std::iter::empty::<&Record>(),
+                std::iter::empty::<&Record>(),
+                std::iter::empty::<&Record>(),
+            );
+            return response_handle
+                .send_response(response)
+                .await
+                .unwrap_or_else(|_| error_info(request, ResponseCode::ServFail));
+        }
+        if is_marker {
+            return reply_nodata(request, &mut response_handle, info.metadata).await;
+        }
 
         // Outside-zone queries are forwarded recursively. We are the
         // *only* nameserver app containers see, so falling through to

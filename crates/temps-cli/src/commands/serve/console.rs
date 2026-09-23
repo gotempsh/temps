@@ -1779,6 +1779,10 @@ pub struct ConsoleApiParams {
     /// further objects to the shared-slot pattern without their own review.
     pub project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
     pub request_policy_gate_slot: Arc<temps_core::RequestPolicyGateSlot>,
+    /// Resolver address published by the proxy-owned DNS listener. The
+    /// deployer reads this slot for each new container and never assumes that
+    /// an enabled setting means a listener actually started.
+    pub overlay_dns_slot: temps_dns::OverlayDnsSlot,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -2835,6 +2839,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         retention_resolver_slot,
         project_ip_gate_slot,
         request_policy_gate_slot,
+        overlay_dns_slot,
         update_status,
         self_updater,
         traefik_discovery,
@@ -3023,6 +3028,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // routine addition.
     service_context.register_service(project_ip_gate_slot.clone());
     service_context.register_service(request_policy_gate_slot.clone());
+    service_context.register_service(overlay_dns_slot);
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.

@@ -396,6 +396,29 @@ impl ProxyCommand {
                 .map(|s| s.preview_domain.clone())
                 .unwrap_or_else(|| "localhost".to_string()),
         );
+        let internal_dns_sync_address = match settings.as_ref() {
+            Some(settings) if settings.cluster_dns.enabled => {
+                match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
+                    Ok(address) => Some(address.to_string()),
+                    Err(error) => {
+                        warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if settings
+            .as_ref()
+            .is_some_and(|settings| settings.cluster_dns.enabled)
+        {
+            super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
+                rt.handle(),
+                db.clone(),
+                data_dir.join("dns"),
+                Arc::new(std::sync::RwLock::new(None)),
+            );
+        }
 
         info!(
             "Starting proxy server with preview_domain: {:?}",
@@ -449,6 +472,7 @@ impl ProxyCommand {
         let proxy_config = temps_proxy::ProxyConfig {
             address,
             console_address,
+            internal_dns_sync_address,
             tls_address,
             preview_domain,
             disable_https_redirect: self.disable_https_redirect,

@@ -31,6 +31,7 @@ pub mod sync_client;
 pub mod upstream;
 pub mod zone_store;
 
+pub use authority::{RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};
 pub use config::ResolverConfig;
 pub use error::ResolverError;
 pub use handle::{ResolverHandle, ResolverStatus};

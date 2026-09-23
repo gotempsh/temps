@@ -11,16 +11,10 @@
 //! hop (the container hop is covered by the live cluster e2e). This exercises
 //! the whole feature end to end: DB feeder -> `ZoneStore` -> Hickory server.
 //!
-//! Skips gracefully (project convention — no `#[ignore]`) when a prerequisite
-//! is missing:
-//!   - Postgres/Docker unavailable (`TestDatabase` returns `Err`),
-//!   - the resolver cannot bind `127.0.0.1:53` (a privileged port; needs
-//!     Linux + root — on a non-root / macOS dev box `start_control_plane_resolver`
-//!     returns `None` and we skip).
-//!
-//! It therefore runs for real in the Linux CI integration jobs.
+//! Uses an ephemeral loopback DNS port so real UDP verification runs without
+//! root privileges. Skips gracefully only when Docker/Postgres is unavailable.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use hickory_resolver::config::{
@@ -34,18 +28,13 @@ use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 
 const TEST_FQDN: &str = "itest-app.temps.local";
 const TEST_IP: &str = "10.123.45.67";
-/// The control plane binds the resolver on its app-bridge gateway:53; here we
-/// use loopback:53 so the test needs no Docker network, only the privilege to
-/// bind a low port.
-const RESOLVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
-
 /// A hickory stub resolver pointed straight at our resolver's UDP socket —
 /// the same shape as `temps-dns-resolver`'s own end-to-end client.
-fn dns_client() -> TokioResolver {
+fn dns_client(resolver_addr: SocketAddr) -> TokioResolver {
     let mut cfg = ClientResolverConfig::default();
-    let mut name_server = NameServerConfig::udp(RESOLVER_ADDR.ip());
+    let mut name_server = NameServerConfig::udp(resolver_addr.ip());
     if let Some(conn) = name_server.connections.first_mut() {
-        conn.port = RESOLVER_ADDR.port();
+        conn.port = resolver_addr.port();
     }
     cfg.add_name_server(name_server);
     let mut opts = ResolverOpts::default();
@@ -67,6 +56,9 @@ async fn cp_resolver_serves_zone_from_real_db() {
     // --- Real Postgres (skip if Docker/testcontainers unavailable) ---
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
+        Err(error) if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() => {
+            panic!("Explicit DNS test database failed: {error}");
+        }
         Err(_) => {
             println!("Docker/Postgres unavailable, skipping cp_resolver integration test");
             return;
@@ -91,21 +83,21 @@ async fn cp_resolver_serves_zone_from_real_db() {
         .await
         .expect("seed service_endpoint");
 
-    // --- Start the REAL control-plane resolver, fed directly from that DB ---
-    // `None` => could not bind 127.0.0.1:53 (non-root / macOS); skip, exactly
-    // as the production path degrades to "containers keep embedded DNS".
-    let snapshot_dir = std::env::temp_dir().join("temps-cp-dns-itest");
-    let _ = std::fs::remove_dir_all(&snapshot_dir); // drop any stale snapshot
-    let Some(slot) =
-        temps_dns::start_control_plane_resolver(db.clone(), RESOLVER_ADDR.ip(), snapshot_dir).await
-    else {
-        println!("could not bind resolver on {RESOLVER_ADDR} (needs Linux+root); skipping");
-        return;
-    };
-    // This is the IP the deployer wires into every container's resolv.conf.
-    assert_eq!(*slot.read().unwrap(), Some(RESOLVER_ADDR.ip()));
-
-    let client = dns_client();
+    // Exercise the same DB feeder and DNS listener on an unprivileged port.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("allocate DNS port");
+    let resolver_addr = socket.local_addr().expect("DNS address");
+    drop(socket);
+    let snapshot_dir =
+        std::env::temp_dir().join(format!("temps-cp-dns-itest-{}", uuid::Uuid::new_v4()));
+    let mut config =
+        temps_dns_resolver::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
+    config.listen_addrs = vec![resolver_addr];
+    config.upstream_resolvers.clear();
+    let slot = temps_dns::start_control_plane_resolver_with_config(db.clone(), config)
+        .await
+        .expect("control-plane DNS must bind ephemeral loopback port");
+    assert_eq!(*slot.read().unwrap(), Some(resolver_addr.ip()));
+    let client = dns_client(resolver_addr);
 
     // The DB feeder polls ~1s; retry the lookup until the zone is populated.
     let mut resolved: Option<Vec<IpAddr>> = None;

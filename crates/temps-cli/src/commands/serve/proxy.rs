@@ -15,6 +15,105 @@ use tracing::{info, warn};
 
 use super::shutdown::CtrlCShutdownSignal;
 
+#[derive(Debug, thiserror::Error)]
+enum ProxyDnsBootstrapError {
+    #[error("Cannot prepare the app network for proxy DNS: {0}")]
+    Network(#[from] temps_deployer::DeployerError),
+    #[error("Cannot start proxy DNS: app-network gateway is unavailable")]
+    MissingGateway,
+    #[error("Proxy DNS resolver failed to start on {0}:53")]
+    Resolver(std::net::IpAddr),
+    #[error("Cannot discover Docker for proxy DNS: {0}")]
+    Docker(#[from] bollard::errors::Error),
+    #[error("Cannot publish proxy DNS readiness: shared resolver slot is poisoned")]
+    PoisonedSlot,
+}
+
+pub(crate) fn spawn_control_plane_dns_bootstrap(
+    runtime: &tokio::runtime::Handle,
+    db: Arc<DbConnection>,
+    docker: Arc<bollard::Docker>,
+    snapshot_dir: std::path::PathBuf,
+    overlay_dns_slot: temps_dns::OverlayDnsSlot,
+) {
+    runtime.spawn(async move {
+        loop {
+            let attempt = tokio::time::timeout(Duration::from_secs(10), async {
+                let docker_runtime = temps_deployer::docker::DockerRuntime::new(
+                    docker.clone(),
+                    true,
+                    temps_core::NETWORK_NAME.to_string(),
+                );
+                docker_runtime.ensure_network_exists().await?;
+                let gateway = docker_runtime
+                    .inspect_app_network_gateway()
+                    .await
+                    .ok_or(ProxyDnsBootstrapError::MissingGateway)?;
+                let started = temps_dns::start_control_plane_resolver(
+                    db.clone(),
+                    gateway,
+                    snapshot_dir.clone(),
+                )
+                .await
+                .ok_or(ProxyDnsBootstrapError::Resolver(gateway))?;
+                let source = started
+                    .read()
+                    .map_err(|_| ProxyDnsBootstrapError::PoisonedSlot)?;
+                let mut target = overlay_dns_slot
+                    .write()
+                    .map_err(|_| ProxyDnsBootstrapError::PoisonedSlot)?;
+                *target = *source;
+                Ok::<(), ProxyDnsBootstrapError>(())
+            })
+            .await;
+            match attempt {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => {
+                    warn!(error = %error, "Proxy cluster DNS bootstrap failed; retrying")
+                }
+                Err(_) => warn!("Proxy cluster DNS bootstrap timed out; retrying"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
+    runtime: &tokio::runtime::Handle,
+    db: Arc<DbConnection>,
+    snapshot_dir: std::path::PathBuf,
+    overlay_dns_slot: temps_dns::OverlayDnsSlot,
+) {
+    let runtime_handle = runtime.clone();
+    runtime.spawn(async move {
+        loop {
+            let docker = tokio::time::timeout(Duration::from_secs(5), async {
+                let docker = bollard::Docker::connect_with_defaults()?;
+                docker.ping().await?;
+                Ok::<_, ProxyDnsBootstrapError>(Arc::new(docker))
+            })
+            .await;
+            match docker {
+                Ok(Ok(docker)) => {
+                    spawn_control_plane_dns_bootstrap(
+                        &runtime_handle,
+                        db,
+                        docker,
+                        snapshot_dir,
+                        overlay_dns_slot,
+                    );
+                    break;
+                }
+                Ok(Err(error)) => {
+                    warn!(error = %error, "Proxy cluster DNS Docker discovery failed; retrying")
+                }
+                Err(_) => warn!("Proxy cluster DNS Docker discovery timed out; retrying"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 /// Keep HTTP serving available when optional Docker-backed features cannot be
 /// initialized. Both combined and split proxy composition roots use this gate,
 /// so an unavailable socket cannot accidentally become a startup failure in
@@ -128,6 +227,9 @@ pub fn start_proxy_server(
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
+    overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    docker: Option<Arc<bollard::Docker>>,
+    local_workloads_enabled: bool,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
@@ -180,6 +282,39 @@ pub fn start_proxy_server(
             .map(|s| s.preview_domain.clone())
             .unwrap_or_else(|| "localhost".to_string()),
     );
+    let internal_dns_sync_address = match settings.as_ref() {
+        Some(settings) if settings.cluster_dns.enabled => {
+            match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
+                Ok(address) => Some(address.to_string()),
+                Err(error) => {
+                    warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if settings
+        .as_ref()
+        .is_some_and(|settings| settings.cluster_dns.enabled)
+    {
+        if let Some(docker) = docker {
+            spawn_control_plane_dns_bootstrap(
+                rt.handle(),
+                db.clone(),
+                docker,
+                config.data_dir.join("dns"),
+                overlay_dns_slot.clone(),
+            );
+        } else if local_workloads_enabled {
+            spawn_control_plane_dns_bootstrap_with_docker_discovery(
+                rt.handle(),
+                db.clone(),
+                config.data_dir.join("dns"),
+                overlay_dns_slot.clone(),
+            );
+        }
+    }
 
     // ADR-018 on-demand TLS: build the certificate manager when enabled in
     // settings. `None` (the default, or when the feature can't be safely
@@ -251,6 +386,7 @@ pub fn start_proxy_server(
     let proxy_config = temps_proxy::ProxyConfig {
         address,
         console_address,
+        internal_dns_sync_address,
         tls_address,
         preview_domain,
         disable_https_redirect,

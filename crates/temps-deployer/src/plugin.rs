@@ -26,6 +26,20 @@ pub struct DeployerPlugin;
 const CONTROL_PLANE_OVERLAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // Exponential backoff for transient errors caps at this ceiling.
 const CONTROL_PLANE_OVERLAY_MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
+const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+fn spawn_control_plane_dns_probe(gateway: std::net::IpAddr, slot: temps_dns::OverlayDnsSlot) {
+    tokio::spawn(async move {
+        let address = std::net::SocketAddr::new(gateway, 53);
+        loop {
+            let available = temps_dns::probe_control_plane_resolver(address).await;
+            if let Ok(mut current) = slot.write() {
+                *current = available.then_some(gateway);
+            }
+            tokio::time::sleep(CONTROL_PLANE_DNS_PROBE_INTERVAL).await;
+        }
+    });
+}
 
 #[derive(Debug, Error)]
 enum ControlPlaneOverlayReconcileError {
@@ -392,9 +406,10 @@ impl TempsPlugin for DeployerPlugin {
                 ),
             }
 
-            // ADR-024: optionally start the control-plane DNS resolver so
-            // containers deployed locally on the control plane — and every
-            // single-node install — can resolve `*.temps.local`.
+            // ADR-024: the proxy owns the control-plane DNS listener. The
+            // deployer only consumes its live address through a shared slot;
+            // it must never bind :53 itself because split and combined
+            // topologies both have exactly one proxy owner.
             //
             // Gated behind `AppSettings.cluster_dns.enabled` (experimental
             // beta, **off by default**). The default-off guards against the
@@ -406,38 +421,26 @@ impl TempsPlugin for DeployerPlugin {
             // (which forwards to the host's own resolv.conf), exactly as
             // before ADR-024 was introduced.
             //
-            // `get_service` (not `require_service`) is deliberate: the DB is an
-            // optional dependency for this best-effort enhancement. A missing
-            // DB (e.g. an embedded/test configuration) must skip DNS startup,
-            // never fail the deployer plugin — do not promote this to
-            // `require_service`.
             if cluster_dns_enabled && local_workloads_enabled {
-                tracing::info!(
-                    "cluster DNS resolver enabled (AppSettings.cluster_dns.enabled=true); \
-                     starting control-plane Hickory resolver"
-                );
-                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                if let Some(slot) =
+                    context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
+                {
+                    docker_runtime = docker_runtime.with_overlay_dns_slot(slot.clone());
                     match docker_runtime.ensure_network_exists().await {
                         Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
-                            Some(gateway) => {
-                                let snapshot_dir =
-                                    config_service.get_server_config().data_dir.join("dns");
-                                if let Some(slot) =
-                                    temps_dns::start_control_plane_resolver(db, gateway, snapshot_dir)
-                                        .await
-                                {
-                                    docker_runtime = docker_runtime.with_overlay_dns_slot(slot);
-                                }
-                            }
-                            None => tracing::warn!(
-                                "app-network gateway not found; control-plane DNS resolver not started"
-                            ),
+                            Some(gateway) => spawn_control_plane_dns_probe(gateway, slot),
+                            None => tracing::warn!("Cannot monitor proxy DNS readiness: app-network gateway is unavailable"),
                         },
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not ensure app network; control-plane DNS resolver not started"
-                        ),
+                        Err(error) => tracing::warn!(error = %error, "Cannot monitor proxy DNS readiness: app-network setup failed"),
                     }
+                    tracing::info!(
+                        "cluster DNS enabled; container injection follows the proxy-owned resolver slot"
+                    );
+                } else {
+                    tracing::warn!(
+                        "cluster DNS enabled but no proxy resolver slot is registered; \
+                         containers will keep Docker embedded DNS"
+                    );
                 }
             } else if cluster_dns_enabled {
                 tracing::info!(
