@@ -965,6 +965,7 @@ impl ServeCommand {
         // review as an explicit exception rather than a second precedent.
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
 
         // Resolve proxy enforcement before console startup. These builders are
         // the same extension boundary used by standalone `temps proxy`; they
@@ -1016,6 +1017,7 @@ impl ServeCommand {
             retention_resolver_slot: retention_resolver_slot.clone(),
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             request_policy_gate_slot: request_policy_gate_slot.clone(),
+            overlay_dns_slot: overlay_dns_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
@@ -1129,6 +1131,9 @@ impl ServeCommand {
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
+            overlay_dns_slot,
+            docker_handle,
+            self.profile.local_workloads_enabled(),
         )
     }
 }

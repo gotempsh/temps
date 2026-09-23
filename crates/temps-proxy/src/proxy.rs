@@ -6134,7 +6134,12 @@ impl ProxyHttp for LoadBalancer {
         // Pass SNI hostname for TLS-based routing
         let selection = self
             .upstream_resolver
-            .resolve_peer(&domain, &path, ctx.sni_hostname.as_deref())
+            .resolve_peer_for_request(
+                &domain,
+                &path,
+                session.req_header().method.as_str(),
+                ctx.sni_hostname.as_deref(),
+            )
             .await?;
 
         let mut peer = selection.peer;

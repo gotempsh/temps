@@ -11172,6 +11172,7 @@ dependencies = [
  "cloudflare 0.14.0",
  "futures",
  "hex",
+ "hickory-proto",
  "hickory-resolver",
  "hmac 0.13.0",
  "mockall",

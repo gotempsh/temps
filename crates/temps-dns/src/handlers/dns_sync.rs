@@ -250,7 +250,7 @@ async fn authenticate_node(
                 .with_title("Node Not Found")
                 .with_detail(format!("Node {} does not exist", node_id))
         })?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hash(token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid DNS sync token");
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -260,7 +260,7 @@ async fn authenticate_node(
     Ok(())
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
+fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, Problem> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -274,7 +274,12 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
             .with_title("Invalid Authorization")
             .with_detail("Authorization header must use Bearer scheme")
     })?;
-    Ok(token.to_string())
+    if token.is_empty() || token.len() > 256 {
+        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Authorization")
+            .with_detail("Bearer token length is invalid"));
+    }
+    Ok(token)
 }
 
 fn sha256_hash(input: &str) -> String {
