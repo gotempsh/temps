@@ -129,8 +129,9 @@ pub enum ComposeParseError {
     Serialization { reason: String },
 }
 
-/// Redacted effective Compose document shown in project settings. Values from
-/// service environments and build arguments are never returned to the client.
+/// Redacted Compose rendering shown in project settings. This does not resolve
+/// referenced files or run deployment's filesystem and runtime policy checks.
+/// Values from service environments and build arguments are never returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveComposePreview {
     pub yaml: String,
@@ -352,15 +353,24 @@ pub fn render_effective_compose_preview_with_policy(
     let mut base = parse_compose_document(yaml, "Compose file")?;
     strip_excluded_services_value(&mut base, excluded_services);
     validate_preview_composition(&base, policy)?;
+    if base
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_none()
+        && !(base.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include))
+    {
+        return Err(ComposeParseError::MissingServices);
+    }
     normalize_sensitive_maps(&mut base);
 
     if let Some(override_yaml) = override_yaml.filter(|value| !value.trim().is_empty()) {
         let mut override_document = parse_compose_document(override_yaml, "Compose override")?;
-        validate_preview_override(&base, &override_document, policy)?;
         validate_preview_composition(&override_document, policy)?;
+        validate_preview_override(&base, &override_document, policy)?;
         normalize_sensitive_maps(&mut override_document);
         merge_compose_value(&mut base, override_document, &[]);
     }
+    validate_preview_build_images(&base, policy)?;
 
     let enabled_services = service_names(&base);
     let mut disabled_services = excluded_services.to_vec();
@@ -410,6 +420,30 @@ fn validate_preview_composition(
     Ok(())
 }
 
+fn validate_preview_build_images(
+    compose: &serde_yaml::Value,
+    policy: &ComposeSecurityPolicy,
+) -> Result<(), ComposeParseError> {
+    if !policy.enforced(ComposeSecurityCheck::BuildImage) {
+        return Ok(());
+    }
+    let Some(services) = compose.get("services").and_then(serde_yaml::Value::as_mapping) else {
+        return Ok(());
+    };
+    for (name, service) in services {
+        if service.get("build").is_some() && service.get("image").is_some() {
+            return Err(ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::BuildImage,
+                reason: format!(
+                    "service '{}' combines 'build' and 'image'; Temps assigns a deployment-scoped image name to build services. Remove the image or an instance administrator can disable the Build Image check in Project Settings → Git → Advanced security settings for a trusted stack",
+                    name.as_str().unwrap_or("<non-string>")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// YAML permits an empty mapping value to be written as `name:`, which parses
 /// as null. Compose treats that as a default named-resource declaration, but
 /// serializing it back as `name: null` is misleading in an effective manifest.
@@ -445,13 +479,6 @@ fn parse_compose_document(
         .map_err(|error| ComposeParseError::InvalidYaml {
             reason: format!("{source}: failed to expand YAML merge keys: {error}"),
         })?;
-    if root
-        .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
-        .is_none()
-    {
-        return Err(ComposeParseError::MissingServices);
-    }
     Ok(root)
 }
 
@@ -563,7 +590,11 @@ fn validate_preview_override(
         });
     };
     if policy.enforced(ComposeSecurityCheck::InlineSections)
-        && root.keys().any(|key| key.as_str() != Some("services"))
+        && root.keys().any(|key| {
+            key.as_str() != Some("services")
+                && !(key.as_str() == Some("include")
+                    && !policy.enforced(ComposeSecurityCheck::Include))
+        })
     {
         return Err(ComposeParseError::PolicyViolation {
             check: ComposeSecurityCheck::InlineSections,
@@ -574,6 +605,9 @@ fn validate_preview_override(
         .get("services")
         .and_then(serde_yaml::Value::as_mapping)
     else {
+        if root.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include) {
+            return Ok(());
+        }
         if !policy.enforced(ComposeSecurityCheck::InlineSections)
             && override_document.get("services").is_none()
         {
@@ -1443,6 +1477,62 @@ secrets:
         let preview = render_effective_compose_preview_with_policy(base, None, &[], &policy)
             .unwrap();
         assert!(preview.yaml.contains("common.yml"));
+    }
+
+    #[test]
+    fn preview_include_uses_only_the_include_exception() {
+        let base = "services:\n  web:\n    image: nginx\n";
+        let override_yaml = "include:\n  - common.yml\n";
+        let error =
+            render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::Include,
+                ..
+            }
+        ));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::Include]),
+        };
+        let preview =
+            render_effective_compose_preview_with_policy(base, Some(override_yaml), &[], &policy)
+                .unwrap();
+        assert!(preview.yaml.contains("common.yml"));
+        assert_eq!(preview.enabled_services, vec!["web"]);
+
+        let include_only = render_effective_compose_preview_with_policy(
+            override_yaml,
+            None,
+            &[],
+            &policy,
+        )
+        .unwrap();
+        assert!(include_only.yaml.contains("common.yml"));
+    }
+
+    #[test]
+    fn preview_rejects_image_override_on_build_service_until_build_image_is_disabled() {
+        let base = "services:\n  web:\n    build: .\n";
+        let override_yaml = "services:\n  web:\n    image: example/web:2\n";
+        let error =
+            render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::BuildImage,
+                ..
+            }
+        ));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::BuildImage]),
+        };
+        let preview =
+            render_effective_compose_preview_with_policy(base, Some(override_yaml), &[], &policy)
+                .unwrap();
+        assert!(preview.yaml.contains("example/web:2"));
     }
 
     #[test]

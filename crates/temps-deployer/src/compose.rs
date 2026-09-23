@@ -1530,10 +1530,14 @@ impl ComposeExecutor {
             )?;
         }
 
-        // Build/image selection is repository-owned. Inline overrides cannot
-        // alter either field, preventing a merge from assigning a daemon-global
-        // image tag to a build or changing the trusted pull/build decision.
-        let has_build = self.has_build_directives(&request.compose_content);
+        // The build definition stays in the repository. Inline image changes
+        // are allowed for image services, while BuildImage policy rejects an
+        // image tag on a built service by default.
+        let has_build = self.has_build_directives(&request.compose_content)
+            || request
+                .compose_override
+                .as_deref()
+                .is_some_and(|content| self.has_build_directives(content));
 
         // Every value that must never appear in a deployment error, including
         // the secrets this deploy is about to mount: a container that echoes
@@ -5461,17 +5465,23 @@ impl ComposeExecutor {
             });
         };
         for key in override_root.keys().filter_map(Self::yaml_key) {
-            if policy.enforced(PolicyCheck::InlineSections) && key != "services" {
+            if policy.enforced(PolicyCheck::InlineSections)
+                && key != "services"
+                && !(key == "include" && !policy.enforced(PolicyCheck::Include))
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot set top-level key '{key}'; only service-level changes are allowed"
+                        "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Git → Advanced security settings for a trusted stack"
                     ),
                 });
             }
         }
 
         let Some(override_services) = Self::compose_services(&override_yaml) else {
+            if override_yaml.get("include").is_some() && !policy.enforced(PolicyCheck::Include) {
+                return Ok(());
+            }
             if !policy.enforced(PolicyCheck::InlineSections)
                 && override_yaml.get("services").is_none()
             {
@@ -5501,7 +5511,7 @@ impl ComposeExecutor {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot add service '{service_name}'; add new services to the repository compose file for review"
+                        "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Git → Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -8282,6 +8292,7 @@ services:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("cannot add service 'attacker'"));
+        assert!(error.to_string().contains("Inline Services check"));
     }
 
     #[test]
@@ -8445,6 +8456,34 @@ services:
     }
 
     #[test]
+    fn test_include_exception_allows_inline_include_without_inline_sections_exception() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let override_content = "include:\n  - common.yml\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([PolicyCheck::Include]),
+        };
+        ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap();
+
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let error = executor
+            .preflight_validate(compose, Some(override_content))
+            .unwrap_err();
+        assert_eq!(violation_field(error), "include");
+        executor
+            .with_security_policy(policy)
+            .preflight_validate(compose, Some(override_content))
+            .unwrap();
+    }
+
+    #[test]
     fn test_inline_field_exception_does_not_disable_privileged_check() {
         let compose = "services:\n  web:\n    image: nginx\n";
         let override_content =
@@ -8497,6 +8536,7 @@ networks:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("top-level key 'networks'"));
+        assert!(error.to_string().contains("Inline Sections check"));
     }
 
     #[test]
