@@ -28,13 +28,26 @@ const CONTROL_PLANE_OVERLAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_OVERLAY_MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
 const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
-fn spawn_control_plane_dns_probe(gateway: std::net::IpAddr, slot: temps_dns::OverlayDnsSlot) {
+fn spawn_control_plane_dns_probe(
+    docker: Arc<temps_core::DockerHandle>,
+    slot: temps_dns::OverlayDnsSlot,
+) {
     tokio::spawn(async move {
-        let address = std::net::SocketAddr::new(gateway, 53);
+        let runtime =
+            DockerRuntime::new_with_handle(docker, true, temps_core::NETWORK_NAME.to_string());
         loop {
-            let available = temps_dns::probe_control_plane_resolver(address).await;
+            // A recreated app network can have a different gateway. Read its
+            // current address on every pass instead of retaining startup's IP.
+            let gateway = runtime.inspect_app_network_gateway().await;
+            let available = match gateway {
+                Some(gateway) => {
+                    temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53))
+                        .await
+                }
+                None => false,
+            };
             if let Ok(mut current) = slot.write() {
-                *current = available.then_some(gateway);
+                *current = gateway.filter(|_| available);
             }
             tokio::time::sleep(CONTROL_PLANE_DNS_PROBE_INTERVAL).await;
         }
@@ -426,13 +439,7 @@ impl TempsPlugin for DeployerPlugin {
                     context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
                 {
                     docker_runtime = docker_runtime.with_overlay_dns_slot(slot.clone());
-                    match docker_runtime.ensure_network_exists().await {
-                        Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
-                            Some(gateway) => spawn_control_plane_dns_probe(gateway, slot),
-                            None => tracing::warn!("Cannot monitor proxy DNS readiness: app-network gateway is unavailable"),
-                        },
-                        Err(error) => tracing::warn!(error = %error, "Cannot monitor proxy DNS readiness: app-network setup failed"),
-                    }
+                    spawn_control_plane_dns_probe(docker.clone(), slot);
                     tracing::info!(
                         "cluster DNS enabled; container injection follows the proxy-owned resolver slot"
                     );

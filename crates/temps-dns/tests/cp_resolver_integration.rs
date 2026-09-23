@@ -93,10 +93,10 @@ async fn cp_resolver_serves_zone_from_real_db() {
         temps_dns_resolver::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
     config.listen_addrs = vec![resolver_addr];
     config.upstream_resolvers.clear();
-    let slot = temps_dns::start_control_plane_resolver_with_config(db.clone(), config)
+    let resolver = temps_dns::start_control_plane_resolver_with_config(db.clone(), config)
         .await
         .expect("control-plane DNS must bind ephemeral loopback port");
-    assert_eq!(*slot.read().unwrap(), Some(resolver_addr.ip()));
+    assert_eq!(resolver.gateway(), resolver_addr.ip());
     let client = dns_client(resolver_addr);
 
     // The DB feeder polls ~1s; retry the lookup until the zone is populated.
@@ -169,4 +169,5 @@ async fn cp_resolver_serves_zone_from_real_db() {
         "the old record must be replaced, not appended"
     );
     assert_eq!(ips[0].to_string(), TEST_IP_2);
+    resolver.shutdown().await;
 }

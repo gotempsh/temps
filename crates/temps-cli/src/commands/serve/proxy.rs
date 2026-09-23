@@ -27,6 +27,21 @@ enum ProxyDnsBootstrapError {
     Docker(#[from] bollard::errors::Error),
     #[error("Cannot publish proxy DNS readiness: shared resolver slot is poisoned")]
     PoisonedSlot,
+    #[error("Proxy DNS app-network preparation timed out after 10 seconds")]
+    NetworkTimeout,
+}
+
+const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DNS_MAX_CONSECUTIVE_FAILURES: u32 = 12;
+
+fn publish_dns_gateway(
+    slot: &temps_dns::OverlayDnsSlot,
+    gateway: Option<std::net::IpAddr>,
+) -> Result<(), ProxyDnsBootstrapError> {
+    *slot
+        .write()
+        .map_err(|_| ProxyDnsBootstrapError::PoisonedSlot)? = gateway;
+    Ok(())
 }
 
 pub(crate) fn spawn_control_plane_dns_bootstrap(
@@ -37,43 +52,72 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
 ) {
     runtime.spawn(async move {
+        let docker_runtime = temps_deployer::docker::DockerRuntime::new(
+            docker,
+            true,
+            temps_core::NETWORK_NAME.to_string(),
+        );
+        let mut active: Option<temps_dns::ControlPlaneResolver> = None;
+        let mut failures = 0u32;
         loop {
-            let attempt = tokio::time::timeout(Duration::from_secs(10), async {
-                let docker_runtime = temps_deployer::docker::DockerRuntime::new(
-                    docker.clone(),
-                    true,
-                    temps_core::NETWORK_NAME.to_string(),
-                );
+            // Only cancellable Docker operations are timed out. Once DNS has
+            // bound port 53, its handle must be explicitly shut down.
+            let gateway = tokio::time::timeout(Duration::from_secs(10), async {
                 docker_runtime.ensure_network_exists().await?;
-                let gateway = docker_runtime
+                docker_runtime
                     .inspect_app_network_gateway()
                     .await
-                    .ok_or(ProxyDnsBootstrapError::MissingGateway)?;
-                let started = temps_dns::start_control_plane_resolver(
-                    db.clone(),
-                    gateway,
-                    snapshot_dir.clone(),
-                )
-                .await
-                .ok_or(ProxyDnsBootstrapError::Resolver(gateway))?;
-                let source = started
-                    .read()
-                    .map_err(|_| ProxyDnsBootstrapError::PoisonedSlot)?;
-                let mut target = overlay_dns_slot
-                    .write()
-                    .map_err(|_| ProxyDnsBootstrapError::PoisonedSlot)?;
-                *target = *source;
-                Ok::<(), ProxyDnsBootstrapError>(())
+                    .ok_or(ProxyDnsBootstrapError::MissingGateway)
             })
-            .await;
-            match attempt {
-                Ok(Ok(())) => break,
-                Ok(Err(error)) => {
-                    warn!(error = %error, "Proxy cluster DNS bootstrap failed; retrying")
+            .await
+            .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
+
+            let attempt = match gateway {
+                Ok(gateway) => {
+                    let healthy = if active.as_ref().is_some_and(|resolver| resolver.gateway() == gateway) {
+                        temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53)).await
+                    } else {
+                        false
+                    };
+                    if healthy {
+                        publish_dns_gateway(&overlay_dns_slot, Some(gateway))
+                    } else {
+                        let cleared = publish_dns_gateway(&overlay_dns_slot, None);
+                        if let Some(resolver) = active.take() {
+                            resolver.shutdown().await;
+                        }
+                        match cleared {
+                            Err(error) => Err(error),
+                            Ok(()) => match temps_dns::start_control_plane_resolver(
+                                db.clone(), gateway, snapshot_dir.clone(),
+                            ).await {
+                                Some(resolver) => {
+                                    active = Some(resolver);
+                                    publish_dns_gateway(&overlay_dns_slot, Some(gateway))
+                                }
+                                None => Err(ProxyDnsBootstrapError::Resolver(gateway)),
+                            }
+                        }
+                    }
                 }
-                Err(_) => warn!("Proxy cluster DNS bootstrap timed out; retrying"),
+                Err(error) => Err(error),
+            };
+            match attempt {
+                Ok(()) => failures = 0,
+                Err(error) => {
+                    let _ = publish_dns_gateway(&overlay_dns_slot, None);
+                    if let Some(resolver) = active.take() {
+                        resolver.shutdown().await;
+                    }
+                    failures += 1;
+                    if failures >= DNS_MAX_CONSECUTIVE_FAILURES {
+                        warn!(error = %error, attempts = failures, "Proxy cluster DNS reconciliation stopped after repeated failures");
+                        break;
+                    }
+                    warn!(error = %error, attempts = failures, "Proxy cluster DNS reconciliation failed; retrying");
+                }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(DNS_RETRY_INTERVAL).await;
         }
     });
 }
@@ -86,7 +130,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
 ) {
     let runtime_handle = runtime.clone();
     runtime.spawn(async move {
-        loop {
+        for attempt in 1..=DNS_MAX_CONSECUTIVE_FAILURES {
             let docker = tokio::time::timeout(Duration::from_secs(5), async {
                 let docker = bollard::Docker::connect_with_defaults()?;
                 docker.ping().await?;
@@ -104,13 +148,14 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
                     );
                     break;
                 }
-                Ok(Err(error)) => {
-                    warn!(error = %error, "Proxy cluster DNS Docker discovery failed; retrying")
-                }
-                Err(_) => warn!("Proxy cluster DNS Docker discovery timed out; retrying"),
+                Ok(Err(error)) => warn!(error = %error, attempt, "Proxy cluster DNS Docker discovery failed; retrying"),
+                Err(_) => warn!(attempt, "Proxy cluster DNS Docker discovery timed out; retrying"),
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            if attempt < DNS_MAX_CONSECUTIVE_FAILURES {
+                tokio::time::sleep(DNS_RETRY_INTERVAL).await;
+            }
         }
+        warn!(attempts = DNS_MAX_CONSECUTIVE_FAILURES, "Proxy cluster DNS Docker discovery stopped after repeated failures");
     });
 }
 

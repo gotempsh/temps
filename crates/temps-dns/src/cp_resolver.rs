@@ -41,6 +41,35 @@ pub type OverlayDnsSlot = Arc<RwLock<Option<IpAddr>>>;
 /// the worker long-poll cadence; reads are cheap (local Postgres).
 const FEED_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Owns both the listener and its database feeder so a gateway change can
+/// stop the old listener before binding the replacement.
+pub struct ControlPlaneResolver {
+    handle: Option<ResolverHandle>,
+    feeder: tokio::task::JoinHandle<()>,
+    gateway: IpAddr,
+}
+
+impl Drop for ControlPlaneResolver {
+    fn drop(&mut self) {
+        self.feeder.abort();
+        // ResolverHandle::drop aborts the DNS server and releases its sockets.
+    }
+}
+
+impl ControlPlaneResolver {
+    pub fn gateway(&self) -> IpAddr {
+        self.gateway
+    }
+
+    pub async fn shutdown(mut self) {
+        self.feeder.abort();
+        let _ = (&mut self.feeder).await;
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown().await;
+        }
+    }
+}
+
 pub async fn probe_control_plane_resolver(address: SocketAddr) -> bool {
     let bind_address = if address.is_ipv6() {
         "[::]:0"
@@ -131,15 +160,13 @@ fn to_zone_record(m: service_endpoints::Model) -> ZoneRecord {
 }
 
 /// Start the control-plane DNS resolver bound on `bridge_gateway:53`, fed
-/// directly from `service_endpoints`. Returns the populated DNS slot for the
-/// deployer to wire into containers, or `None` if the resolver could not start
-/// (best-effort — the caller then continues without DNS injection, exactly as
-/// the control plane does today).
+/// directly from `service_endpoints`. The caller owns the returned listener
+/// and must shut it down before binding a replacement gateway.
 pub async fn start_control_plane_resolver(
     db: Arc<DatabaseConnection>,
     bridge_gateway: IpAddr,
     snapshot_dir: PathBuf,
-) -> Option<OverlayDnsSlot> {
+) -> Option<ControlPlaneResolver> {
     // node_id 0 is conventional for the control plane; the DB-direct feeder
     // ignores it (it serves the full zone, not a per-node slice). `new_local_feed`
     // binds ONLY the bridge gateway (not 127.0.0.53, which systemd-resolved owns)
@@ -154,7 +181,7 @@ pub async fn start_control_plane_resolver(
 pub async fn start_control_plane_resolver_with_config(
     db: Arc<DatabaseConnection>,
     config: ResolverConfig,
-) -> Option<OverlayDnsSlot> {
+) -> Option<ControlPlaneResolver> {
     let listen_address = *config.listen_addrs.first()?;
     let bridge_gateway = listen_address.ip();
     let handle = match ResolverHandle::start(config).await {
@@ -181,11 +208,9 @@ pub async fn start_control_plane_resolver_with_config(
     let registry = DnsRegistry::new(db);
     let zone = handle.zone.clone();
 
-    // The feeder task OWNS `handle` so the Hickory server tasks stay alive for
-    // the life of the process. It refreshes the in-memory zone from the DB
-    // whenever the generation advances.
-    tokio::spawn(async move {
-        let _handle = handle; // keep the server alive
+    // Keep ownership with the caller so gateway reconciliation can shut down
+    // both the feeder and the bound DNS listener.
+    let feeder = tokio::spawn(async move {
         let mut last_generation: i64 = -1;
         loop {
             match registry.get_full_zone().await {
@@ -208,13 +233,48 @@ pub async fn start_control_plane_resolver_with_config(
         }
     });
 
-    Some(Arc::new(RwLock::new(Some(bridge_gateway))))
+    Some(ControlPlaneResolver {
+        handle: Some(handle),
+        feeder,
+        gateway: bridge_gateway,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::service_endpoints;
+
+    #[tokio::test]
+    async fn managed_resolver_shutdown_releases_udp_and_tcp_listeners() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let address = reservation.local_addr().expect("test address");
+        drop(reservation);
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let mut config = ResolverConfig::new_local_feed(
+            0,
+            address.ip(),
+            std::env::temp_dir().join(format!("temps-cp-dns-shutdown-{}", uuid::Uuid::new_v4())),
+        );
+        config.listen_addrs = vec![address];
+        config.upstream_resolvers.clear();
+
+        let first = start_control_plane_resolver_with_config(db.clone(), config.clone())
+            .await
+            .expect("first resolver starts");
+        assert!(
+            start_control_plane_resolver_with_config(db.clone(), config.clone())
+                .await
+                .is_none(),
+            "second resolver cannot bind occupied port"
+        );
+        first.shutdown().await;
+        let restarted = start_control_plane_resolver_with_config(db, config)
+            .await
+            .expect("resolver restarts after shutdown");
+        restarted.shutdown().await;
+    }
 
     fn model(
         record_type: &str,
