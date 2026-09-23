@@ -79,4 +79,15 @@ describe('deployment watcher HTTP polling', () => {
     expect(result.success).toBe(true)
     expect(attempts).toBe(2)
   })
+
+  for (const status of [408, 425, 429]) {
+    test(`retries HTTP ${status} and completes successfully`, async () => {
+      let attempts = 0
+      const { result } = await watch(() => ++attempts === 1
+        ? new Response('Please retry', { status })
+        : Response.json({ id: 42, status: 'completed' }))
+      expect(result.success).toBe(true)
+      expect(attempts).toBe(2)
+    })
+  }
 })

@@ -69,6 +69,7 @@ interface JobState {
 const TERMINAL_STATUSES = ['success', 'completed', 'deployed', 'failed', 'error', 'cancelled']
 const SUCCESS_STATUSES = ['success', 'completed', 'deployed']
 const FAILURE_STATUSES = ['failed', 'error', 'cancelled']
+const RETRYABLE_CLIENT_STATUSES = new Set([408, 425, 429])
 
 // Convert API timestamp to milliseconds
 function toMs(timestamp: number): number {
@@ -324,7 +325,8 @@ export function DeploymentWatcher({
             const errorText = await deploymentRes.text()
             const message = `API Error ${deploymentRes.status}: ${errorText.substring(0, 200)}`
             setError(message)
-            if (deploymentRes.status >= 400 && deploymentRes.status < 500) {
+            if (deploymentRes.status >= 400 && deploymentRes.status < 500 &&
+                !RETRYABLE_CLIENT_STATUSES.has(deploymentRes.status)) {
               setResult({ success: false, error: message })
               return
             }
