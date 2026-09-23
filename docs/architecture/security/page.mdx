@@ -86,7 +86,7 @@ Choose how you want to log in:
 - **Secure Password Storage** - Passwords never stored, only Argon2 hashes
 - **Session Management** - Secure session handling
 - **Token Expiration** - Tokens expire automatically
-- **Login Rate Limiting** - Repeated failed attempts from an IP are throttled on login, password-reset, and MFA-verification endpoints to slow down brute-force attempts
+- **Authentication Rate Limiting** - All requests from an IP to protected authentication endpoints count toward a shared request limit, including successful login, password-reset, and MFA-verification requests; requests over the limit receive HTTP 429
 
 ## Authorization
 
