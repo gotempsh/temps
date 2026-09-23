@@ -166,8 +166,9 @@ pub enum LogAggregatorError {
 
 impl LogAggregatorError {
     /// Classify recovery failures without inspecting error strings. Recovery
-    /// may wait out unavailable infrastructure, but malformed data and invalid
-    /// configuration require operator action and must not spin forever.
+    /// may wait out unavailable infrastructure, poll retained WAL after an
+    /// operator repairs it in place, and stop on invalid configuration or
+    /// deterministic malformed input that cannot change without a restart.
     pub(crate) fn retry_class(&self) -> RetryClass {
         match self {
             Self::WalRecoveryIncomplete { .. } | Self::WalRecoveryReadFailed { .. } => {

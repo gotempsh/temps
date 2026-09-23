@@ -412,6 +412,8 @@ pub struct ChunkWriterService {
     unindexed_chunks: AtomicU64,
     recovery_ready: tokio::sync::watch::Sender<bool>,
     recovery_started: AtomicBool,
+    #[cfg(test)]
+    recovery_failures: AtomicU64,
 }
 
 impl ChunkWriterService {
@@ -521,6 +523,8 @@ impl ChunkWriterService {
             unindexed_chunks: AtomicU64::new(0),
             recovery_ready,
             recovery_started: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_failures: AtomicU64::new(0),
         });
 
         Ok(service)
@@ -580,6 +584,8 @@ impl ChunkWriterService {
                         break;
                     }
                     Err(error) => {
+                        #[cfg(test)]
+                        writer.recovery_failures.fetch_add(1, Ordering::Relaxed);
                         match error.retry_class() {
                             RetryClass::Transient => {
                                 // RetryConfig performs `1 << attempt`; clamp
@@ -597,9 +603,10 @@ impl ChunkWriterService {
                             RetryClass::RepairRequired => {
                                 tracing::error!(
                                     %error,
-                                    "Background log WAL recovery requires operator repair; WAL retained and log collection remains paused; restart after repairing the WAL"
+                                    retry_seconds = 600,
+                                    "Background log WAL recovery requires operator repair; WAL retained and log collection remains paused; retrying in case the WAL is repaired in place"
                                 );
-                                break;
+                                tokio::time::sleep(Duration::from_secs(600)).await;
                             }
                             RetryClass::Permanent => {
                                 tracing::error!(
@@ -1681,6 +1688,86 @@ mod tests {
         ));
         assert!(!*writer.recovery_ready.borrow());
         assert!(has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test]
+    async fn background_recovery_resumes_after_retained_wal_is_repaired_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let path = entries.next_entry().await.unwrap().unwrap().path();
+        let valid_len = tokio::fs::metadata(&path).await.unwrap().len();
+        use tokio::io::AsyncWriteExt;
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap()
+            .write_all(&[1, 2])
+            .await
+            .unwrap();
+
+        let sink = Arc::new(VecSink::default());
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        writer.start_background_recovery();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while writer.recovery_failures.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("initial retained-WAL pass should enter the repair polling state");
+        // Let the recovery task enter its 600-second sleep before freezing
+        // time, so repairing below cannot race the initial completeness check.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
+        assert_eq!(sink.all().await.len(), 1);
+
+        tokio::time::pause();
+
+        let mut retained_entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let mut retained_path = None;
+        while let Some(entry) = retained_entries.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("recovery-wal") {
+                retained_path = Some(entry.path());
+                break;
+            }
+        }
+        let retained_path = retained_path.expect("damaged generation should remain retained");
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&retained_path)
+            .await
+            .unwrap()
+            .set_len(valid_len)
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !*writer.recovery_ready.borrow(),
+            "repair-required recovery should remain paused until its polling interval"
+        );
+
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
+            .await
+            .expect("in-place WAL repair should be detected on the next poll");
+        assert_eq!(sink.all().await.len(), 1);
+        assert!(!has_recovery_wal(&wal_root).await);
     }
 
     #[tokio::test]
