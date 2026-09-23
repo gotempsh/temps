@@ -2775,7 +2775,7 @@ pub async fn get_repository_compose_preview(
             return Ok(ComposePreviewProblemResponse::new(
                 "Compose Preview Failed",
                 &path,
-                uri.path(),
+                &uri,
                 &source,
             )
             .into_response());

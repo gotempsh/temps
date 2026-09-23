@@ -993,7 +993,7 @@ pub async fn get_public_compose_preview(
             return Ok(ComposePreviewProblemResponse::new(
                 "Invalid Compose Preview",
                 &request.path,
-                uri.path(),
+                &uri,
                 &error,
             )
             .into_response());

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use axum::{
-    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -24,7 +24,7 @@ pub struct ComposePreviewProblemResponse {
 }
 
 impl ComposePreviewProblemResponse {
-    pub fn new(title: &str, path: &str, instance: &str, error: &ComposeParseError) -> Self {
+    pub fn new(title: &str, path: &str, uri: &Uri, error: &ComposeParseError) -> Self {
         let policy_check = match error {
             ComposeParseError::PolicyViolation { check, .. } => Some(*check),
             _ => None,
@@ -37,7 +37,7 @@ impl ComposePreviewProblemResponse {
                 detail: Some(format!(
                     "Compose preview for '{path}' could not be rendered: {error}"
                 )),
-                instance: Some(instance.to_string()),
+                instance: Some(uri.to_string()),
                 extensions: BTreeMap::new(),
             },
             policy_check,
@@ -82,7 +82,7 @@ mod tests {
         let response = ComposePreviewProblemResponse::new(
             "Compose Preview Failed",
             "compose.yaml",
-            "/compose-preview",
+            &Uri::from_static("/compose-preview"),
             &error,
         )
         .into_response();
@@ -113,7 +113,7 @@ mod tests {
         let response = ComposePreviewProblemResponse::new(
             "Invalid Compose Preview",
             "compose.yaml",
-            "/compose-preview",
+            &Uri::from_static("/compose-preview"),
             &error,
         )
         .into_response();
@@ -125,5 +125,29 @@ mod tests {
         assert!(problem.get("policy_check").is_none());
         assert_eq!(problem["status"], 400);
         assert_eq!(problem["instance"], "/compose-preview");
+    }
+
+    #[tokio::test]
+    async fn problem_instance_preserves_public_preview_base_url_query() {
+        let uri = Uri::from_static(
+            "/git/public/gitlab/owner/repo/compose-file?base_url=https%3A%2F%2Fgitlab.example.com",
+        );
+        let response = ComposePreviewProblemResponse::new(
+            "Invalid Compose Preview",
+            "compose.yaml",
+            &uri,
+            &ComposeParseError::MissingServices,
+        )
+        .into_response();
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("problem body should be readable");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem body should be valid JSON");
+
+        assert_eq!(
+            problem["instance"],
+            "/git/public/gitlab/owner/repo/compose-file?base_url=https%3A%2F%2Fgitlab.example.com"
+        );
     }
 }
