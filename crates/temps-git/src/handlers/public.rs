@@ -957,6 +957,7 @@ pub async fn get_public_compose_services(
 )]
 pub async fn get_public_compose_preview(
     State(state): State<Arc<AppState>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicGitLabQueryParams>,
@@ -992,6 +993,7 @@ pub async fn get_public_compose_preview(
             return Ok(ComposePreviewProblemResponse::new(
                 "Invalid Compose Preview",
                 &request.path,
+                uri.path(),
                 &error,
             )
             .into_response());
