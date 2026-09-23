@@ -8,6 +8,9 @@ use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum LogAggregatorError {
+    #[error("Log WAL recovery is incomplete: retained generation '{path}' requires recovery or repair before log collection and purge can resume")]
+    WalRecoveryIncomplete { path: String },
+
     #[error("Timed out waiting to {operation} for {target}; in-flight I/O continues safely")]
     OperationTimedOut {
         operation: &'static str,

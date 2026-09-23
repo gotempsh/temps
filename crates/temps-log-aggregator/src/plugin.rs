@@ -227,7 +227,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 selected_index
             };
 
-            let chunk_writer = ChunkWriterService::open_with_index(
+            let chunk_writer = ChunkWriterService::open_deferred_with_index(
                 storage.clone(),
                 Arc::new(ManifestRepo::new(db.clone())),
                 wal_dir,
@@ -341,6 +341,7 @@ impl TempsPlugin for LogAggregatorPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let chunk_writer = context.require_service::<ChunkWriterService>();
+            chunk_writer.start_background_recovery();
             let collector = context.require_service::<CollectorService>();
             let docker_handle = context.require_service::<temps_core::DockerHandle>();
             let db = context.require_service::<sea_orm::DatabaseConnection>();
@@ -355,7 +356,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             // (object write + manifest insert + WAL truncate), so there is
             // nothing left for the ticker to do with a result.
             let flush_chunk_writer = chunk_writer.clone();
+            let recovery_writer = chunk_writer.clone();
             tokio::spawn(async move {
+                recovery_writer.wait_for_recovery().await;
                 let mut interval = tokio::time::interval(FLUSH_TICKER_INTERVAL);
                 loop {
                     interval.tick().await;
@@ -371,7 +374,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Flushes and fsyncs every open per-container WAL file so at
             // most ~1s of ingest is unsynced at any time (ADR-046 §1).
             let sync_chunk_writer = chunk_writer.clone();
+            let recovery_writer = chunk_writer.clone();
             tokio::spawn(async move {
+                recovery_writer.wait_for_recovery().await;
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
@@ -396,7 +401,9 @@ impl TempsPlugin for LogAggregatorPlugin {
                     remote_metadata,
                     remote_tail_tx,
                 ));
+                let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
+                    recovery_writer.wait_for_recovery().await;
                     // Small initial delay so node registration / agent readiness
                     // settles before the first reconcile.
                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -428,7 +435,13 @@ impl TempsPlugin for LogAggregatorPlugin {
             // remote collector above already covers worker-node containers.
             match local_discovery_plan(&docker_handle) {
                 LocalDiscoveryPlan::Start(docker) => {
-                    spawn_local_container_discovery(docker, collector.clone(), db.clone())
+                    let recovery_writer = chunk_writer.clone();
+                    let collector = collector.clone();
+                    let db = db.clone();
+                    tokio::spawn(async move {
+                        recovery_writer.wait_for_recovery().await;
+                        spawn_local_container_discovery(docker, collector, db);
+                    });
                 }
                 LocalDiscoveryPlan::Skip { reason } => tracing::info!("{}", reason),
             }
@@ -440,7 +453,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
                 let cache = context.require_service::<ChunkCache>();
                 let writer = context.require_service::<ChunkWriterService>();
+                let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
+                    recovery_writer.wait_for_recovery().await;
                     let mut interval = tokio::time::interval(BUDGET_SYNC_INTERVAL);
                     loop {
                         interval.tick().await;
@@ -475,7 +490,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             // ── Retention scheduler ─────────────────────────────────────
             // Run retention cleanup once every 24 hours
             let retention_settings = context.get_service::<temps_config::ConfigService>();
+            let recovery_writer = chunk_writer.clone();
             tokio::spawn(async move {
+                recovery_writer.wait_for_recovery().await;
                 let mut interval = tokio::time::interval(RETENTION_INTERVAL);
                 loop {
                     interval.tick().await;
@@ -547,14 +564,18 @@ impl TempsPlugin for LogAggregatorPlugin {
                 .with_line_index(line_index.clone()),
             );
             let gc = compactor.clone();
+            let recovery_writer = chunk_writer.clone();
             tokio::spawn(async move {
+                recovery_writer.wait_for_recovery().await;
                 let mut interval = tokio::time::interval(GC_INTERVAL);
                 loop {
                     interval.tick().await;
                     gc.gc_once().await;
                 }
             });
+            let recovery_writer = chunk_writer.clone();
             tokio::spawn(async move {
+                recovery_writer.wait_for_recovery().await;
                 // First pass shortly after boot so an upgrade picks up the
                 // backlog; then daily.
                 tokio::time::sleep(COMPACTION_STARTUP_DELAY).await;
@@ -585,7 +606,9 @@ impl TempsPlugin for LogAggregatorPlugin {
                     context.require_service::<dyn LogStorage>(),
                     line_index.clone(),
                 );
+                let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
+                    recovery_writer.wait_for_recovery().await;
                     tokio::time::sleep(REINDEX_STARTUP_DELAY).await;
                     loop {
                         let report = reindexer.run_once(DEFAULT_REINDEX_BATCH).await;
@@ -616,7 +639,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             if line_index.backend().is_some() {
                 let sweeper =
                     ForgetSweeper::new(Arc::new(ManifestRepo::new(db.clone())), line_index.clone());
+                let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
+                    recovery_writer.wait_for_recovery().await;
                     loop {
                         let report = sweeper.run_once(DEFAULT_FORGET_BATCH).await;
                         let pause = if report.more && report.failed == 0 {
