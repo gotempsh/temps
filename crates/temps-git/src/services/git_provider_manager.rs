@@ -130,6 +130,12 @@ pub enum GitProviderManagerError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("Compose preview for '{path}' could not be rendered: {source}")]
+    ComposePreview {
+        path: String,
+        #[source]
+        source: temps_presets::ComposeParseError,
+    },
     #[error("Repository not found: {0}")]
     RepositoryNotFound(String),
 
@@ -3566,6 +3572,7 @@ impl GitProviderManager {
         path: String,
         compose_override: Option<String>,
         excluded_services: Vec<String>,
+        preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
     ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
         let repository = self.get_repository_for_user(repository_id).await?;
 
@@ -3591,16 +3598,15 @@ impl GitProviderManager {
             .await?;
 
         let content = decode_file_content(&file.content, &file.encoding);
-        let preview = temps_presets::render_effective_compose_preview(
+        let preview = temps_presets::render_effective_compose_preview_with_policy(
             &content,
             compose_override.as_deref(),
             &excluded_services,
+            &preview_policy,
         )
-        .map_err(|error| {
-            GitProviderManagerError::InvalidConfiguration(format!(
-                "Compose preview for '{}' could not be rendered: {}",
-                path, error
-            ))
+        .map_err(|source| GitProviderManagerError::ComposePreview {
+            path: path.clone(),
+            source,
         })?;
 
         Ok(RepositoryComposePreviewDomain {
@@ -6770,6 +6776,7 @@ services:
                         .to_string(),
                 ),
                 vec!["db".to_string()],
+                Default::default(),
             )
             .await
             .expect("connected Compose preview should render");
@@ -6805,6 +6812,7 @@ services:
                 "ops/custom.compose.yaml".to_string(),
                 None,
                 Vec::new(),
+                Default::default(),
             )
             .await
             .expect_err("invalid repository YAML must fail preview rendering");

@@ -8407,6 +8407,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "previewPolicy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Advisory preview only. Deployment reloads the saved project policy."
           }
         },
         "required": [
@@ -36110,6 +36114,10 @@
             "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
             "type": "string"
           },
+          "pull_only_root_directory": {
+            "description": "When true, deploy clones only `directory` via git sparse-checkout.",
+            "type": "boolean"
+          },
           "repo_name": {
             "type": [
               "string",
@@ -36164,6 +36172,7 @@
           "slug",
           "name",
           "directory",
+          "pull_only_root_directory",
           "main_branch",
           "project_type",
           "created_at",
@@ -37861,6 +37870,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "previewPolicy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Advisory preview only. Deployment reloads the saved project policy."
           }
         },
         "required": [
@@ -51561,6 +51574,13 @@
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration (e.g., Dockerfile path for Docker preset)\n\nExample for Dockerfile preset:\n```json\n{\n  \"dockerfilePath\": \"docker/Dockerfile\",\n  \"buildContext\": \"./api\"\n}\n```"
               }
+            ]
+          },
+          "pull_only_root_directory": {
+            "description": "When true, deploy clones only `directory`. Ignored when directory is the repo root.",
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "repo_name": {

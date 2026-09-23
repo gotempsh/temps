@@ -15,6 +15,7 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
+  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -82,6 +83,7 @@ import {
 } from '@/lib/compose-port-discovery'
 import {
   composePreviewErrorMessage,
+  composePreviewPolicyCheck,
   fetchComposePreview,
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
@@ -513,6 +515,12 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
+  const composeSecurityQuery = useQuery(
+    getComposeSecurityOptions({ path: { id: project.id } })
+  )
+  const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
+    null
+  )
   const composePreviewQuery = useQuery({
     queryKey: [
       'effective-compose-preview',
@@ -525,6 +533,7 @@ function GitSettingsInline({
       composeRepositoryPath,
       debouncedOverrideDraft,
       excludedComposeServices,
+      composeSecurityQuery.data?.policy.disabled_checks,
     ],
     queryFn: ({ signal }) =>
       fetchComposePreview(
@@ -545,12 +554,14 @@ function GitSettingsInline({
           path: composeRepositoryPath,
           composeOverride: debouncedOverrideDraft || undefined,
           excludedServices: excludedComposeServices,
+          previewPolicy: composeSecurityQuery.data?.policy,
         },
         signal
       ),
     enabled:
       advancedComposeOpen &&
       isComposePreset &&
+      !composeSecurityQuery.isPending &&
       (isPublicRepo
         ? !!project.repo_owner && !!project.repo_name
         : !!repositoryData?.id),
@@ -1289,7 +1300,10 @@ function GitSettingsInline({
               isUploadedSource={isUploadedSource}
             />
 
-            <ComposeSecuritySettings projectId={project.id} />
+            <ComposeSecuritySettings
+              projectId={project.id}
+              focusCheck={focusedComposeCheck}
+            />
 
             {!isUploadedSource && (
               <Collapsible
@@ -1469,6 +1483,30 @@ function GitSettingsInline({
                                     composePreviewQuery.error
                                   )}
                             </p>
+                            {composePreviewPolicyCheck(
+                              composePreviewQuery.error
+                            ) && (
+                              <div className="mt-4 space-y-2">
+                                <p className="text-sm text-muted-foreground">
+                                  If you trust this stack, an instance
+                                  administrator can disable this check for this
+                                  project.
+                                </p>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    setFocusedComposeCheck(
+                                      composePreviewPolicyCheck(
+                                        composePreviewQuery.error
+                                      )
+                                    )
+                                  }
+                                >
+                                  Review or disable this check
+                                </Button>
+                              </div>
+                            )}
                             {composePreviewRateLimited && (
                               <div className="mt-4 flex flex-wrap justify-center gap-2">
                                 <Button

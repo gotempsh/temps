@@ -123,6 +123,36 @@ pub struct ComposeSecurityCheckDefinition {
 }
 
 impl ComposeSecurityCheck {
+    /// The deploy-time check that guards a service field forbidden by default
+    /// in inline overrides. Keep preview and deployment aligned on the grant
+    /// that makes each field usable.
+    pub fn for_restricted_service_field(field: &str) -> Option<Self> {
+        Some(match field {
+            "privileged" => Self::Privileged,
+            "cgroup_parent" => Self::CgroupParent,
+            "cap_add" => Self::Capabilities,
+            "devices" => Self::Devices,
+            "device_cgroup_rules" => Self::DeviceRules,
+            "security_opt" => Self::SecurityOptions,
+            "sysctls" => Self::Sysctls,
+            "volumes_from" => Self::VolumesFrom,
+            "external_links" => Self::ExternalLinks,
+            "label_file" => Self::LabelFiles,
+            "post_start" | "pre_stop" => Self::LifecycleHooks,
+            "provider" => Self::Provider,
+            "container_name" => Self::ContainerName,
+            "blkio_config" => Self::Blkio,
+            "storage_opt" => Self::StorageOptions,
+            "memswap_limit" => Self::Swap,
+            "group_add" => Self::Groups,
+            "runtime" => Self::Runtime,
+            "oom_kill_disable" => Self::OomKiller,
+            "tmpfs" => Self::Tmpfs,
+            "ulimits" => Self::Ulimits,
+            _ => return None,
+        })
+    }
+
     pub fn catalog() -> Vec<ComposeSecurityCheckDefinition> {
         vec![
             ComposeSecurityCheckDefinition { id: Self::Extends, group: "Composition", label: "Block extends", consequence: "Reuse service definitions from other Compose files." },
@@ -238,5 +268,25 @@ mod tests {
             r#"{"disabled_checks":["unknown"]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn restricted_override_fields_map_to_catalog_checks() {
+        let catalog: BTreeSet<_> = ComposeSecurityCheck::catalog()
+            .into_iter()
+            .map(|definition| definition.id)
+            .collect();
+        for field in ["privileged", "cap_add", "label_file", "tmpfs", "ulimits"] {
+            let check = ComposeSecurityCheck::for_restricted_service_field(field)
+                .expect("restricted field must have a check");
+            assert!(
+                catalog.contains(&check),
+                "{field} is missing from the catalog"
+            );
+        }
+        assert_eq!(
+            ComposeSecurityCheck::for_restricted_service_field("image"),
+            None
+        );
     }
 }

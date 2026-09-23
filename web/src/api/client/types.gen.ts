@@ -3923,6 +3923,10 @@ export type ComposePreviewRequest = {
     composeOverride?: string | null;
     excludedServices?: Array<string>;
     path: string;
+    /**
+     * Advisory preview only. Deployment reloads the saved project policy.
+     */
+    previewPolicy?: ComposeSecurityPolicy;
 };
 
 export type ComposePreviewResponse = {
@@ -16689,10 +16693,6 @@ export type ProjectResponse = {
     directory: string;
     docker_socket?: null | DockerSocketCapability;
     /**
-     * When true, deploy clones only `directory` via git sparse-checkout.
-     */
-    pull_only_root_directory: boolean;
-    /**
      * Enable automatic preview environment creation for each branch
      */
     enable_preview_environments: boolean;
@@ -16763,6 +16763,10 @@ export type ProjectResponse = {
      * deployment transport in `source_type`.
      */
     project_type: string;
+    /**
+     * When true, deploy clones only `directory` via git sparse-checkout.
+     */
+    pull_only_root_directory: boolean;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -17485,6 +17489,10 @@ export type PublicComposePreviewRequest = {
     composeOverride?: string | null;
     excludedServices?: Array<string>;
     path: string;
+    /**
+     * Advisory preview only. Deployment reloads the saved project policy.
+     */
+    previewPolicy?: ComposeSecurityPolicy;
 };
 
 export type PublicComposePreviewResponse = {
@@ -23972,10 +23980,6 @@ export type UpdateFlagRequest = {
 
 export type UpdateGitSettingsRequest = {
     directory: string;
-    /**
-     * When true, deploy clones only `directory`. Ignored when directory is the repo root.
-     */
-    pull_only_root_directory?: boolean | null;
     git_provider_connection_id?: number | null;
     /**
      * Git clone URL for public repositories
@@ -23988,6 +23992,10 @@ export type UpdateGitSettingsRequest = {
     main_branch: string;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
+    /**
+     * When true, deploy clones only `directory`. Ignored when directory is the repo root.
+     */
+    pull_only_root_directory?: boolean | null;
     repo_name: string;
     repo_owner: string;
 };

@@ -95,6 +95,19 @@ impl From<GitProviderManagerError> for Problem {
                     .with_title("Invalid Configuration")
                     .with_detail(msg)
             }
+            GitProviderManagerError::ComposePreview { path, source } => {
+                let check = match &source {
+                    temps_presets::ComposeParseError::PolicyViolation { check, .. } => Some(*check),
+                    _ => None,
+                };
+                let mut problem = problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Compose Preview Failed")
+                    .with_detail(format!("Compose preview for '{}' could not be rendered: {}", path, source));
+                if let Some(check) = check {
+                    problem = problem.with_value("policy_check", serde_json::json!(check));
+                }
+                problem
+            }
             GitProviderManagerError::JsonError(e) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("JSON Error")
                 .with_detail(e.to_string()),
@@ -2654,6 +2667,9 @@ pub struct ComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2755,6 +2771,7 @@ pub async fn get_repository_compose_preview(
             request.path,
             request.compose_override,
             request.excluded_services,
+            request.preview_policy,
         )
         .await?;
 

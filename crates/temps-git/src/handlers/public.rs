@@ -202,6 +202,9 @@ pub struct PublicComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -977,18 +980,23 @@ pub async fn get_public_compose_preview(
         .await
         .map_err(|error| map_error(error, &owner, &repo))?;
     let content = decode_file_content(&file.content, &file.encoding);
-    let preview = temps_presets::render_effective_compose_preview(
+    let preview = temps_presets::render_effective_compose_preview_with_policy(
         &content,
         request.compose_override.as_deref(),
         &request.excluded_services,
+        &request.preview_policy,
     )
     .map_err(|error| {
-        problem_new(StatusCode::BAD_REQUEST)
+        let mut problem = problem_new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Compose Preview")
             .with_detail(format!(
                 "Compose preview for '{}' could not be rendered: {}",
                 request.path, error
-            ))
+            ));
+        if let temps_presets::ComposeParseError::PolicyViolation { check, .. } = error {
+            problem = problem.with_value("policy_check", serde_json::json!(check));
+        }
+        problem
     })?;
 
     Ok(Json(PublicComposePreviewResponse {

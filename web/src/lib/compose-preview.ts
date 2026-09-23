@@ -5,12 +5,14 @@ import {
   getPublicComposePreview,
   getRepositoryComposePreview,
 } from '@/api/client'
+import type { ComposeSecurityPolicy } from '@/api/client'
 
 export interface ComposePreviewRequest {
   branch?: string
   path: string
   composeOverride?: string
   excludedServices: string[]
+  previewPolicy?: ComposeSecurityPolicy
 }
 
 export interface ComposePreviewResponse {
@@ -106,6 +108,12 @@ export function composePreviewErrorMessage(error: unknown): string {
     }
   }
   return 'The effective Compose preview could not be generated.'
+}
+
+export function composePreviewPolicyCheck(error: unknown): string | null {
+  const problem = (error as { problem?: { policy_check?: unknown } } | null)
+    ?.problem
+  return typeof problem?.policy_check === 'string' ? problem.policy_check : null
 }
 
 export function isPublicRepositoryRateLimitError(error: unknown): boolean {
