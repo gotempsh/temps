@@ -17,7 +17,7 @@ use crate::services::{
     repository::RepositoryFilter,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
@@ -2752,6 +2752,7 @@ pub async fn get_repository_compose_services_live(
 pub async fn get_repository_compose_preview(
     State(state): State<Arc<AppState>>,
     Path(repository_id): Path<i32>,
+    OriginalUri(uri): OriginalUri,
     RequireAuth(auth): RequireAuth,
     Json(request): Json<ComposePreviewRequest>,
 ) -> Result<axum::response::Response, Problem> {
@@ -2774,6 +2775,7 @@ pub async fn get_repository_compose_preview(
             return Ok(ComposePreviewProblemResponse::new(
                 "Compose Preview Failed",
                 &path,
+                &uri,
                 &source,
             )
             .into_response());
