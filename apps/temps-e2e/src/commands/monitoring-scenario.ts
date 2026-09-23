@@ -87,6 +87,7 @@ import {
   listIncidents,
   getIncident,
 } from '@temps-sdk/api'
+import type { MonitorResponse } from '@temps-sdk/api'
 import { makeClient, resolveConfig, unwrap } from '../lib/client.ts'
 import {
   createE2eProject,
@@ -122,6 +123,19 @@ interface MonitoringScenarioResult {
   runId: string
   ok: boolean
   steps: StepLog[]
+}
+
+export function autoMonitorReady(
+  monitors: Array<Pick<MonitorResponse, 'environment_id'>>,
+  environmentId: number,
+): boolean {
+  if (monitors.length > 1) {
+    throw new Error(`expected exactly 1 auto-created monitor for a fresh project, got ${monitors.length}`)
+  }
+  if (monitors.length === 1 && monitors[0]!.environment_id !== environmentId) {
+    throw new Error(`auto-created monitor environment_id=${monitors[0]!.environment_id}, expected ${environmentId}`)
+  }
+  return monitors.length === 1
 }
 
 export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions): Promise<void> {
@@ -190,18 +204,17 @@ export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions)
     const autoMonitor = await step(
       'production environment auto-got a default monitor (EnvironmentCreated -> ensure_monitor_for_environment)',
       async () => {
-        const monitors = unwrap(
-          await listMonitors({ client, path: { project_id: project.id } }),
-          'listMonitors',
+        const monitors = await pollUntil(
+          () => listMonitors({ client, path: { project_id: project.id } }).then((r) => unwrap(r, 'listMonitors')),
+          (found) => autoMonitorReady(found, env.id),
+          {
+            timeoutMs: 20_000,
+            intervalMs: 1000,
+            label: `auto-created monitor for project ${project.id} environment ${env.id}`,
+            onPoll: (found) => log(`    ...found ${found.length} monitor(s)`),
+          },
         )
-        if (monitors.length !== 1) {
-          throw new Error(`expected exactly 1 auto-created monitor for a fresh project, got ${monitors.length}`)
-        }
-        const m = monitors[0]!
-        if (m.environment_id !== env.id) {
-          throw new Error(`auto-created monitor environment_id=${m.environment_id}, expected ${env.id}`)
-        }
-        return m
+        return monitors[0]!
       },
     )
     log(`  auto monitor #${autoMonitor.id} (${autoMonitor.name})`)
