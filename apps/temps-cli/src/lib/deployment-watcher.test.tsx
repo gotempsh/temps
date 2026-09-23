@@ -66,7 +66,7 @@ describe('deployment watcher HTTP polling', () => {
   test('reports the failing job when the deployment has no reason', async () => {
     const { result } = await watch(
       () => Response.json({ id: 42, status: 'failed' }),
-      () => Response.json({ jobs: [{ id: 1, job_id: 'validate', name: 'Validate', status: 'failed', error_message: 'Archive validation failed' }] }),
+      () => Response.json({ jobs: [{ id: 1, job_id: 'validate', name: 'Validate', status: 'failure', error_message: 'Archive validation failed' }] }),
     )
     expect(result.error).toBe('Archive validation failed')
   })

@@ -69,6 +69,7 @@ interface JobState {
 const TERMINAL_STATUSES = ['success', 'completed', 'deployed', 'failed', 'error', 'cancelled']
 const SUCCESS_STATUSES = ['success', 'completed', 'deployed']
 const FAILURE_STATUSES = ['failed', 'error', 'cancelled']
+const FAILED_JOB_STATUSES = ['failure', 'cancelled']
 const RETRYABLE_CLIENT_STATUSES = new Set([408, 425, 429])
 
 // Convert API timestamp to milliseconds
@@ -105,6 +106,7 @@ function StatusIcon({ status }: { status: string }) {
     case 'deployed':
       return <Text color="green">✓</Text>
     case 'failed':
+    case 'failure':
     case 'error':
       return <Text color="red">✗</Text>
     case 'cancelled':
@@ -124,6 +126,7 @@ function getStatusColor(status: string): string {
     case 'deployed':
       return 'green'
     case 'failed':
+    case 'failure':
     case 'error':
       return 'red'
     default:
@@ -182,7 +185,7 @@ function JobRow({ jobState, isFinished }: { jobState: JobState; isFinished?: boo
       </Box>
 
       {/* Error message */}
-      {FAILURE_STATUSES.includes(job.status) && job.error_message && (
+      {FAILED_JOB_STATUSES.includes(job.status) && job.error_message && (
         <Box marginLeft={2}>
           <Text color="red">Error: {job.error_message}</Text>
         </Box>
@@ -349,7 +352,7 @@ export function DeploymentWatcher({
               setResult({
                 success: false,
                 deployment: dep,
-                error: dep.cancelled_reason || Array.from(latestJobStates.values()).find(({ job }) => FAILURE_STATUSES.includes(job.status) && job.error_message)?.job.error_message || 'Deployment failed',
+                error: dep.cancelled_reason || Array.from(latestJobStates.values()).find(({ job }) => FAILED_JOB_STATUSES.includes(job.status) && job.error_message)?.job.error_message || 'Deployment failed',
               })
               return
             }
