@@ -200,7 +200,7 @@ function JobRow({ jobState, isFinished }: { jobState: JobState; isFinished?: boo
 }
 
 // Main deployment watcher component
-function DeploymentWatcher({
+export function DeploymentWatcher({
   projectId,
   deploymentId,
   timeoutSecs,
@@ -319,13 +319,24 @@ function DeploymentWatcher({
           if (deploymentRes.ok) {
             dep = (await deploymentRes.json()) as DeploymentResponse
             setDeployment(dep)
+            setError(null)
           } else {
             const errorText = await deploymentRes.text()
-            setError(`API Error ${deploymentRes.status}: ${errorText.substring(0, 200)}`)
+            const message = `API Error ${deploymentRes.status}: ${errorText.substring(0, 200)}`
+            setError(message)
+            if (deploymentRes.status >= 400 && deploymentRes.status < 500) {
+              setResult({ success: false, error: message })
+              return
+            }
           }
 
           // 2. Always fetch jobs (so final states are captured)
-          latestJobStates = await fetchJobs(latestJobStates)
+          // Optional job details must not hide a terminal deployment status.
+          try {
+            latestJobStates = await fetchJobs(latestJobStates)
+          } catch (err) {
+            setError(`Unable to fetch deployment jobs: ${err instanceof Error ? err.message : String(err)}`)
+          }
           if (!cancelled) {
             setJobStates(latestJobStates)
           }
@@ -336,7 +347,7 @@ function DeploymentWatcher({
               setResult({
                 success: false,
                 deployment: dep,
-                error: dep.cancelled_reason || 'Deployment failed',
+                error: dep.cancelled_reason || Array.from(latestJobStates.values()).find(({ job }) => FAILURE_STATUSES.includes(job.status) && job.error_message)?.job.error_message || 'Deployment failed',
               })
               return
             }
