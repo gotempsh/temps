@@ -93,6 +93,7 @@ import {
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
+import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -134,11 +135,6 @@ import {
   repositoryConnectionPath,
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
-
-function isRepositoryRootDirectory(directory: string | undefined | null): boolean {
-  const normalized = (directory ?? '').trim()
-  return normalized === '' || normalized === '.' || normalized === './'
-}
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -1059,23 +1055,20 @@ function GitSettingsInline({
                       />
                     }
                   />
-                  <div className="flex items-start gap-2 px-1">
+                  <div
+                    className={cn(
+                      'flex items-start gap-2 px-1',
+                      isRepositoryRootDirectory(
+                        editing === 'directory'
+                          ? directoryDraft
+                          : project.directory
+                      ) && 'hidden'
+                    )}
+                  >
                     <Checkbox
                       id="pull-only-root-directory"
-                      checked={
-                        !isRepositoryRootDirectory(
-                          editing === 'directory'
-                            ? directoryDraft
-                            : project.directory
-                        ) && !!project.pull_only_root_directory
-                      }
-                      disabled={
-                        isRepositoryRootDirectory(
-                          editing === 'directory'
-                            ? directoryDraft
-                            : project.directory
-                        ) || updateGitSettings.isPending
-                      }
+                      checked={!!project.pull_only_root_directory}
+                      disabled={updateGitSettings.isPending}
                       onCheckedChange={async (checked) => {
                         await saveGitField({
                           pull_only_root_directory: checked === true,
@@ -1096,16 +1089,7 @@ function GitSettingsInline({
                     <div className="space-y-1">
                       <label
                         htmlFor="pull-only-root-directory"
-                        className={cn(
-                          'text-sm leading-none',
-                          isRepositoryRootDirectory(
-                            editing === 'directory'
-                              ? directoryDraft
-                              : project.directory
-                          )
-                            ? 'text-muted-foreground'
-                            : 'cursor-pointer'
-                        )}
+                        className="text-sm leading-none cursor-pointer"
                       >
                         Pull only the root directory
                       </label>
@@ -3036,14 +3020,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 Subdirectory to build from (for monorepos). Defaults to the
                 repository root.
               </p>
-              <div className="flex items-start gap-2 pt-1">
+              <div
+                className={cn(
+                  'flex items-start gap-2 pt-1',
+                  isRepositoryRootDirectory(directory) && 'hidden'
+                )}
+              >
                 <Checkbox
                   id="connect-pull-only-root-directory"
-                  checked={
-                    !isRepositoryRootDirectory(directory) &&
-                    pullOnlyRootDirectory
-                  }
-                  disabled={isRepositoryRootDirectory(directory)}
+                  checked={pullOnlyRootDirectory}
                   onCheckedChange={(checked) =>
                     setPullOnlyRootDirectory(checked === true)
                   }
@@ -3051,12 +3036,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 <div className="space-y-1">
                   <label
                     htmlFor="connect-pull-only-root-directory"
-                    className={cn(
-                      'text-sm leading-none',
-                      isRepositoryRootDirectory(directory)
-                        ? 'text-muted-foreground'
-                        : 'cursor-pointer'
-                    )}
+                    className="text-sm leading-none cursor-pointer"
                   >
                     Pull only the root directory
                   </label>
