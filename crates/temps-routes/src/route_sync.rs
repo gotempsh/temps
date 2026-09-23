@@ -739,11 +739,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
 
-    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase};
+    use temps_database::test_utils::TestDatabase;
     use temps_entities::domains;
 
     use super::*;
+    use crate::route_table::BackendEntry;
+    use crate::test_utils::TestDBMockOperations;
 
     fn test_node(public_ingress_enabled: bool) -> nodes::Model {
         let now = chrono::Utc::now();
@@ -782,6 +786,126 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    struct RestrictiveRequestPolicy;
+
+    impl temps_core::RequestPolicyGate for RestrictiveRequestPolicy {
+        fn evaluate(
+            &self,
+            _context: &temps_core::RequestPolicyContext<'_>,
+        ) -> temps_core::RequestPolicyDecision {
+            temps_core::RequestPolicyDecision::Deny {
+                reason: "test policy",
+                rule_id: None,
+                revision: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_snapshot_exports_public_route_only_for_ready_open_request_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_database = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+                    && temps_database::test_utils::is_container_runtime_unavailable(
+                        &error.to_string(),
+                    ) =>
+            {
+                eprintln!("skipping worker snapshot test: test database unavailable: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let test_db = TestDBMockOperations::new(test_database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("worker-public.example.test")
+            .await?;
+        let node = test_node(true);
+        nodes::ActiveModel::from(node.clone())
+            .insert(test_db.db.as_ref())
+            .await?;
+
+        let peer_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        peer_table.insert_route_for_test(
+            "worker-public.example.test",
+            RouteInfo {
+                backend: BackendType::Upstream {
+                    backends: vec![BackendEntry {
+                        address: "192.0.2.7:32000".to_string(),
+                        container_id: Some("worker-container".to_string()),
+                        container_name: Some("worker-app".to_string()),
+                    }],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: Some(Arc::new(project)),
+                environment: Some(Arc::new(environment)),
+                deployment: Some(Arc::new(deployment)),
+                cert_eligible: true,
+            },
+        );
+        let encryption_service = Arc::new(temps_core::EncryptionService::new(&"11".repeat(32))?);
+
+        let open_gate = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+        assert!(open_gate.set(Arc::new(temps_core::OpenRequestPolicyGate)));
+        let open_snapshot = build_snapshot(
+            &RouteSyncAppState {
+                db: test_db.db.clone(),
+                peer_table: Arc::clone(&peer_table),
+                encryption_service: Arc::clone(&encryption_service),
+                request_policy_gate: open_gate,
+            },
+            &node,
+            1,
+        )
+        .await?;
+        assert_eq!(open_snapshot.public_ingress.routes.len(), 1);
+        assert_eq!(
+            open_snapshot.public_ingress.routes[0].host,
+            "worker-public.example.test"
+        );
+        assert_eq!(
+            open_snapshot.public_ingress.routes[0].backends[0].address,
+            "192.0.2.7:32000"
+        );
+        assert!(open_snapshot.public_ingress.unsupported_reasons.is_empty());
+
+        for request_policy_gate in [
+            Arc::new(temps_core::RequestPolicyGateSlot::new_default()),
+            {
+                let slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+                assert!(slot.set(Arc::new(RestrictiveRequestPolicy)));
+                slot
+            },
+        ] {
+            let snapshot = build_snapshot(
+                &RouteSyncAppState {
+                    db: test_db.db.clone(),
+                    peer_table: Arc::clone(&peer_table),
+                    encryption_service: Arc::clone(&encryption_service),
+                    request_policy_gate,
+                },
+                &node,
+                1,
+            )
+            .await?;
+            assert!(snapshot.public_ingress.routes.is_empty());
+            assert_eq!(snapshot.public_ingress.unsupported_route_count, 1);
+            assert!(snapshot
+                .public_ingress
+                .unsupported_reasons
+                .iter()
+                .any(|reason| {
+                    reason == "a custom request-policy provider requires control-plane ingress"
+                }));
+        }
+
+        test_db.cleanup().await?;
+        Ok(())
     }
 
     fn challenge_domain(

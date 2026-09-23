@@ -479,8 +479,13 @@ impl ChunkWriterService {
         });
 
         if let Some(wal_dir) = service.wal_dir.as_ref() {
-            let recovered = wal_dir.recover().await?;
-            for stream in recovered {
+            let mut recovered = wal_dir
+                .recover_batched(
+                    service.head_max_bytes(),
+                    !service.shed_bloom.load(Ordering::Relaxed),
+                )
+                .await?;
+            while let Some(stream) = recovered.next().await? {
                 service.recover_stream(stream).await?;
             }
         }
@@ -566,7 +571,10 @@ impl ChunkWriterService {
             let mut buffers = self.buffers.lock().await;
             buffers.insert(stream.container_id.clone(), buffer);
         }
-        self.seal_inner(&stream.container_id, false).await
+        // Startup must stop on persistence failure. Continuing to a final
+        // batch could remove the source generation while an earlier batch is
+        // still only present in memory.
+        self.seal_inner(&stream.container_id, true).await
     }
 
     /// Append one line to its container's head buffer, sealing immediately
@@ -966,7 +974,20 @@ impl ChunkWriterService {
         let labels = &encoded.footer.labels;
         // Bind object identity to its complete encoded contents, not merely
         // its first timestamp: different generations may start at the same ts.
-        let content_hash = hex::encode(Sha256::digest(&encoded.bytes));
+        let content_hash = match generation
+            .as_ref()
+            .and_then(WalGeneration::recovery_identity)
+        {
+            Some(recovery_identity) => {
+                let mut digest = Sha256::new();
+                digest.update(b"wal-recovery-v1\0");
+                digest.update(recovery_identity.as_bytes());
+                digest.update(b"\0");
+                digest.update(&encoded.bytes);
+                hex::encode(digest.finalize())
+            }
+            None => hex::encode(Sha256::digest(&encoded.bytes)),
+        };
         let storage_key = build_storage_key_v2(
             labels.project_id,
             labels.external_service_id,
@@ -1193,6 +1214,21 @@ mod tests {
         }
     }
 
+    async fn has_recovery_wal(root: &std::path::Path) -> bool {
+        let mut entries = tokio::fs::read_dir(root).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("recovery-wal")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[async_trait]
     impl ManifestSink for VecSink {
         async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
@@ -1205,6 +1241,24 @@ mod tests {
             }
             rows.push(meta.clone());
             Ok(rows.len() as i64)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailAfterFirstCommitSink {
+        rows: VecSink,
+        failing: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ManifestSink for FailAfterFirstCommitSink {
+        async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            if self.failing.load(Ordering::Relaxed) && !self.rows.all().await.is_empty() {
+                return Err(LogAggregatorError::Validation {
+                    message: "injected recovery failure after first commit".to_string(),
+                });
+            }
+            self.rows.insert(meta).await
         }
     }
 
@@ -1370,6 +1424,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_recovery_keeps_identical_batches_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        let wal_dir = WalDir::open(wal_root.clone()).await.unwrap();
+        let mut wal = wal_dir.stream("identical-batches").await.unwrap();
+        let line = make_line(
+            "identical-batches",
+            LogLevel::Info,
+            &format!("same-{}", "x".repeat(2048)),
+        );
+        for _ in 0..30 {
+            wal.append(&line).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+        drop(wal);
+
+        let sink = Arc::new(VecSink::default());
+        let _writer = ChunkWriterService::open_for_test(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root),
+            None,
+            8 * 1024,
+            300,
+            64 * 1024,
+            1_800,
+        )
+        .await
+        .unwrap();
+        let rows = sink.all().await;
+        assert!(rows.len() > 2, "fixture must span at least three batches");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.line_count as usize)
+                .sum::<usize>(),
+            30,
+            "identical encoded batches need distinct stable recovery identities"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_startup_recovery_retries_without_loss_or_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        let wal_dir = WalDir::open(wal_root.clone()).await.unwrap();
+        let mut wal = wal_dir.stream("recovery-retry").await.unwrap();
+        let line = make_line(
+            "recovery-retry",
+            LogLevel::Info,
+            &format!("same-{}", "z".repeat(2048)),
+        );
+        for _ in 0..30 {
+            wal.append(&line).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+        drop(wal);
+
+        let sink = Arc::new(FailAfterFirstCommitSink::default());
+        sink.failing.store(true, Ordering::Relaxed);
+        let first = ChunkWriterService::open_for_test(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            8 * 1024,
+            300,
+            64 * 1024,
+            1_800,
+        )
+        .await;
+        assert!(first.is_err(), "second recovery batch must fail startup");
+        assert_eq!(sink.rows.all().await.len(), 1, "first batch committed");
+        assert!(has_recovery_wal(&wal_root).await);
+
+        sink.failing.store(false, Ordering::Relaxed);
+        let _recovered = ChunkWriterService::open_for_test(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            8 * 1024,
+            300,
+            64 * 1024,
+            1_800,
+        )
+        .await
+        .unwrap();
+        let rows = sink.rows.all().await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.line_count as usize)
+                .sum::<usize>(),
+            30
+        );
+        assert!(!has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test]
     async fn restart_preserves_committed_chunk_and_replays_only_its_tail() {
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn LogStorage> =
@@ -1484,6 +1636,10 @@ mod tests {
             rows.len(),
             2,
             "exact generation replay must hit ON CONFLICT while B gets its own manifest"
+        );
+        assert_eq!(
+            rows[0].storage_key, committed.storage_key,
+            "a committed immutable generation must retain its original object identity"
         );
         assert_eq!(
             storage.read_chunk(&committed.storage_key).await.unwrap(),

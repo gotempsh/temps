@@ -136,6 +136,11 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("IO Error")
                 .with_detail(error.to_string()),
+            LogAggregatorError::WalRecoveryReadFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("WAL Recovery Read Failed")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::Serialization(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Serialization Error")
