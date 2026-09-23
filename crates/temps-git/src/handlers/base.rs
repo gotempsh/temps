@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
     get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,
@@ -94,6 +95,11 @@ impl From<GitProviderManagerError> for Problem {
                 problem_new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Configuration")
                     .with_detail(msg)
+            }
+            GitProviderManagerError::ComposePreview { path, source } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Compose Preview Failed")
+                    .with_detail(format!("Compose preview for '{}' could not be rendered: {}", path, source))
             }
             GitProviderManagerError::JsonError(e) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("JSON Error")
@@ -2002,6 +2008,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             ComposePortMapping,
             ComposePreviewRequest,
             ComposePreviewResponse,
+            ComposePreviewProblemResponse,
             RepositoryListQuery,
             SyncedRepositoryListQuery,
             RepositoryListResponse,
@@ -2654,6 +2661,9 @@ pub struct ComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2732,7 +2742,7 @@ pub async fn get_repository_compose_services_live(
     request_body = ComposePreviewRequest,
     responses(
         (status = 200, description = "Effective Compose preview rendered", body = ComposePreviewResponse),
-        (status = 400, description = "Compose file or override is invalid"),
+        (status = 400, description = "Compose file or override is invalid", body = ComposePreviewProblemResponse, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found")
     ),
@@ -2744,10 +2754,10 @@ pub async fn get_repository_compose_preview(
     Path(repository_id): Path<i32>,
     RequireAuth(auth): RequireAuth,
     Json(request): Json<ComposePreviewRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<axum::response::Response, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    let result = state
+    let result = match state
         .git_provider_manager
         .calculate_repository_compose_preview_live(
             repository_id,
@@ -2755,8 +2765,21 @@ pub async fn get_repository_compose_preview(
             request.path,
             request.compose_override,
             request.excluded_services,
+            request.preview_policy,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(GitProviderManagerError::ComposePreview { path, source }) => {
+            return Ok(ComposePreviewProblemResponse::new(
+                "Compose Preview Failed",
+                &path,
+                &source,
+            )
+            .into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     Ok((
         StatusCode::OK,
@@ -2768,7 +2791,8 @@ pub async fn get_repository_compose_preview(
             disabled_services: result.preview.disabled_services,
             redacted_values: result.preview.redacted_values,
         }),
-    ))
+    )
+        .into_response())
 }
 
 /// Get connections for a specific git provider

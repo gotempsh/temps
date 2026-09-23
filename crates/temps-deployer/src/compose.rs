@@ -179,7 +179,6 @@ const REPO_ONLY_OVERRIDE_KEYS: &[&str] = &[
     "shm_size",
     "labels",
     "build",
-    "image",
     "env_file",
 ];
 const SAFE_DOCKER_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
@@ -247,7 +246,7 @@ pub enum ComposeError {
     )]
     ComposeUnavailable { reason: String },
 
-    #[error("Compose security policy rejected {field} for service '{service}': {reason}")]
+    #[error("Compose security policy rejected {field} for service '{service}': {reason}. Review the matching individual check in Project Settings → Git → Advanced security settings; an instance administrator can disable that check for a trusted stack. If no check covers this validation error, correct the Compose file")]
     SecurityPolicyViolation {
         service: String,
         field: String,
@@ -1531,10 +1530,14 @@ impl ComposeExecutor {
             )?;
         }
 
-        // Build/image selection is repository-owned. Inline overrides cannot
-        // alter either field, preventing a merge from assigning a daemon-global
-        // image tag to a build or changing the trusted pull/build decision.
-        let has_build = self.has_build_directives(&request.compose_content);
+        // The build definition stays in the repository. Inline image changes
+        // are allowed for image services, while BuildImage policy rejects an
+        // image tag on a built service by default.
+        let has_build = self.has_build_directives(&request.compose_content)
+            || request
+                .compose_override
+                .as_deref()
+                .is_some_and(|content| self.has_build_directives(content));
 
         // Every value that must never appear in a deployment error, including
         // the secrets this deploy is about to mount: a container that echoes
@@ -5462,17 +5465,23 @@ impl ComposeExecutor {
             });
         };
         for key in override_root.keys().filter_map(Self::yaml_key) {
-            if policy.enforced(PolicyCheck::InlineSections) && key != "services" {
+            if policy.enforced(PolicyCheck::InlineSections)
+                && key != "services"
+                && !(key == "include" && !policy.enforced(PolicyCheck::Include))
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot set top-level key '{key}'; only service-level changes are allowed"
+                        "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Git → Advanced security settings for a trusted stack"
                     ),
                 });
             }
         }
 
         let Some(override_services) = Self::compose_services(&override_yaml) else {
+            if override_yaml.get("include").is_some() && !policy.enforced(PolicyCheck::Include) {
+                return Ok(());
+            }
             if !policy.enforced(PolicyCheck::InlineSections)
                 && override_yaml.get("services").is_none()
             {
@@ -5502,14 +5511,12 @@ impl ComposeExecutor {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot add service '{service_name}'; add new services to the repository compose file for review"
+                        "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Git → Advanced security settings for a trusted stack"
                     ),
                 });
             }
 
-            if policy.enforced(PolicyCheck::InlineFields) {
-                Self::validate_override_service(project_name, &service_name, service_config)?;
-            }
+            Self::validate_override_service(project_name, &service_name, service_config, policy)?;
         }
 
         Ok(())
@@ -5549,6 +5556,7 @@ impl ComposeExecutor {
         project_name: &str,
         service_name: &str,
         service_config: &Value,
+        policy: &ComposeSecurityPolicy,
     ) -> Result<(), ComposeError> {
         let Some(service) = service_config.as_mapping() else {
             return Err(ComposeError::InvalidOverride {
@@ -5559,24 +5567,25 @@ impl ComposeExecutor {
 
         for key in service.keys().filter_map(Self::yaml_key) {
             if NEVER_ALLOWED_OVERRIDE_KEYS.contains(&key.as_str()) {
-                return Err(ComposeError::InvalidOverride {
-                    project: project_name.to_string(),
-                    reason: format!(
-                        "service '{service_name}' uses forbidden key '{key}', which Compose \
-                         deployments do not permit anywhere — the deploy-time security policy \
-                         rejects it in the repository compose file too, so moving it there \
-                         will not help"
-                    ),
-                });
+                let check = PolicyCheck::for_restricted_service_field(&key)
+                    .unwrap_or(PolicyCheck::InlineFields);
+                if policy.enforced(check) {
+                    return Err(ComposeError::InvalidOverride {
+                        project: project_name.to_string(),
+                        reason: format!("service '{service_name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Git → Advanced security settings for a trusted stack"),
+                    });
+                }
             }
-            if REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str()) {
+            if policy.enforced(PolicyCheck::InlineFields)
+                && REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str())
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
                         "service '{service_name}' cannot set '{key}' as an inline override; \
-                         declare it in the repository compose file instead, where it is \
-                         checked against the deployment security policy (host paths, host \
-                         namespaces and resource limits are still rejected there)"
+                         declare it in the repository compose file, or an instance administrator \
+                         can disable the Inline Fields check in Project Settings → Git → \
+                         Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -8257,6 +8266,16 @@ services:
     }
 
     #[test]
+    fn test_validate_compose_override_allows_image_change_for_existing_service() {
+        let compose = "services:\n  web:\n    image: example/web:1\n";
+        let override_content =
+            "services:\n  web:\n    image: example/web:2\n    ports: ['8080:80']\n";
+
+        ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
+            .unwrap();
+    }
+
+    #[test]
     fn test_validate_compose_override_rejects_new_services() {
         let compose = r#"
 services:
@@ -8273,6 +8292,7 @@ services:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("cannot add service 'attacker'"));
+        assert!(error.to_string().contains("Inline Services check"));
     }
 
     #[test]
@@ -8293,7 +8313,6 @@ services:
             "volumes: ['/:/host:rw']",
             "volumes_from: ['container:temps-db']",
             "labels: {sh.temps.managed: 'false'}",
-            "image: attacker-controlled:latest",
             "build: ./attacker",
             "env_file: ./override.env",
         ];
@@ -8393,6 +8412,10 @@ services:
                 !REPO_ONLY_OVERRIDE_KEYS.contains(key),
                 "'{key}' is classified both as never-allowed and as repo-only"
             );
+            assert!(
+                PolicyCheck::for_restricted_service_field(key).is_some(),
+                "'{key}' needs a specific policy check"
+            );
         }
     }
 
@@ -8409,14 +8432,8 @@ services:
         )
         .unwrap_err();
         let message = error.to_string();
-        assert!(
-            message.contains("do not permit anywhere"),
-            "expected an anywhere-forbidden message, got {message}"
-        );
-        assert!(
-            message.contains("will not help"),
-            "expected the message to rule out moving it to the repository, got {message}"
-        );
+        assert!(message.contains("disable that check"), "{message}");
+        assert!(!message.contains("repository compose file"), "{message}");
     }
 
     /// A key the repository compose file legitimately accepts must point there,
@@ -8435,10 +8452,67 @@ services:
             message.contains("declare it in the repository compose file"),
             "expected the message to point at the repository compose file, got {message}"
         );
-        assert!(
-            !message.contains("do not permit anywhere"),
-            "'volumes' is accepted in the repository compose file, got {message}"
-        );
+        assert!(message.contains("Inline Fields check"), "{message}");
+    }
+
+    #[test]
+    fn test_include_exception_allows_inline_include_without_inline_sections_exception() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let override_content = "include:\n  - common.yml\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([PolicyCheck::Include]),
+        };
+        ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap();
+
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let error = executor
+            .preflight_validate(compose, Some(override_content))
+            .unwrap_err();
+        assert_eq!(violation_field(error), "include");
+        executor
+            .with_security_policy(policy)
+            .preflight_validate(compose, Some(override_content))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_inline_field_exception_does_not_disable_privileged_check() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let override_content =
+            "services:\n  web:\n    privileged: true\n    volumes: ['data:/data']\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([PolicyCheck::InlineFields]),
+        };
+        let error = ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Privileged check"));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([
+                PolicyCheck::InlineFields,
+                PolicyCheck::Privileged,
+            ]),
+        };
+        ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -8462,6 +8536,7 @@ networks:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("top-level key 'networks'"));
+        assert!(error.to_string().contains("Inline Sections check"));
     }
 
     #[test]
@@ -10956,6 +11031,7 @@ services:
         let err = executor
             .validate_compose_security_policy("compose file", compose)
             .unwrap_err();
+        assert!(err.to_string().contains("Advanced security settings"));
         assert_eq!(violation_field(err), "extends");
     }
 
@@ -12224,7 +12300,8 @@ services:
         let error =
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
-        assert!(error.to_string().contains("forbidden key 'runtime'"));
+        assert!(error.to_string().contains("'runtime'"), "{error}");
+        assert!(error.to_string().contains("Advanced security settings"));
     }
 
     #[test]

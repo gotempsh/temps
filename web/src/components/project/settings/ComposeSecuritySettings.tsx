@@ -37,13 +37,28 @@ import {
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ShieldAlert } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
-export function ComposeSecuritySettings({ projectId }: { projectId: number }) {
+export function ComposeSecuritySettings({
+  projectId,
+  focusCheck,
+}: {
+  projectId: number
+  focusCheck?: string | null
+}) {
   const [legacyAcknowledged, setLegacyAcknowledged] = useState(false)
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
+  useEffect(() => {
+    if (!focusCheck) return
+    setOpen(true)
+    setSearch(focusCheck)
+    document.getElementById('compose-security')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
+  }, [focusCheck])
   const [pending, setPending] = useState<ComposeSecurityCheckDefinition | null>(
     null
   )
@@ -100,7 +115,7 @@ export function ComposeSecuritySettings({ projectId }: { projectId: number }) {
   const checks = query.data?.checks ?? []
   const searchText = search.trim().toLowerCase()
   const filtered = checks.filter((check) =>
-    `${check.group} ${check.label} ${check.consequence}`
+    `${check.id} ${check.group} ${check.label} ${check.consequence}`
       .toLowerCase()
       .includes(searchText)
   )

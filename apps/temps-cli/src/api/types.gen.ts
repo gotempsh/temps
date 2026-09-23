@@ -3918,11 +3918,24 @@ export type ComposePortMapping = {
     target: number;
 };
 
+/**
+ * Problem Details returned when a Compose preview cannot be rendered.
+ */
+export type ComposePreviewProblemResponse = {
+    detail: string;
+    policy_check?: null | ComposeSecurityCheck;
+    title: string;
+};
+
 export type ComposePreviewRequest = {
     branch?: string | null;
     composeOverride?: string | null;
     excludedServices?: Array<string>;
     path: string;
+    /**
+     * Advisory preview only. Deployment reloads the saved project policy.
+     */
+    previewPolicy?: ComposeSecurityPolicy;
 };
 
 export type ComposePreviewResponse = {
@@ -16511,6 +16524,10 @@ export type ProjectResponse = {
      * deployment transport in `source_type`.
      */
     project_type: string;
+    /**
+     * When true, deploy clones only `directory` via git sparse-checkout.
+     */
+    pull_only_root_directory: boolean;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -17233,6 +17250,10 @@ export type PublicComposePreviewRequest = {
     composeOverride?: string | null;
     excludedServices?: Array<string>;
     path: string;
+    /**
+     * Advisory preview only. Deployment reloads the saved project policy.
+     */
+    previewPolicy?: ComposeSecurityPolicy;
 };
 
 export type PublicComposePreviewResponse = {
@@ -23600,6 +23621,10 @@ export type UpdateGitSettingsRequest = {
     main_branch: string;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
+    /**
+     * When true, deploy clones only `directory`. Ignored when directory is the repo root.
+     */
+    pull_only_root_directory?: boolean | null;
     repo_name: string;
     repo_owner: string;
 };
@@ -39967,7 +39992,7 @@ export type GetPublicComposePreviewErrors = {
     /**
      * Compose file or override is invalid
      */
-    400: unknown;
+    400: ComposePreviewProblemResponse;
     /**
      * Authentication required for custom GitLab origins
      */
@@ -39981,6 +40006,8 @@ export type GetPublicComposePreviewErrors = {
      */
     404: unknown;
 };
+
+export type GetPublicComposePreviewError = GetPublicComposePreviewErrors[keyof GetPublicComposePreviewErrors];
 
 export type GetPublicComposePreviewResponses = {
     /**
@@ -59221,7 +59248,7 @@ export type GetRepositoryComposePreviewErrors = {
     /**
      * Compose file or override is invalid
      */
-    400: unknown;
+    400: ComposePreviewProblemResponse;
     /**
      * Authentication required
      */
@@ -59231,6 +59258,8 @@ export type GetRepositoryComposePreviewErrors = {
      */
     404: unknown;
 };
+
+export type GetRepositoryComposePreviewError = GetRepositoryComposePreviewErrors[keyof GetRepositoryComposePreviewErrors];
 
 export type GetRepositoryComposePreviewResponses = {
     /**

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
+use temps_entities::compose_security::{ComposeSecurityCheck, ComposeSecurityPolicy};
 
 pub struct DockerComposePreset;
 
@@ -119,12 +120,18 @@ pub enum ComposeParseError {
     MissingServices,
     #[error("Compose override is invalid: {reason}")]
     InvalidOverride { reason: String },
+    #[error("Compose security check rejected the preview: {reason}")]
+    PolicyViolation {
+        check: ComposeSecurityCheck,
+        reason: String,
+    },
     #[error("Compose preview could not be serialized: {reason}")]
     Serialization { reason: String },
 }
 
-/// Redacted effective Compose document shown in project settings. Values from
-/// service environments and build arguments are never returned to the client.
+/// Redacted Compose rendering shown in project settings. This does not resolve
+/// referenced files or run deployment's filesystem and runtime policy checks.
+/// Values from service environments and build arguments are never returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveComposePreview {
     pub yaml: String,
@@ -327,16 +334,43 @@ pub fn render_effective_compose_preview(
     override_yaml: Option<&str>,
     excluded_services: &[String],
 ) -> Result<EffectiveComposePreview, ComposeParseError> {
+    render_effective_compose_preview_with_policy(
+        yaml,
+        override_yaml,
+        excluded_services,
+        &ComposeSecurityPolicy::default(),
+    )
+}
+
+/// Preview using the project's saved policy. The deployment executor reads the
+/// policy independently from the database; preview input never grants a deploy.
+pub fn render_effective_compose_preview_with_policy(
+    yaml: &str,
+    override_yaml: Option<&str>,
+    excluded_services: &[String],
+    policy: &ComposeSecurityPolicy,
+) -> Result<EffectiveComposePreview, ComposeParseError> {
     let mut base = parse_compose_document(yaml, "Compose file")?;
     strip_excluded_services_value(&mut base, excluded_services);
+    validate_preview_composition(&base, policy)?;
+    if base
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_none()
+        && !(base.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include))
+    {
+        return Err(ComposeParseError::MissingServices);
+    }
     normalize_sensitive_maps(&mut base);
 
     if let Some(override_yaml) = override_yaml.filter(|value| !value.trim().is_empty()) {
         let mut override_document = parse_compose_document(override_yaml, "Compose override")?;
-        validate_preview_override(&base, &override_document)?;
+        validate_preview_composition(&override_document, policy)?;
+        validate_preview_override(&base, &override_document, policy)?;
         normalize_sensitive_maps(&mut override_document);
         merge_compose_value(&mut base, override_document, &[]);
     }
+    validate_preview_build_images(&base, policy)?;
 
     let enabled_services = service_names(&base);
     let mut disabled_services = excluded_services.to_vec();
@@ -354,6 +388,60 @@ pub fn render_effective_compose_preview(
         disabled_services,
         redacted_values,
     })
+}
+
+fn validate_preview_composition(
+    compose: &serde_yaml::Value,
+    policy: &ComposeSecurityPolicy,
+) -> Result<(), ComposeParseError> {
+    if policy.enforced(ComposeSecurityCheck::Include) && compose.get("include").is_some() {
+        return Err(ComposeParseError::PolicyViolation {
+            check: ComposeSecurityCheck::Include,
+            reason: "'include' loads additional Compose files; an instance administrator can disable the Include check in Project Settings → Git → Advanced security settings for a trusted stack".to_string(),
+        });
+    }
+    if policy.enforced(ComposeSecurityCheck::Extends) {
+        for name in service_names(compose) {
+            if compose
+                .get("services")
+                .and_then(|services| services.get(&name))
+                .and_then(|service| service.get("extends"))
+                .is_some()
+            {
+                return Err(ComposeParseError::PolicyViolation {
+                    check: ComposeSecurityCheck::Extends,
+                    reason: format!(
+                        "service '{name}' uses 'extends', which can import settings from another Compose file; an instance administrator can disable the Extends check in Project Settings → Git → Advanced security settings for a trusted stack"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_preview_build_images(
+    compose: &serde_yaml::Value,
+    policy: &ComposeSecurityPolicy,
+) -> Result<(), ComposeParseError> {
+    if !policy.enforced(ComposeSecurityCheck::BuildImage) {
+        return Ok(());
+    }
+    let Some(services) = compose.get("services").and_then(serde_yaml::Value::as_mapping) else {
+        return Ok(());
+    };
+    for (name, service) in services {
+        if service.get("build").is_some() && service.get("image").is_some() {
+            return Err(ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::BuildImage,
+                reason: format!(
+                    "service '{}' combines 'build' and 'image'; Temps assigns a deployment-scoped image name to build services. Remove the image or an instance administrator can disable the Build Image check in Project Settings → Git → Advanced security settings for a trusted stack",
+                    name.as_str().unwrap_or("<non-string>")
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// YAML permits an empty mapping value to be written as `name:`, which parses
@@ -391,13 +479,6 @@ fn parse_compose_document(
         .map_err(|error| ComposeParseError::InvalidYaml {
             reason: format!("{source}: failed to expand YAML merge keys: {error}"),
         })?;
-    if root
-        .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
-        .is_none()
-    {
-        return Err(ComposeParseError::MissingServices);
-    }
     Ok(root)
 }
 
@@ -495,28 +576,43 @@ const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
     "shm_size",
     "labels",
     "build",
-    "image",
     "env_file",
 ];
 
 fn validate_preview_override(
     base: &serde_yaml::Value,
     override_document: &serde_yaml::Value,
+    policy: &ComposeSecurityPolicy,
 ) -> Result<(), ComposeParseError> {
     let Some(root) = override_document.as_mapping() else {
         return Err(ComposeParseError::InvalidOverride {
             reason: "override must be a YAML mapping".to_string(),
         });
     };
-    if root.keys().any(|key| key.as_str() != Some("services")) {
-        return Err(ComposeParseError::InvalidOverride {
-            reason: "only service-level changes under 'services' are allowed".to_string(),
+    if policy.enforced(ComposeSecurityCheck::InlineSections)
+        && root.keys().any(|key| {
+            key.as_str() != Some("services")
+                && !(key.as_str() == Some("include")
+                    && !policy.enforced(ComposeSecurityCheck::Include))
+        })
+    {
+        return Err(ComposeParseError::PolicyViolation {
+            check: ComposeSecurityCheck::InlineSections,
+            reason: "only service-level changes under 'services' are allowed; an instance administrator can disable the Inline Sections check in Project Settings → Git → Advanced security settings for a trusted stack".to_string(),
         });
     }
     let Some(override_services) = override_document
         .get("services")
         .and_then(serde_yaml::Value::as_mapping)
     else {
+        if root.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include) {
+            return Ok(());
+        }
+        if !policy.enforced(ComposeSecurityCheck::InlineSections)
+            && override_document.get("services").is_none()
+        {
+            return Ok(());
+        }
         return Err(ComposeParseError::InvalidOverride {
             reason: "override must define a 'services' mapping".to_string(),
         });
@@ -526,11 +622,10 @@ fn validate_preview_override(
         .keys()
         .filter_map(serde_yaml::Value::as_str)
     {
-        if !enabled.contains(name) {
-            return Err(ComposeParseError::InvalidOverride {
-                reason: format!(
-                    "service '{name}' is disabled or is not present in the repository Compose file"
-                ),
+        if policy.enforced(ComposeSecurityCheck::InlineServices) && !enabled.contains(name) {
+            return Err(ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::InlineServices,
+                reason: format!("service '{name}' is disabled or is not present in the repository Compose file; an instance administrator can disable the Inline Services check in Project Settings → Git → Advanced security settings for a trusted stack"),
             });
         }
 
@@ -542,32 +637,25 @@ fn validate_preview_override(
                 reason: format!("service '{name}' override must be a mapping"),
             });
         };
-        if let Some(key) = service
-            .keys()
-            .filter_map(serde_yaml::Value::as_str)
-            .find(|key| NEVER_ALLOWED_SERVICE_KEYS.contains(key))
-        {
-            return Err(ComposeParseError::InvalidOverride {
-                reason: format!(
-                    "service '{name}' uses forbidden key '{key}', which Compose deployments \
-                     do not permit anywhere — the deploy-time security policy rejects it in \
-                     the repository Compose file too, so moving it there will not help"
-                ),
-            });
-        }
-        if let Some(key) = service
-            .keys()
-            .filter_map(serde_yaml::Value::as_str)
-            .find(|key| REPO_ONLY_SERVICE_KEYS.contains(key))
-        {
-            return Err(ComposeParseError::InvalidOverride {
-                reason: format!(
-                    "service '{name}' cannot set '{key}' as an inline override; declare it in \
-                     the repository Compose file instead, where it is checked against the \
-                     deployment security policy (host paths, host namespaces and resource \
-                     limits are still rejected there)"
-                ),
-            });
+        for key in service.keys().filter_map(serde_yaml::Value::as_str) {
+            if NEVER_ALLOWED_SERVICE_KEYS.contains(&key) {
+                if let Some(check) = ComposeSecurityCheck::for_restricted_service_field(key) {
+                    if policy.enforced(check) {
+                        return Err(ComposeParseError::PolicyViolation {
+                            check,
+                            reason: format!("service '{name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Git → Advanced security settings for a trusted stack"),
+                        });
+                    }
+                }
+            }
+            if policy.enforced(ComposeSecurityCheck::InlineFields)
+                && REPO_ONLY_SERVICE_KEYS.contains(&key)
+            {
+                return Err(ComposeParseError::PolicyViolation {
+                    check: ComposeSecurityCheck::InlineFields,
+                    reason: format!("service '{name}' cannot set '{key}' as an inline override; declare it in the repository Compose file, or an instance administrator can disable the Inline Fields check in Project Settings → Git → Advanced security settings for a trusted stack"),
+                });
+            }
         }
     }
     Ok(())
@@ -1257,7 +1345,13 @@ services:
             render_effective_compose_preview(base, Some(override_yaml), &["db".to_string()])
                 .unwrap_err();
 
-        assert!(matches!(error, ComposeParseError::InvalidOverride { .. }));
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::InlineServices,
+                ..
+            }
+        ));
         assert!(error.to_string().contains("disabled"));
     }
 
@@ -1296,7 +1390,13 @@ secrets:
 
         let error = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
 
-        assert!(error.to_string().contains("forbidden key 'privileged'"));
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::Privileged,
+                ..
+            }
+        ));
     }
 
     /// `privileged` is rejected by the deploy-time policy as well, so the
@@ -1310,10 +1410,8 @@ secrets:
         let error = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
 
         let message = error.to_string();
-        assert!(
-            message.contains("do not permit anywhere") && message.contains("will not help"),
-            "expected the message to rule out the repository Compose file, got {message}"
-        );
+        assert!(message.contains("disable that check"), "{message}");
+        assert!(!message.contains("repository Compose file"), "{message}");
     }
 
     /// `volumes` *is* accepted in the repository Compose file (subject to
@@ -1337,13 +1435,142 @@ secrets:
     }
 
     #[test]
+    fn effective_preview_applies_image_override_for_existing_service() {
+        let base = "services:\n  web:\n    image: example/web:1\n";
+        let override_yaml = "services:\n  web:\n    image: example/web:2\n    ports: ['8080:80']\n";
+
+        let preview = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap();
+
+        assert!(preview.yaml.contains("image: example/web:2"));
+        assert!(preview.yaml.contains("8080:80"));
+        assert!(!preview.yaml.contains("example/web:1"));
+    }
+
+    #[test]
     fn override_key_denylists_are_disjoint() {
         for key in NEVER_ALLOWED_SERVICE_KEYS {
             assert!(
                 !REPO_ONLY_SERVICE_KEYS.contains(key),
                 "'{key}' is classified both as never-allowed and as repo-only"
             );
+            assert!(
+                ComposeSecurityCheck::for_restricted_service_field(key).is_some(),
+                "'{key}' needs a specific policy check"
+            );
         }
+    }
+
+    #[test]
+    fn preview_extends_names_the_check_and_respects_its_exception() {
+        let base = "services:\n  web:\n    extends:\n      file: common.yml\n      service: web\n";
+        let error = render_effective_compose_preview(base, None, &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::Extends,
+                ..
+            }
+        ));
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::Extends]),
+        };
+        let preview = render_effective_compose_preview_with_policy(base, None, &[], &policy)
+            .unwrap();
+        assert!(preview.yaml.contains("common.yml"));
+    }
+
+    #[test]
+    fn preview_include_uses_only_the_include_exception() {
+        let base = "services:\n  web:\n    image: nginx\n";
+        let override_yaml = "include:\n  - common.yml\n";
+        let error =
+            render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::Include,
+                ..
+            }
+        ));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::Include]),
+        };
+        let preview =
+            render_effective_compose_preview_with_policy(base, Some(override_yaml), &[], &policy)
+                .unwrap();
+        assert!(preview.yaml.contains("common.yml"));
+        assert_eq!(preview.enabled_services, vec!["web"]);
+
+        let include_only = render_effective_compose_preview_with_policy(
+            override_yaml,
+            None,
+            &[],
+            &policy,
+        )
+        .unwrap();
+        assert!(include_only.yaml.contains("common.yml"));
+    }
+
+    #[test]
+    fn preview_rejects_image_override_on_build_service_until_build_image_is_disabled() {
+        let base = "services:\n  web:\n    build: .\n";
+        let override_yaml = "services:\n  web:\n    image: example/web:2\n";
+        let error =
+            render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::BuildImage,
+                ..
+            }
+        ));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::BuildImage]),
+        };
+        let preview =
+            render_effective_compose_preview_with_policy(base, Some(override_yaml), &[], &policy)
+                .unwrap();
+        assert!(preview.yaml.contains("example/web:2"));
+    }
+
+    #[test]
+    fn preview_respects_field_and_inline_exceptions_independently() {
+        let base = "services:\n  web:\n    image: nginx\n";
+        let override_yaml = "services:\n  web:\n    privileged: true\n    volumes: ['data:/data']\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([ComposeSecurityCheck::Privileged]),
+        };
+        let error = render_effective_compose_preview_with_policy(
+            base,
+            Some(override_yaml),
+            &[],
+            &policy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeParseError::PolicyViolation {
+                check: ComposeSecurityCheck::InlineFields,
+                ..
+            }
+        ));
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: BTreeSet::from([
+                ComposeSecurityCheck::Privileged,
+                ComposeSecurityCheck::InlineFields,
+            ]),
+        };
+        let preview = render_effective_compose_preview_with_policy(
+            base,
+            Some(override_yaml),
+            &[],
+            &policy,
+        )
+        .unwrap();
+        assert!(preview.yaml.contains("privileged: true"));
+        assert!(preview.yaml.contains("data:/data"));
     }
 
     #[test]

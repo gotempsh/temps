@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+services:
+  open-seo-base:
+    image: ghcr.io/every-app/open-seo:latest
+    environment:
+      AUTH_MODE: local_noauth
+      CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"
+      PORT: "3001"
+      OPENSEO_TELEMETRY_DISABLED: "1"
+      DATAFORSEO_API_KEY: ""
+      # Set the deployment's proxy hostname in the project override.
+      ALLOWED_HOST: localhost

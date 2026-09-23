@@ -8385,6 +8385,33 @@
         ],
         "type": "object"
       },
+      "ComposePreviewProblemResponse": {
+        "description": "Problem Details returned when a Compose preview cannot be rendered.",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "policy_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeSecurityCheck",
+                "description": "The individual project security check an administrator may review."
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "detail"
+        ],
+        "type": "object"
+      },
       "ComposePreviewRequest": {
         "properties": {
           "branch": {
@@ -8407,6 +8434,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "previewPolicy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Advisory preview only. Deployment reloads the saved project policy."
           }
         },
         "required": [
@@ -36110,6 +36141,10 @@
             "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
             "type": "string"
           },
+          "pull_only_root_directory": {
+            "description": "When true, deploy clones only `directory` via git sparse-checkout.",
+            "type": "boolean"
+          },
           "repo_name": {
             "type": [
               "string",
@@ -36164,6 +36199,7 @@
           "slug",
           "name",
           "directory",
+          "pull_only_root_directory",
           "main_branch",
           "project_type",
           "created_at",
@@ -37861,6 +37897,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "previewPolicy": {
+            "$ref": "#/components/schemas/ComposeSecurityPolicy",
+            "description": "Advisory preview only. Deployment reloads the saved project policy."
           }
         },
         "required": [
@@ -51561,6 +51601,13 @@
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration (e.g., Dockerfile path for Docker preset)\n\nExample for Dockerfile preset:\n```json\n{\n  \"dockerfilePath\": \"docker/Dockerfile\",\n  \"buildContext\": \"./api\"\n}\n```"
               }
+            ]
+          },
+          "pull_only_root_directory": {
+            "description": "When true, deploy clones only `directory`. Ignored when directory is the repo root.",
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "repo_name": {
@@ -80019,6 +80066,13 @@
             "description": "Effective Compose preview rendered"
           },
           "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePreviewProblemResponse"
+                }
+              }
+            },
             "description": "Compose file or override is invalid"
           },
           "401": {
@@ -112176,6 +112230,13 @@
             "description": "Effective Compose preview rendered"
           },
           "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePreviewProblemResponse"
+                }
+              }
+            },
             "description": "Compose file or override is invalid"
           },
           "401": {

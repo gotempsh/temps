@@ -15,6 +15,7 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
+  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -82,6 +83,7 @@ import {
 } from '@/lib/compose-port-discovery'
 import {
   composePreviewErrorMessage,
+  composePreviewPolicyCheck,
   fetchComposePreview,
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
@@ -513,6 +515,12 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
+  const composeSecurityQuery = useQuery(
+    getComposeSecurityOptions({ path: { id: project.id } })
+  )
+  const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
+    null
+  )
   const composePreviewQuery = useQuery({
     queryKey: [
       'effective-compose-preview',
@@ -525,6 +533,7 @@ function GitSettingsInline({
       composeRepositoryPath,
       debouncedOverrideDraft,
       excludedComposeServices,
+      composeSecurityQuery.data?.policy.disabled_checks,
     ],
     queryFn: ({ signal }) =>
       fetchComposePreview(
@@ -545,12 +554,14 @@ function GitSettingsInline({
           path: composeRepositoryPath,
           composeOverride: debouncedOverrideDraft || undefined,
           excludedServices: excludedComposeServices,
+          previewPolicy: composeSecurityQuery.data?.policy,
         },
         signal
       ),
     enabled:
       advancedComposeOpen &&
       isComposePreset &&
+      composeSecurityQuery.isSuccess &&
       (isPublicRepo
         ? !!project.repo_owner && !!project.repo_name
         : !!repositoryData?.id),
@@ -1289,7 +1300,10 @@ function GitSettingsInline({
               isUploadedSource={isUploadedSource}
             />
 
-            <ComposeSecuritySettings projectId={project.id} />
+            <ComposeSecuritySettings
+              projectId={project.id}
+              focusCheck={focusedComposeCheck}
+            />
 
             {!isUploadedSource && (
               <Collapsible
@@ -1422,23 +1436,37 @@ function GitSettingsInline({
                       <div className="flex min-h-14 items-center justify-between gap-3 border-b bg-muted/30 px-3 py-2 dark:border-white/10 dark:bg-zinc-900">
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-foreground dark:text-zinc-100">
-                            Effective deployment
+                            Effective Compose preview
                           </div>
                           <div className="truncate text-sm/5 text-muted-foreground dark:text-zinc-400">
                             Repository + enabled services + override
                           </div>
                         </div>
-                        {composePreviewQuery.isFetching ? (
+                        {composeSecurityQuery.isError ? null : composePreviewQuery.isFetching ? (
                           <div className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground dark:text-zinc-400">
                             <Loader2 className="size-4 animate-spin" /> Updating
                           </div>
                         ) : composePreviewQuery.data ? (
-                          <div className="flex shrink-0 items-center gap-1.5 text-sm text-emerald-700 dark:text-emerald-400">
-                            <Check className="size-4" /> Current
+                          <div className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
+                            <FileIcon className="size-4" /> Rendered
                           </div>
                         ) : null}
                       </div>
-                      {composePreviewQuery.isError ? (
+                      {composeSecurityQuery.isError ? (
+                        <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
+                          <p className="text-sm text-destructive">
+                            Could not load this project's Compose security
+                            policy.
+                          </p>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void composeSecurityQuery.refetch()}
+                          >
+                            Retry loading policy
+                          </Button>
+                        </div>
+                      ) : composePreviewQuery.isError ? (
                         <div className="flex h-[360px] items-center justify-center p-6">
                           <div
                             className={cn(
@@ -1469,6 +1497,30 @@ function GitSettingsInline({
                                     composePreviewQuery.error
                                   )}
                             </p>
+                            {composePreviewPolicyCheck(
+                              composePreviewQuery.error
+                            ) && (
+                              <div className="mt-4 space-y-2">
+                                <p className="text-sm text-muted-foreground">
+                                  If you trust this stack, an instance
+                                  administrator can disable this check for this
+                                  project.
+                                </p>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    setFocusedComposeCheck(
+                                      composePreviewPolicyCheck(
+                                        composePreviewQuery.error
+                                      )
+                                    )
+                                  }
+                                >
+                                  Review or disable this check
+                                </Button>
+                              </div>
+                            )}
                             {composePreviewRateLimited && (
                               <div className="mt-4 flex flex-wrap justify-center gap-2">
                                 <Button
@@ -1522,7 +1574,9 @@ function GitSettingsInline({
                       ) : (
                         <div className="flex h-[360px] items-center justify-center gap-2 text-sm text-muted-foreground">
                           <Loader2 className="size-4 animate-spin" />
-                          Loading repository Compose file…
+                          {composeSecurityQuery.isPending
+                            ? 'Loading Compose security policy…'
+                            : 'Loading repository Compose file…'}
                         </div>
                       )}
                     </section>
@@ -1532,8 +1586,9 @@ function GitSettingsInline({
                     This preview applies disabled services and your override.
                     Temps-managed security, network, labels, and runtime
                     environment layers are added during deployment and cannot be
-                    edited here. Environment and build-argument values are
-                    always replaced with{' '}
+                    edited here. Deployment validates referenced files and the
+                    full Compose security policy. Environment and build-argument
+                    values are always replaced with{' '}
                     <span className="font-mono text-foreground">
                       &lt;redacted&gt;
                     </span>

@@ -4,6 +4,7 @@
 pub mod audit;
 pub mod base;
 pub mod bitbucket;
+pub mod compose_preview_problem;
 pub mod generic;
 pub mod gitea;
 pub mod github;
