@@ -495,7 +495,6 @@ const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
     "shm_size",
     "labels",
     "build",
-    "image",
     "env_file",
 ];
 
@@ -1334,6 +1333,18 @@ secrets:
             !message.contains("do not permit anywhere"),
             "'volumes' is not forbidden everywhere, got {message}"
         );
+    }
+
+    #[test]
+    fn effective_preview_applies_image_override_for_existing_service() {
+        let base = "services:\n  web:\n    image: example/web:1\n";
+        let override_yaml = "services:\n  web:\n    image: example/web:2\n    ports: ['8080:80']\n";
+
+        let preview = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap();
+
+        assert!(preview.yaml.contains("image: example/web:2"));
+        assert!(preview.yaml.contains("8080:80"));
+        assert!(!preview.yaml.contains("example/web:1"));
     }
 
     #[test]

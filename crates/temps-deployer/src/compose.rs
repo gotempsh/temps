@@ -179,7 +179,6 @@ const REPO_ONLY_OVERRIDE_KEYS: &[&str] = &[
     "shm_size",
     "labels",
     "build",
-    "image",
     "env_file",
 ];
 const SAFE_DOCKER_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
@@ -8257,6 +8256,16 @@ services:
     }
 
     #[test]
+    fn test_validate_compose_override_allows_image_change_for_existing_service() {
+        let compose = "services:\n  web:\n    image: example/web:1\n";
+        let override_content =
+            "services:\n  web:\n    image: example/web:2\n    ports: ['8080:80']\n";
+
+        ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
+            .unwrap();
+    }
+
+    #[test]
     fn test_validate_compose_override_rejects_new_services() {
         let compose = r#"
 services:
@@ -8293,7 +8302,6 @@ services:
             "volumes: ['/:/host:rw']",
             "volumes_from: ['container:temps-db']",
             "labels: {sh.temps.managed: 'false'}",
-            "image: attacker-controlled:latest",
             "build: ./attacker",
             "env_file: ./override.env",
         ];
