@@ -775,8 +775,13 @@ mod tests {
                 &CancellationToken::new(),
             )
             .unwrap();
-            let result = tokio::time::timeout(
-                Duration::ZERO,
+            // A zero-duration timeout can share the timer driver's current tick
+            // with this tiny copy and let it finish first. Use an elapsed deadline:
+            // Timeout polls adoption first, so synchronous copying would still
+            // incorrectly succeed, while a yielding copy must be cancelled.
+            let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+            let result = tokio::time::timeout_at(
+                deadline,
                 adopt_archive(extracted, cache.path(), |_, _| {
                     Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
                 }),
