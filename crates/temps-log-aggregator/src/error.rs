@@ -6,8 +6,18 @@
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryClass {
+    Transient,
+    RepairRequired,
+    Permanent,
+}
+
 #[derive(Error, Debug)]
 pub enum LogAggregatorError {
+    #[error("Log WAL recovery is incomplete: retained generation '{path}' requires recovery or repair before log collection and purge can resume")]
+    WalRecoveryIncomplete { path: String },
+
     #[error("Timed out waiting to {operation} for {target}; in-flight I/O continues safely")]
     OperationTimedOut {
         operation: &'static str,
@@ -152,6 +162,80 @@ pub enum LogAggregatorError {
          could not be found"
     )]
     ManifestConflictUnresolved { storage_key: String },
+}
+
+impl LogAggregatorError {
+    /// Classify recovery failures without inspecting error strings. Recovery
+    /// may wait out unavailable infrastructure, poll retained WAL after an
+    /// operator repairs it in place, and stop on invalid configuration or
+    /// deterministic malformed input that cannot change without a restart.
+    pub(crate) fn retry_class(&self) -> RetryClass {
+        match self {
+            Self::WalRecoveryIncomplete { .. } | Self::WalRecoveryReadFailed { .. } => {
+                RetryClass::RepairRequired
+            }
+            Self::OperationTimedOut { .. }
+            | Self::ChunkWriteFailed { .. }
+            | Self::ChunkReadFailed { .. }
+            | Self::ChunkDeleteFailed { .. }
+            | Self::ChunkListFailed { .. }
+            | Self::DockerStreamFailed { .. }
+            | Self::DockerUnavailable(_)
+            | Self::S3 { .. }
+            | Self::LineIndex { .. } => RetryClass::Transient,
+            Self::Io(error) => match error.kind() {
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::Unsupported => RetryClass::Permanent,
+                _ => RetryClass::Transient,
+            },
+            Self::Database(error) => match error {
+                sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => {
+                    RetryClass::Transient
+                }
+                sea_orm::DbErr::Exec(_) | sea_orm::DbErr::Query(_) => {
+                    if error.sql_err().is_some() {
+                        RetryClass::Permanent
+                    } else {
+                        // `sql_err` identifies the supported constraint
+                        // errors. Other runtime failures can include
+                        // serialization failures, deadlocks, and lost
+                        // connections, so stopping would strand recoverable
+                        // WAL.
+                        RetryClass::Transient
+                    }
+                }
+                sea_orm::DbErr::TryIntoErr { .. }
+                | sea_orm::DbErr::ConvertFromU64(_)
+                | sea_orm::DbErr::UnpackInsertId
+                | sea_orm::DbErr::UpdateGetPrimaryKey
+                | sea_orm::DbErr::RecordNotFound(_)
+                | sea_orm::DbErr::AttrNotSet(_)
+                | sea_orm::DbErr::Custom(_)
+                | sea_orm::DbErr::Type(_)
+                | sea_orm::DbErr::Json(_)
+                | sea_orm::DbErr::Migration(_)
+                | sea_orm::DbErr::RecordNotInserted
+                | sea_orm::DbErr::RecordNotUpdated => RetryClass::Permanent,
+            },
+            Self::CompressionFailed { .. }
+            | Self::DecompressionFailed { .. }
+            | Self::ChunkNotFound { .. }
+            | Self::ContainerNotFound { .. }
+            | Self::SearchMissingRequiredParams
+            | Self::SearchTimeRangeExceeded { .. }
+            | Self::InvalidCursor { .. }
+            | Self::LineNotFound { .. }
+            | Self::AccessResolutionFailed { .. }
+            | Self::Validation { .. }
+            | Self::StorageConfiguration { .. }
+            | Self::Serialization(_)
+            | Self::ChunkFormat { .. }
+            | Self::ManifestConflictUnresolved { .. } => RetryClass::Permanent,
+        }
+    }
 }
 
 impl From<bollard::errors::Error> for LogAggregatorError {

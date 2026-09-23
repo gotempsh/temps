@@ -67,6 +67,8 @@ use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use temps_core::retry::RetryConfig;
+
 use crate::chunk::cache::{CacheTier, ChunkCache};
 use crate::chunk::format::{ChunkEncoder, ChunkIdentity};
 use crate::chunk::wal::{WalDir, WalGeneration};
@@ -74,7 +76,7 @@ use crate::chunk::{
     level_bit, ChunkLabels, DEFAULT_HEAD_MAX_BYTES, FLUSH_AGE_SECS, MAX_FLUSH_AGE_SECS,
     MIN_FLUSH_BYTES,
 };
-use crate::error::LogAggregatorError;
+use crate::error::{LogAggregatorError, RetryClass};
 use crate::index::{IndexOutcome, LineIndexSink, NoLineIndex};
 use crate::storage::traits::build_storage_key_v2;
 use crate::storage::LogStorage;
@@ -408,6 +410,10 @@ pub struct ChunkWriterService {
     dropped_chunks: AtomicU64,
     /// Chunks sealed but not indexed because the line index write failed.
     unindexed_chunks: AtomicU64,
+    recovery_ready: tokio::sync::watch::Sender<bool>,
+    recovery_started: AtomicBool,
+    #[cfg(test)]
+    recovery_failures: AtomicU64,
 }
 
 impl ChunkWriterService {
@@ -457,11 +463,50 @@ impl ChunkWriterService {
         line_index: Arc<dyn LineIndexSink>,
         thresholds: Thresholds,
     ) -> Result<Arc<Self>, LogAggregatorError> {
+        let service = Self::open_deferred_with_thresholds(
+            storage, manifests, wal_dir, cache, line_index, thresholds,
+        )
+        .await?;
+        service.recover_wal().await?;
+        service.recovery_ready.send_replace(true);
+        Ok(service)
+    }
+
+    /// Construct without replaying WAL. Call `start_background_recovery` from
+    /// the long-lived plugin runtime; writes and purge stay gated until replay
+    /// succeeds, while readers and console initialization remain available.
+    pub async fn open_deferred_with_index(
+        storage: Arc<dyn LogStorage>,
+        manifests: Arc<dyn ManifestSink>,
+        wal_dir: Option<std::path::PathBuf>,
+        cache: Option<ChunkCache>,
+        line_index: Arc<dyn LineIndexSink>,
+    ) -> Result<Arc<Self>, LogAggregatorError> {
+        Self::open_deferred_with_thresholds(
+            storage,
+            manifests,
+            wal_dir,
+            cache,
+            line_index,
+            Thresholds::default(),
+        )
+        .await
+    }
+
+    async fn open_deferred_with_thresholds(
+        storage: Arc<dyn LogStorage>,
+        manifests: Arc<dyn ManifestSink>,
+        wal_dir: Option<std::path::PathBuf>,
+        cache: Option<ChunkCache>,
+        line_index: Arc<dyn LineIndexSink>,
+        thresholds: Thresholds,
+    ) -> Result<Arc<Self>, LogAggregatorError> {
         let wal_dir = match wal_dir {
             Some(root) => Some(WalDir::open(root).await?),
             None => None,
         };
 
+        let recovery_ready = tokio::sync::watch::channel(wal_dir.is_none()).0;
         let service = Arc::new(Self {
             storage,
             manifests,
@@ -476,21 +521,121 @@ impl ChunkWriterService {
             shed_bloom: AtomicBool::new(false),
             dropped_chunks: AtomicU64::new(0),
             unindexed_chunks: AtomicU64::new(0),
+            recovery_ready,
+            recovery_started: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_failures: AtomicU64::new(0),
         });
 
-        if let Some(wal_dir) = service.wal_dir.as_ref() {
+        Ok(service)
+    }
+
+    async fn recover_wal(&self) -> Result<(), LogAggregatorError> {
+        if let Some(wal_dir) = self.wal_dir.as_ref() {
             let mut recovered = wal_dir
                 .recover_batched(
-                    service.head_max_bytes(),
-                    !service.shed_bloom.load(Ordering::Relaxed),
+                    self.head_max_bytes(),
+                    !self.shed_bloom.load(Ordering::Relaxed),
                 )
                 .await?;
+            let mut batches = 0u64;
             while let Some(stream) = recovered.next().await? {
-                service.recover_stream(stream).await?;
+                self.recover_stream(stream).await?;
+                batches += 1;
+                if batches.is_multiple_of(100) {
+                    tracing::info!(batches, "Background log WAL recovery progressing");
+                }
             }
         }
+        Ok(())
+    }
 
-        Ok(service)
+    /// Schedule once, without making console readiness depend on recovery.
+    /// Failed passes retain WAL and retry; no collector or destructive log
+    /// maintenance may run until an entire pass succeeds.
+    pub fn start_background_recovery(self: &Arc<Self>) {
+        if *self.recovery_ready.borrow() || self.recovery_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let writer = self.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let retry = RetryConfig::default()
+                .with_base_delay(Duration::from_secs(30))
+                .with_max_delay(Duration::from_secs(600));
+            let mut retry_attempt = 0u32;
+            tracing::info!("Background log WAL recovery started; console startup continues");
+            loop {
+                let result = async {
+                    writer.recover_wal().await?;
+                    if let Some(wal_dir) = &writer.wal_dir {
+                        wal_dir.ensure_recovery_complete().await?;
+                    }
+                    Ok::<(), LogAggregatorError>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        writer.recovery_ready.send_replace(true);
+                        tracing::info!(
+                            elapsed_seconds = started.elapsed().as_secs(),
+                            "Background log WAL recovery completed; log collection resumed"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        #[cfg(test)]
+                        writer.recovery_failures.fetch_add(1, Ordering::Relaxed);
+                        match error.retry_class() {
+                            RetryClass::Transient => {
+                                // RetryConfig performs `1 << attempt`; clamp
+                                // before calling it so a service left down for
+                                // months cannot overflow the shift.
+                                let delay = retry.compute_delay(retry_attempt.min(31));
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                tracing::error!(
+                                    %error,
+                                    retry_seconds = delay.as_secs(),
+                                    "Background log WAL recovery hit a transient failure; WAL retained, log collection paused; retrying"
+                                );
+                                tokio::time::sleep(delay).await;
+                            }
+                            RetryClass::RepairRequired => {
+                                tracing::error!(
+                                    %error,
+                                    retry_seconds = 600,
+                                    "Background log WAL recovery requires operator repair; WAL retained and log collection remains paused; retrying in case the WAL is repaired in place"
+                                );
+                                tokio::time::sleep(Duration::from_secs(600)).await;
+                            }
+                            RetryClass::Permanent => {
+                                tracing::error!(
+                                    %error,
+                                    "Background log WAL recovery cannot continue with the current data or configuration; WAL retained and log collection remains paused; correct the reported error and restart"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Background log workers wait here, independently of console startup.
+    pub async fn wait_for_recovery(&self) {
+        let mut ready = self.recovery_ready.subscribe();
+        // This service owns the sender, so it cannot close while borrowed.
+        let _ = ready.wait_for(|ready| *ready).await;
+    }
+
+    async fn ensure_recovered(&self, target: String) -> Result<(), LogAggregatorError> {
+        tokio::time::timeout(self.wait_timeout, self.wait_for_recovery())
+            .await
+            .map_err(|_| LogAggregatorError::OperationTimedOut {
+                operation: "wait for log WAL recovery",
+                target,
+            })
     }
 
     /// Test-only constructor with shrunk thresholds so flush-policy tests
@@ -586,6 +731,10 @@ impl ChunkWriterService {
     /// detached task continues to completion and clears `buffer.sealing`,
     /// instead of leaving it permanently stuck `Some(...)`.
     pub async fn write_line(self: &Arc<Self>, line: LogLine) -> Result<(), LogAggregatorError> {
+        if !*self.recovery_ready.borrow() {
+            self.ensure_recovered(format!("container {}", line.container_id))
+                .await?;
+        }
         let project_gate = {
             let mut gates = self.project_gates.lock().await;
             gates
@@ -656,6 +805,9 @@ impl ChunkWriterService {
 
     /// Seal every head buffer whose flush policy (ADR-046 §1) says it's due.
     pub async fn flush_expired(self: &Arc<Self>) {
+        if !*self.recovery_ready.borrow() {
+            return;
+        }
         let head_max_bytes = self.head_max_bytes();
         let due: Vec<String> = {
             let buffers = self.buffers.lock().await;
@@ -676,6 +828,9 @@ impl ChunkWriterService {
 
     /// Seal every non-empty head buffer — called on graceful shutdown.
     pub async fn flush_all(self: &Arc<Self>) {
+        if !*self.recovery_ready.borrow() {
+            return;
+        }
         let ids: Vec<String> = {
             let buffers = self.buffers.lock().await;
             buffers
@@ -699,6 +854,8 @@ impl ChunkWriterService {
         &self,
         project_id: i32,
     ) -> Result<PurgeGuard, LogAggregatorError> {
+        self.ensure_recovered(format!("project {project_id}"))
+            .await?;
         let gate = {
             let mut gates = self.project_gates.lock().await;
             gates
@@ -795,6 +952,8 @@ impl ChunkWriterService {
         self: &Arc<Self>,
         container_id: &str,
     ) -> Result<(), LogAggregatorError> {
+        self.ensure_recovered(format!("container {container_id}"))
+            .await?;
         let writer = self.clone();
         let id = container_id.to_owned();
         self.await_task(
@@ -825,6 +984,9 @@ impl ChunkWriterService {
     /// Flush and fsync every open WAL file. The plugin calls this on a 1 s
     /// ticker so at most ~1 s of ingest is unsynced at any time.
     pub async fn sync_wals(&self) {
+        if !*self.recovery_ready.borrow() {
+            return;
+        }
         let mut buffers = self.buffers.lock().await;
         for (container_id, buffer) in buffers.iter_mut() {
             if let Some(wal) = buffer.wal.as_mut() {
@@ -877,6 +1039,8 @@ impl ChunkWriterService {
     }
 
     async fn seal_guarded(&self, container_id: &str) -> Result<(), LogAggregatorError> {
+        self.ensure_recovered(format!("container {container_id}"))
+            .await?;
         let project_id = {
             let buffers = self.buffers.lock().await;
             let Some(buffer) = buffers.get(container_id) else {
@@ -998,8 +1162,10 @@ impl ChunkWriterService {
             Some(&content_hash),
         );
 
-        let write_result =
-            retry_with_backoff(|| self.storage.write_chunk(&storage_key, &encoded.bytes)).await;
+        let write_result = retry_log_operation_with_backoff(|| {
+            self.storage.write_chunk(&storage_key, &encoded.bytes)
+        })
+        .await;
         let compressed_size = match write_result {
             Ok(size) => size,
             Err(e) => {
@@ -1020,7 +1186,7 @@ impl ChunkWriterService {
 
         let meta = build_chunk_meta(&encoded, &storage_key, compressed_size);
         let manifests = &self.manifests;
-        let seq = match retry_with_backoff(|| manifests.insert(&meta)).await {
+        let seq = match retry_log_operation_with_backoff(|| manifests.insert(&meta)).await {
             Ok(seq) => seq,
             Err(e) => {
                 error!(
@@ -1030,6 +1196,7 @@ impl ChunkWriterService {
                     "manifest insert failed after retries; object is on disk, WAL retained for \
                      the reconcile sweep to re-adopt it"
                 );
+                self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
                 self.drop_sealing(container_id).await;
                 if fail_on_persistence_error {
                     return Err(e);
@@ -1042,7 +1209,11 @@ impl ChunkWriterService {
         // index failure never blocks sealing — the manifest simply stays
         // unmarked and the reindexer retries it from the chunk later.
         let line_index = &self.line_index;
-        match retry_with_backoff(|| line_index.index_chunk(seq, labels, &sealing_segments)).await {
+        match retry_log_operation_with_backoff(|| {
+            line_index.index_chunk(seq, labels, &sealing_segments)
+        })
+        .await
+        {
             Ok(IndexOutcome::Indexed) => {
                 if let Err(e) = manifests.mark_indexed(seq).await {
                     warn!(seq, error = %e, "could not mark chunk as indexed; reindexer will redo it");
@@ -1193,6 +1364,26 @@ where
     }
 }
 
+async fn retry_log_operation_with_backoff<T, F, Fut>(mut f: F) -> Result<T, LogAggregatorError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LogAggregatorError>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if error.retry_class() != RetryClass::Transient || attempt >= RETRY_DELAYS.len() {
+                    return Err(error);
+                }
+                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,6 +1392,403 @@ mod tests {
     use crate::types::{LogLevel, LogStream};
     use chrono::Utc;
     use tokio::sync::Mutex as StdAsyncMutex;
+
+    async fn seed_background_wal(root: &std::path::Path) {
+        let wal_dir = WalDir::open(root.to_path_buf()).await.unwrap();
+        let mut wal = wal_dir.stream("background-container").await.unwrap();
+        wal.append(&make_line(
+            "background-container",
+            LogLevel::Info,
+            "before restart",
+        ))
+        .await
+        .unwrap();
+        wal.sync().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_recovery_returns_before_commit_and_protects_writes_and_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let sink = Arc::new(GatedSink::default());
+        let mut writer = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChunkWriterService::open_deferred_with_index(
+                Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+                sink.clone(),
+                Some(wal_root.clone()),
+                None,
+                Arc::new(NoLineIndex::default()),
+            ),
+        )
+        .await
+        .expect("console registration must not wait for manifest insertion")
+        .unwrap();
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_millis(20);
+        // Exercise the production plugin initialization, not just the writer:
+        // it must return even while the recovery manifest sink is blocked.
+        use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
+        let context = ServiceRegistrationContext::new();
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let docker = Arc::new(temps_core::DockerHandle::disabled(
+            "control-plane",
+            "test has no daemon",
+        ));
+        let metadata = Arc::new(crate::services::LogMetadataService::new(db.clone()));
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let index: Arc<dyn crate::index::LineIndex> = Arc::new(NoLineIndex::default());
+        context.register_service(db.clone());
+        context.register_service(docker.clone());
+        context.register_service(writer.clone());
+        context.register_service(metadata.clone());
+        context.register_service(storage);
+        context.register_service(index);
+        context.register_service(Arc::new(ChunkCache::open(None, 1024).await.unwrap()));
+        context.register_service(Arc::new(crate::services::CollectorService::new(
+            docker,
+            writer.clone(),
+            metadata.clone(),
+            100,
+        )));
+        context.register_service(Arc::new(
+            crate::services::RetentionService::new(Arc::new(ManifestRepo::new(db)), metadata)
+                .with_chunk_writer(writer.clone()),
+        ));
+        let plugin =
+            crate::plugin::LogAggregatorPlugin::new(crate::types::StorageConfig::Filesystem {
+                base_path: tmp.path().join("objects"),
+            });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            plugin.initialize_plugin_services(&context.create_plugin_context()),
+        )
+        .await
+        .expect("console plugin initialization must not await WAL replay")
+        .unwrap();
+        writer.start_background_recovery(); // Must not launch a second replay.
+        tokio::time::timeout(Duration::from_secs(2), sink.entered.notified())
+            .await
+            .unwrap();
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(sink.rows.all().await.is_empty());
+        assert!(matches!(
+            writer
+                .write_line(make_line(
+                    "background-container",
+                    LogLevel::Info,
+                    "during recovery"
+                ))
+                .await,
+            Err(LogAggregatorError::OperationTimedOut {
+                operation: "wait for log WAL recovery",
+                ..
+            })
+        ));
+        assert!(matches!(
+            writer.prepare_project_for_purge(1).await,
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        assert!(matches!(
+            writer.remove_container("background-container").await,
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        writer.flush_all().await;
+        writer.flush_expired().await;
+        assert!(has_recovery_wal(&wal_root).await);
+        sink.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
+            .await
+            .unwrap();
+        assert_eq!(sink.rows.all().await.len(), 1);
+        assert_eq!(sink.rows.all().await[0].line_count, 1);
+        assert!(!has_recovery_wal(&wal_root).await);
+        writer
+            .write_line(make_line(
+                "background-container",
+                LogLevel::Info,
+                "after recovery",
+            ))
+            .await
+            .unwrap();
+        let flush_writer = writer.clone();
+        let flush = tokio::spawn(async move { flush_writer.flush_all().await });
+        sink.entered.notified().await;
+        sink.release.notify_one();
+        flush.await.unwrap();
+        // The intentionally short public-operation timeout can return while
+        // the cancellation-safe detached seal is still committing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sink.rows.all().await.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new lines must not be replaced by recovery");
+    }
+
+    #[derive(Default)]
+    struct RetryRecoverySink {
+        fail: AtomicBool,
+        attempts: AtomicU64,
+        rows: VecSink,
+    }
+
+    #[async_trait]
+    impl ManifestSink for RetryRecoverySink {
+        async fn insert(&self, meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(LogAggregatorError::Database(
+                    sea_orm::DbErr::ConnectionAcquire(
+                        sea_orm::error::ConnAcquireErr::ConnectionClosed,
+                    ),
+                ));
+            }
+            self.rows.insert(meta).await
+        }
+    }
+
+    #[derive(Default)]
+    struct PermanentRecoverySink {
+        attempts: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ManifestSink for PermanentRecoverySink {
+        async fn insert(&self, _meta: &ChunkMeta) -> Result<i64, LogAggregatorError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            Err(LogAggregatorError::Validation {
+                message: "injected invalid recovered manifest".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn background_recovery_retries_failed_pass_without_losing_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let sink = Arc::new(RetryRecoverySink::default());
+        sink.fail.store(true, Ordering::Relaxed);
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        writer.start_background_recovery();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while writer.dropped_chunks() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed recovery pass should finish its bounded insert retries");
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
+        sink.fail.store(false, Ordering::Relaxed);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(3), writer.wait_for_recovery())
+            .await
+            .unwrap();
+        assert_eq!(sink.rows.all().await.len(), 1);
+        assert!(!has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_recovery_stops_after_one_permanent_failure_and_retains_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let sink = Arc::new(PermanentRecoverySink::default());
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+
+        writer.start_background_recovery();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sink.attempts.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("permanent recovery failure should be observed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&writer) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("terminal recovery task should exit and release its writer clone");
+        // Cross both the former 30-second general retry and the former
+        // 600-second damaged-WAL retry. This catches regressions in either
+        // the inner persistence retry or the outer recovery-pass loop.
+        tokio::time::advance(Duration::from_secs(601)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(sink.attempts.load(Ordering::Relaxed), 1);
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test]
+    async fn background_recovery_retained_generation_does_not_enable_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        // A truncated header leaves its valid prefix replayable on disk.
+        let wal_dir = WalDir::open(wal_root.clone()).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let path = entries.next_entry().await.unwrap().unwrap().path();
+        use tokio::io::AsyncWriteExt;
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap()
+            .write_all(&[1, 2])
+            .await
+            .unwrap();
+        let mut writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            Arc::new(VecSink::default()),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_millis(20);
+        writer.recover_wal().await.unwrap();
+        assert!(matches!(
+            wal_dir.ensure_recovery_complete().await,
+            Err(LogAggregatorError::WalRecoveryIncomplete { .. })
+        ));
+        writer.start_background_recovery();
+        assert!(matches!(
+            writer.prepare_project_for_purge(1).await,
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test]
+    async fn background_recovery_resumes_after_retained_wal_is_repaired_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let path = entries.next_entry().await.unwrap().unwrap().path();
+        let valid_len = tokio::fs::metadata(&path).await.unwrap().len();
+        use tokio::io::AsyncWriteExt;
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap()
+            .write_all(&[1, 2])
+            .await
+            .unwrap();
+
+        let sink = Arc::new(VecSink::default());
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        writer.start_background_recovery();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while writer.recovery_failures.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("initial retained-WAL pass should enter the repair polling state");
+        // Let the recovery task enter its 600-second sleep before freezing
+        // time, so repairing below cannot race the initial completeness check.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!*writer.recovery_ready.borrow());
+        assert!(has_recovery_wal(&wal_root).await);
+        assert_eq!(sink.all().await.len(), 1);
+
+        tokio::time::pause();
+
+        let mut retained_entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let mut retained_path = None;
+        while let Some(entry) = retained_entries.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("recovery-wal") {
+                retained_path = Some(entry.path());
+                break;
+            }
+        }
+        let retained_path = retained_path.expect("damaged generation should remain retained");
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&retained_path)
+            .await
+            .unwrap()
+            .set_len(valid_len)
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !*writer.recovery_ready.borrow(),
+            "repair-required recovery should remain paused until its polling interval"
+        );
+
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
+            .await
+            .expect("in-place WAL repair should be detected on the next poll");
+        assert_eq!(sink.all().await.len(), 1);
+        assert!(!has_recovery_wal(&wal_root).await);
+    }
+
+    #[tokio::test]
+    async fn background_recovery_without_wal_is_ready_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            Arc::new(VecSink::default()),
+            None,
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        writer.start_background_recovery();
+        assert!(*writer.recovery_ready.borrow());
+        writer
+            .write_line(make_line("no-wal", LogLevel::Info, "live"))
+            .await
+            .unwrap();
+    }
 
     /// In-memory [`ManifestSink`] for tests.
     #[derive(Default)]

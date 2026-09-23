@@ -47,6 +47,11 @@ use crate::types::*;
 impl From<LogAggregatorError> for Problem {
     fn from(error: LogAggregatorError) -> Self {
         match error {
+            LogAggregatorError::WalRecoveryIncomplete { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Log Recovery Incomplete")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::OperationTimedOut { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("Log Operation Timed Out")
@@ -815,6 +820,25 @@ async fn purge_project_logs(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn background_recovery_incomplete_returns_contextual_unavailable_problem() {
+        use axum::response::IntoResponse;
+        let problem: Problem = LogAggregatorError::WalRecoveryIncomplete {
+            path: "logs/wal/example.b.recovery-wal".to_owned(),
+        }
+        .into();
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("example.b.recovery-wal"));
+    }
+
     #[tokio::test]
     async fn operation_timeout_returns_service_unavailable_problem() {
         use axum::response::IntoResponse;

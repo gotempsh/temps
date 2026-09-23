@@ -293,6 +293,24 @@ pub struct WalDir {
 }
 
 impl WalDir {
+    /// Background recovery must not enable purge while a deferred or damaged
+    /// generation could replay previously deleted records on a later restart.
+    pub(crate) async fn ensure_recovery_complete(&self) -> Result<(), LogAggregatorError> {
+        let mut entries = fs::read_dir(&self.root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("sealed-wal" | "recovery-wal")
+            ) {
+                return Err(LogAggregatorError::WalRecoveryIncomplete {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Open (creating if necessary) the WAL root directory.
     pub async fn open(root: PathBuf) -> Result<Self, LogAggregatorError> {
         fs::create_dir_all(&root).await?;
