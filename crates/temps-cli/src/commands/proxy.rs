@@ -682,18 +682,17 @@ fn build_on_demand_sleeping_callback(
     manager: Arc<OnDemandManager>,
 ) -> temps_routes::route_table::OnSleepingCallback {
     Arc::new(move |entries, on_demand_configs| {
-        manager.clear_sleeping_domains();
-        for entry in entries {
-            manager.register_sleeping_domain(
-                entry.domain.clone(),
+        manager.replace_sleeping_domains(entries.into_iter().map(|entry| {
+            (
+                entry.domain,
                 temps_proxy::on_demand::SleepingEnvironmentInfo {
                     environment_id: entry.environment_id,
                     project_id: entry.project_id,
                     deployment_id: entry.deployment_id,
                     wake_timeout_seconds: entry.wake_timeout_seconds,
                 },
-            );
-        }
+            )
+        }));
         for config in on_demand_configs {
             manager.register_on_demand_environment(
                 config.environment_id,

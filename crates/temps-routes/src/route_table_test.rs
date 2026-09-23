@@ -161,6 +161,112 @@ mod route_table_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_project_wildcard_routes_single_label_and_preserves_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::EntityTrait;
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("project.example.com")
+            .await?;
+        test_db
+            .create_deployment_container(deployment.id, 9011, None)
+            .await?;
+
+        let wildcard = project_custom_domains::ActiveModel {
+            domain: Set("*.apps.example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            redirect_to: Set(None),
+            status_code: Set(None),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        // An exact HTTP route must beat the project wildcard regardless of
+        // which lookup API the proxy caller uses.
+        custom_routes::ActiveModel {
+            domain: Set("api.apps.example.com".to_string()),
+            host: Set("exact-backend".to_string()),
+            port: Set(7443),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be published with the wildcard route generation"
+        );
+
+        for lookup in [
+            route_table.get_route("preview.apps.example.com"),
+            route_table.get_route_by_host("preview.apps.example.com"),
+        ] {
+            let route = lookup.expect("a direct child must match the project wildcard");
+            assert_eq!(route.get_backend_addr(), "127.0.0.1:9011");
+            assert_eq!(
+                route.project.as_ref().map(|model| model.id),
+                Some(project.id)
+            );
+            assert_eq!(
+                route.environment.as_ref().map(|model| model.id),
+                Some(environment.id)
+            );
+            assert_eq!(
+                route.deployment.as_ref().map(|model| model.id),
+                Some(deployment.id)
+            );
+            assert!(
+                !route.cert_eligible,
+                "wildcard-derived hosts must not trigger per-subdomain HTTP-01 issuance"
+            );
+        }
+
+        assert_eq!(
+            route_table
+                .get_route_by_host("api.apps.example.com")
+                .expect("exact route must resolve")
+                .get_backend_addr(),
+            "exact-backend:7443"
+        );
+        for host in [
+            "apps.example.com",
+            "deep.preview.apps.example.com",
+            "preview.notapps.example.com",
+            "preview.apps.example.com.invalid",
+        ] {
+            assert!(
+                route_table.get_route(host).is_none(),
+                "wildcard must not match apex, deep, sibling, or suffix-confused host {host}"
+            );
+        }
+
+        project_custom_domains::Entity::delete_by_id(wildcard.id)
+            .exec(test_db.db.as_ref())
+            .await?;
+        route_table.load_routes().await?;
+        assert!(
+            route_table.get_route("preview.apps.example.com").is_none(),
+            "reload must remove stale wildcard index entries"
+        );
+        assert!(
+            !route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be removed in the same snapshot generation"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
     /// Issue #478: a project custom domain that matches the console hostname
     /// (`external_url`) must never win the route, otherwise the operator is
     /// locked out of the console and can only recover over the public IP.
@@ -201,7 +307,7 @@ mod route_table_tests {
             .await?;
 
         // A pre-existing row claiming the console hostname, plus a normal one
-        for domain in ["console.example.com", "app.example.com"] {
+        for domain in ["console.example.com", "app.example.com", "*.example.com"] {
             project_custom_domains::ActiveModel {
                 domain: Set(domain.to_string()),
                 project_id: Set(project.id),
@@ -222,6 +328,13 @@ mod route_table_tests {
             route_table.get_route("console.example.com").is_none(),
             "console hostname must not be routed to a project (issue #478)"
         );
+        assert!(
+            route_table
+                .get_route_by_host("console.example.com")
+                .is_none(),
+            "console hostname must also be protected from wildcard fallback"
+        );
+        assert!(route_table.is_reserved_hostname("console.example.com"));
         assert!(
             route_table.get_route("app.example.com").is_some(),
             "ordinary custom domains must still route"

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 ///   1. Reverse: `com.example.api`
 ///   2. Strip first label: `com.example`
 ///   3. Lookup in HashMap → O(1)
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WildcardMatcher {
     /// Map of reversed base domain (without `*.` prefix) -> RouteInfo
     /// e.g., `*.example.com` → key = `com.example`
@@ -114,6 +114,14 @@ impl WildcardMatcher {
         let reversed_key = reverse_domain(base_domain);
 
         self.patterns.remove(&reversed_key)
+    }
+
+    /// Return whether this exact wildcard pattern is present.
+    pub fn contains_pattern(&self, pattern: &str) -> bool {
+        let Some(base_domain) = pattern.strip_prefix("*.") else {
+            return false;
+        };
+        self.patterns.contains_key(&reverse_domain(base_domain))
     }
 
     /// Check if the matcher is empty
@@ -217,6 +225,7 @@ mod tests {
 
         matcher.insert("*.example.com", route);
         assert_eq!(matcher.len(), 1);
+        assert!(matcher.contains_pattern("*.example.com"));
 
         // Remove the pattern
         let removed = matcher.remove("*.example.com");

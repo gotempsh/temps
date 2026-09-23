@@ -11,11 +11,13 @@
 //! - **Multi-node**: Stops/starts all containers (local + remote) in parallel
 //! - **Multi-proxy**: Uses atomic DB transitions (UPDATE WHERE) instead of locks
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +82,35 @@ pub struct SleepingEnvironmentInfo {
     pub wake_timeout_seconds: i32,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SleepingDomainSnapshot {
+    exact: HashMap<String, SleepingEnvironmentInfo>,
+    wildcard_bases: HashMap<String, SleepingEnvironmentInfo>,
+}
+
+impl SleepingDomainSnapshot {
+    fn insert(&mut self, domain: String, info: SleepingEnvironmentInfo) {
+        if let Some(base) = domain.strip_prefix("*.") {
+            if !base.is_empty() {
+                self.wildcard_bases.insert(base.to_string(), info);
+            }
+        } else {
+            self.exact.insert(domain, info);
+        }
+    }
+
+    fn get(&self, domain: &str) -> Option<&SleepingEnvironmentInfo> {
+        if let Some(info) = self.exact.get(domain) {
+            return Some(info);
+        }
+        let (label, base) = domain.split_once('.')?;
+        if label.is_empty() || base.is_empty() {
+            return None;
+        }
+        self.wildcard_bases.get(base)
+    }
+}
+
 /// Core on-demand manager. Lives in the proxy process.
 pub struct OnDemandManager {
     /// Last request timestamp (epoch seconds) per environment_id.
@@ -95,7 +126,7 @@ pub struct OnDemandManager {
 
     /// Sleeping environments indexed by domain (for wake-on-request lookup).
     /// Populated during route table reload for environments with sleeping=true.
-    sleeping_by_domain: DashMap<String, SleepingEnvironmentInfo>,
+    sleeping_domains: ArcSwap<SleepingDomainSnapshot>,
 
     /// Database connection for state transitions.
     db: Arc<DatabaseConnection>,
@@ -160,7 +191,7 @@ impl OnDemandManager {
             last_activity: DashMap::new(),
             configs: DashMap::new(),
             wake_states: DashMap::new(),
-            sleeping_by_domain: DashMap::new(),
+            sleeping_domains: ArcSwap::from_pointee(SleepingDomainSnapshot::default()),
             db,
             local_node_id,
             container_lifecycle,
@@ -223,19 +254,32 @@ impl OnDemandManager {
     /// Check if a domain maps to a sleeping environment.
     /// Returns wake info if found.
     pub fn get_sleeping_environment(&self, domain: &str) -> Option<SleepingEnvironmentInfo> {
-        self.sleeping_by_domain
-            .get(domain)
-            .map(|r| r.value().clone())
+        self.sleeping_domains.load().get(domain).cloned()
     }
 
     /// Register a sleeping environment domain for wake-on-request lookup.
     pub fn register_sleeping_domain(&self, domain: String, info: SleepingEnvironmentInfo) {
-        self.sleeping_by_domain.insert(domain, info);
+        let mut snapshot = (*self.sleeping_domains.load_full()).clone();
+        snapshot.insert(domain, info);
+        self.sleeping_domains.store(Arc::new(snapshot));
+    }
+
+    /// Atomically replace every sleeping-domain mapping after a route reload.
+    pub fn replace_sleeping_domains(
+        &self,
+        entries: impl IntoIterator<Item = (String, SleepingEnvironmentInfo)>,
+    ) {
+        let mut snapshot = SleepingDomainSnapshot::default();
+        for (domain, info) in entries {
+            snapshot.insert(domain, info);
+        }
+        self.sleeping_domains.store(Arc::new(snapshot));
     }
 
     /// Clear all sleeping domain mappings (called before route table reload).
     pub fn clear_sleeping_domains(&self) {
-        self.sleeping_by_domain.clear();
+        self.sleeping_domains
+            .store(Arc::new(SleepingDomainSnapshot::default()));
     }
 
     /// Signal that the route table has been reloaded.
@@ -1301,6 +1345,92 @@ mod tests {
         assert_eq!(info.environment_id, 1);
         assert_eq!(info.project_id, 10);
         assert_eq!(info.deployment_id, 100);
+    }
+
+    #[test]
+    fn test_sleeping_wildcard_domain_lookup_is_single_label() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
+
+        manager.register_sleeping_domain(
+            "*.apps.example.com".to_string(),
+            SleepingEnvironmentInfo {
+                environment_id: 2,
+                project_id: 20,
+                deployment_id: 200,
+                wake_timeout_seconds: 45,
+            },
+        );
+
+        let info = manager
+            .get_sleeping_environment("preview.apps.example.com")
+            .expect("a direct wildcard child should wake the environment");
+        assert_eq!(info.environment_id, 2);
+        assert!(manager
+            .get_sleeping_environment("apps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment("deep.preview.apps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment("preview.notapps.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment(".apps.example.com")
+            .is_none());
+
+        manager.clear_sleeping_domains();
+        assert!(manager
+            .get_sleeping_environment("preview.apps.example.com")
+            .is_none());
+    }
+
+    #[test]
+    fn test_replace_sleeping_domains_publishes_complete_generation() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
+        let old = SleepingEnvironmentInfo {
+            environment_id: 1,
+            project_id: 10,
+            deployment_id: 100,
+            wake_timeout_seconds: 30,
+        };
+        let new = SleepingEnvironmentInfo {
+            environment_id: 2,
+            project_id: 20,
+            deployment_id: 200,
+            wake_timeout_seconds: 45,
+        };
+
+        manager.replace_sleeping_domains([
+            ("old.example.com".to_string(), old.clone()),
+            ("*.old-apps.example.com".to_string(), old),
+        ]);
+        manager.replace_sleeping_domains([
+            ("new.example.com".to_string(), new.clone()),
+            ("*.new-apps.example.com".to_string(), new),
+        ]);
+
+        assert!(manager
+            .get_sleeping_environment("old.example.com")
+            .is_none());
+        assert!(manager
+            .get_sleeping_environment("api.old-apps.example.com")
+            .is_none());
+        assert_eq!(
+            manager
+                .get_sleeping_environment("new.example.com")
+                .map(|info| info.environment_id),
+            Some(2)
+        );
+        assert_eq!(
+            manager
+                .get_sleeping_environment("api.new-apps.example.com")
+                .map(|info| info.environment_id),
+            Some(2)
+        );
     }
 
     #[test]

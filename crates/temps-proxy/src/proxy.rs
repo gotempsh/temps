@@ -398,6 +398,13 @@ pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 /// a redirect to a certificate that has not been issued yet.
 pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
 
+fn should_lookup_sleeping_environment(
+    route_table: Option<&temps_routes::CachedPeerTable>,
+    host: &str,
+) -> bool {
+    !route_table.is_some_and(|routes| routes.owns_hostname(host))
+}
+
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
 ///
@@ -4562,7 +4569,15 @@ impl ProxyHttp for LoadBalancer {
         // and hold the request until the container is ready and routes are reloaded.
         if let Some(ref on_demand) = self.on_demand_manager {
             let host_without_port = ctx.host.split(':').next().unwrap_or(&ctx.host);
-            if let Some(sleeping_info) = on_demand.get_sleeping_environment(host_without_port) {
+            // An awake route always wins over a sleeping wildcard. Without
+            // this check, `api.example.com` could wake an environment behind
+            // `*.example.com` even when the exact host belongs to another
+            // active project. Both lookups are in-memory.
+            if let Some(sleeping_info) =
+                should_lookup_sleeping_environment(self.route_table.as_deref(), host_without_port)
+                    .then(|| on_demand.get_sleeping_environment(host_without_port))
+                    .flatten()
+            {
                 info!(
                     environment_id = sleeping_info.environment_id,
                     host = %ctx.host,
@@ -6547,8 +6562,58 @@ mod on_demand_http_tests {
     //! The session-writing wrapper (`handle_on_demand_http`) is exercised in
     //! integration; here we pin the two pure helpers it delegates to so the
     //! 503 contract and the `redirect_to_env` target derivation are locked.
-    use super::{ephemeral_redirect_location, on_demand_cert_state_response};
+    use super::{
+        ephemeral_redirect_location, on_demand_cert_state_response,
+        should_lookup_sleeping_environment,
+    };
     use crate::on_demand_cert::OnDemandCertState;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use temps_routes::{BackendEntry, BackendType, CachedPeerTable, RouteInfo};
+
+    fn test_route() -> RouteInfo {
+        RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:8080".to_string(),
+                    container_id: None,
+                    container_name: None,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    #[test]
+    fn active_or_reserved_host_suppresses_sleeping_wildcard_lookup() {
+        let table = CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+        table.insert_route_for_test("api.apps.example.com", test_route());
+        table.insert_tls_route_for_test("tcp.apps.example.com", test_route());
+        table.reserve_hostname_for_test("console.apps.example.com");
+
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "api.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "tcp.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "console.apps.example.com"
+        ));
+        assert!(should_lookup_sleeping_environment(
+            Some(&table),
+            "preview.apps.example.com"
+        ));
+    }
 
     #[test]
     fn pending_and_issuing_map_to_provisioning_503() {
