@@ -154,17 +154,18 @@ where
     })
     .await
     .map_err(|_| rejected("remote Compose archive extraction task failed"))??;
-    // No await separates accepting the result from persistence: cancellation can
-    // never detach a worker that already disarmed its snapshot's cleanup guard.
+    // The worker returns its owning guard. The receiver retains both staging
+    // and adoption guards until every asynchronous copy operation has finished.
     adopt_archive(result, cache, |source, destination| {
         std::fs::rename(source, destination)
     })
+    .await
 }
 
-/// Adoption intentionally has no async suspension point. The worker writes only
-/// system-temporary staging, so cancellation and checkout cleanup cannot race it.
-/// The uncommon cross-filesystem copy is bounded by the same archive limits.
-fn adopt_archive(
+/// All path creation happens synchronously on the receiving task. The async
+/// fallback only submits I/O on already-open descriptors, so a cancelled copy
+/// cannot recreate paths after the snapshot guards or checkout are removed.
+async fn adopt_archive(
     archive: ExtractedArchive,
     cache: &Path,
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
@@ -196,7 +197,13 @@ fn adopt_archive(
     match rename(archive.snapshot.path(), &destination) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
-            copy_snapshot(archive.snapshot.path(), &destination).map_err(|e| {
+            tokio::time::timeout(
+                FETCH_TIMEOUT,
+                copy_snapshot(archive.snapshot.path(), &destination),
+            )
+            .await
+            .map_err(|_| rejected("remote Compose adoption exceeded 60 seconds"))?
+            .map_err(|e| {
                 rejected(format!(
                     "could not adopt remote Compose archive across filesystems: {e}"
                 ))
@@ -220,27 +227,20 @@ fn adopt_archive(
     Ok((selected, root))
 }
 
-fn copy_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let started = Instant::now();
-    let cancellation = CancellationToken::new();
+async fn copy_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
     let mut entries = 0_usize;
     let mut remaining = MAX_EXTRACTED_BYTES;
+    let mut buffer = vec![0_u8; 64 * 1024];
     while let Some((source, destination)) = pending.pop() {
-        if started.elapsed() > FETCH_TIMEOUT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "remote Compose adoption exceeded 60 seconds",
-            ));
-        }
+        // Never delegate namespace mutations to tokio::fs or a blocking worker:
+        // those operations could outlive cancellation and recreate the checkout.
         std::fs::create_dir(&destination)?;
+        tokio::task::yield_now().await;
         for entry in std::fs::read_dir(&source)? {
-            if started.elapsed() > FETCH_TIMEOUT {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "remote Compose adoption exceeded 60 seconds",
-                ));
-            }
+            tokio::task::yield_now().await;
             entries += 1;
             // Include directories implicitly created for archives that omit them.
             if entries > MAX_ARCHIVE_ENTRIES * 2 {
@@ -256,20 +256,27 @@ fn copy_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
                 pending.push((path, target));
             } else if kind.is_file() {
                 let input = std::fs::File::open(&path)?;
-                let mut output = std::fs::OpenOptions::new()
+                let output = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&target)?;
-                let copied = copy_with_deadline(
-                    &mut input.take(remaining + 1),
-                    &mut output,
-                    started,
-                    &cancellation,
-                )?;
-                remaining = remaining.checked_sub(copied).ok_or_else(|| {
-                    std::io::Error::other("remote Compose adoption exceeds the 64 MiB limit")
-                })?;
-                std::fs::set_permissions(&target, entry.metadata()?.permissions())?;
+                output.set_permissions(input.metadata()?.permissions())?;
+                let mut input = tokio::fs::File::from_std(input);
+                let mut output = tokio::fs::File::from_std(output);
+                loop {
+                    tokio::task::yield_now().await;
+                    let count = input.read(&mut buffer).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    remaining = remaining.checked_sub(count as u64).ok_or_else(|| {
+                        std::io::Error::other("remote Compose adoption exceeds the 64 MiB limit")
+                    })?;
+                    output.write_all(&buffer[..count]).await?;
+                }
+                // Tokio may buffer a write in its blocking pool. Await completion
+                // before exposing the adopted paths to Docker Compose.
+                output.flush().await?;
             } else {
                 return Err(std::io::Error::other(
                     "remote Compose adoption encountered a link or special file",
@@ -692,58 +699,153 @@ mod tests {
 
     #[test]
     fn adoption_handles_rename_cross_device_copy_and_failed_copy_cleanup() {
-        for cross_device in [false, true] {
+        extraction_runtime().block_on(async {
+            for cross_device in [false, true] {
+                let cache = tempfile::tempdir().unwrap();
+                let snapshot = tempfile::tempdir().unwrap();
+                let staging = snapshot.path().to_path_buf();
+                let bytes = archive(&[
+                    ("root/docker/compose.yaml", b"services: {}"),
+                    ("root/docker/asset.txt", b"asset"),
+                ]);
+                let archive = extract_archive_contents(
+                    bytes.as_slice(),
+                    snapshot,
+                    Some(Path::new("docker/compose.yaml")),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                let (selected, root) = adopt_archive(archive, cache.path(), |source, target| {
+                    if cross_device {
+                        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                    } else {
+                        std::fs::rename(source, target)
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(selected.starts_with(cache.path().canonicalize().unwrap()));
+                assert_eq!(
+                    std::fs::read(root.join("docker/asset.txt")).unwrap(),
+                    b"asset"
+                );
+                assert!(!staging.exists());
+            }
             let cache = tempfile::tempdir().unwrap();
             let snapshot = tempfile::tempdir().unwrap();
             let staging = snapshot.path().to_path_buf();
-            let bytes = archive(&[
-                ("root/docker/compose.yaml", b"services: {}"),
-                ("root/docker/asset.txt", b"asset"),
-            ]);
+            let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
             let archive = extract_archive_contents(
                 bytes.as_slice(),
                 snapshot,
-                Some(Path::new("docker/compose.yaml")),
+                None,
                 &CancellationToken::new(),
             )
             .unwrap();
-            let (selected, root) = adopt_archive(archive, cache.path(), |source, target| {
-                if cross_device {
-                    Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
-                } else {
-                    std::fs::rename(source, target)
-                }
-            })
-            .unwrap();
-            assert!(selected.starts_with(cache.path().canonicalize().unwrap()));
-            assert_eq!(
-                std::fs::read(root.join("docker/asset.txt")).unwrap(),
-                b"asset"
+            // Force a bounded-copy error without allocating a large buffer.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&archive.selected)
+                .unwrap()
+                .set_len(MAX_EXTRACTED_BYTES + 1)
+                .unwrap();
+            assert!(
+                adopt_archive(archive, cache.path(), |_, _| Err(std::io::Error::from(
+                    std::io::ErrorKind::CrossesDevices
+                )))
+                .await
+                .is_err()
             );
             assert!(!staging.exists());
-        }
-        let cache = tempfile::tempdir().unwrap();
-        let snapshot = tempfile::tempdir().unwrap();
-        let staging = snapshot.path().to_path_buf();
-        let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
-        let archive =
-            extract_archive_contents(bytes.as_slice(), snapshot, None, &CancellationToken::new())
-                .unwrap();
-        // Force a bounded-copy error without allocating a large buffer.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&archive.selected)
-            .unwrap()
-            .set_len(MAX_EXTRACTED_BYTES + 1)
+            assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn cross_device_adoption_yields_to_outer_deadline_and_cleans_both_guards() {
+        extraction_runtime().block_on(async {
+            let cache = tempfile::tempdir().unwrap();
+            let snapshot = tempfile::tempdir().unwrap();
+            let staging = snapshot.path().to_path_buf();
+            let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
+            let extracted = extract_archive_contents(
+                bytes.as_slice(),
+                snapshot,
+                None,
+                &CancellationToken::new(),
+            )
             .unwrap();
-        assert!(
-            adopt_archive(archive, cache.path(), |_, _| Err(std::io::Error::from(
-                std::io::ErrorKind::CrossesDevices
-            )))
-            .is_err()
-        );
-        assert!(!staging.exists());
-        assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+            let result = tokio::time::timeout(
+                Duration::ZERO,
+                adopt_archive(extracted, cache.path(), |_, _| {
+                    Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                }),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "outer timeout must be polled while adopting"
+            );
+            assert!(!staging.exists());
+            assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn cancelling_partial_cross_device_copy_never_recreates_checkout() {
+        extraction_runtime().block_on(async {
+            let checkout = tempfile::tempdir().unwrap();
+            let checkout_path = checkout.path().to_path_buf();
+            let cache = tempfile::tempdir_in(&checkout_path).unwrap();
+            let snapshot = tempfile::tempdir().unwrap();
+            let staging = snapshot.path().to_path_buf();
+            let bytes = archive(&[("root/compose.yaml", b"services: {}")]);
+            let extracted = extract_archive_contents(
+                bytes.as_slice(),
+                snapshot,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&extracted.selected)
+                .unwrap()
+                .set_len(MAX_EXTRACTED_BYTES)
+                .unwrap();
+            let mut adoption = Box::pin(adopt_archive(extracted, cache.path(), |_, _| {
+                Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+            }));
+            let mut pending_polls = 0;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    assert!(futures::poll!(adoption.as_mut()).is_pending());
+                    pending_polls += 1;
+                    if let Some(adopted) = std::fs::read_dir(cache.path()).unwrap().next() {
+                        let copied = adopted.unwrap().path().join("snapshot/root/compose.yaml");
+                        if let Ok(metadata) = copied.metadata() {
+                            if metadata.len() >= 64 * 1024 {
+                                assert!(metadata.len() < MAX_EXTRACTED_BYTES);
+                                break;
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                pending_polls > 1,
+                "copy must cooperate with the runtime between chunks"
+            );
+            // Cancel with asynchronous descriptor I/O potentially still in flight.
+            std::fs::remove_dir_all(&checkout_path).unwrap();
+            drop(adoption);
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!checkout_path.exists());
+            assert!(!staging.exists());
+        });
     }
 
     #[test]
