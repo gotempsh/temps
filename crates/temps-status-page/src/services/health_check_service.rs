@@ -1456,10 +1456,12 @@ mod tests {
         let address = listener.local_addr().expect("read TLS listener address");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept TLS probe");
-            let mut stream = acceptor
-                .accept(stream)
-                .await
-                .expect("complete TLS handshake");
+            // A caller that does not trust this test certificate must reject
+            // the handshake. That is an expected path in the certificate
+            // validation regression below, rather than a server panic.
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
             let mut request = [0_u8; 2048];
             let size = stream.read(&mut request).await.expect("read HTTPS probe");
             assert!(
@@ -1729,6 +1731,161 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(attempts, 1);
         assert_eq!(response.url().host_str(), Some(hostname));
+    }
+
+    #[tokio::test]
+    async fn managed_redirect_tls_certificate_failure_records_outage() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP proxy test listener");
+        let http_address = http_listener
+            .local_addr()
+            .expect("read HTTP listener address");
+        let initial_config = temps_config::ServerConfig::new(
+            http_address.to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .expect("build initial server config");
+        let initial_config_service =
+            temps_config::ConfigService::new(Arc::new(initial_config), db.clone());
+        let subdomain = "tls-follow-up-coverage";
+        let (public_url, is_external) = initial_config_service
+            .get_deployment_url_by_slug_with_source(subdomain)
+            .await
+            .expect("resolve generated health URL");
+        assert!(!is_external);
+        let hostname = reqwest::Url::parse(&public_url)
+            .expect("parse generated URL")
+            .host_str()
+            .expect("generated URL has host")
+            .to_string();
+        let (tls_address, _untrusted_root) = spawn_test_tls_server(&hostname).await;
+        let config = temps_config::ServerConfig::new(
+            http_address.to_string(),
+            test_db.database_url.clone(),
+            Some(tls_address.to_string()),
+            None,
+        )
+        .expect("build split proxy config");
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("TLS Follow-up Test".to_string()),
+            repo_name: Set("tls-follow-up".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("tls-follow-up".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(subdomain.to_string()),
+            host: Set(hostname.clone()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test environment");
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("tls-follow-up-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test deployment");
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        let environment = active_environment
+            .update(db.as_ref())
+            .await
+            .expect("select test deployment");
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("managed TLS health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_path: Set(Some("/ready".to_string())),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            is_managed: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert managed monitor");
+
+        let redirect_url = format!("https://{hostname}/ready");
+        let http_server = tokio::spawn(async move {
+            let (mut stream, _) = http_listener.accept().await.expect("accept HTTP probe");
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).await.expect("read HTTP probe");
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1"));
+            let response = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {redirect_url}\r\nX-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("send proxy-owned redirect");
+        });
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let service =
+            HealthCheckService::new(db.clone(), config_service.clone(), job_queue.clone())
+                .expect("build health check service");
+        HealthCheckService::check_monitor(
+            db.clone(),
+            service.http_client.clone(),
+            config_service,
+            monitor.clone(),
+            job_queue,
+        )
+        .await
+        .expect("record failed TLS verification");
+        http_server.await.expect("proxy redirect was served");
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .expect("load recorded checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "major_outage");
+        assert!(checks[0].response_time_ms.is_some());
+        assert!(checks[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Local HTTPS proxy probe failed")));
     }
 
     #[tokio::test]
