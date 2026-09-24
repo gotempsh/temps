@@ -5360,6 +5360,24 @@ impl DeploymentService {
     }
 }
 
+#[async_trait::async_trait]
+impl temps_monitoring::ContainerRuntimeResolver for DeploymentService {
+    async fn resolve_runtime(
+        &self,
+        node_id: i32,
+    ) -> Result<
+        Arc<dyn temps_deployer::ContainerDeployer>,
+        temps_monitoring::ContainerRuntimeResolutionError,
+    > {
+        self.deployer_for_node(Some(node_id))
+            .await
+            .map_err(|error| temps_monitoring::ContainerRuntimeResolutionError {
+                node_id,
+                reason: error.to_string(),
+            })
+    }
+}
+
 // Implement DeploymentCanceller trait from temps-core
 #[async_trait::async_trait]
 impl temps_core::DeploymentCanceller for DeploymentService {
