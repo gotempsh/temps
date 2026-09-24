@@ -136,6 +136,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 docker_log_service,
                 docker_handle.clone(),
                 deployer.clone(),
+                image_builder.clone(),
                 encryption_service.clone(),
             ));
             // Wire telemetry for deploy-funnel events (rollback_triggered).
@@ -390,7 +391,8 @@ impl TempsPlugin for DeploymentsPlugin {
                         temps_core::docker_socket_grant::process_grant().clone(),
                     ),
             );
-            workflow_execution_service.set_node_scheduler(node_scheduler);
+            workflow_execution_service.set_node_scheduler(node_scheduler.clone());
+            deployment_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
             if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
@@ -430,6 +432,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 dsn_service.clone(),
                 encryption_service.clone(),
             ));
+            deployment_service.set_workflow_planner(workflow_planner.clone());
             let source_drop_planner = workflow_planner.clone();
 
             // Capture the secrets-resolver handle BEFORE moving workflow_planner

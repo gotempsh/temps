@@ -391,6 +391,15 @@ pub struct DeploymentService {
     /// `telemetry`: a missing sink degrades to a log line, never a failed
     /// deployment.
     audit_logger: std::sync::OnceLock<Arc<dyn temps_core::AuditLogger>>,
+    /// Scheduler shared with the normal workflow path. Promotion and rollback
+    /// build deploy jobs inline, so they must receive it explicitly or every
+    /// reused image is implicitly assigned to the control plane.
+    node_scheduler: std::sync::OnceLock<Arc<crate::services::NodeScheduler>>,
+    /// Image source used when a selected worker needs an image transferred.
+    image_builder: Arc<dyn temps_deployer::ImageBuilder>,
+    /// Planner shared with normal deployments for worker-specific environment
+    /// rewrites and cross-node managed-service blockers.
+    workflow_planner: std::sync::OnceLock<Arc<crate::services::WorkflowPlanner>>,
 }
 
 fn deployment_url_from_settings(
@@ -1030,6 +1039,7 @@ impl DeploymentService {
         docker_log_service: Arc<temps_logs::DockerLogService>,
         docker_handle: Arc<temps_core::DockerHandle>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+        image_builder: Arc<dyn temps_deployer::ImageBuilder>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         DeploymentService {
@@ -1040,11 +1050,14 @@ impl DeploymentService {
             docker_log_service,
             docker_handle,
             deployer,
+            image_builder,
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
+            node_scheduler: std::sync::OnceLock::new(),
+            workflow_planner: std::sync::OnceLock::new(),
         }
     }
 
@@ -1074,6 +1087,15 @@ impl DeploymentService {
     /// same way an ordinary deployment does.
     pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
         let _ = self.audit_logger.set(logger);
+    }
+
+    /// Use the cluster scheduler for inline artifact-reuse deployments.
+    pub fn set_node_scheduler(&self, scheduler: Arc<crate::services::NodeScheduler>) {
+        let _ = self.node_scheduler.set(scheduler);
+    }
+
+    pub fn set_workflow_planner(&self, planner: Arc<crate::services::WorkflowPlanner>) {
+        let _ = self.workflow_planner.set(planner);
     }
 
     /// The telemetry reporter, or a no-op when none has been wired.
@@ -2155,6 +2177,157 @@ impl DeploymentService {
         Ok(())
     }
 
+    async fn configure_reuse_deploy_builder(
+        &self,
+        mut builder: crate::jobs::DeployImageJobBuilder,
+        project: &projects::Model,
+        environment: &environments::Model,
+        image_name: &str,
+        local_environment_variables: &HashMap<String, String>,
+    ) -> crate::jobs::DeployImageJobBuilder {
+        if let Some(scheduler) = self.node_scheduler.get() {
+            builder = builder.node_scheduler(scheduler.clone());
+        }
+        builder = builder
+            .encryption_service(self.encryption_service.clone())
+            .config_service(self.config_service.clone())
+            .image_builder(self.image_builder.clone());
+
+        let environment_config = environment.deployment_config.as_ref();
+        let project_config = project.deployment_config.as_ref();
+        if let Some(target_nodes) = environment_config
+            .and_then(|config| config.configured_target_nodes().map(<[i32]>::to_vec))
+            .or_else(|| {
+                project_config
+                    .and_then(|config| config.configured_target_nodes().map(<[i32]>::to_vec))
+            })
+        {
+            builder = builder.target_nodes(target_nodes);
+        }
+        if let Some(target_labels) = environment_config
+            .and_then(|config| config.configured_target_labels().cloned())
+            .or_else(|| {
+                project_config.and_then(|config| config.configured_target_labels().cloned())
+            })
+        {
+            builder = builder.target_labels(target_labels);
+        }
+        builder = builder.anti_affinity(
+            environment_config
+                .map(|config| config.anti_affinity)
+                .or_else(|| project_config.map(|config| config.anti_affinity))
+                .unwrap_or(true),
+        );
+
+        if let Some(planner) = self.workflow_planner.get() {
+            let remote_plan = planner
+                .build_remote_environment_variables(project, local_environment_variables)
+                .await;
+            builder = builder
+                .remote_environment_variables(remote_plan.variables)
+                .cross_node_service_blockers(remote_plan.blockers);
+        }
+
+        if let Ok(settings) = self.config_service.get_settings().await {
+            builder = builder.container_log_config(temps_deployer::ContainerLogConfig::new(
+                settings.container_logs.max_size.clone(),
+                settings.container_logs.max_file,
+            ));
+            let registry = &settings.docker_registry;
+            if registry.enabled {
+                if let (Some(username), Some(password), Some(registry_url)) = (
+                    registry.username.clone(),
+                    registry.password.clone(),
+                    registry.registry_url.clone(),
+                ) {
+                    let image_registry =
+                        crate::jobs::PullExternalImageJob::registry_from_image_ref(image_name);
+                    let configured_registry =
+                        crate::jobs::PullExternalImageJob::registry_host_from_url(&registry_url);
+                    if matches!(
+                        (&image_registry, &configured_registry),
+                        (Some(image_registry), Some(configured_registry))
+                            if image_registry == configured_registry
+                    ) {
+                        builder = builder.registry_credentials(
+                            temps_deployer::remote::RemotePullCredentials {
+                                username: Some(username),
+                                password: Some(password),
+                                identity_token: None,
+                                server_address: Some(registry_url),
+                            },
+                        );
+                    } else {
+                        warn!(
+                            image_registry = ?image_registry,
+                            configured_registry = ?configured_registry,
+                            "Skipping Docker registry credentials for reused image because the registry does not match"
+                        );
+                    }
+                }
+            }
+        }
+
+        builder
+    }
+
+    async fn fail_reuse_deployment(
+        &self,
+        deployment_id: i32,
+        operation: &str,
+        error: impl std::fmt::Display,
+    ) -> DeploymentError {
+        let reason = format!("{operation} for deployment {deployment_id}: {error}");
+        let update = deployments::Entity::update_many()
+            .col_expr(
+                deployments::Column::State,
+                sea_orm::sea_query::Expr::value("failed"),
+            )
+            .col_expr(
+                deployments::Column::FinishedAt,
+                sea_orm::sea_query::Expr::value(Some(chrono::Utc::now())),
+            )
+            .col_expr(
+                deployments::Column::CancelledReason,
+                sea_orm::sea_query::Expr::value(Some(reason.clone())),
+            )
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .exec(self.db.as_ref())
+            .await;
+
+        match update {
+            Ok(result) if result.rows_affected == 1 => DeploymentError::Other(reason),
+            Ok(result) => DeploymentError::DatabaseError {
+                reason: format!(
+                    "{reason}; additionally failed to persist terminal state: expected one deployment row, updated {}",
+                    result.rows_affected
+                ),
+            },
+            Err(update_error) => DeploymentError::DatabaseError {
+                reason: format!(
+                    "{reason}; additionally failed to persist terminal state: {update_error}"
+                ),
+            },
+        }
+    }
+
+    async fn activate_static_reuse(
+        &self,
+        environment: environments::Model,
+        deployment: deployments::Model,
+    ) -> Result<(), DbErr> {
+        let transaction = self.db.begin().await?;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        active_environment.update(&transaction).await?;
+
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("completed".to_string());
+        active_deployment.finished_at = Set(Some(chrono::Utc::now()));
+        active_deployment.update(&transaction).await?;
+        transaction.commit().await
+    }
+
     pub async fn rollback_to_deployment(
         &self,
         project_id: i32,
@@ -2222,29 +2395,23 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let preset =
+        let is_static = project.preset == temps_entities::preset::Preset::Static;
+        if !is_static {
             temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
                 .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
                 .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        }
 
         // --- Git projects: rebuild from source when the image isn't reusable ---
         //
-        // The image-reuse path below is fast — it redeploys the target
-        // deployment's stored Docker image as-is — but it only works when that
-        // image is still present locally. The nightly cleanup prunes images
-        // after ~7 days, so reusing an older one fails with "image no longer
-        // exists locally", and static deployments have no runnable server image
-        // to reuse at all.
+        // The artifact-reuse path below redeploys the target's immutable image
+        // reference or static asset lineage as-is. The selected worker owns
+        // image verification/pull, so a daemon-less control plane never probes
+        // its own cache.
         //
-        // So for git-sourced projects we PREFER image reuse when the image is
-        // still in the local Docker cache (the common case — rolling back a
-        // recent deploy): it's near-instant and byte-identical to what we're
-        // rolling back to, with no dependency on the git remote or registry.
-        // We only fall back to a full rebuild-from-source at the target
-        // deployment's commit when the image is gone (pruned) or the preset is
-        // static (no reusable server image). The rebuild path always works (no
-        // dependency on a surviving image), goes through the same health checks
-        // as a normal deploy, and reconstructs static bundles correctly.
+        // Git projects fall back to rebuilding the recorded commit only when
+        // the durable artifact reference itself is absent. Static deployments
+        // reuse their stored asset origin without requiring a server image.
         //
         // Non-git projects (docker_image / static_files / manual without a git
         // ref) have no source to rebuild, so they always use image reuse.
@@ -2257,30 +2424,29 @@ impl DeploymentService {
                 .as_ref()
                 .is_some_and(|b| !b.is_empty());
 
-        // Is the target's image still in the local cache? A static preset has no
-        // reusable server image, so treat it as "not present" to force a rebuild.
-        // Any error probing Docker is treated as "not present" — rebuilding from
-        // source is always safe, whereas trusting a possibly-stale image is not.
-        let is_static = preset.project_type() == temps_presets::ProjectType::Static;
-        let image_present = if is_static {
-            false
+        // Artifact availability is represented by durable deployment metadata.
+        // The selected worker verifies or pulls a container image; the control
+        // plane may intentionally have no Docker daemon at all.
+        let artifact_available = if is_static {
+            target_deployment
+                .static_dir_location
+                .as_ref()
+                .is_some_and(|location| !location.is_empty())
         } else {
-            match target_deployment.image_name.as_deref() {
-                Some(img) if !img.is_empty() => {
-                    self.deployer.image_exists(img).await.unwrap_or(false)
-                }
-                _ => false,
-            }
+            target_deployment
+                .image_name
+                .as_ref()
+                .is_some_and(|image| !image.is_empty())
         };
 
         if project.source_type == temps_entities::source_type::SourceType::Git
             && has_git_ref
-            && !image_present
+            && !artifact_available
         {
             info!(
                 "Rollback: project {} is git-sourced and the target image is unavailable ({}) — rebuilding from source at commit {:?} (rolling back to #{})",
                 project_id,
-                if is_static { "static preset" } else { "image not in local cache" },
+                if is_static { "static artifact missing" } else { "image reference missing" },
                 target_deployment.commit_sha,
                 deployment_id
             );
@@ -2338,12 +2504,7 @@ impl DeploymentService {
                 .await);
         }
 
-        // Ensure target deployment has an image to roll back to
-        let image_name = target_deployment.image_name.clone().ok_or_else(|| {
-            DeploymentError::Other(
-                "Target deployment has no image_name - cannot rollback".to_string(),
-            )
-        })?;
+        let image_name = target_deployment.image_name.clone();
 
         let environment = environments::Entity::find_by_id(environment_id)
             .filter(environments::Column::DeletedAt.is_null())
@@ -2353,7 +2514,10 @@ impl DeploymentService {
 
         info!(
             "Initiating rollback for project_id: {}, to deployment_id: {}, image: {}, environment_id: {}",
-            project_id, deployment_id, image_name, environment_id
+            project_id,
+            deployment_id,
+            image_name.as_deref().unwrap_or("static artifact"),
+            environment_id
         );
 
         // --- Create a NEW deployment record for the rollback ---
@@ -2401,7 +2565,7 @@ impl DeploymentService {
             commit_message: Set(target_deployment.commit_message.clone()),
             commit_author: Set(target_deployment.commit_author.clone()),
             commit_json: Set(target_deployment.commit_json.clone()),
-            image_name: Set(Some(image_name.clone())),
+            image_name: Set(image_name.clone()),
             started_at: Set(Some(now)),
             finished_at: Set(None),
             deploying_at: Set(Some(now)),
@@ -2436,25 +2600,37 @@ impl DeploymentService {
 
         let rollback_deployment_id = rollback_deployment.id;
         info!(
-            "Created rollback deployment #{} (rolling back to #{}, image: {})",
-            rollback_deployment_id, deployment_id, image_name
+            "Created rollback deployment #{} (rolling back to #{}, artifact: {})",
+            rollback_deployment_id,
+            deployment_id,
+            image_name.as_deref().unwrap_or("static")
         );
 
-        if !super::job_processor::JobProcessorService::try_admit_deployment(
+        let admitted = match super::job_processor::JobProcessorService::try_admit_deployment(
             self.db.as_ref(),
             rollback_deployment_id,
         )
         .await
-        .map_err(|error| DeploymentError::DatabaseError {
-            reason: format!(
-                "Failed to admit rollback deployment {}: {}",
-                rollback_deployment_id, error
-            ),
-        })? {
-            return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Rollback deployment {} was not admitted because its owner is being deleted",
-                rollback_deployment_id
-            )));
+        {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return Err(self
+                    .fail_reuse_deployment(
+                        rollback_deployment_id,
+                        "Failed to admit rollback",
+                        error,
+                    )
+                    .await);
+            }
+        };
+        if !admitted {
+            return Err(self
+                .fail_reuse_deployment(
+                    rollback_deployment_id,
+                    "Rollback was not admitted",
+                    "its project or environment is being deleted",
+                )
+                .await);
         }
 
         // Anonymous telemetry: a rollback was initiated. No identifying props.
@@ -2463,59 +2639,37 @@ impl DeploymentService {
                 temps_core::telemetry::TelemetryEventKind::RollbackTriggered,
             ));
 
+        // From this point onward the deployment row exists and has been
+        // admitted. Keep every fallible setup/finalization step inside one
+        // boundary so no `?` can leave it pending or running indefinitely.
+        let execution_result: Result<(), DeploymentError> = async {
         // Check if preset is static - if so, just update environment without deploying
-        if preset.project_type() == temps_presets::ProjectType::Static {
+        if is_static {
             info!("Rollback: Static preset detected - updating environment only");
 
-            let mut active_env: environments::ActiveModel = environment.into();
-            active_env.current_deployment_id = Set(Some(rollback_deployment_id));
-            active_env.update(self.db.as_ref()).await?;
-
-            // Mark the rollback deployment as completed
-            let mut active_dep: deployments::ActiveModel = rollback_deployment.clone().into();
-            active_dep.state = Set("completed".to_string());
-            active_dep.finished_at = Set(Some(chrono::Utc::now()));
-            active_dep.update(self.db.as_ref()).await?;
+            if let Err(error) = self
+                .activate_static_reuse(environment, rollback_deployment.clone())
+                .await
+            {
+                return Err(self
+                    .fail_reuse_deployment(
+                        rollback_deployment_id,
+                        "Failed to activate static rollback",
+                        error,
+                    )
+                    .await);
+            }
 
             info!(
                 "Rollback completed - environment {} now points to rollback deployment {}",
                 environment_id, rollback_deployment_id
             );
         } else {
-            // Pre-flight check: verify the Docker image still exists locally
-            match self.deployer.image_exists(&image_name).await {
-                Ok(true) => {
-                    info!(
-                        "Rollback: Image '{}' exists locally, proceeding",
-                        image_name
-                    );
-                }
-                Ok(false) => {
-                    // Mark the rollback deployment as failed
-                    let mut active_dep: deployments::ActiveModel =
-                        rollback_deployment.clone().into();
-                    active_dep.state = Set("failed".to_string());
-                    active_dep.finished_at = Set(Some(chrono::Utc::now()));
-                    active_dep.cancelled_reason = Set(Some(format!(
-                        "Docker image '{}' no longer exists locally",
-                        image_name
-                    )));
-                    let _ = active_dep.update(self.db.as_ref()).await;
-
-                    return Err(DeploymentError::Other(format!(
-                        "Cannot rollback: Docker image '{}' no longer exists locally. \
-                         The image may have been removed by Docker pruning. \
-                         Consider redeploying from source instead.",
-                        image_name
-                    )));
-                }
-                Err(e) => {
-                    return Err(DeploymentError::Other(format!(
-                        "Cannot rollback: failed to verify Docker image '{}' exists: {}",
-                        image_name, e
-                    )));
-                }
-            }
+            let image_name = image_name.ok_or_else(|| {
+                DeploymentError::Other(format!(
+                    "Target deployment {deployment_id} has no reusable image reference"
+                ))
+            })?;
 
             // --- Create per-job log paths (matching normal deployment pattern) ---
             let deploy_log_id = format!(
@@ -2605,15 +2759,6 @@ impl DeploymentService {
                         ))
                     })?;
 
-            // --- Step 0: Stop current environment containers BEFORE deploying ---
-            // This prevents port conflicts where the old container still holds a port.
-            info!(
-                "Rollback: Stopping current containers for environment {}",
-                environment_id
-            );
-            self.stop_environment_containers(environment_id, rollback_deployment_id)
-                .await;
-
             info!("Rollback: Deploying image: {}", image_name);
 
             // Step 1: Execute DeployImageJob with external image
@@ -2670,15 +2815,6 @@ impl DeploymentService {
                     .log_service(self.log_service.clone())
                     .failed_container_retention(self.db.clone(), rollback_deployment_id);
 
-            // Apply container log rotation settings from config
-            if let Ok(settings) = self.config_service.get_settings().await {
-                deploy_builder =
-                    deploy_builder.container_log_config(temps_deployer::ContainerLogConfig::new(
-                        settings.container_logs.max_size.clone(),
-                        settings.container_logs.max_file,
-                    ));
-            }
-
             // Resolve CPU/memory limits + requests (env → project), matching the
             // normal deploy path (WorkflowExecutionService). Each field resolves
             // independently; when neither side configures a value it stays unset
@@ -2711,7 +2847,17 @@ impl DeploymentService {
                 );
                 std::collections::HashMap::new()
             };
-            deploy_builder = deploy_builder.environment_variables(resolved_env);
+            deploy_builder = deploy_builder.environment_variables(resolved_env.clone());
+
+            deploy_builder = self
+                .configure_reuse_deploy_builder(
+                    deploy_builder,
+                    &project,
+                    &environment,
+                    &image_name,
+                    &resolved_env,
+                )
+                .await;
 
             let deploy_job = deploy_builder
                 .build(self.deployer.clone())
@@ -2852,6 +2998,18 @@ impl DeploymentService {
                 rollback_deployment_id
             );
         }
+        Ok(())
+        }
+        .await;
+        if let Err(error) = execution_result {
+            return Err(self
+                .fail_reuse_deployment(
+                    rollback_deployment_id,
+                    "Rollback artifact reuse failed",
+                    error,
+                )
+                .await);
+        }
 
         // Re-fetch the rollback deployment to get the final state
         let final_deployment = deployments::Entity::find_by_id(rollback_deployment_id)
@@ -2862,130 +3020,6 @@ impl DeploymentService {
         Ok(self
             .map_db_deployment_to_deployment(final_deployment, true, None)
             .await)
-    }
-
-    /// Stop all running containers for an environment (used before rollback deploys)
-    async fn stop_environment_containers(&self, environment_id: i32, exclude_deployment_id: i32) {
-        // Find all active deployments for this environment
-        let active_deployments = match deployments::Entity::find()
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::Id.ne(exclude_deployment_id))
-            .filter(deployments::Column::State.is_in(vec!["running", "completed", "deployed"]))
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(deps) => deps,
-            Err(e) => {
-                warn!(
-                    "Failed to fetch active deployments for pre-rollback cleanup: {}",
-                    e
-                );
-                return;
-            }
-        };
-
-        for dep in &active_deployments {
-            let containers = match deployment_containers::Entity::find()
-                .filter(deployment_containers::Column::DeploymentId.eq(dep.id))
-                .filter(deployment_containers::Column::DeletedAt.is_null())
-                .all(self.db.as_ref())
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch containers for deployment {}: {}",
-                        dep.id, e
-                    );
-                    continue;
-                }
-            };
-
-            for container in containers {
-                let container_id = container.container_id.clone();
-
-                // Mark the row deleted *before* stopping the container in Docker
-                // (see the identical race explained in
-                // WorkflowExecutionService::teardown_previous_deployment):
-                // ContainerHealthMonitor polls on its own schedule and would
-                // otherwise observe this container mid-exit with no signal that
-                // the exit is an intentional pre-rollback cleanup, firing a
-                // false ContainerCrash alarm.
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("removed".to_string()));
-                if let Err(e) = active_container.update(self.db.as_ref()).await {
-                    warn!(
-                        "Failed to mark container {} deleted before pre-rollback stop: {}",
-                        container_id, e
-                    );
-                }
-
-                if let Err(e) = self.deployer.stop_container(&container_id).await {
-                    warn!(
-                        "Failed to stop container {} during pre-rollback cleanup: {}",
-                        container_id, e
-                    );
-                }
-                if let Err(e) = self.deployer.remove_container(&container_id).await {
-                    warn!(
-                        "Failed to remove container {} during pre-rollback cleanup: {}",
-                        container_id, e
-                    );
-                }
-
-                info!(
-                    "Pre-rollback: stopped and removed container {}",
-                    container_id
-                );
-            }
-
-            // If this deployment is currently in-flight (state = "running"),
-            // its MarkDeploymentCompleteJob may still be executing — in
-            // particular, it may be waiting inside Phase 2.75 (public
-            // readiness check). We have just killed all of its containers, so
-            // Phase 2.75 will fail, causing reject_unusable_deployment to mark
-            // this deployment "failed" even though it was intentionally
-            // superseded by the incoming rollback. Atomically flip it to
-            // "stopped" here (CAS: only transitions from "running") so that
-            // the staleness check added to mark_complete_inner can detect the
-            // supersession and abort cleanly without calling
-            // reject_unusable_deployment, preserving "stopped" for
-            // promote/rollback reuse.
-            if dep.state == "running" {
-                use sea_orm::sea_query::Expr;
-                match deployments::Entity::update_many()
-                    .col_expr(deployments::Column::State, Expr::value("stopped"))
-                    .col_expr(
-                        deployments::Column::UpdatedAt,
-                        Expr::value(chrono::Utc::now()),
-                    )
-                    .filter(deployments::Column::Id.eq(dep.id))
-                    .filter(deployments::Column::State.eq("running"))
-                    .exec(self.db.as_ref())
-                    .await
-                {
-                    Ok(res) if res.rows_affected > 0 => {
-                        info!(
-                            "Pre-rollback: marked in-flight deployment {} as stopped \
-                             to prevent spurious 'failed' state from concurrent Phase 2.75",
-                            dep.id
-                        );
-                    }
-                    Ok(_) => {
-                        // 0 rows affected: deployment already left "running"
-                        // (e.g., completed between the container kill and this
-                        // update) — nothing to do.
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Pre-rollback: failed to mark in-flight deployment {} as stopped: {}",
-                            dep.id, e
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// Promote a deployment to a different environment.
@@ -3048,13 +3082,10 @@ impl DeploymentService {
             )));
         }
 
-        // Must have an image to promote
-        let image_name = source.image_name.clone().ok_or_else(|| {
-            DeploymentError::Other(format!(
-                "Source deployment {} has no image — cannot promote",
-                source_deployment_id
-            ))
-        })?;
+        // Static deployments reuse their durable asset origin and do not have
+        // a container image. Validate the appropriate artifact after the
+        // project preset has been resolved below.
+        let image_name = source.image_name.clone();
 
         // Fetch target environment and verify it belongs to the same project
         let target_env = environments::Entity::find_by_id(target_environment_id)
@@ -3077,13 +3108,29 @@ impl DeploymentService {
 
         info!(
             "Promoting deployment {} to environment '{}' (project {}, image: {})",
-            source_deployment_id, target_env.name, project_id, image_name
+            source_deployment_id,
+            target_env.name,
+            project_id,
+            image_name.as_deref().unwrap_or("static artifact")
         );
 
-        let preset =
+        let is_static = project.preset == temps_entities::preset::Preset::Static;
+        if !is_static {
             temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
                 .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
                 .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        }
+
+        if is_static
+            && source
+                .static_dir_location
+                .as_ref()
+                .is_none_or(|location| location.is_empty())
+        {
+            return Err(DeploymentError::Other(format!(
+                "Source deployment {source_deployment_id} has no reusable static artifact"
+            )));
+        }
 
         let now = chrono::Utc::now();
 
@@ -3144,7 +3191,7 @@ impl DeploymentService {
             commit_message: Set(source.commit_message.clone()),
             commit_author: Set(source.commit_author.clone()),
             commit_json: Set(source.commit_json.clone()),
-            image_name: Set(Some(image_name.clone())),
+            image_name: Set(image_name.clone()),
             started_at: Set(Some(now)),
             finished_at: Set(None),
             deploying_at: Set(Some(now)),
@@ -3183,65 +3230,54 @@ impl DeploymentService {
             promoted_id, source_deployment_id, target_env.name
         );
 
-        if !super::job_processor::JobProcessorService::try_admit_deployment(
+        let admitted = match super::job_processor::JobProcessorService::try_admit_deployment(
             self.db.as_ref(),
             promoted_id,
         )
         .await
-        .map_err(|error| DeploymentError::DatabaseError {
-            reason: format!(
-                "Failed to admit promoted deployment {}: {}",
-                promoted_id, error
-            ),
-        })? {
-            return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Promoted deployment {} was not admitted because its owner is being deleted",
-                promoted_id
-            )));
+        {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return Err(self
+                    .fail_reuse_deployment(promoted_id, "Failed to admit promotion", error)
+                    .await);
+            }
+        };
+        if !admitted {
+            return Err(self
+                .fail_reuse_deployment(
+                    promoted_id,
+                    "Promotion was not admitted",
+                    "its project or environment is being deleted",
+                )
+                .await);
         }
 
+        // As with rollback, every error after admission must converge the new
+        // row to a durable terminal state.
+        let execution_result: Result<(), DeploymentError> = async {
         // Same logic as rollback — for static presets, just update env pointer
-        if preset.project_type() == temps_presets::ProjectType::Static {
+        if is_static {
             info!("Promotion: Static preset detected — updating environment only");
 
-            let mut active_env: environments::ActiveModel = target_env.into();
-            active_env.current_deployment_id = Set(Some(promoted_id));
-            active_env.update(self.db.as_ref()).await?;
-
-            let mut active_dep: deployments::ActiveModel = promoted_deployment.clone().into();
-            active_dep.state = Set("completed".to_string());
-            active_dep.finished_at = Set(Some(chrono::Utc::now()));
-            active_dep.update(self.db.as_ref()).await?;
-        } else {
-            // Verify the Docker image still exists
-            match self.deployer.image_exists(&image_name).await {
-                Ok(true) => {
-                    info!("Promotion: Image '{}' exists locally", image_name);
-                }
-                Ok(false) => {
-                    let mut active_dep: deployments::ActiveModel =
-                        promoted_deployment.clone().into();
-                    active_dep.state = Set("failed".to_string());
-                    active_dep.finished_at = Set(Some(chrono::Utc::now()));
-                    active_dep.cancelled_reason = Set(Some(format!(
-                        "Docker image '{}' no longer exists locally",
-                        image_name
-                    )));
-                    let _ = active_dep.update(self.db.as_ref()).await;
-
-                    return Err(DeploymentError::Other(format!(
-                        "Cannot promote: Docker image '{}' no longer exists locally. \
-                         Consider redeploying from source instead.",
-                        image_name
-                    )));
-                }
-                Err(e) => {
-                    return Err(DeploymentError::Other(format!(
-                        "Cannot promote: failed to verify Docker image '{}': {}",
-                        image_name, e
-                    )));
-                }
+            if let Err(error) = self
+                .activate_static_reuse(target_env, promoted_deployment.clone())
+                .await
+            {
+                return Err(self
+                    .fail_reuse_deployment(
+                        promoted_id,
+                        "Failed to activate static promotion",
+                        error,
+                    )
+                    .await);
             }
+        } else {
+            let image_name = image_name.ok_or_else(|| {
+                DeploymentError::Other(format!(
+                    "Source deployment {source_deployment_id} has no reusable image reference"
+                ))
+            })?;
 
             // --- Create per-job log paths (matching rollback/normal deployment pattern) ---
             let deploy_log_id = format!(
@@ -3331,14 +3367,6 @@ impl DeploymentService {
                         ))
                     })?;
 
-            // Stop current environment containers before deploying
-            info!(
-                "Promotion: Stopping current containers for environment {}",
-                target_environment_id
-            );
-            self.stop_environment_containers(target_environment_id, promoted_id)
-                .await;
-
             info!("Promotion: Deploying image: {}", image_name);
 
             // Execute DeployImageJob with external image
@@ -3393,15 +3421,6 @@ impl DeploymentService {
                     .log_service(self.log_service.clone())
                     .failed_container_retention(self.db.clone(), promoted_id);
 
-            // Apply container log rotation settings from config
-            if let Ok(settings) = self.config_service.get_settings().await {
-                deploy_builder =
-                    deploy_builder.container_log_config(temps_deployer::ContainerLogConfig::new(
-                        settings.container_logs.max_size.clone(),
-                        settings.container_logs.max_file,
-                    ));
-            }
-
             // Resolve CPU/memory limits + requests (target env → project),
             // matching the normal deploy path so a promotion preserves a
             // configured limit and leaves an unconfigured environment uncapped.
@@ -3433,7 +3452,17 @@ impl DeploymentService {
                 );
                 std::collections::HashMap::new()
             };
-            deploy_builder = deploy_builder.environment_variables(resolved_env);
+            deploy_builder = deploy_builder.environment_variables(resolved_env.clone());
+
+            deploy_builder = self
+                .configure_reuse_deploy_builder(
+                    deploy_builder,
+                    &project,
+                    &target_env,
+                    &image_name,
+                    &resolved_env,
+                )
+                .await;
 
             let deploy_job = deploy_builder
                 .build(self.deployer.clone())
@@ -3563,6 +3592,14 @@ impl DeploymentService {
                 "Promotion completed - deployment {} is now active",
                 promoted_id
             );
+        }
+        Ok(())
+        }
+        .await;
+        if let Err(error) = execution_result {
+            return Err(self
+                .fail_reuse_deployment(promoted_id, "Promotion artifact reuse failed", error)
+                .await);
         }
 
         // Re-fetch the promoted deployment to get the final state
@@ -5424,6 +5461,86 @@ mod tests {
     use std::sync::Arc;
     use temps_core::EncryptionService;
 
+    struct NoopImageBuilder;
+
+    #[async_trait::async_trait]
+    impl temps_deployer::ImageBuilder for NoopImageBuilder {
+        async fn build_image(
+            &self,
+            request: temps_deployer::BuildRequest,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            Ok(temps_deployer::BuildResult {
+                image_id: "sha256:test".to_string(),
+                image_name: request.image_name,
+                size_bytes: 0,
+                build_duration_ms: 0,
+            })
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            request: temps_deployer::BuildRequestWithCallback,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            self.build_image(request.request).await
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, temps_deployer::BuilderError> {
+            Ok("sha256:test".to_string())
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            Ok(())
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            Ok(())
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            Ok(())
+        }
+
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            Ok(temps_deployer::ImageInfo {
+                id: "sha256:test".to_string(),
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                platform: "linux/amd64".to_string(),
+                size_bytes: 0,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+            })
+        }
+
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
+
     #[test]
     fn archive_cleanup_paths_are_lexically_confined() {
         let root = std::path::Path::new("/var/lib/temps");
@@ -6186,7 +6303,7 @@ mod tests {
             let stream = stream::empty();
             Ok(Box::new(stream))
         });
-        deployer.expect_image_exists().returning(|_| Ok(true));
+        deployer.expect_image_exists().times(0);
         let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
 
         // For tests, we'll create a service that directly accepts the trait
@@ -6198,11 +6315,14 @@ mod tests {
             docker_log_service,
             docker_handle,
             deployer,
+            image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
+            node_scheduler: std::sync::OnceLock::new(),
+            workflow_planner: std::sync::OnceLock::new(),
         }
     }
 
@@ -6280,11 +6400,14 @@ mod tests {
             docker_log_service: Arc::new(temps_logs::DockerLogService::new(docker_handle.clone())),
             docker_handle,
             deployer,
+            image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
+            node_scheduler: std::sync::OnceLock::new(),
+            workflow_planner: std::sync::OnceLock::new(),
         }
     }
 
@@ -6903,6 +7026,94 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn static_promotion_reuses_assets_without_an_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _source_environment, source) = setup_test_data(&db).await?;
+
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.preset = Set(temps_entities::preset::Preset::Static);
+        active_project.preset_config = Set(Some(
+            temps_entities::preset::PresetConfig::default_for_preset(
+                temps_entities::preset::Preset::Static,
+            ),
+        ));
+        active_project.update(db.as_ref()).await?;
+
+        let mut active_source: deployments::ActiveModel = source.into();
+        active_source.image_name = Set(None);
+        active_source.static_dir_location = Set(Some("cas/static/site-asset".to_string()));
+        let source = active_source.update(db.as_ref()).await?;
+
+        let target_environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Static Target".to_string()),
+            slug: Set("static-target".to_string()),
+            host: Set("static-target.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("static-target.example.com".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let promoted = deployment_service
+            .promote_deployment(project.id, source.id, target_environment.id)
+            .await?;
+
+        let persisted = deployments::Entity::find_by_id(promoted.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static promotion was not persisted")?;
+        assert_eq!(persisted.state, "completed");
+        assert_eq!(persisted.image_name, None);
+        assert_eq!(persisted.static_dir_location, source.static_dir_location);
+        assert_eq!(persisted.promoted_from_deployment_id, Some(source.id));
+
+        let target_environment = environments::Entity::find_by_id(target_environment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static target environment disappeared")?;
+        assert_eq!(target_environment.current_deployment_id, Some(promoted.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reuse_setup_failure_persists_terminal_deployment_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let error = service
+            .fail_reuse_deployment(
+                deployment.id,
+                "Failed to configure remote worker",
+                "worker registry pull failed",
+            )
+            .await;
+        assert!(error.to_string().contains("worker registry pull failed"));
+
+        let persisted = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("failed deployment disappeared")?;
+        assert_eq!(persisted.state, "failed");
+        assert!(persisted.finished_at.is_some());
+        assert!(persisted
+            .cancelled_reason
+            .as_deref()
+            .is_some_and(
+                |reason| reason.contains("Failed to configure remote worker")
+                    && reason.contains("worker registry pull failed")
+            ));
+        Ok(())
+    }
+
     /// When the target deployment carries a git commit on a git-sourced
     /// project AND the stored image is gone (pruned), rollback should rebuild
     /// from source (enqueue a GitPushEvent) rather than fail. We assert it does
@@ -6919,10 +7130,13 @@ mod tests {
         // setup_test_data creates a Git-source project (SourceType default).
         let (_project, _environment, target_deployment) = setup_test_data(&db).await?;
 
-        // Give the target a real git commit so it's rebuildable from source.
+        // Give the target a real git commit so it's rebuildable from source,
+        // and remove the durable image reference. A control-plane-local cache
+        // miss is no longer evidence that a worker cannot pull the artifact.
         let mut active: deployments::ActiveModel = target_deployment.clone().into();
         active.commit_sha = Set(Some("abc1234deadbeef".to_string()));
         active.branch_ref = Set(Some("main".to_string()));
+        active.image_name = Set(None);
         let target_deployment = active.update(db.as_ref()).await?;
 
         let count_before = deployments::Entity::find()
@@ -6930,9 +7144,8 @@ mod tests {
             .count(db.as_ref())
             .await?;
 
-        // image_exists -> false simulates the nightly prune having removed the
-        // target's image, so rollback must rebuild from source.
-        let deployment_service = create_deployment_service_with_missing_image(db.clone());
+        // With no stored image reference, rollback must rebuild from source.
+        let deployment_service = create_deployment_service_for_rebuild(db.clone());
 
         let result = deployment_service
             .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
@@ -6959,14 +7172,14 @@ mod tests {
     }
 
     /// When the target deployment carries a git commit on a git-sourced project
-    /// AND the stored image is still in the local Docker cache (the common case
-    /// — rolling back a recent deploy), rollback should REUSE that image rather
+    /// AND the stored image reference remains available, rollback should REUSE
+    /// that image rather
     /// than pay for a full rebuild from source. Reuse is near-instant and
     /// byte-identical to the deployment we're rolling back to. We assert it
     /// takes the image-reuse path: that path synchronously inserts a brand-new
     /// rollback deployment row (a different id from the target) and returns it.
     #[tokio::test]
-    async fn test_rollback_reuses_local_image_for_git_projects(
+    async fn test_rollback_reuses_stored_image_for_git_projects(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -6975,8 +7188,8 @@ mod tests {
         // with a non-static preset (NextJs) and image_name "nginx:latest".
         let (_project, _environment, target_deployment) = setup_test_data(&db).await?;
 
-        // Give the target a real git commit — without the fix this alone would
-        // force a rebuild even though the image is sitting right here.
+        // A git commit does not force a rebuild while the deployment still
+        // carries a reusable image reference.
         let mut active: deployments::ActiveModel = target_deployment.clone().into();
         active.commit_sha = Set(Some("abc1234deadbeef".to_string()));
         active.branch_ref = Set(Some("main".to_string()));
@@ -6987,7 +7200,8 @@ mod tests {
             .count(db.as_ref())
             .await?;
 
-        // Default test service: image_exists -> true (image present locally).
+        // The stored image reference is sufficient; execution verifies it on
+        // the selected node without consulting the control-plane cache.
         let deployment_service = create_deployment_service_for_test(db.clone());
         configure_test_service_for_http_readiness(&deployment_service).await?;
 
@@ -7176,9 +7390,8 @@ mod tests {
         Ok(())
     }
 
-    /// Creates a DeploymentService where image_exists returns false,
-    /// simulating a pruned/missing Docker image.
-    fn create_deployment_service_with_missing_image(
+    /// Minimal service for the source-rebuild path, which has no container job.
+    fn create_deployment_service_for_rebuild(
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
         let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
@@ -7218,7 +7431,25 @@ mod tests {
         });
         deployer.expect_stop_container().returning(|_| Ok(()));
         deployer.expect_remove_container().returning(|_| Ok(()));
-        deployer.expect_image_exists().returning(|_| Ok(false));
+        deployer
+            .expect_get_container_info()
+            .returning(|container_id| {
+                Ok(temps_deployer::ContainerInfo {
+                    container_id: container_id.to_string(),
+                    container_name: "test-container".to_string(),
+                    image_name: "nginx:latest".to_string(),
+                    created_at: chrono::Utc::now(),
+                    status: temps_deployer::ContainerStatus::Running,
+                    ..Default::default()
+                })
+            });
+        deployer
+            .expect_list_containers()
+            .returning(|| Ok(Vec::new()));
+        deployer
+            .expect_stream_container_logs()
+            .returning(|_| Ok(Box::new(futures::stream::empty())));
+        deployer.expect_image_exists().times(0);
         let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
 
         DeploymentService {
@@ -7229,49 +7460,108 @@ mod tests {
             docker_log_service,
             docker_handle,
             deployer,
+            image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
+            node_scheduler: std::sync::OnceLock::new(),
+            workflow_planner: std::sync::OnceLock::new(),
         }
     }
 
     #[tokio::test]
-    async fn test_rollback_fails_when_image_missing() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_rollback_does_not_probe_control_plane_image_cache(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
         // Setup test data (creates a non-static project with a deployed deployment)
         let (_project, _environment, target_deployment) = setup_test_data(&db).await?;
 
-        // Use a service where image_exists returns false
-        let deployment_service = create_deployment_service_with_missing_image(db.clone());
+        // The deployer reports that the image is absent on the control plane.
+        // Artifact reuse must still proceed because the selected worker owns
+        // verification/pull of this registry image.
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
-        // Attempt rollback — should fail with a clear error before any containers are touched
         let result = deployment_service
             .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
-            .await;
+            .await?;
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            DeploymentError::Other(msg) => {
-                assert!(
-                    msg.contains("no longer exists locally"),
-                    "Expected 'no longer exists locally' in error message, got: {}",
-                    msg
-                );
-                assert!(
-                    msg.contains("Docker image"),
-                    "Expected 'Docker image' in error message, got: {}",
-                    msg
-                );
-            }
-            e => panic!(
-                "Expected DeploymentError::Other with image-not-found message, got: {:?}",
-                e
-            ),
+        assert_ne!(result.id, target_deployment.id);
+        let persisted = deployments::Entity::find_by_id(result.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("rollback deployment was not persisted")?;
+        assert_eq!(persisted.image_name, target_deployment.image_name);
+        assert_eq!(persisted.state, "completed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_keeps_current_deployment_active(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, target_deployment) = setup_test_data(&db).await?;
+
+        let current_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("current-deployment-before-failed-rollback".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            image_name: Set(Some("nginx:current".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
         }
+        .insert(db.as_ref())
+        .await?;
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        active_environment.update(db.as_ref()).await?;
+
+        let mut failing_deployer = MockContainerDeployer::new();
+        failing_deployer
+            .expect_deploy_container()
+            .times(1)
+            .returning(|_| {
+                Err(temps_deployer::DeployerError::DeploymentFailed(
+                    "candidate failed to start".to_string(),
+                ))
+            });
+        failing_deployer.expect_image_exists().times(0);
+
+        let mut service = create_deployment_service_for_test(db.clone());
+        service.deployer = Arc::new(failing_deployer);
+        let result = service
+            .rollback_to_deployment(project.id, target_deployment.id)
+            .await;
+        assert!(result.is_err());
+
+        let persisted_environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("environment disappeared")?;
+        assert_eq!(
+            persisted_environment.current_deployment_id,
+            Some(current_deployment.id),
+            "a failed candidate must not replace the active deployment"
+        );
+        let persisted_current = deployments::Entity::find_by_id(current_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("current deployment disappeared")?;
+        assert_eq!(
+            persisted_current.state, "completed",
+            "a failed candidate must not stop the active deployment"
+        );
 
         Ok(())
     }
@@ -9012,117 +9302,6 @@ mod tests {
             DeploymentService::rollback_snapshot_port_and_replicas(&invalid_replicas, 42),
             Err(DeploymentError::InvalidDeploymentState(_))
         ));
-    }
-
-    /// `stop_environment_containers` (pre-rollback cleanup) has the same
-    /// deleted-before-stopped ordering requirement as
-    /// `WorkflowExecutionService::teardown_previous_deployment`. Uses
-    /// `block_in_place` to run a real DB check from inside the mock's
-    /// `stop_container` expectation, which requires the multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_stop_environment_containers_marks_deleted_before_stopping_container(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let test_db = TestDatabase::with_migrations().await?;
-        let db = test_db.connection_arc();
-
-        let (_project, environment, old_deployment) = setup_test_data(&db).await?;
-
-        let container = deployment_containers::ActiveModel {
-            deployment_id: Set(old_deployment.id),
-            container_id: Set("old-env-container-1".to_string()),
-            container_name: Set("old-env-container-1".to_string()),
-            container_port: Set(3000),
-            deployed_at: Set(Utc::now()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await?;
-
-        // Deployment state must be one of the active states
-        // `stop_environment_containers` scans for; a nonexistent id is enough
-        // for the "exclude current deployment" filter.
-        let exclude_deployment_id = old_deployment.id + 1_000_000;
-
-        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
-        let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
-        let server_config = Arc::new(
-            temps_config::ServerConfig::new(
-                "127.0.0.1:8080".to_string(),
-                test_db_url.to_string(),
-                None,
-                None,
-            )
-            .expect("Failed to create test server config"),
-        );
-        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
-
-        let mut queue_service = MockQueueService::new();
-        queue_service.expect_send().returning(|_| Ok(()));
-        queue_service
-            .expect_subscribe()
-            .returning(|| Box::new(MockJobReceiver::new()));
-        let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
-
-        let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker));
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
-
-        let db_for_check = db.clone();
-        let mut deployer = MockContainerDeployer::new();
-        deployer
-            .expect_stop_container()
-            .returning(move |container_id| {
-                let db_for_check = db_for_check.clone();
-                let container_id = container_id.to_string();
-                let refreshed = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::ContainerId.eq(container_id))
-                            .one(db_for_check.as_ref())
-                            .await
-                    })
-                })
-                .expect("query deployment_containers row")
-                .expect("deployment_containers row exists");
-                assert!(
-                    refreshed.deleted_at.is_some(),
-                    "container must be marked deleted before stop_container() is called \
-                     during pre-rollback cleanup — otherwise ContainerHealthMonitor's \
-                     concurrent poll can observe it mid-exit with no signal the exit is \
-                     intentional, and fires a false ContainerCrash alarm"
-                );
-                Ok(())
-            });
-        deployer.expect_remove_container().returning(|_| Ok(()));
-        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
-
-        let service = DeploymentService {
-            db: db.clone(),
-            log_service,
-            config_service,
-            queue_service,
-            docker_log_service,
-            docker_handle,
-            deployer,
-            encryption_service: create_test_encryption_service(),
-            telemetry: std::sync::OnceLock::new(),
-            env_resolver: std::sync::OnceLock::new(),
-            compose_executor: std::sync::OnceLock::new(),
-            audit_logger: std::sync::OnceLock::new(),
-        };
-
-        service
-            .stop_environment_containers(environment.id, exclude_deployment_id)
-            .await;
-
-        let refreshed = deployment_containers::Entity::find_by_id(container.id)
-            .one(db.as_ref())
-            .await?
-            .expect("container row still exists");
-        assert!(refreshed.deleted_at.is_some());
-        assert_eq!(refreshed.status.as_deref(), Some("removed"));
-
-        Ok(())
     }
 
     #[tokio::test]
