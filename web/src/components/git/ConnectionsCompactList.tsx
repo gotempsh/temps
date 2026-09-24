@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
 import {
   deleteConnectionMutation,
@@ -41,6 +42,7 @@ import {
   Circle,
   Clock,
   EllipsisVertical,
+  FolderGit2,
   HeartPulse,
   Key,
   RefreshCw,
@@ -153,6 +155,17 @@ export function ConnectionsCompactList({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        {provider && (
+          <>
+            <DropdownMenuItem asChild>
+              <Link to={`/git-providers/${provider.id}/connections/${c.id}`}>
+                <FolderGit2 className="mr-2 h-4 w-4" />
+                View repositories
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem
           onSelect={(e) => {
             e.preventDefault()
@@ -218,6 +231,20 @@ export function ConnectionsCompactList({
       </DropdownMenuContent>
     </DropdownMenu>
   )
+
+  // The account name opens the connection's own page (its repositories and
+  // health) when the provider is known; without it there is no route to build.
+  const AccountName = ({ c }: { c: ConnectionResponse }) =>
+    provider ? (
+      <Link
+        to={`/git-providers/${provider.id}/connections/${c.id}`}
+        className="truncate text-sm font-medium hover:underline"
+      >
+        {c.account_name}
+      </Link>
+    ) : (
+      <span className="truncate text-sm font-medium">{c.account_name}</span>
+    )
 
   const StatusBadge = ({ c }: { c: ConnectionResponse }) =>
     c.is_active ? (
@@ -318,9 +345,7 @@ export function ConnectionsCompactList({
           />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <Users className="h-4 w-4 text-muted-foreground shrink-0" />
-            <span className="truncate text-sm font-medium">
-              {c.account_name}
-            </span>
+            <AccountName c={c} />
             <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
               {c.account_type || 'unknown'}
             </Badge>
@@ -376,9 +401,7 @@ export function ConnectionsCompactList({
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="truncate text-sm font-medium">
-                {c.account_name}
-              </span>
+              <AccountName c={c} />
               <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
                 {c.account_type || 'unknown'}
               </Badge>
@@ -425,9 +448,7 @@ export function ConnectionsCompactList({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-medium">
-              {c.account_name}
-            </span>
+            <AccountName c={c} />
             <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
               {c.account_type || 'unknown'}
             </Badge>
