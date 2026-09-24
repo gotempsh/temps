@@ -456,6 +456,13 @@ pub enum ProjectError {
     #[error("GitHub error: {0}")]
     GitHubError(String),
 
+    #[error("{provider} API rate limit reached while deploying project {project_id}")]
+    PublicRepoRateLimited {
+        project_id: i32,
+        project_slug: String,
+        provider: String,
+    },
+
     #[error("Deployment error: {0}")]
     DeploymentError(String),
 

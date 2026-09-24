@@ -1186,6 +1186,18 @@ impl From<ProjectError> for Problem {
                 .with_title("GitHub Error")
                 .with_detail(msg),
 
+            ProjectError::PublicRepoRateLimited {
+                project_id,
+                project_slug,
+                provider,
+            } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                .with_title("Git Provider Rate Limit")
+                .with_detail(format!(
+                    "{} is rate limiting project {}. Connect this project's repository to your Git provider or retry after the limit resets.",
+                    provider, project_id
+                ))
+                .with_value("setup_path", format!("/projects/{project_slug}/git/change-repository")),
+
             ProjectError::DeploymentError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Deployment Error")
@@ -1411,6 +1423,27 @@ mod tests {
     use super::*;
     use crate::services::custom_domains::CustomDomainError;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn public_repo_rate_limit_returns_actionable_429() {
+        let problem: Problem = ProjectError::PublicRepoRateLimited {
+            project_id: 42,
+            project_slug: "example-app".to_string(),
+            provider: "github".to_string(),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            problem.body.get("setup_path"),
+            Some(&serde_json::json!(
+                "/projects/example-app/git/change-repository"
+            ))
+        );
+        assert!(problem.body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Connect this project")));
+    }
 
     #[test]
     fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {

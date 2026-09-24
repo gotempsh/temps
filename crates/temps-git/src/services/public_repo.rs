@@ -227,7 +227,7 @@ impl GitHubPublicProvider {
                     let response = request.send().await.map_err(Self::map_error)?;
 
                     let status = response.status();
-                    if status.is_server_error() || status.as_u16() == 429 {
+                    if status.is_server_error() {
                         let error_text = response.text().await.unwrap_or_default();
                         return Err(PublicRepoError::ApiError(format!(
                             "HTTP {}: {}",
@@ -278,6 +278,34 @@ impl GitHubPublicProvider {
             ))),
         }
     }
+
+    async fn validate_response(
+        response: reqwest::Response,
+        authenticated: bool,
+        context: &str,
+    ) -> Result<reqwest::Response, PublicRepoError> {
+        let status = response.status();
+        let remaining = github_rate_limit_remaining(&response);
+        if status == reqwest::StatusCode::FORBIDDEN && remaining != Some(0) {
+            let retry_after = response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER);
+            let message = response.text().await.unwrap_or_default();
+            if retry_after || message.to_ascii_lowercase().contains("rate limit") {
+                return Err(PublicRepoError::RateLimitExceeded);
+            }
+            return Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: if authenticated {
+                    "Contents: read and access to the target repository".to_string()
+                } else {
+                    "authenticate with a token that has Contents: read and access to the target repository".to_string()
+                },
+            });
+        }
+        Self::check_response_status(status, remaining, authenticated, context)?;
+        Ok(response)
+    }
 }
 
 impl Default for GitHubPublicProvider {
@@ -299,14 +327,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
     ) -> Result<PublicRepoInfo, PublicRepoError> {
         let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
-        let response = self.send_with_retry(|| self.client.get(&url)).await?;
-
-        Self::check_response_status(
-            response.status(),
-            github_rate_limit_remaining(&response),
+        let response = Self::validate_response(
+            self.send_with_retry(|| self.client.get(&url)).await?,
             self.token.is_some(),
             &format!("read repository {}/{}", owner, repo),
-        )?;
+        )
+        .await?;
 
         #[derive(Deserialize)]
         struct GitHubRepo {
@@ -381,14 +407,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
                 self.api_url, owner, repo, per_page, page
             );
 
-            let response = self.send_with_retry(|| self.client.get(&url)).await?;
-
-            Self::check_response_status(
-                response.status(),
-                github_rate_limit_remaining(&response),
+            let response = Self::validate_response(
+                self.send_with_retry(|| self.client.get(&url)).await?,
                 self.token.is_some(),
                 &format!("list branches for {}/{}", owner, repo),
-            )?;
+            )
+            .await?;
 
             let branches: Vec<GitHubBranch> = response.json().await.map_err(|e| {
                 PublicRepoError::ApiError(format!("Failed to parse branches: {}", e))
@@ -422,14 +446,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
             self.api_url, owner, repo, reference
         );
 
-        let response = self.send_with_retry(|| self.client.get(&url)).await?;
-
-        Self::check_response_status(
-            response.status(),
-            github_rate_limit_remaining(&response),
+        let response = Self::validate_response(
+            self.send_with_retry(|| self.client.get(&url)).await?,
             self.token.is_some(),
             &format!("read the file tree for {}/{} at {}", owner, repo, reference),
-        )?;
+        )
+        .await?;
 
         #[derive(Deserialize)]
         struct TreeResponse {
@@ -480,14 +502,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
             urlencoding::encode(reference)
         );
 
-        let response = self.send_with_retry(|| self.client.get(&url)).await?;
-
-        Self::check_response_status(
-            response.status(),
-            github_rate_limit_remaining(&response),
+        let response = Self::validate_response(
+            self.send_with_retry(|| self.client.get(&url)).await?,
             self.token.is_some(),
             &format!("read file {} in {}/{} at {}", path, owner, repo, reference),
-        )?;
+        )
+        .await?;
 
         #[derive(Deserialize)]
         struct GitHubFile {
@@ -603,7 +623,7 @@ impl GitLabPublicProvider {
                     let response = request.send().await.map_err(Self::map_error)?;
 
                     let status = response.status();
-                    if status.is_server_error() || status.as_u16() == 429 {
+                    if status.is_server_error() {
                         // Do not buffer or log an attacker-controlled response
                         // body. Status is sufficient to drive the retry.
                         return Err(PublicRepoError::ApiError(format!("HTTP {status}")));
@@ -1358,6 +1378,75 @@ mod tests {
                 if name == "example/private-repository"
         ));
         repository.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_http_429_is_rate_limit_without_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/repos/example/public-repository")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = GitHubPublicProvider::with_token_and_api_url(
+            "request-user-token".to_string(),
+            server.url(),
+        );
+
+        let error = provider
+            .get_repository("example", "public-repository")
+            .await
+            .expect_err("GitHub 429 must be reported as a rate limit");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+        response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_secondary_403_is_rate_limit_even_with_remaining_quota() {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/repos/example/public-repository")
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "100")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"You have exceeded a secondary rate limit"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = GitHubPublicProvider::with_token_and_api_url(
+            "request-user-token".to_string(),
+            server.url(),
+        );
+
+        let error = provider
+            .get_repository("example", "public-repository")
+            .await
+            .expect_err("secondary limits must not be reported as permission errors");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+        response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gitlab_http_429_is_rate_limit_without_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/api/v4/projects/example%2Frepository")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = GitLabPublicProvider::with_test_base_url(server.url());
+
+        let error = provider
+            .get_repository("example", "repository")
+            .await
+            .expect_err("GitLab 429 must be reported as a rate limit");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+        response.assert_async().await;
     }
 
     #[test]

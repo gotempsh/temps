@@ -37,3 +37,12 @@ export function problemSetupPath(error: unknown): string | undefined {
   }
   return undefined
 }
+
+/** Keep Git provider setup links inside the current project's repository flow. */
+export function gitProviderSetupPath(error: unknown): string | undefined {
+  const path = problemSetupPath(error)
+  return path &&
+    /^\/projects\/[a-zA-Z0-9_-]+\/git\/change-repository$/.test(path)
+    ? path
+    : undefined
+}

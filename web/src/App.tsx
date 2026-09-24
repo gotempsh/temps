@@ -27,7 +27,7 @@ import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
-import { problemSetupPath } from '@/lib/api-problem'
+import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import {
   nodeCapabilityQueryKey,
   type NodeCapability,
@@ -1153,6 +1153,21 @@ const queryClient = new QueryClient({
           (problemDetails as ProblemDetails & { error_code?: string })
             .error_code ?? problemDetails.extensions?.error_code
         if (errorCode === 'STEP_UP_REQUIRED') return
+
+        if (problemDetails.title === 'Git Provider Rate Limit') {
+          const safeSetupPath = gitProviderSetupPath(problemDetails)
+          toast.error(problemDetails.title, {
+            description: problemDetails.detail,
+            duration: 10000,
+            action: safeSetupPath
+              ? {
+                  label: 'Connect Git',
+                  onClick: () => window.location.assign(safeSetupPath),
+                }
+              : undefined,
+          })
+          return
+        }
 
         // Nothing can run the work: this installation has no local Docker and
         // no worker node has joined. The raw detail is accurate but leaves the
