@@ -22,6 +22,7 @@ temps-entities = { path = "../temps-entities" }
 temps-metrics = { path = "../temps-metrics" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
@@ -35,5 +36,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
-futures = { workspace = true }
 maplit = "1.0"

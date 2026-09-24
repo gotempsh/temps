@@ -10,6 +10,7 @@
 //! - Containers that exited unexpectedly
 
 use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
+use futures::{stream, StreamExt};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
     EntityTrait, QueryFilter, Statement, TransactionTrait,
@@ -42,6 +43,14 @@ pub struct ContainerRuntimeResolutionError {
     pub reason: String,
 }
 
+#[derive(Debug, Error)]
+pub enum ContainerHealthMonitorInitError {
+    #[error(
+        "Container health monitoring requires a worker runtime resolver; ensure the deployments plugin registered ContainerRuntimeResolver"
+    )]
+    MissingRuntimeResolver,
+}
+
 /// Cached state for a container between health checks
 #[derive(Debug, Clone)]
 struct ContainerState {
@@ -55,6 +64,15 @@ struct ContainerState {
 
 type RuntimeCache =
     HashMap<i32, Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError>>;
+
+struct ContainerCheckJob {
+    container: deployment_containers::Model,
+    deployment: deployments::Model,
+    deployer: Arc<dyn ContainerDeployer>,
+    is_remote: bool,
+}
+
+const MAX_CONCURRENT_CONTAINER_CHECKS: usize = 16;
 
 fn published_tcp_host_port(
     container_port: i32,
@@ -89,6 +107,8 @@ pub struct ContainerHealthConfig {
     pub memory_threshold_percent: f64,
     /// Number of consecutive checks above threshold before firing alarm
     pub consecutive_threshold_checks: u32,
+    /// Maximum time one worker container may occupy a monitoring slot.
+    pub worker_check_timeout_ms: u64,
 }
 
 impl Default for ContainerHealthConfig {
@@ -98,6 +118,7 @@ impl Default for ContainerHealthConfig {
             cpu_threshold_percent: 90.0,
             memory_threshold_percent: 90.0,
             consecutive_threshold_checks: 3,
+            worker_check_timeout_ms: 15_000,
         }
     }
 }
@@ -138,6 +159,21 @@ impl ContainerHealthMonitor {
             container_states: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Construct the production monitor, where worker runtime resolution is a
+    /// required dependency. Returning an error here prevents a multi-node
+    /// installation from silently running without worker health checks.
+    pub fn try_new(
+        db: Arc<DatabaseConnection>,
+        deployer: Arc<dyn ContainerDeployer>,
+        alarm_service: Arc<AlarmService>,
+        config: ContainerHealthConfig,
+        runtime_resolver: Option<Arc<dyn ContainerRuntimeResolver>>,
+    ) -> Result<Self, ContainerHealthMonitorInitError> {
+        let runtime_resolver =
+            runtime_resolver.ok_or(ContainerHealthMonitorInitError::MissingRuntimeResolver)?;
+        Ok(Self::new(db, deployer, alarm_service, config).with_runtime_resolver(runtime_resolver))
     }
 
     /// Attach a metrics store. When set, container resource metrics
@@ -249,6 +285,7 @@ impl ContainerHealthMonitor {
         // the next poll.
         let mut remote_runtimes = RuntimeCache::new();
 
+        let mut jobs = Vec::with_capacity(containers.len());
         for container in &containers {
             match deployments_map.get(&container.deployment_id) {
                 None => {
@@ -275,20 +312,59 @@ impl ContainerHealthMonitor {
                             continue;
                         }
                     };
-                    if let Err(e) = self
-                        .check_container(container, deployment, deployer.as_ref())
-                        .await
-                    {
-                        debug!(
-                            "Failed to check container {} ({}): {}",
-                            container.id, container.container_name, e
-                        );
-                    }
+                    jobs.push(ContainerCheckJob {
+                        container: container.clone(),
+                        deployment: deployment.clone(),
+                        deployer,
+                        is_remote: container.node_id.is_some(),
+                    });
                 }
             }
         }
 
+        self.check_container_jobs(jobs).await;
+
         Ok(())
+    }
+
+    async fn check_container_jobs(&self, jobs: Vec<ContainerCheckJob>) {
+        stream::iter(jobs)
+            .for_each_concurrent(MAX_CONCURRENT_CONTAINER_CHECKS, |job| async move {
+                let check =
+                    self.check_container(&job.container, &job.deployment, job.deployer.as_ref());
+                let result = if job.is_remote {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(self.config.worker_check_timeout_ms),
+                        check,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                node_id = job.container.node_id,
+                                container_id = job.container.id,
+                                container_runtime_id = %job.container.container_id,
+                                deployment_id = job.container.deployment_id,
+                                timeout_ms = self.config.worker_check_timeout_ms,
+                                "Worker container health check timed out"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    check.await
+                };
+                if let Err(error) = result {
+                    debug!(
+                        container_id = job.container.id,
+                        container_name = %job.container.container_name,
+                        %error,
+                        "Failed to check container"
+                    );
+                }
+            })
+            .await;
     }
 
     /// Check a single container for health issues
@@ -959,7 +1035,7 @@ mod tests {
     use crate::alarm_service::AlarmService;
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temps_core::jobs::QueueError;
     use temps_core::notifications::{
         EmailMessage, NotificationData, NotificationError, NotificationService,
@@ -1006,6 +1082,7 @@ mod tests {
         stats: tokio::sync::Mutex<ContainerStats>,
         info_calls: AtomicUsize,
         stats_calls: AtomicUsize,
+        block_info: AtomicBool,
     }
 
     #[allow(dead_code)]
@@ -1038,6 +1115,7 @@ mod tests {
                 }),
                 info_calls: AtomicUsize::new(0),
                 stats_calls: AtomicUsize::new(0),
+                block_info: AtomicBool::new(false),
             }
         }
 
@@ -1064,6 +1142,10 @@ mod tests {
 
         async fn set_memory_percent(&self, percent: f64) {
             self.stats.lock().await.memory_percent = Some(percent);
+        }
+
+        fn block_container_info(&self) {
+            self.block_info.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1092,6 +1174,9 @@ mod tests {
         }
         async fn get_container_info(&self, _id: &str) -> Result<ContainerInfo, DeployerError> {
             self.info_calls.fetch_add(1, Ordering::Relaxed);
+            if self.block_info.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             Ok(self.info.lock().await.clone())
         }
         async fn get_container_stats(&self, _id: &str) -> Result<ContainerStats, DeployerError> {
@@ -1205,6 +1290,82 @@ mod tests {
             Arc::new(NoopNotificationService),
             Arc::new(NoopJobQueue),
         ))
+    }
+
+    #[test]
+    fn production_monitor_requires_worker_runtime_resolver() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let result = ContainerHealthMonitor::try_new(
+            db.clone(),
+            deployer,
+            make_alarm_service(db),
+            ContainerHealthConfig::default(),
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ContainerHealthMonitorInitError::MissingRuntimeResolver)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unresponsive_worker_does_not_stall_healthy_local_or_remote_containers() {
+        let slow_worker = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        slow_worker.block_container_info();
+        let healthy_local = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let healthy_worker = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let config = ContainerHealthConfig {
+            worker_check_timeout_ms: 25,
+            ..ContainerHealthConfig::default()
+        };
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            healthy_local.clone(),
+            make_alarm_service(db),
+            config,
+        );
+        let mut worker_container = make_container_model(1);
+        worker_container.node_id = Some(7);
+        let local_container = make_container_model(2);
+        let mut healthy_worker_container = make_container_model(3);
+        healthy_worker_container.node_id = Some(8);
+        let deployment = make_deployment_model();
+        let jobs = vec![
+            ContainerCheckJob {
+                container: worker_container,
+                deployment: deployment.clone(),
+                deployer: slow_worker.clone(),
+                is_remote: true,
+            },
+            ContainerCheckJob {
+                container: local_container,
+                deployment,
+                deployer: healthy_local.clone(),
+                is_remote: false,
+            },
+            ContainerCheckJob {
+                container: healthy_worker_container,
+                deployment: make_deployment_model(),
+                deployer: healthy_worker.clone(),
+                is_remote: true,
+            },
+        ];
+
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            monitor.check_container_jobs(jobs),
+        )
+        .await
+        .expect("slow worker must be bounded by its own deadline");
+
+        assert_eq!(slow_worker.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_local.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_local.stats_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_worker.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_worker.stats_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
