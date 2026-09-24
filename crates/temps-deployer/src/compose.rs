@@ -4477,7 +4477,8 @@ impl ComposeExecutor {
                     service: service_name.to_string(),
                     field: (*field).to_string(),
                     reason: format!(
-                        "'${{...}}' interpolation in guarded field '{field}' is not allowed; \
+                        "the 'Block variables in guarded fields' security check rejects \
+                         '${{...}}' interpolation in guarded field '{field}'; \
                          it can smuggle host/privileged access past static validation"
                     ),
                 });
@@ -4767,7 +4768,8 @@ impl ComposeExecutor {
                     service: service_name.to_string(),
                     field: "volumes".to_string(),
                     reason: format!(
-                        "interpolation in bind mount source '{source}' is not allowed; \
+                        "the 'Block variables in guarded fields' security check rejects \
+                         interpolation in bind mount source '{source}'; \
                          it cannot be statically validated"
                     ),
                 });
@@ -11764,6 +11766,33 @@ services:
             .validate_compose_security_policy("compose file", userns)
             .unwrap_err();
         assert_eq!(violation_field(err), "userns_mode");
+    }
+
+    #[test]
+    fn interpolation_in_volumes_names_the_security_check() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+
+        let compose = "services:\n  trawl:\n    image: alpine\n    volumes:\n      - ${HOST_PATH:-/tmp}:/data\n";
+        let error = executor
+            .validate_compose_security_policy("compose file", compose)
+            .expect_err("interpolated volume must be rejected");
+        let message = error.to_string();
+        let interpolation_label = PolicyCheck::catalog()
+            .into_iter()
+            .find(|definition| definition.id == PolicyCheck::Interpolation)
+            .expect("interpolation check is in the settings catalog")
+            .label;
+        assert!(
+            message.contains("rejected volumes for service 'trawl'"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("'{interpolation_label}' security check")),
+            "{message}"
+        );
+        assert!(message.contains("Advanced security settings"), "{message}");
     }
 
     #[test]
