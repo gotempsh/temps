@@ -25,6 +25,13 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -39,6 +46,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ShieldAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
+import {
+  filterComposeSecurityChecks,
+  type SecurityCheckStatusFilter,
+} from '@/lib/compose-security-filter'
 
 export function ComposeSecuritySettings({
   projectId,
@@ -50,10 +61,13 @@ export function ComposeSecuritySettings({
   const [legacyAcknowledged, setLegacyAcknowledged] = useState(false)
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
+  const [statusFilter, setStatusFilter] =
+    useState<SecurityCheckStatusFilter>('all')
   useEffect(() => {
     if (!focusCheck) return
     setOpen(true)
     setSearch(focusCheck)
+    setStatusFilter('all')
     document.getElementById('compose-security')?.scrollIntoView({
       behavior: 'smooth',
       block: 'start',
@@ -113,11 +127,11 @@ export function ComposeSecuritySettings({
   const canEdit = query.data?.can_edit ?? false
   const disabled = query.data?.policy.disabled_checks ?? []
   const checks = query.data?.checks ?? []
-  const searchText = search.trim().toLowerCase()
-  const filtered = checks.filter((check) =>
-    `${check.id} ${check.group} ${check.label} ${check.consequence}`
-      .toLowerCase()
-      .includes(searchText)
+  const filtered = filterComposeSecurityChecks(
+    checks,
+    disabled,
+    search,
+    statusFilter
   )
   const groups = [...new Set(filtered.map((check) => check.group))]
   const saveCheck = (
@@ -250,15 +264,36 @@ export function ComposeSecuritySettings({
                 </Button>
               </div>
             )}
-            <Input
-              aria-label="Search Compose security checks"
-              placeholder="Search security checks…"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-            />
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Input
+                aria-label="Search Compose security checks"
+                placeholder="Search security checks…"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                className="sm:flex-1"
+              />
+              <Select
+                value={statusFilter}
+                onValueChange={(value) =>
+                  setStatusFilter(value as SecurityCheckStatusFilter)
+                }
+              >
+                <SelectTrigger
+                  aria-label="Filter Compose security checks by status"
+                  className="w-full sm:w-44"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All checks</SelectItem>
+                  <SelectItem value="enabled">Enabled</SelectItem>
+                  <SelectItem value="disabled">Disabled</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
             {filtered.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                No security checks match your search.
+                No security checks match these filters.
               </p>
             )}
             {groups.map((group) => (

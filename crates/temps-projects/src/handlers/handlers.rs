@@ -2630,6 +2630,9 @@ pub async fn trigger_project_pipeline(
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
                 auth.is_instance_admin(),
             ),
+            auth.has_permission(&Permission::GitRepositoriesRead)
+                .then(|| auth.user_id_opt())
+                .flatten(),
         )
         .await
         .map_err(|e| {

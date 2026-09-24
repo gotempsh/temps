@@ -19,7 +19,7 @@ use temps_entities::{
     env_var_environments, env_vars, environments, external_services, git_provider_connections,
     git_providers, project_services, projects, types::ProjectType,
 };
-use temps_git::services::public_repo::PublicRepoProviderFactory;
+use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
 
 use serde::Serialize;
 
@@ -5415,6 +5415,7 @@ impl ProjectService {
             tag,
             commit,
             DeployCaller::default(),
+            None,
         )
         .await
     }
@@ -5425,6 +5426,7 @@ impl ProjectService {
     /// deployed image and command as host root, so it is admin-only — deploy
     /// permission on the project is not sufficient. Every other project is
     /// unaffected.
+    #[allow(clippy::too_many_arguments)]
     pub async fn trigger_pipeline_as(
         &self,
         project_id: i32,
@@ -5433,6 +5435,7 @@ impl ProjectService {
         tag: Option<String>,
         commit: Option<String>,
         caller: DeployCaller,
+        github_user_id: Option<i32>,
     ) -> Result<(i32, i32, Option<String>, Option<String>, Option<String>), ProjectError> {
         // Get the project to validate it exists and get repository information
         let project = temps_entities::projects::Entity::find_by_id(project_id)
@@ -5513,15 +5516,27 @@ impl ProjectService {
                 "github"
             };
 
-            // Public projects must never borrow a credential from an arbitrary
-            // provider connection. A repository that needs authentication must
-            // use the caller-owned connected-repository workflow instead.
-            let provider = PublicRepoProviderFactory::create(provider_name).map_err(|e| {
-                ProjectError::Other(format!(
-                    "Failed to create public repo provider for {}: {}",
-                    provider_name, e
-                ))
-            })?;
+            // Use only the requesting user's GitHub credential. A provider
+            // configured by another user cannot be borrowed by this project.
+            let token = if provider_name == "github" {
+                match github_user_id {
+                    Some(user_id) => {
+                        self.git_provider_manager
+                            .get_valid_github_token_for_user(user_id)
+                            .await
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let provider = PublicRepoProviderFactory::create_with_token(provider_name, token)
+                .map_err(|e| {
+                    ProjectError::Other(format!(
+                        "Failed to create public repo provider for {}: {}",
+                        provider_name, e
+                    ))
+                })?;
 
             // A shared credential may be able to see private repositories.
             // `is_public_repo` must never turn that credential into a private
@@ -5529,21 +5544,31 @@ impl ProjectService {
             provider
                 .get_repository(&project.repo_owner, &project.repo_name)
                 .await
-                .map_err(|e| {
-                    ProjectError::Other(format!(
+                .map_err(|e| match e {
+                    PublicRepoError::RateLimitExceeded => ProjectError::PublicRepoRateLimited {
+                        project_id,
+                        project_slug: project.slug.clone(),
+                        provider: provider_name.to_string(),
+                    },
+                    e => ProjectError::Other(format!(
                         "Failed to verify that repository {}/{} is public: {}",
                         project.repo_owner, project.repo_name, e
-                    ))
+                    )),
                 })?;
 
             let branches = provider
                 .list_branches(&project.repo_owner, &project.repo_name)
                 .await
-                .map_err(|e| {
-                    ProjectError::Other(format!(
+                .map_err(|e| match e {
+                    PublicRepoError::RateLimitExceeded => ProjectError::PublicRepoRateLimited {
+                        project_id,
+                        project_slug: project.slug.clone(),
+                        provider: provider_name.to_string(),
+                    },
+                    e => ProjectError::Other(format!(
                         "Failed to fetch branches from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
                         project.repo_owner, project.repo_name, e
-                    ))
+                    )),
                 })?;
 
             // Find the target branch
