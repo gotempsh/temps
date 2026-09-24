@@ -31,8 +31,9 @@ deployment running indefinitely.
 - Static reuse passes through the normal generation fence and route reload
   confirmation before it is marked completed.
 - Completion errors are reconciled against the selected route: an already
-  completed live release remains successful, while an incomplete candidate
-  restores and confirms the prior usable route without overwriting newer work.
+  completed release clears sleeping state, confirms a fresh route load, and
+  re-emits success; an incomplete candidate restores and confirms the prior
+  usable route without overwriting newer work.
 - `DeploymentService` shares the scheduler, workflow planner, and image builder
   used by ordinary workflow execution.
 

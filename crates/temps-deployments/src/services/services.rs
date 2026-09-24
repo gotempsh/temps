@@ -2432,7 +2432,76 @@ impl DeploymentService {
             return Err(DeploymentError::Other(reason));
         }
         if deployment.state == "completed" {
+            let completed_environment = environment.clone();
+            let completed_deployment = deployment.clone();
+            let mut active_environment: environments::ActiveModel = environment.into();
+            active_environment.sleeping = Set(false);
+            active_environment.updated_at = Set(chrono::Utc::now());
+            active_environment.update(&transaction).await?;
             transaction.commit().await?;
+
+            self.queue_service
+                .send(temps_core::Job::ForceRouteReload(
+                    temps_core::ForceRouteReloadJob {
+                        environment_id: Some(environment_id),
+                        deployment_id: Some(deployment_id),
+                    },
+                ))
+                .await
+                .map_err(|reload_error| DeploymentError::Other(format!(
+                    "{reason}; completed deployment remained selected but its route reload request failed: {reload_error}"
+                )))?;
+            crate::jobs::MarkDeploymentCompleteJob::wait_for_route_ready(
+                &mut route_receiver,
+                self.db.as_ref(),
+                environment_id,
+                deployment_id,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(|route_error| DeploymentError::Other(format!(
+                "{reason}; completed deployment remained selected but route confirmation failed: {route_error}"
+            )))?;
+
+            let url = if !completed_environment.host.is_empty() {
+                let scheme = self
+                    .config_service
+                    .get_url_scheme()
+                    .await
+                    .unwrap_or_else(|_| "https".to_string());
+                Some(format!("{}://{}", scheme, completed_environment.host))
+            } else if !completed_environment.subdomain.is_empty() {
+                self.config_service
+                    .get_deployment_url_by_slug(&completed_environment.subdomain)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if let Err(event_error) = self
+                .queue_service
+                .send(temps_core::Job::DeploymentSucceeded(
+                    temps_core::DeploymentSucceededJob {
+                        deployment_id,
+                        project_id: completed_deployment.project_id,
+                        environment_id,
+                        environment_name: completed_environment.name,
+                        commit_sha: completed_deployment.commit_sha,
+                        url,
+                        health_check_path: completed_deployment
+                            .metadata
+                            .and_then(|metadata| metadata.health_check_path),
+                    },
+                ))
+                .await
+            {
+                warn!(
+                    deployment_id,
+                    environment_id,
+                    error = %event_error,
+                    "Failed to re-emit DeploymentSucceeded during static completion reconciliation"
+                );
+            }
             warn!(
                 deployment_id,
                 environment_id,
@@ -7337,9 +7406,11 @@ mod tests {
         .await?;
         let mut active_environment: environments::ActiveModel = environment.into();
         active_environment.current_deployment_id = Set(Some(completed.id));
+        active_environment.sleeping = Set(true);
         active_environment.update(db.as_ref()).await?;
 
         let service = create_deployment_service_for_test(db.clone());
+        let mut event_receiver = service.queue_service.subscribe();
         service
             .reconcile_static_completion_error(
                 completed.environment_id,
@@ -7349,6 +7420,22 @@ mod tests {
             )
             .await?;
 
+        let success_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match event_receiver.recv().await {
+                    Ok(temps_core::Job::DeploymentSucceeded(event))
+                        if event.deployment_id == completed.id =>
+                    {
+                        break event;
+                    }
+                    Ok(_) => continue,
+                    Err(error) => panic!("queue closed before success event: {error}"),
+                }
+            }
+        })
+        .await?;
+        assert_eq!(success_event.environment_id, completed.environment_id);
+
         let persisted_environment = environments::Entity::find_by_id(completed.environment_id)
             .one(db.as_ref())
             .await?
@@ -7356,6 +7443,10 @@ mod tests {
         assert_eq!(
             persisted_environment.current_deployment_id,
             Some(completed.id)
+        );
+        assert!(
+            !persisted_environment.sleeping,
+            "a reconciled completed static release must be routable"
         );
         Ok(())
     }
