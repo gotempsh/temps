@@ -1066,9 +1066,9 @@ function GitSettingsInline({
                       />
                     }
                   />
-                  <div
+                  <li
                     className={cn(
-                      'flex items-start gap-2 px-1',
+                      'px-6 py-4',
                       isRepositoryRootDirectory(
                         editing === 'directory'
                           ? directoryDraft
@@ -1076,40 +1076,45 @@ function GitSettingsInline({
                       ) && 'hidden'
                     )}
                   >
-                    <Checkbox
-                      id="pull-only-root-directory"
-                      checked={!!project.pull_only_root_directory}
-                      disabled={updateGitSettings.isPending}
-                      onCheckedChange={async (checked) => {
-                        await saveGitField({
-                          pull_only_root_directory: checked === true,
-                          ...(editing === 'directory'
-                            ? { directory: directoryDraft || './' }
-                            : {}),
-                        })
-                        if (editing === 'directory') {
-                          close()
-                        }
-                        toast.success(
-                          checked === true
-                            ? 'Deploy will pull only the root directory'
-                            : 'Deploy will pull the full repository'
-                        )
-                      }}
-                    />
-                    <div className="space-y-1">
-                      <label
-                        htmlFor="pull-only-root-directory"
-                        className="text-sm leading-none cursor-pointer"
-                      >
-                        Pull only the root directory
-                      </label>
-                      <p className="text-xs text-muted-foreground">
-                        Clone only this subdirectory instead of the whole
-                        repository.
-                      </p>
+                    <div className="flex items-start gap-4">
+                      <div className="w-32 shrink-0" aria-hidden="true" />
+                      <div className="flex min-w-0 items-start gap-2">
+                        <Checkbox
+                          id="pull-only-root-directory"
+                          checked={!!project.pull_only_root_directory}
+                          disabled={updateGitSettings.isPending}
+                          onCheckedChange={async (checked) => {
+                            await saveGitField({
+                              pull_only_root_directory: checked === true,
+                              ...(editing === 'directory'
+                                ? { directory: directoryDraft || './' }
+                                : {}),
+                            })
+                            if (editing === 'directory') {
+                              close()
+                            }
+                            toast.success(
+                              checked === true
+                                ? 'Deploy will pull only the root directory'
+                                : 'Deploy will pull the full repository'
+                            )
+                          }}
+                        />
+                        <div className="space-y-1">
+                          <label
+                            htmlFor="pull-only-root-directory"
+                            className="text-sm leading-none cursor-pointer"
+                          >
+                            Pull only the root directory
+                          </label>
+                          <p className="text-xs text-muted-foreground">
+                            Clone only this subdirectory instead of the whole
+                            repository.
+                          </p>
+                        </div>
+                      </div>
                     </div>
-                  </div>
+                  </li>
 
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (

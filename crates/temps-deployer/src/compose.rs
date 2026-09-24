@@ -246,7 +246,7 @@ pub enum ComposeError {
     )]
     ComposeUnavailable { reason: String },
 
-    #[error("Compose security policy rejected {field} for service '{service}': {reason}. Review the matching individual check in Project Settings → Git → Advanced security settings; an instance administrator can disable that check for a trusted stack. If no check covers this validation error, correct the Compose file")]
+    #[error("Compose security policy rejected {field} for service '{service}': {reason}. Review Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings; only instance administrators can change security checks. Invalid Compose values must be corrected in the Compose file")]
     SecurityPolicyViolation {
         service: String,
         field: String,
@@ -3579,7 +3579,7 @@ impl ComposeExecutor {
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
-                            "shared-memory size is limited to {} MiB per service",
+                            "'Limit service shared memory' (Resources) limits shared-memory size to {} MiB per service; lower shm_size or disable that check for a trusted stack",
                             MAX_SERVICE_SHM_BYTES / 1024 / 1024
                         ),
                     });
@@ -3599,7 +3599,7 @@ impl ComposeExecutor {
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
-                            "aggregate shared-memory sizing is limited to {} MiB per Compose deployment",
+                            "'Limit aggregate shared memory' (Resources) limits total shared-memory size to {} MiB per Compose deployment; lower the stack total or disable that check for a trusted stack",
                             MAX_COMPOSE_SHM_BYTES / 1024 / 1024
                         ),
                     });
@@ -12322,26 +12322,43 @@ services:
 
     #[test]
     fn test_validate_compose_security_policy_rejects_oversized_or_invalid_shm_sizes() {
-        let Some(executor) = test_executor() else {
-            return;
-        };
-        for yaml in [
-            "services:\n  app:\n    image: alpine\n    shm_size: 513m\n",
-            "services:\n  app:\n    image: alpine\n    shm_size: unlimited\n",
-            "services:\n  app:\n    image: alpine\n    shm_size: 0\n",
+        let executor = disabled_executor(PathBuf::from("/tmp/test"));
+        for (yaml, expected_check) in [
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: 513m\n",
+                Some("Limit service shared memory"),
+            ),
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: unlimited\n",
+                None,
+            ),
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: 0\n",
+                None,
+            ),
         ] {
             let err = executor
                 .validate_compose_security_policy("compose file", yaml)
                 .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings"),
+                "{message}"
+            );
+            match expected_check {
+                Some(check) => assert!(message.contains(check), "{message}"),
+                None => assert!(
+                    !message.contains("Limit service shared memory"),
+                    "{message}"
+                ),
+            }
             assert_eq!(violation_field(err), "shm_size");
         }
     }
 
     #[test]
     fn test_validate_compose_security_policy_caps_aggregate_shm_size() {
-        let Some(executor) = test_executor() else {
-            return;
-        };
+        let executor = disabled_executor(PathBuf::from("/tmp/test"));
         let yaml = "services:\n  first:\n    image: alpine\n    shm_size: 400m\n  second:\n    image: alpine\n    shm_size: 400m\n  third:\n    image: alpine\n    shm_size: 400m\n";
 
         let err = executor
@@ -12350,7 +12367,8 @@ services:
         let message = err.to_string();
 
         assert_eq!(violation_field(err), "shm_size");
-        assert!(message.contains("aggregate"));
+        assert!(message.contains("'Limit aggregate shared memory' (Resources)"));
+        assert!(message.contains("lower the stack total or disable that check"));
     }
 
     #[test]

@@ -166,7 +166,7 @@ impl ComposeSecurityCheck {
             ComposeSecurityCheckDefinition { id: Self::Capabilities, group: "Runtime", label: "Block additional capabilities", consequence: "Grant custom Linux capabilities with cap_add." },
             ComposeSecurityCheckDefinition { id: Self::DropCapabilities, group: "Runtime", label: "Drop Linux capabilities", consequence: "Restore Docker default capabilities instead of the Temps restricted set." },
             ComposeSecurityCheckDefinition { id: Self::SecurityOptions, group: "Runtime", label: "Block custom security options", consequence: "Customize seccomp, AppArmor, and other security_opt settings." },
-            ComposeSecurityCheckDefinition { id: Self::NoNewPrivileges, group: "Runtime", label: "Prevent privilege escalation", consequence: "Allow privilege gains through executable files inside containers." },
+            ComposeSecurityCheckDefinition { id: Self::NoNewPrivileges, group: "Runtime", label: "Prevent sudo and setuid privilege elevation", consequence: "Allow programs such as sudo to gain root privileges through setuid or file capabilities inside containers. Some images need this during startup." },
             ComposeSecurityCheckDefinition { id: Self::Devices, group: "Runtime", label: "Block host devices", consequence: "Map host devices into containers." },
             ComposeSecurityCheckDefinition { id: Self::DeviceRules, group: "Runtime", label: "Block device cgroup rules", consequence: "Configure device access rules." },
             ComposeSecurityCheckDefinition { id: Self::Gpu, group: "Runtime", label: "Block GPU access", consequence: "Expose GPUs and reserved devices to containers." },
