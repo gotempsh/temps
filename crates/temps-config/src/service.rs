@@ -1195,14 +1195,25 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         // The handler's earlier snapshot is advisory only. Rebase against the
         // authoritative row while its write lock is held, before serializing.
-        let locked_settings = existing
-            .as_ref()
-            .map(|model| AppSettings::from_json(model.data.clone()))
-            .unwrap_or_default();
+        let locked_settings = match existing.as_ref() {
+            Some(model) => serde_json::from_value(model.data.clone()).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings",
+                }
+            })?,
+            None => AppSettings::default(),
+        };
         // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
         // settings save must not undo a consent update committed before this lock.
         settings.plugin_installation_reporting_enabled =
             locked_settings.plugin_installation_reporting_enabled;
+        // CA lifecycle and join tokens have dedicated, locked write paths. Generic
+        // settings saves must neither erase them nor revert a concurrent rotation.
+        settings.multi_node.cluster_ca_cert_pem =
+            locked_settings.multi_node.cluster_ca_cert_pem.clone();
+        settings.multi_node.cluster_ca_key_encrypted =
+            locked_settings.multi_node.cluster_ca_key_encrypted.clone();
+        settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -1492,6 +1503,70 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Set the legacy join-token hash under the settings-row lock.
+    ///
+    /// Bulk settings saves deliberately restore this server-owned value from
+    /// the locked row. Token generation and revocation must therefore write
+    /// this field directly, without a cached whole-document snapshot. Keep
+    /// every other key, including cluster CA material, as it was committed.
+    pub async fn set_join_token_hash(
+        &self,
+        token_hash: Option<String>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            let multi_node = fields
+                .entry("multi_node")
+                .or_insert_with(|| serde_json::json!({}));
+            if multi_node.is_null() {
+                *multi_node = serde_json::json!({});
+            }
+            let multi_node =
+                multi_node
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            multi_node.insert("join_token_hash".to_string(), serde_json::json!(token_hash));
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.multi_node.join_token_hash = token_hash;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
     }
 
     /// Atomically update only managed Cloud export consent. The settings row
@@ -2958,6 +3033,199 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_preserves_authoritative_ca_and_join_token() {
+        for submitted in [None, Some("stale-or-client-supplied")] {
+            let mut locked =
+                settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+            let mut locked_settings = AppSettings::from_json(locked.data.clone());
+            locked_settings.multi_node.join_token_hash = Some("authoritative-token-hash".into());
+            locked.data = locked_settings.to_json();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+            let mut incoming = AppSettings {
+                preview_domain: "updated.example.test".into(),
+                ..Default::default()
+            };
+            incoming.multi_node.cluster_ca_cert_pem = submitted.map(str::to_string);
+            incoming.multi_node.cluster_ca_key_encrypted = submitted.map(str::to_string);
+            incoming.multi_node.join_token_hash = submitted.map(str::to_string);
+            service
+                .update_settings(incoming)
+                .await
+                .expect("unrelated settings save");
+            let saved = service.get_settings().await.unwrap();
+            assert_eq!(saved.preview_domain, "updated.example.test");
+            assert_eq!(
+                saved.multi_node.cluster_ca_cert_pem.as_deref(),
+                Some("authoritative-cert")
+            );
+            assert_eq!(
+                saved.multi_node.cluster_ca_key_encrypted.as_deref(),
+                Some("authoritative-key")
+            );
+            assert_eq!(
+                saved.multi_node.join_token_hash.as_deref(),
+                Some("authoritative-token-hash")
+            );
+            drop(service);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let sql = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .map(ToString::to_string)
+                .find(|sql| sql.starts_with("UPDATE "))
+                .expect("saved settings SQL");
+            assert!(sql.contains("authoritative-cert") && sql.contains("authoritative-key"));
+            assert!(!sql.contains("stale-or-client-supplied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_rejects_malformed_unrelated_field_before_touching_cluster_trust() {
+        let mut row =
+            settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+        row.data["multi_node"]["join_token_hash"] = serde_json::json!("authoritative-hash");
+        row.data["preview_domain"] = serde_json::json!(42);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row.clone()], [row.clone()], [row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_settings(AppSettings::default())
+            .await
+            .expect_err("malformed stored settings must abort the bulk save");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings"
+                }
+            ),
+            "unexpected settings-save error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn join_token_writes_survive_stale_bulk_settings_saves() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("join-token test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+
+        service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect("generate join token");
+        let generated = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read generated token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(generated.data)
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save after token creation");
+        assert_eq!(
+            service
+                .get_settings()
+                .await
+                .expect("settings after stale save")
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .set_join_token_hash(None)
+            .await
+            .expect("revoke join token");
+        service
+            .update_settings(stale_bulk_document)
+            .await
+            .expect("stale bulk save after token revocation");
+        let revoked = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read revoked token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(revoked.data)
+                .multi_node
+                .join_token_hash,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn join_token_write_rejects_malformed_multi_node_without_overwriting_settings() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["multi_node"] = serde_json::json!(["invalid"]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect_err("malformed multi-node settings must abort token write");
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection {
+                section: "multi_node"
+            }
+        ));
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
     }
 
     #[tokio::test]
