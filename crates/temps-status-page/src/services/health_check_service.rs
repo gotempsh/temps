@@ -204,16 +204,8 @@ fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
         == Some("1")
 }
 
-fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+fn same_host_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
     if !response.status().is_redirection() {
-        return None;
-    }
-    if response
-        .headers()
-        .get(PROXY_HTTPS_REDIRECT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        != Some("1")
-    {
         return None;
     }
     let requested = reqwest::Url::parse(requested_url).ok()?;
@@ -230,6 +222,24 @@ fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Op
         && target.host_str() == requested.host_str()
         && target.port_or_known_default() == Some(443))
     .then(|| target.to_string())
+}
+
+fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+    (response
+        .headers()
+        .get(PROXY_HTTPS_REDIRECT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("1"))
+    .then(|| same_host_https_redirect(requested_url, response))
+    .flatten()
+}
+
+fn local_https_follow_up_url(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+    proxy_https_redirect(requested_url, response).or_else(|| {
+        (!proxy_supports_probe_markers(response))
+            .then(|| same_host_https_redirect(requested_url, response))
+            .flatten()
+    })
 }
 
 #[derive(Clone)]
@@ -739,7 +749,7 @@ impl HealthCheckService {
                     // TLS listener. All application-controlled cross-host
                     // redirects remain unfollowed.
                     let response = if let Some(https_url) = is_local_probe
-                        .then(|| proxy_https_redirect(&health_url, &response))
+                        .then(|| local_https_follow_up_url(&health_url, &response))
                         .flatten()
                     {
                         let Some(tls_listener) = local_tls_listener.as_deref() else {
@@ -1635,6 +1645,7 @@ mod tests {
 
         assert!(proxy_https_redirect(logical_url, &response).is_none());
         assert!(proxy_supports_probe_markers(&response));
+        assert!(local_https_follow_up_url(logical_url, &response).is_none());
         assert!(HealthCheckService::is_operational_http_status(
             response.status()
         ));
@@ -1642,7 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_proxy_redirect_without_capability_is_inconclusive() {
+    async fn old_proxy_same_host_https_redirect_uses_safe_tls_follow_up() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind old proxy listener");
@@ -1671,6 +1682,10 @@ mod tests {
 
         assert!(response.status().is_redirection());
         assert!(!proxy_supports_probe_markers(&response));
+        assert_eq!(
+            local_https_follow_up_url(logical_url, &response).as_deref(),
+            Some("https://old-proxy.invalid/health")
+        );
         server.await.expect("old proxy task completes");
     }
 
