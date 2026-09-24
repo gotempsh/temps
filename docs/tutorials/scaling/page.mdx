@@ -31,7 +31,7 @@ Temps runs your application in Docker containers on your own server. Scaling mea
   </Col>
 </Row>
 
-**Multi-node scaling** — if you need more capacity than a single server provides, you can [add worker nodes](/docs/multi-node) to distribute containers across multiple machines. The control plane schedules replicas across all active nodes using round-robin.
+**Multi-node scaling** — if you need more capacity than a single server provides, you can [add worker nodes](/docs/multi-node) to distribute containers across multiple machines; see that guide for how the scheduler picks which node runs a given replica.
 
 Before scaling, check whether optimization can solve the problem for free. A slow database query or missing index can make an application feel overloaded when the server has plenty of capacity.
 
@@ -109,33 +109,38 @@ app.use(session({
 
 ## Resource limits {{ anchor: true, id: 'resource-limits' }}
 
-Each container runs with configurable CPU and memory limits:
+Each container can be given CPU and memory limits, but **none are set by default** — a newly deployed container is uncapped and can use as much CPU and memory as the host has available, unless you explicitly configure a limit.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| CPU request | 100m | Minimum guaranteed CPU (0.1 cores) |
-| CPU limit | 1000m | Maximum CPU (1 core) |
-| Memory request | 128Mi | Minimum guaranteed memory |
-| Memory limit | 512Mi | Maximum memory |
+| CPU request | Unset (uncapped) | Minimum guaranteed CPU, if configured |
+| CPU limit | Unset (uncapped) | Maximum CPU, if configured |
+| Memory request | Unset (uncapped) | Minimum guaranteed memory, if configured |
+| Memory limit | Unset (uncapped) | Maximum memory, if configured |
 
-Configure these per environment in **Environment Settings**:
+Set these per environment from the CLI or dashboard:
+
+```bash
+bunx @temps-sdk/cli environments resources production -p my-project \
+  --cpu 1000 --cpu-request 100 --memory 512 --memory-request 128
+```
 
 <Properties>
-  <Property name="cpu_limit" type="string">
-    Maximum CPU allocation. `1000m` = 1 full CPU core. `500m` = half a core.
+  <Property name="--cpu" type="millicores">
+    Maximum CPU allocation. `1000` = 1 full CPU core, `500` = half a core.
   </Property>
-  <Property name="memory_limit" type="string">
-    Maximum memory allocation. `512Mi` = 512 MB. `1024Mi` = 1 GB.
+  <Property name="--memory" type="MB">
+    Maximum memory allocation in megabytes, e.g. `512`.
   </Property>
-  <Property name="cpu_request" type="string">
+  <Property name="--cpu-request" type="millicores">
     Minimum guaranteed CPU. Used for scheduling decisions.
   </Property>
-  <Property name="memory_request" type="string">
+  <Property name="--memory-request" type="MB">
     Minimum guaranteed memory.
   </Property>
 </Properties>
 
-If your container exceeds its memory limit, Docker kills it and Temps restarts it (restart policy is `always`). If this happens repeatedly, increase the memory limit or investigate memory leaks.
+If you do set a memory limit and your container exceeds it, Docker kills it and Temps restarts it (restart policy is `always`). If this happens repeatedly, raise the memory limit or investigate memory leaks. With no limit configured, a runaway container can instead consume all memory on the host, so setting a limit is recommended once you have a sense of your app's real usage.
 
 ---
 

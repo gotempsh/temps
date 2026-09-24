@@ -44,13 +44,13 @@ sequenceDiagram
 
 ```bash
 # List recent deployments
-temps deployments list --project my-app
+bunx @temps-sdk/cli deployments list --project my-app
 
-# Rollback to previous deployment
-temps deployments rollback --project my-app
+# Rollback without --to: pick the target deployment from an interactive prompt
+bunx @temps-sdk/cli deployments rollback --project my-app
 
-# Rollback to specific deployment
-temps deployments rollback --project my-app --deployment-id abc123
+# Rollback to a specific deployment, no prompt
+bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
 
 ## How Rollbacks Work
@@ -84,8 +84,8 @@ temps deployments rollback --project my-app --deployment-id abc123
 When you detect issues immediately:
 
 ```bash
-# Rollback the latest deployment
-temps deployments rollback --project my-app --latest
+# Omitting --to opens an interactive prompt to pick the target deployment
+bunx @temps-sdk/cli deployments rollback --project my-app
 ```
 
 **Use when:**
@@ -94,35 +94,20 @@ temps deployments rollback --project my-app --latest
 - Critical errors appear immediately
 - Performance degrades significantly
 
-### Automatic Rollback
+### Failed deploys don't need a rollback
 
-Configure automatic rollback on failure:
+There's no separate, configurable "automatic rollback" feature to set up — but you get equivalent protection for free from how deploys work. A new deployment's containers must pass health checks before Temps switches routing to them. If health checks fail, the deployment is marked failed and cleaned up, and whatever was previously running (if anything) simply keeps serving traffic the whole time — routing was never switched away from it. See [How rollbacks work](#how-rollbacks-work) above for the full process.
 
-```yaml
-# Deployment configuration
-deployment:
-  auto_rollback:
-    enabled: true
-    conditions:
-      - health_check_fails: 3 # Rollback after 3 failed checks
-      - error_rate_threshold: 0.1 # 10% error rate
-      - response_time_threshold: 5000 # 5 seconds
-    delay: 60 # Wait 60 seconds before rolling back
-```
-
-**Use when:**
-
-- Deploying to production
-- Critical applications
-- Unattended deployments
+This means a manual rollback is only something you need for a deployment that passed its health checks but is still broken in some way health checks don't catch (a bad business-logic bug, a misconfigured integration, and so on).
 
 ### Canary Rollback
 
 Roll back only a percentage of traffic:
 
 ```bash
-# Rollback 50% of traffic to previous version
-temps deployments rollback --project my-app --canary 50
+# Omitting --to opens an interactive prompt to pick the target deployment
+bunx @temps-sdk/cli deployments rollback --project my-app
+# Canary traffic splitting is configured via the web UI
 ```
 
 **Use when:**
@@ -139,25 +124,22 @@ See all your deployments and their status:
 
 ```bash
 # List all deployments
-temps deployments list --project my-app
+bunx @temps-sdk/cli deployments list --project my-app
 
 # Output:
-# ID       Status    Created              Version
-# abc123   ACTIVE    2024-01-15 10:30    v1.2.0
-# def456   STOPPED   2024-01-15 09:15    v1.1.9
-# ghi789   STOPPED   2024-01-15 08:00    v1.1.8
+# ID    Status     Created              Version
+# 789   deployed   2024-01-15 10:30    v1.2.0
+# 456   deployed   2024-01-15 09:15    v1.1.9
+# 123   deployed   2024-01-15 08:00    v1.1.8
 ```
 
 ### Compare Deployments
 
-See what changed between deployments:
+There's no dedicated CLI command for diffing two deployments. List them as JSON and compare the fields that matter (Git commit, environment variables, resource limits) yourself, or use the web UI:
 
 ```bash
-# Compare two deployments
-temps deployments compare \
-  --project my-app \
-  --deployment-1 abc123 \
-  --deployment-2 def456
+# List deployments with full details as JSON
+bunx @temps-sdk/cli deployments list --project my-app --json
 ```
 
 **Shows:**
