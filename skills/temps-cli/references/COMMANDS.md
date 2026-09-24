@@ -1027,6 +1027,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -1318,7 +1319,7 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Provider ID (optional, lists all if not provided) | - | No |
+| `--id <id>` | Connection ID (lists every synced repository if omitted) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `--search <term>` | Search repositories by name | - | No |
 | `--page <n>` | Page number | - | No |
@@ -1335,6 +1336,7 @@ Manage Git provider connections
 **Subcommands:**
 
 - `list` (`ls`) - List all Git connections
+- `get` - Show one Git connection: account, health and sync state
 - `show` - Show connection details for a provider
 - `delete` (`rm`) - Delete a Git connection
 - `activate` - Activate a Git connection
@@ -1356,6 +1358,17 @@ List all Git connections
 | `--per-page <n>` | Items per page (default: 30, max: 100) | - | No |
 | `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | No |
 | `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | No |
+
+#### `providers connections get`
+
+Show one Git connection: account, health and sync state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 #### `providers connections show`
 

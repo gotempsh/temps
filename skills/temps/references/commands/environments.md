@@ -105,6 +105,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
