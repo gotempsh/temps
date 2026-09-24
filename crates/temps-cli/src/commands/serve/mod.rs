@@ -127,6 +127,32 @@ pub enum ServeRole {
     Console,
 }
 
+fn effective_proxy_listeners(
+    role: ServeRole,
+    address: &str,
+    tls_address: Option<&str>,
+    proxy_address: Option<&str>,
+    proxy_tls_address: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
+    match role {
+        ServeRole::All => Ok((address.to_string(), tls_address.map(str::to_string))),
+        ServeRole::Console => {
+            let proxy_address = proxy_address.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`temps serve --role=console` requires the sibling proxy address.\n\n\
+                     Set --proxy-address (or TEMPS_PROXY_ADDRESS), e.g. \
+                     `--proxy-address 127.0.0.1:8080`. Managed uptime checks and \
+                     plugin callback URLs need a proxy endpoint reachable from the console."
+                )
+            })?;
+            Ok((
+                proxy_address.to_string(),
+                proxy_tls_address.map(str::to_string),
+            ))
+        }
+    }
+}
+
 /// How much of the platform this `temps serve` process runs itself.
 ///
 /// Orthogonal to [`ServeRole`], which only decides which listeners this
@@ -177,6 +203,18 @@ pub struct ServeCommand {
     /// TLS address to bind the server to
     #[arg(long, env = "TEMPS_TLS_ADDRESS")]
     pub tls_address: Option<String>,
+
+    /// Reachable address of the sibling proxy in split console mode.
+    ///
+    /// Required with `--role=console` so console-side services such as managed
+    /// uptime monitors do not mistake the console's unused `--address` value
+    /// for the application proxy listener.
+    #[arg(long, env = "TEMPS_PROXY_ADDRESS")]
+    pub proxy_address: Option<String>,
+
+    /// Reachable TLS address of the sibling proxy in split console mode.
+    #[arg(long, env = "TEMPS_PROXY_TLS_ADDRESS")]
+    pub proxy_tls_address: Option<String>,
 
     /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
@@ -361,12 +399,20 @@ impl ServeCommand {
             );
         }
 
+        let (effective_proxy_address, effective_proxy_tls_address) = effective_proxy_listeners(
+            self.role,
+            &self.address,
+            self.tls_address.as_deref(),
+            self.proxy_address.as_deref(),
+            self.proxy_tls_address.as_deref(),
+        )?;
+
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
         let serve_config = Arc::new(temps_config::ServerConfig::new(
-            self.address.clone(),
+            effective_proxy_address,
             self.database_url.clone(),
-            self.tls_address.clone(),
+            effective_proxy_tls_address,
             self.console_address.clone(),
         )?);
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
@@ -1336,6 +1382,47 @@ mod serve_profile_tests {
         // applications on worker nodes are reached through this proxy.
         let parsed = parse(&["--profile", "control-plane"]);
         assert_eq!(parsed.role, ServeRole::All);
+    }
+
+    #[test]
+    fn monolith_uses_its_bound_proxy_listeners() {
+        assert_eq!(
+            effective_proxy_listeners(
+                ServeRole::All,
+                "0.0.0.0:8080",
+                Some("0.0.0.0:8443"),
+                None,
+                None,
+            )
+            .expect("monolith listeners are self-contained"),
+            ("0.0.0.0:8080".to_string(), Some("0.0.0.0:8443".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_console_uses_explicit_sibling_proxy_listeners() {
+        assert_eq!(
+            effective_proxy_listeners(
+                ServeRole::Console,
+                "127.0.0.1:8085",
+                None,
+                Some("127.0.0.1:8080"),
+                Some("127.0.0.1:8443"),
+            )
+            .expect("split proxy listeners are explicit"),
+            (
+                "127.0.0.1:8080".to_string(),
+                Some("127.0.0.1:8443".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn split_console_rejects_missing_sibling_proxy_address() {
+        let error =
+            effective_proxy_listeners(ServeRole::Console, "127.0.0.1:8085", None, None, None)
+                .expect_err("split console must not use its parked address for probes");
+        assert!(error.to_string().contains("--proxy-address"));
     }
 
     #[test]

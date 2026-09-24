@@ -4,11 +4,10 @@ Issue: https://github.com/gotempsh/temps/issues/1100
 
 ## Assignment
 
-- Worktree: `/Users/davidviejo/projects/temps/temps-wt-1100-local-monitor-probes`
 - Branch: `fix/1100-local-monitor-probes`
 - Investigated base: `origin/main` at `5045dca71` (2026-09-23).
 - Deliverable: a verified fix and one focused PR targeting `main`, referencing `Fixes #1100`. Do not merge automatically.
-- This document is a handoff, not a claim that implementation is complete. The user requested documents for other agents after investigation/partial implementation.
+- Follow-up correctness fixes are tracked in issue #1121 and its implementation document.
 
 Read workspace and repository `AGENTS.md`, `CLAUDE.md`, and applicable `bugfix` / `pr-evidence` guidance. You are not alone in the workspace: preserve existing edits, including the explicitly listed work below, and coordinate overlapping files with the other issue agents. Use only this issue's worktree; the original `temps/` checkout contains unrelated dirty files and local secrets.
 
@@ -45,7 +44,7 @@ Reproduce using a synthetic environment hostname that does not resolve to the lo
 - Wildcard listeners become matching-family loopback destinations (`0.0.0.0` → `127.0.0.1`, `::` → `::1`); explicit listener IPs and configured ports are preserved.
 - Local probes disable inherited HTTP proxy settings and retain redirect blocking and certificate verification.
 - Manual monitors and installations with an explicit `external_url` retain their public-network behavior.
-- A same-host HTTP-to-HTTPS redirect on port 443 is re-probed through the configured local TLS listener. Cross-host redirects are never followed. If HTTPS is required but no TLS listener exists, the monitor records a degraded result instead of treating a proxy-only redirect as proof that the application is healthy.
+- A proxy-owned, same-host HTTP-to-HTTPS redirect on port 443 is re-probed through the configured local TLS listener. Application redirects and cross-host redirects are never followed. If HTTPS is required but no TLS listener exists, the monitor records a degraded result instead of treating a proxy-only redirect as proof that the application is healthy.
 - Existing monitor rows benefit immediately; no migration or monitor recreation is required.
 
 ## Evidence
@@ -65,5 +64,3 @@ Reproduce using a synthetic environment hostname that does not resolve to the lo
 ## Merge gate
 
 Review transport pinning, Host/path construction, redirect constraints, TLS verification, and proxy-environment isolation. Do not merge without the required security review and green CI.
-
-The handoff file itself is local/uncommitted when created. Decide whether it belongs in the implementation PR; do not blindly stage it with source changes. Other issue branches exist independently and should not be cherry-picked wholesale into this branch.

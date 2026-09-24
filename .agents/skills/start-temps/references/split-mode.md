@@ -60,6 +60,8 @@ cd "$TEMPS_ROOT/crates/temps-cli" && \
     --disable-https-redirect \
     --database-url="$TEMPS_DATABASE_URL" \
     --address=127.0.0.1:$TEMPS_PARKED_PORT \
+    --proxy-address=127.0.0.1:$TEMPS_HTTP_PORT \
+    --proxy-tls-address=127.0.0.1:$TEMPS_TLS_PORT \
     --console-address=127.0.0.1:$TEMPS_CONSOLE_PORT \
     --log-level=debug \
     > "$TEMPS_CONSOLE_LOG" 2>&1 & disown
@@ -68,8 +70,11 @@ echo "console launched, pid $!"
 
 > `--address=127.0.0.1:$TEMPS_PARKED_PORT` is a parked, unused value: in
 > `--role=console` the process does **not** bind the proxy listener, but the
-> flag is still required by the parser. The parked series (`8085 + slot*10`)
-> never collides with any other slot's HTTP/console/TLS port.
+> flag is still required by the parser. `--proxy-address` and
+> `--proxy-tls-address` describe the reachable listeners owned by the sibling
+> proxy process; console-side managed monitors use them as transport
+> destinations. The parked series (`8085 + slot*10`) never collides with any
+> other slot's HTTP/console/TLS port.
 
 ## 4. Launch the standalone proxy, pointed at the console
 

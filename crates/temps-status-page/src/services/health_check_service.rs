@@ -45,6 +45,55 @@ const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
 /// running it four times a minute costs far less than the old design, which
 /// probed every active monitor once a minute.
 const SCHEDULER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_RETRIES: u32 = 3;
+const INITIAL_DELAY_MS: u64 = 100;
+const MAX_DELAY_MS: u64 = 2000;
+
+#[derive(Debug, thiserror::Error)]
+enum ProbeSendError {
+    #[error("request failed after {attempts} attempts: {source}")]
+    Request {
+        attempts: u32,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("request timed out after {attempts} attempts")]
+    Timeout { attempts: u32 },
+}
+
+async fn send_with_timeout_retries(
+    client: &reqwest::Client,
+    url: &str,
+    request_timeout: Duration,
+) -> Result<(reqwest::Response, u32), ProbeSendError> {
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay = std::cmp::min(INITIAL_DELAY_MS * (2_u64.pow(attempt - 1)), MAX_DELAY_MS);
+            sleep(Duration::from_millis(delay)).await;
+        }
+
+        match timeout(request_timeout, client.get(url).send()).await {
+            Ok(Ok(response)) => return Ok((response, attempt + 1)),
+            Ok(Err(source)) if source.is_timeout() && attempt < MAX_RETRIES => continue,
+            Ok(Err(source)) => {
+                return Err(ProbeSendError::Request {
+                    attempts: attempt + 1,
+                    source,
+                });
+            }
+            Err(_) if attempt < MAX_RETRIES => continue,
+            Err(_) => {
+                return Err(ProbeSendError::Timeout {
+                    attempts: attempt + 1,
+                });
+            }
+        }
+    }
+
+    Err(ProbeSendError::Timeout {
+        attempts: MAX_RETRIES + 1,
+    })
+}
 
 fn probe_url(
     public_url: &str,
@@ -94,6 +143,14 @@ fn local_proxy_client(
     logical_url: &str,
     listener: &str,
 ) -> Result<reqwest::Client, StatusPageError> {
+    local_proxy_client_with_roots(logical_url, listener, &[])
+}
+
+fn local_proxy_client_with_roots(
+    logical_url: &str,
+    listener: &str,
+    additional_roots: &[reqwest::Certificate],
+) -> Result<reqwest::Client, StatusPageError> {
     let url = reqwest::Url::parse(logical_url).map_err(|error| {
         StatusPageError::InvalidRequest(format!(
             "Generated deployment URL '{logical_url}' is invalid: {error}"
@@ -106,22 +163,48 @@ fn local_proxy_client(
     })?;
     let destination = local_proxy_destination(listener)?;
 
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("Temps-Status-Monitor/1.0")
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(hostname, destination)
+        .resolve(hostname, destination);
+    for root in additional_roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
+    builder
         .build()
         .map_err(|source| StatusPageError::HttpClientBuild { source })
 }
 
-fn should_route_probe_locally(is_managed: bool, external_url: Option<&str>) -> bool {
-    is_managed && external_url.is_none()
+fn should_route_probe_locally(is_managed: bool, uses_external_url: bool) -> bool {
+    is_managed && !uses_external_url
 }
 
-fn same_host_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+fn local_listener_for_url<'a>(
+    logical_url: &str,
+    http_listener: &'a str,
+    tls_listener: Option<&'a str>,
+) -> Option<&'a str> {
+    if logical_url.starts_with("https://") {
+        tls_listener
+    } else {
+        Some(http_listener)
+    }
+}
+
+const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
+
+fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
     if !response.status().is_redirection() {
+        return None;
+    }
+    if response
+        .headers()
+        .get(PROXY_HTTPS_REDIRECT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
         return None;
     }
     let requested = reqwest::Url::parse(requested_url).ok()?;
@@ -504,17 +587,17 @@ impl HealthCheckService {
 
         // IMPORTANT: Always use the public URL for health checks
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
-        let health_url = match config_service
-            .get_deployment_url_by_slug(&environment.subdomain)
+        let (health_url, uses_external_url) = match config_service
+            .get_deployment_url_by_slug_with_source(&environment.subdomain)
             .await
         {
-            Ok(public_url) => {
+            Ok((public_url, uses_external_url)) => {
                 debug!("Using public URL for health check: {}", public_url);
                 // Use custom check_path if set, otherwise fall back to monitor_type logic.
                 // Defense-in-depth: re-validate the stored path at use time so that any
                 // rows written before write-time validation was added (or written by a
                 // future migration/import path) cannot inject a manipulated URL.
-                match probe_url(
+                let health_url = match probe_url(
                     &public_url,
                     &monitor.monitor_type,
                     monitor.check_path.as_deref(),
@@ -528,7 +611,8 @@ impl HealthCheckService {
                         );
                         public_url
                     }
-                }
+                };
+                (health_url, uses_external_url)
             }
             Err(e) => {
                 error!(
@@ -551,72 +635,63 @@ impl HealthCheckService {
             }
         };
 
-        let (probe_client, is_local_probe, local_tls_listener) =
-            match config_service.get_external_url().await {
-                Ok(external_url)
-                    if should_route_probe_locally(monitor.is_managed, external_url.as_deref()) =>
-                {
-                    let server_config = config_service.get_server_config();
-                    let listener = if health_url.starts_with("https://") {
-                        server_config
-                            .tls_address
-                            .as_deref()
-                            .unwrap_or(&server_config.address)
-                    } else {
-                        &server_config.address
-                    };
-                    match local_proxy_client(&health_url, listener) {
-                        Ok(client) => {
-                            debug!(
-                                monitor_id = monitor.id,
-                                logical_url = %health_url,
-                                proxy_listener = %listener,
-                                "Routing managed health check through the configured local proxy"
-                            );
-                            (client, true, server_config.tls_address.clone())
-                        }
-                        Err(error) => {
-                            error!(
-                                monitor_id = monitor.id,
-                                logical_url = %health_url,
-                                proxy_listener = %listener,
-                                error = %error,
-                                "Failed to configure local proxy health check"
-                            );
-                            Self::record_check(
-                                &db,
-                                probe.clone(),
-                                "degraded".to_string(),
-                                None,
-                                Some(format!("Failed to configure local proxy probe: {error}")),
-                                &job_queue,
-                            )
-                            .await?;
-                            return Ok(());
-                        }
-                    }
+        let (probe_client, is_local_probe, local_tls_listener) = if should_route_probe_locally(
+            monitor.is_managed,
+            uses_external_url,
+        ) {
+            let server_config = config_service.get_server_config();
+            let Some(listener) = local_listener_for_url(
+                &health_url,
+                &server_config.address,
+                server_config.tls_address.as_deref(),
+            ) else {
+                Self::record_check(
+                        &db,
+                        probe.clone(),
+                        "degraded".to_string(),
+                        None,
+                        Some(
+                            "Managed HTTPS health URL has no configured local TLS proxy listener; application health is unverified"
+                                .to_string(),
+                        ),
+                        &job_queue,
+                    )
+                    .await?;
+                return Ok(());
+            };
+            match local_proxy_client(&health_url, listener) {
+                Ok(client) => {
+                    debug!(
+                        monitor_id = monitor.id,
+                        logical_url = %health_url,
+                        proxy_listener = %listener,
+                        "Routing managed health check through the configured local proxy"
+                    );
+                    (client, true, server_config.tls_address.clone())
                 }
-                Ok(_) => (http_client, false, None),
                 Err(error) => {
                     error!(
                         monitor_id = monitor.id,
+                        logical_url = %health_url,
+                        proxy_listener = %listener,
                         error = %error,
-                        "Failed to determine whether monitor should use the local proxy"
+                        "Failed to configure local proxy health check"
                     );
                     Self::record_check(
                         &db,
                         probe.clone(),
                         "degraded".to_string(),
                         None,
-                        Some(format!(
-                            "Failed to load external URL configuration: {error}"
-                        )),
+                        Some(format!("Failed to configure local proxy probe: {error}")),
                         &job_queue,
                     )
                     .await?;
                     return Ok(());
                 }
-            };
+            }
+        } else {
+            (http_client, false, None)
+        };
 
         debug!("Checking URL: {}", health_url);
 
@@ -624,11 +699,6 @@ impl HealthCheckService {
         let start_time = std::time::Instant::now();
         let mut last_error = None;
         let mut total_response_time_ms = 0i32;
-
-        // Retry configuration
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 100;
-        const MAX_DELAY_MS: u64 = 2000;
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
@@ -660,17 +730,21 @@ impl HealthCheckService {
                     // TLS listener. All application-controlled cross-host
                     // redirects remain unfollowed.
                     let response = if let Some(https_url) = is_local_probe
-                        .then(|| same_host_https_redirect(&health_url, &response))
+                        .then(|| proxy_https_redirect(&health_url, &response))
                         .flatten()
                     {
                         let Some(tls_listener) = local_tls_listener.as_deref() else {
+                            // A proxy-owned redirect is emitted before the app is
+                            // contacted. Without a local TLS listener the probe is
+                            // therefore inconclusive and must not report a dead app
+                            // as operational.
                             return Self::record_check(
                                 &db,
                                 probe.clone(),
                                 "degraded".to_string(),
                                 Some(total_response_time_ms),
                                 Some(
-                                    "Local proxy redirected to HTTPS before reaching the application, but no TLS listener is configured"
+                                    "Local proxy requires HTTPS, but no local TLS listener is configured; application health is unverified"
                                         .to_string(),
                                 ),
                                 &job_queue,
@@ -693,28 +767,29 @@ impl HealthCheckService {
                                 .await;
                             }
                         };
-                        match timeout(Duration::from_secs(10), tls_client.get(&https_url).send())
-                            .await
-                        {
-                            Ok(Ok(response)) => response,
-                            Ok(Err(error)) => {
+                        let tls_result = send_with_timeout_retries(
+                            &tls_client,
+                            &https_url,
+                            Duration::from_secs(10),
+                        )
+                        .await;
+                        total_response_time_ms = start_time.elapsed().as_millis() as i32;
+                        match tls_result {
+                            Ok((response, tls_attempts)) => {
+                                debug!(
+                                    monitor_id = monitor.id,
+                                    attempts = tls_attempts,
+                                    "Local HTTPS proxy follow-up completed"
+                                );
+                                response
+                            }
+                            Err(error) => {
                                 return Self::record_check(
                                     &db,
                                     probe.clone(),
                                     "major_outage".to_string(),
                                     Some(total_response_time_ms),
                                     Some(format!("Local HTTPS proxy probe failed: {error}")),
-                                    &job_queue,
-                                )
-                                .await;
-                            }
-                            Err(_) => {
-                                return Self::record_check(
-                                    &db,
-                                    probe.clone(),
-                                    "major_outage".to_string(),
-                                    Some(10000),
-                                    Some("Local HTTPS proxy probe timed out".to_string()),
                                     &job_queue,
                                 )
                                 .await;
@@ -1293,7 +1368,53 @@ impl HealthCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_test_tls_server(hostname: &str) -> (SocketAddr, reqwest::Certificate) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
+                .expect("generate test TLS certificate");
+        let cert_pem = cert.pem();
+        let key_pem = signing_key.serialize_pem();
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test certificate");
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .expect("parse test private key")
+            .expect("test private key is present");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .expect("build test TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test TLS listener");
+        let address = listener.local_addr().expect("read TLS listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept TLS probe");
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .expect("complete TLS handshake");
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).await.expect("read HTTPS probe");
+            assert!(
+                String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1\r\n")
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write HTTPS response");
+        });
+        (
+            address,
+            reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse reqwest test root"),
+        )
+    }
 
     #[test]
     fn local_proxy_destination_normalizes_wildcard_addresses() {
@@ -1313,12 +1434,37 @@ mod tests {
 
     #[test]
     fn only_unconfigured_managed_monitors_route_through_local_proxy() {
-        assert!(should_route_probe_locally(true, None));
-        assert!(!should_route_probe_locally(
-            true,
-            Some("https://public.example.test")
-        ));
-        assert!(!should_route_probe_locally(false, None));
+        assert!(should_route_probe_locally(true, false));
+        assert!(!should_route_probe_locally(true, true));
+        assert!(!should_route_probe_locally(false, false));
+    }
+
+    #[test]
+    fn https_local_probe_requires_a_tls_listener() {
+        assert_eq!(
+            local_listener_for_url(
+                "https://environment.example.test/health",
+                "127.0.0.1:80",
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            local_listener_for_url(
+                "https://environment.example.test/health",
+                "127.0.0.1:80",
+                Some("127.0.0.1:443"),
+            ),
+            Some("127.0.0.1:443")
+        );
+        assert_eq!(
+            local_listener_for_url(
+                "http://environment.example.test/health",
+                "127.0.0.1:80",
+                None,
+            ),
+            Some("127.0.0.1:80")
+        );
     }
 
     #[tokio::test]
@@ -1373,7 +1519,7 @@ mod tests {
             let _size = stream.read(&mut request).await.expect("read local probe");
             stream
                 .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: 0\r\n\r\n",
+                    b"HTTP/1.1 302 Found\r\nLocation: https://169.254.169.254/latest/meta-data\r\nX-Temps-Proxy-Https-Redirect: 1\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await
                 .expect("write redirect response");
@@ -1389,7 +1535,7 @@ mod tests {
             .expect("receive original redirect");
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
         assert!(
-            same_host_https_redirect(logical_url, &response).is_none(),
+            proxy_https_redirect(logical_url, &response).is_none(),
             "cross-host redirects must never be eligible for the local TLS probe"
         );
         assert_eq!(
@@ -1401,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_host_http_to_https_redirect_is_eligible_for_local_tls_probe() {
+    async fn marked_proxy_https_redirect_is_eligible_for_local_tls_probe() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local probe listener");
@@ -1412,7 +1558,7 @@ mod tests {
             let _size = stream.read(&mut request).await.expect("read local probe");
             stream
                 .write_all(
-                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure-probe.invalid/ready\r\nContent-Length: 0\r\n\r\n",
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure-probe.invalid/ready\r\nX-Temps-Proxy-Https-Redirect: 1\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await
                 .expect("write redirect response");
@@ -1426,10 +1572,94 @@ mod tests {
             .await
             .expect("receive HTTPS upgrade redirect");
         assert_eq!(
-            same_host_https_redirect(logical_url, &response).as_deref(),
+            proxy_https_redirect(logical_url, &response).as_deref(),
             Some("https://secure-probe.invalid/ready")
         );
         server.await.expect("local probe task completes");
+    }
+
+    #[tokio::test]
+    async fn unmarked_same_host_application_redirect_remains_operational_without_tls_follow_up() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind application redirect listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept application probe");
+            let mut request = [0_u8; 1024];
+            let _size = stream
+                .read(&mut request)
+                .await
+                .expect("read application probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://application-redirect.invalid/login\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write application redirect");
+        });
+        let logical_url = "http://application-redirect.invalid/health";
+        let response = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build application probe client")
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive application redirect");
+
+        assert!(proxy_https_redirect(logical_url, &response).is_none());
+        assert!(HealthCheckService::is_operational_http_status(
+            response.status()
+        ));
+        server.await.expect("application redirect task completes");
+    }
+
+    #[tokio::test]
+    async fn local_https_follow_up_pins_host_validates_tls_and_reaches_application_path() {
+        let hostname = "secure-probe.invalid";
+        let (destination, root) = spawn_test_tls_server(hostname).await;
+        let logical_url = format!("https://{hostname}/ready");
+        let client = local_proxy_client_with_roots(&logical_url, &destination.to_string(), &[root])
+            .expect("build pinned TLS client with test root");
+
+        let (response, attempts) =
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+                .await
+                .expect("HTTPS follow-up succeeds");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(attempts, 1);
+        assert_eq!(response.url().host_str(), Some(hostname));
+    }
+
+    #[tokio::test]
+    async fn https_follow_up_retries_all_bounded_timeouts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind timeout listener");
+        let destination = listener.local_addr().expect("read timeout address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let mut held_streams = Vec::new();
+            for _ in 0..=MAX_RETRIES {
+                let (stream, _) = listener.accept().await.expect("accept timed-out probe");
+                accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                held_streams.push(stream);
+            }
+            held_streams
+        });
+        let logical_url = "http://timeout-probe.invalid/ready";
+        let client = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build pinned timeout client");
+
+        let error = send_with_timeout_retries(&client, logical_url, Duration::from_millis(20))
+            .await
+            .expect_err("all attempts should time out");
+        assert!(matches!(
+            error,
+            ProbeSendError::Timeout { attempts } if attempts == MAX_RETRIES + 1
+        ));
+        server.abort();
+        assert_eq!(accepted.load(Ordering::SeqCst), (MAX_RETRIES + 1) as usize);
     }
 
     #[test]
