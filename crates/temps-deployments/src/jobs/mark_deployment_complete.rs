@@ -840,14 +840,7 @@ impl MarkDeploymentCompleteJob {
         // this check it would wait for an ACK that can structurally never
         // arrive and revert every single deployment after the full 10s,
         // regardless of whether routing actually propagated fine.
-        let cluster_dns_enabled = match self.config_service.as_ref() {
-            Some(config_service) => config_service
-                .get_settings()
-                .await
-                .map(|settings| settings.cluster_dns.enabled)
-                .unwrap_or(false),
-            None => false,
-        };
+        let cluster_dns_enabled = self.cluster_dns_enabled().await?;
         if !cluster_dns_enabled {
             self.log(
                 "Cluster DNS is disabled — skipping the DNS-generation propagation check \
@@ -1516,6 +1509,24 @@ WHERE project.id = $2
                 return Err(reason);
             }
         }
+    }
+
+    async fn cluster_dns_enabled(&self) -> Result<bool, WorkflowError> {
+        let config_service = self.config_service.as_ref().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Cannot verify worker DNS propagation because ConfigService is not configured"
+                    .to_string(),
+            )
+        })?;
+        config_service
+            .get_settings()
+            .await
+            .map(|settings| settings.cluster_dns.enabled)
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load cluster DNS settings before worker propagation gate: {error}"
+                ))
+            })
     }
 
     /// Check whether the environment's current_deployment_id matches what we expect.
@@ -2843,6 +2854,16 @@ mod teardown_tests {
         deployment_id: i32,
         deployer: Arc<RecordingDeployer>,
     ) -> MarkDeploymentCompleteJob {
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                "postgresql://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
         MarkDeploymentCompleteJob::new(
             "mark-complete".to_string(),
             deployment_id,
@@ -2853,6 +2874,30 @@ mod teardown_tests {
                 "test-password",
             )),
         )
+        .with_config_service(config_service)
+    }
+
+    #[tokio::test]
+    async fn cluster_dns_gate_rejects_missing_config_service() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let job = MarkDeploymentCompleteJob::new(
+            "mark-complete".to_string(),
+            42,
+            db,
+            Arc::new(RecordingDeployer::new()),
+            Arc::new(NoopQueue),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )),
+        );
+
+        let error = job
+            .cluster_dns_enabled()
+            .await
+            .expect_err("missing ConfigService must fail closed");
+        assert!(error
+            .to_string()
+            .contains("ConfigService is not configured"));
     }
 
     #[tokio::test]
