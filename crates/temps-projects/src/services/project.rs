@@ -5426,6 +5426,7 @@ impl ProjectService {
     /// deployed image and command as host root, so it is admin-only — deploy
     /// permission on the project is not sufficient. Every other project is
     /// unaffected.
+    #[allow(clippy::too_many_arguments)]
     pub async fn trigger_pipeline_as(
         &self,
         project_id: i32,
