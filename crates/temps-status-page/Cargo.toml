@@ -40,3 +40,7 @@ tokio-test = "0.4"
 wiremock = "0.6"
 hex = { workspace = true }
 async-trait = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
