@@ -164,16 +164,10 @@ impl ContainerHealthMonitor {
     /// Construct the production monitor, where worker runtime resolution is a
     /// required dependency. Returning an error here prevents a multi-node
     /// installation from silently running without worker health checks.
-    pub fn try_new(
-        db: Arc<DatabaseConnection>,
-        deployer: Arc<dyn ContainerDeployer>,
-        alarm_service: Arc<AlarmService>,
-        config: ContainerHealthConfig,
+    pub fn require_runtime_resolver(
         runtime_resolver: Option<Arc<dyn ContainerRuntimeResolver>>,
-    ) -> Result<Self, ContainerHealthMonitorInitError> {
-        let runtime_resolver =
-            runtime_resolver.ok_or(ContainerHealthMonitorInitError::MissingRuntimeResolver)?;
-        Ok(Self::new(db, deployer, alarm_service, config).with_runtime_resolver(runtime_resolver))
+    ) -> Result<Arc<dyn ContainerRuntimeResolver>, ContainerHealthMonitorInitError> {
+        runtime_resolver.ok_or(ContainerHealthMonitorInitError::MissingRuntimeResolver)
     }
 
     /// Attach a metrics store. When set, container resource metrics
@@ -330,30 +324,16 @@ impl ContainerHealthMonitor {
     async fn check_container_jobs(&self, jobs: Vec<ContainerCheckJob>) {
         stream::iter(jobs)
             .for_each_concurrent(MAX_CONCURRENT_CONTAINER_CHECKS, |job| async move {
-                let check =
-                    self.check_container(&job.container, &job.deployment, job.deployer.as_ref());
                 let result = if job.is_remote {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(self.config.worker_check_timeout_ms),
-                        check,
+                    self.check_remote_container(
+                        &job.container,
+                        &job.deployment,
+                        job.deployer.as_ref(),
                     )
                     .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(
-                                node_id = job.container.node_id,
-                                container_id = job.container.id,
-                                container_runtime_id = %job.container.container_id,
-                                deployment_id = job.container.deployment_id,
-                                timeout_ms = self.config.worker_check_timeout_ms,
-                                "Worker container health check timed out"
-                            );
-                            return;
-                        }
-                    }
                 } else {
-                    check.await
+                    self.check_container(&job.container, &job.deployment, job.deployer.as_ref())
+                        .await
                 };
                 if let Err(error) = result {
                     debug!(
@@ -385,6 +365,52 @@ impl ContainerHealthMonitor {
                 )
             })?;
 
+        self.process_container_info(container, deployment, deployer, info, None)
+            .await;
+
+        Ok(())
+    }
+
+    async fn check_remote_container(
+        &self,
+        container: &deployment_containers::Model,
+        deployment: &deployments::Model,
+        deployer: &dyn ContainerDeployer,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Duration::from_millis(self.config.worker_check_timeout_ms);
+        let info = tokio::time::timeout(
+            deadline,
+            deployer.get_container_info(&container.container_id),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Worker container info timed out after {}ms for {} ({})",
+                self.config.worker_check_timeout_ms,
+                container.container_id,
+                container.container_name
+            )
+        })?
+        .map_err(|error| {
+            format!(
+                "Failed to get info for container {} ({}): {error}",
+                container.container_id, container.container_name
+            )
+        })?;
+
+        self.process_container_info(container, deployment, deployer, info, Some(deadline))
+            .await;
+        Ok(())
+    }
+
+    async fn process_container_info(
+        &self,
+        container: &deployment_containers::Model,
+        deployment: &deployments::Model,
+        deployer: &dyn ContainerDeployer,
+        info: temps_deployer::ContainerInfo,
+        stats_deadline: Option<tokio::time::Duration>,
+    ) {
         // Check restart count
         self.check_restart_count(container, deployment, &info).await;
 
@@ -401,10 +427,8 @@ impl ContainerHealthMonitor {
             .await;
 
         // Check resource usage (CPU, memory)
-        self.check_resource_usage(container, deployment, deployer)
+        self.check_resource_usage(container, deployment, deployer, stats_deadline)
             .await;
-
-        Ok(())
     }
 
     /// Reconcile runtime metadata and published ports after container restarts.
@@ -717,8 +741,29 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         deployment: &deployments::Model,
         deployer: &dyn ContainerDeployer,
+        deadline: Option<tokio::time::Duration>,
     ) {
-        let stats = match deployer.get_container_stats(&container.container_id).await {
+        let stats_result = match deadline {
+            Some(deadline) => match tokio::time::timeout(
+                deadline,
+                deployer.get_container_stats(&container.container_id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        container_id = container.id,
+                        node_id = container.node_id,
+                        timeout_ms = self.config.worker_check_timeout_ms,
+                        "Worker container stats request timed out"
+                    );
+                    return;
+                }
+            },
+            None => deployer.get_container_stats(&container.container_id).await,
+        };
+        let stats = match stats_result {
             Ok(s) => s,
             Err(e) => {
                 debug!(
@@ -1294,15 +1339,7 @@ mod tests {
 
     #[test]
     fn production_monitor_requires_worker_runtime_resolver() {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
-        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
-        let result = ContainerHealthMonitor::try_new(
-            db.clone(),
-            deployer,
-            make_alarm_service(db),
-            ContainerHealthConfig::default(),
-            None,
-        );
+        let result = ContainerHealthMonitor::require_runtime_resolver(None);
 
         assert!(matches!(
             result,
@@ -1934,7 +1971,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref())
+            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
             .await;
 
         let counters = monitor.resource_counters.read().await;
@@ -1954,7 +1991,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref())
+            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
             .await;
 
         let counters = monitor.resource_counters.read().await;
@@ -1972,7 +2009,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref())
+            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
             .await;
 
         let counters = monitor.resource_counters.read().await;
