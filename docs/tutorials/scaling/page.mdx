@@ -109,18 +109,20 @@ app.use(session({
 
 ## Resource limits {{ anchor: true, id: 'resource-limits' }}
 
-Each container can be given CPU and memory limits. New projects start with a conservative default profile rather than being fully uncapped — a scheduling request plus a hard memory limit, so a runaway app can't OOM a small single-node host. You can raise, lower, or uncap these per environment at any time.
+Each container can be given CPU and memory limits. New projects start with a conservative default profile rather than being fully uncapped — a hard memory limit, so a runaway app can't OOM a small single-node host, plus recorded CPU and memory request values. You can raise, lower, or uncap these per environment at any time.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| CPU request | 0.5 CPU | Minimum guaranteed CPU |
+| CPU request | 0.5 CPU | Recorded, but not currently enforced (see below) |
 | CPU limit | Unset (uncapped) | Maximum CPU, if configured |
-| Memory request | 128 MB | Minimum guaranteed memory |
+| Memory request | 128 MB | Recorded, but not currently enforced (see below) |
 | Memory limit | 512 MB | Maximum memory |
+
+Only the **limits** are applied to the container. The **request** values are stored and shown in the dashboard and CLI, but Temps doesn't currently pass them to Docker as reservations or use them when choosing a node, so they don't guarantee any minimum CPU or memory. On a shared host, other workloads can still contend for those resources.
 
 Set these per environment from the dashboard (Project → Environments → select environment → Settings), which takes plain CPU core counts (e.g. `0.5`, `1`, `2`) and converts them correctly.
 
-The CLI's `environments resources` command has a known unit bug in its `--cpu`/`--cpu-request` flags: they're documented and displayed as millicores (`1000` = 1 core), but the value is passed straight through to a field the API stores in microcores (`1_000_000` = 1 core), with no conversion. Setting `--cpu 1000` therefore applies a ~0.001-core limit, not 1 core. Until this is fixed, pass the raw microcore value instead of the number the flag's help text suggests:
+The CLI's `environments resources` command has a known unit bug in its `--cpu`/`--cpu-request` flags: they're documented and displayed as millicores (`1000` = 1 core), but the value is passed straight through to a field the API stores in microcores (`1_000_000` = 1 core), with no conversion. Setting `--cpu 1000` therefore asks for a 0.001-core limit — too small for Docker to apply, so the container fails to start and the deployment fails. Until this is fixed, pass the raw microcore value instead of the number the flag's help text suggests:
 
 ```bash
 # Sets a 1 CPU core limit (1_000_000 microcores) and a 0.5 CPU core request (500_000 microcores)
@@ -136,10 +138,10 @@ bunx @temps-sdk/cli environments resources production -p my-project \
     Maximum memory allocation in megabytes, e.g. `512`.
   </Property>
   <Property name="--cpu-request" type="microcores, despite the flag's own help text saying millicores">
-    Minimum guaranteed CPU. Used for scheduling decisions.
+    CPU request. Recorded only — not currently enforced or used for scheduling.
   </Property>
   <Property name="--memory-request" type="MB">
-    Minimum guaranteed memory.
+    Memory request. Recorded only — not currently enforced or used for scheduling.
   </Property>
 </Properties>
 
