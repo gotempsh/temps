@@ -4346,7 +4346,7 @@ SELECT cp.id
             }
             // Try connecting to the database
             let database_url = self.config_service.get_database_url();
-            match sea_orm::Database::connect(&database_url).await {
+            match sea_orm::Database::connect(temps_database::connect_options(&database_url)).await {
                 Ok(conn) => {
                     // Try a simple query to verify it's fully operational
                     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
