@@ -429,25 +429,32 @@ impl ContainerHealthMonitor {
             )
         })?;
 
-        let stats = match tokio::time::timeout_at(
-            deadline,
-            deployer.get_container_stats(&container.container_id),
-        )
-        .await
-        {
-            Ok(Ok(stats)) => Some(stats),
-            Ok(Err(error)) => {
-                debug!(container_id = container.id, %error, "Failed to get worker container stats");
-                None
-            }
-            Err(_) => {
-                warn!(
-                    container_id = container.id,
-                    node_id = container.node_id,
-                    timeout_ms = self.config.worker_check_timeout_ms,
-                    "Worker container runtime deadline expired while fetching stats"
-                );
-                None
+        let stats = if matches!(
+            info.status,
+            temps_deployer::ContainerStatus::Exited | temps_deployer::ContainerStatus::Dead
+        ) {
+            None
+        } else {
+            match tokio::time::timeout_at(
+                deadline,
+                deployer.get_container_stats(&container.container_id),
+            )
+            .await
+            {
+                Ok(Ok(stats)) => Some(stats),
+                Ok(Err(error)) => {
+                    debug!(container_id = container.id, %error, "Failed to get worker container stats");
+                    None
+                }
+                Err(_) => {
+                    warn!(
+                        container_id = container.id,
+                        node_id = container.node_id,
+                        timeout_ms = self.config.worker_check_timeout_ms,
+                        "Worker container runtime deadline expired while fetching stats"
+                    );
+                    None
+                }
             }
         };
 
@@ -1448,6 +1455,31 @@ mod tests {
         assert_eq!(healthy_local.stats_calls.load(Ordering::Relaxed), 1);
         assert_eq!(healthy_worker.info_calls.load(Ordering::Relaxed), 1);
         assert_eq!(healthy_worker.stats_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_worker_container_processes_exit_without_requesting_stats() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            deployer.clone(),
+            make_alarm_service(db),
+            ContainerHealthConfig {
+                worker_check_timeout_ms: 25,
+                ..ContainerHealthConfig::default()
+            },
+        );
+        let mut container = make_container_model(1);
+        container.node_id = Some(7);
+
+        monitor
+            .check_remote_container(&container, &make_deployment_model(), deployer.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(deployer.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(deployer.stats_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
