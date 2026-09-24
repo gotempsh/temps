@@ -194,6 +194,15 @@ fn local_listener_for_url<'a>(
 }
 
 const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
+const PROXY_PROBE_CAPABILITY_HEADER: &str = "x-temps-proxy-probe-capable";
+
+fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(PROXY_PROBE_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
 
 fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
     if !response.status().is_redirection() {
@@ -798,6 +807,24 @@ impl HealthCheckService {
                     } else {
                         response
                     };
+
+                    if is_local_probe
+                        && response.status().is_redirection()
+                        && !proxy_supports_probe_markers(&response)
+                    {
+                        return Self::record_check(
+                            &db,
+                            probe.clone(),
+                            "degraded".to_string(),
+                            Some(total_response_time_ms),
+                            Some(
+                                "Local proxy returned a redirect without probe capability metadata; application health is unverified during a mixed-version upgrade"
+                                    .to_string(),
+                            ),
+                            &job_queue,
+                        )
+                        .await;
+                    }
                     let status_code = response.status();
 
                     let status = if Self::is_operational_http_status(status_code) {
@@ -1558,7 +1585,7 @@ mod tests {
             let _size = stream.read(&mut request).await.expect("read local probe");
             stream
                 .write_all(
-                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure-probe.invalid/ready\r\nX-Temps-Proxy-Https-Redirect: 1\r\nContent-Length: 0\r\n\r\n",
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure-probe.invalid/ready\r\nX-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await
                 .expect("write redirect response");
@@ -1593,7 +1620,7 @@ mod tests {
                 .expect("read application probe");
             stream
                 .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: https://application-redirect.invalid/login\r\nContent-Length: 0\r\n\r\n",
+                    b"HTTP/1.1 302 Found\r\nLocation: https://application-redirect.invalid/login\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await
                 .expect("write application redirect");
@@ -1607,10 +1634,44 @@ mod tests {
             .expect("receive application redirect");
 
         assert!(proxy_https_redirect(logical_url, &response).is_none());
+        assert!(proxy_supports_probe_markers(&response));
         assert!(HealthCheckService::is_operational_http_status(
             response.status()
         ));
         server.await.expect("application redirect task completes");
+    }
+
+    #[tokio::test]
+    async fn old_proxy_redirect_without_capability_is_inconclusive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind old proxy listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept old proxy probe");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read old proxy probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://old-proxy.invalid/health\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write old proxy redirect");
+        });
+        let logical_url = "http://old-proxy.invalid/health";
+        let response = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build old proxy client")
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive old proxy redirect");
+
+        assert!(response.status().is_redirection());
+        assert!(!proxy_supports_probe_markers(&response));
+        server.await.expect("old proxy task completes");
     }
 
     #[tokio::test]

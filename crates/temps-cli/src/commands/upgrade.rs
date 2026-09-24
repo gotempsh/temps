@@ -666,7 +666,10 @@ fn restart_guidance(split: bool) -> String {
     out.push('\n');
     out.push_str("  1. Restart however you run the console, for example:\n");
     out.push_str("       # if you run it as a manual/foreground process: stop it, then\n");
-    out.push_str("       temps serve --role=console --console-address <host:port>\n");
+    out.push_str("       temps serve --role=console --console-address <host:port> \\\n");
+    out.push_str(
+        "         --proxy-address <proxy-host:port> [--proxy-tls-address <proxy-host:port>]\n",
+    );
     out.push_str("       # if you wrapped it in your own unit, restart that unit instead\n");
     out.push('\n');
     out.push_str("  2. Confirm the console is ready (expects 'ready' / HTTP 200):\n");
@@ -2043,6 +2046,7 @@ mod tests {
         assert!(!g.is_empty());
         // Targets the CONSOLE the operator runs, not the proxy.
         assert!(g.contains("temps serve --role=console"));
+        assert!(g.contains("--proxy-address"));
         // Readiness confirmation via /readyz curl line.
         assert!(g.contains("/readyz"));
         assert!(g.contains("curl"));
