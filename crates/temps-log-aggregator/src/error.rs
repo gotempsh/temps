@@ -15,7 +15,7 @@ pub(crate) enum RetryClass {
 
 #[derive(Error, Debug)]
 pub enum LogAggregatorError {
-    #[error("Log WAL recovery is incomplete: retained generation '{path}' requires recovery or repair before log collection and purge can resume")]
+    #[error("Log WAL recovery is incomplete: generation '{path}' is still in the WAL directory after a recovery pass that neither replayed nor deferred it; log collection and purge stay paused until the next pass handles it")]
     WalRecoveryIncomplete { path: String },
 
     #[error("Timed out waiting to {operation} for {target}; in-flight I/O continues safely")]

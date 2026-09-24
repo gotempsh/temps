@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
+import { LogCollectionNotice } from '@/components/observability/LogCollectionNotice'
 import {
   AttrPredicateChips,
   LogAttributeSidebar,
@@ -198,6 +199,7 @@ export default function GlobalLogs() {
         title="Logs"
         description={`${view.projectId ? 'Selected project' : 'All projects'} · application and database logs`}
       />
+      <LogCollectionNotice collection={capabilities.data?.collection} />
       <LogExplorer
         lines={lines}
         environmentLabels={environmentLabels}

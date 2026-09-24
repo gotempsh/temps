@@ -19,6 +19,7 @@
 //!   Postgres, and refuses the request outright if it cannot (ADR-045 §7).
 
 use crate::{
+    chunk::wal::DEFERRED_DIR,
     error::LogAggregatorError,
     handlers::types::LogAggregatorAppState,
     index::analytics::{AggregateRow, AttrOp, AttrPredicate, GroupKey, HistogramBucket, Metric},
@@ -27,6 +28,7 @@ use crate::{
         GlobalLogSearchResponse, GlobalLogSource,
     },
     services::search::to_search_line,
+    services::{CollectionStatus, RecoveryState},
     store::{
         encode_cursor, resolve_log_access_scope, FacetField, FacetValue, LogAccessScope, LogQuery,
     },
@@ -222,6 +224,139 @@ pub const ANALYTICS_SETUP_PATH: &str = "/settings/metrics-monitoring";
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct GlobalLogCapabilities {
     pub analytics: AnalyticsCapability,
+    pub collection: LogCollectionCapability,
+}
+
+/// How many deferred generations the response itemizes. The counts cover
+/// all of them; the list is for the operator to recognise what they are.
+const DEFERRED_GENERATIONS_LISTED: usize = 20;
+
+/// Whether new container log lines are being collected right now. Separate
+/// from `analytics` because the two fail independently: after a restart the
+/// index can be healthy while collection waits on WAL recovery, and without
+/// this the explorer shows a histogram that simply stops.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct LogCollectionCapability {
+    pub state: LogCollectionState,
+    /// `true` only in the `running` state.
+    pub collecting: bool,
+    /// When the current state began: recovery start for `recovering`,
+    /// recovery end for `running`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub since: Option<DateTime<Utc>>,
+    /// Why collection is paused, verbatim, for `retrying` and `stopped`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the next recovery pass starts, for `retrying`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub retry_at: Option<DateTime<Utc>>,
+    /// Generations recovery set aside because it could not replay them in
+    /// full. Collection runs regardless; their lines are missing from search
+    /// until an operator retries them.
+    pub deferred_count: u64,
+    pub deferred_bytes: u64,
+    /// The oldest few deferred generations.
+    pub deferred: Vec<DeferredWalGeneration>,
+    /// Directory holding them, on the server's filesystem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_dir: Option<String>,
+    /// `false` when the caller is not an instance administrator: `error`,
+    /// `deferred_dir` and each generation's `reason` are then omitted, since
+    /// they carry server filesystem paths and raw I/O errors. State and
+    /// counts are always present, so a paused collector is never hidden.
+    pub details_visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LogCollectionState {
+    /// Collecting.
+    Running,
+    /// Replaying the WAL from before the last restart; collection starts
+    /// when it finishes.
+    Recovering,
+    /// A recovery pass failed; paused until the retry at `retry_at` works.
+    Retrying,
+    /// Recovery gave up; paused until temps is restarted.
+    Stopped,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DeferredWalGeneration {
+    pub file_name: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub deferred_at: Option<DateTime<Utc>>,
+    /// What recovery could not read and what it did with the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl LogCollectionCapability {
+    /// What a non-administrator may see: the state and the counts, not the
+    /// paths and error text that only someone with a shell could act on.
+    fn without_server_details(mut self) -> Self {
+        self.details_visible = false;
+        self.error = None;
+        self.deferred_dir = None;
+        for generation in &mut self.deferred {
+            generation.reason = None;
+        }
+        self
+    }
+}
+
+impl From<CollectionStatus> for LogCollectionCapability {
+    fn from(status: CollectionStatus) -> Self {
+        let (state, since, error, retry_at) = match status.recovery {
+            RecoveryState::Complete { finished_at } => {
+                (LogCollectionState::Running, Some(finished_at), None, None)
+            }
+            RecoveryState::Recovering { started_at } => {
+                (LogCollectionState::Recovering, Some(started_at), None, None)
+            }
+            RecoveryState::Retrying { error, retry_at } => (
+                LogCollectionState::Retrying,
+                None,
+                Some(error),
+                Some(retry_at),
+            ),
+            RecoveryState::Stopped { error } => {
+                (LogCollectionState::Stopped, None, Some(error), None)
+            }
+        };
+        Self {
+            details_visible: true,
+            state,
+            collecting: state == LogCollectionState::Running,
+            since,
+            error,
+            retry_at,
+            deferred_count: status.deferred.len() as u64,
+            deferred_bytes: status.deferred.iter().map(|g| g.bytes).sum(),
+            deferred_dir: status
+                .wal_dir
+                .map(|dir| dir.join(DEFERRED_DIR).display().to_string()),
+            deferred: status
+                .deferred
+                .into_iter()
+                .take(DEFERRED_GENERATIONS_LISTED)
+                .map(|generation| DeferredWalGeneration {
+                    file_name: generation
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bytes: generation.bytes,
+                    deferred_at: generation.deferred_at,
+                    reason: generation.reason,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -283,6 +418,12 @@ pub async fn global_log_capabilities(
             .with_title("Could not read log index status")
             .with_detail(e.to_string())
     })?;
+    let collection = state.chunk_writer.collection_status().await.map_err(|e| {
+        tracing::error!(error = %e, "log collection status read failed");
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Could not read log collection status")
+            .with_detail(e.to_string())
+    })?;
     Ok(Json(GlobalLogCapabilities {
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
@@ -296,6 +437,11 @@ pub async fn global_log_capabilities(
             live_chunks,
             indexed_chunks,
             forget_backlog,
+        },
+        collection: if auth.is_instance_admin() {
+            collection.into()
+        } else {
+            LogCollectionCapability::from(collection).without_server_details()
         },
     }))
 }
@@ -844,5 +990,107 @@ mod attr_parser_tests {
         assert!(parse_metric("bogus:key").is_err());
         assert!(parse_metric("avg:").is_err());
         assert!(parse_metric("avg").is_err());
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    fn deferred(index: usize) -> crate::chunk::wal::DeferredGeneration {
+        crate::chunk::wal::DeferredGeneration {
+            path: std::path::PathBuf::from(format!(
+                "/data/logs/wal/deferred/g{index}.b.sealed-wal"
+            )),
+            bytes: 10,
+            deferred_at: None,
+            reason: Some(format!("reason {index}")),
+        }
+    }
+
+    #[test]
+    fn collection_reports_paused_recovery_with_its_error_and_retry_time() {
+        let retry_at = Utc::now();
+        let capability = LogCollectionCapability::from(CollectionStatus {
+            recovery: RecoveryState::Retrying {
+                error: "object storage unreachable".into(),
+                retry_at,
+            },
+            wal_dir: Some("/data/logs/wal".into()),
+            deferred: Vec::new(),
+        });
+        assert_eq!(capability.state, LogCollectionState::Retrying);
+        assert!(!capability.collecting);
+        assert_eq!(
+            capability.error.as_deref(),
+            Some("object storage unreachable")
+        );
+        assert_eq!(capability.retry_at, Some(retry_at));
+        assert_eq!(
+            capability.deferred_dir.as_deref(),
+            Some("/data/logs/wal/deferred")
+        );
+    }
+
+    #[test]
+    fn collection_counts_every_deferred_generation_but_lists_a_bounded_few() {
+        let capability = LogCollectionCapability::from(CollectionStatus {
+            recovery: RecoveryState::Complete {
+                finished_at: Utc::now(),
+            },
+            wal_dir: Some("/data/logs/wal".into()),
+            deferred: (0..DEFERRED_GENERATIONS_LISTED + 5).map(deferred).collect(),
+        });
+        assert_eq!(capability.state, LogCollectionState::Running);
+        assert!(
+            capability.collecting,
+            "deferred files never pause collection"
+        );
+        assert_eq!(
+            capability.deferred_count,
+            (DEFERRED_GENERATIONS_LISTED + 5) as u64
+        );
+        assert_eq!(
+            capability.deferred_bytes,
+            10 * (DEFERRED_GENERATIONS_LISTED + 5) as u64
+        );
+        assert_eq!(capability.deferred.len(), DEFERRED_GENERATIONS_LISTED);
+        assert_eq!(capability.deferred[0].file_name, "g0.b.sealed-wal");
+        assert_eq!(capability.deferred[0].reason.as_deref(), Some("reason 0"));
+    }
+
+    #[test]
+    fn non_administrators_see_state_and_counts_but_no_server_paths_or_errors() {
+        let capability = LogCollectionCapability::from(CollectionStatus {
+            recovery: RecoveryState::Stopped {
+                error: "IO error reading /srv/temps/logs/wal/x.sealed-wal".into(),
+            },
+            wal_dir: Some("/srv/temps/logs/wal".into()),
+            deferred: vec![deferred(0)],
+        })
+        .without_server_details();
+        assert!(!capability.details_visible);
+        assert_eq!(capability.state, LogCollectionState::Stopped);
+        assert!(!capability.collecting, "a paused collector is never hidden");
+        assert_eq!(capability.deferred_count, 1);
+        assert!(capability.error.is_none());
+        assert!(capability.deferred_dir.is_none());
+        assert!(capability.deferred[0].reason.is_none());
+        let json = serde_json::to_string(&capability).unwrap();
+        assert!(!json.contains("/srv/temps"), "{json}");
+    }
+
+    #[test]
+    fn collection_without_a_wal_is_running_with_nothing_deferred() {
+        let capability = LogCollectionCapability::from(CollectionStatus {
+            recovery: RecoveryState::Complete {
+                finished_at: Utc::now(),
+            },
+            wal_dir: None,
+            deferred: Vec::new(),
+        });
+        assert!(capability.collecting);
+        assert_eq!(capability.deferred_count, 0);
+        assert!(capability.deferred_dir.is_none());
     }
 }

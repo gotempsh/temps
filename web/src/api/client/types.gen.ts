@@ -6322,6 +6322,16 @@ export type DatabaseMetricsRow = {
  */
 export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
 
+export type DeferredWalGeneration = {
+    bytes: number;
+    deferred_at?: string | null;
+    file_name: string;
+    /**
+     * What recovery could not read and what it did with the rest.
+     */
+    reason?: string | null;
+};
+
 /**
  * Request to delete keys
  */
@@ -10954,6 +10964,7 @@ export type GlobalEventStatsResponse = {
  */
 export type GlobalLogCapabilities = {
     analytics: AnalyticsCapability;
+    collection: LogCollectionCapability;
 };
 
 /**
@@ -12922,6 +12933,57 @@ export type LocationInfo = {
     country?: string | null;
     region?: string | null;
 };
+
+/**
+ * Whether new container log lines are being collected right now. Separate
+ * from `analytics` because the two fail independently: after a restart the
+ * index can be healthy while collection waits on WAL recovery, and without
+ * this the explorer shows a histogram that simply stops.
+ */
+export type LogCollectionCapability = {
+    /**
+     * `true` only in the `running` state.
+     */
+    collecting: boolean;
+    /**
+     * The oldest few deferred generations.
+     */
+    deferred: Array<DeferredWalGeneration>;
+    deferred_bytes: number;
+    /**
+     * Generations recovery set aside because it could not replay them in
+     * full. Collection runs regardless; their lines are missing from search
+     * until an operator retries them.
+     */
+    deferred_count: number;
+    /**
+     * Directory holding them, on the server's filesystem.
+     */
+    deferred_dir?: string | null;
+    /**
+     * `false` when the caller is not an instance administrator: `error`,
+     * `deferred_dir` and each generation's `reason` are then omitted, since
+     * they carry server filesystem paths and raw I/O errors. State and
+     * counts are always present, so a paused collector is never hidden.
+     */
+    details_visible: boolean;
+    /**
+     * Why collection is paused, verbatim, for `retrying` and `stopped`.
+     */
+    error?: string | null;
+    /**
+     * When the next recovery pass starts, for `retrying`.
+     */
+    retry_at?: string | null;
+    /**
+     * When the current state began: recovery start for `recovering`,
+     * recovery end for `running`.
+     */
+    since?: string | null;
+    state: LogCollectionState;
+};
+
+export type LogCollectionState = 'running' | 'recovering' | 'retrying' | 'stopped';
 
 /**
  * Normalized log level
@@ -18563,6 +18625,19 @@ export type ResetPgStatStatementsResponse = {
      * Human-readable message confirming the destructive action.
      */
     message: string;
+};
+
+/**
+ * Returned once when an administrator resets another user's password. The
+ * temporary password is not stored in retrievable form, so this response is
+ * the only place it ever appears. The user must replace it at next sign-in.
+ */
+export type ResetUserPasswordResponse = {
+    /**
+     * Always true: the user must choose a new password at next sign-in.
+     */
+    must_change_password: boolean;
+    temporary_password: string;
 };
 
 export type ResizeSandboxBody = {
@@ -62651,6 +62726,54 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
+
+export type ResetUserPasswordData = {
+    body?: never;
+    path: {
+        /**
+         * User ID
+         */
+        user_id: number;
+    };
+    query?: never;
+    url: '/users/{user_id}/password';
+};
+
+export type ResetUserPasswordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * users:manage required, or attempted to reset your own password (use POST /users/me/password)
+     */
+    403: unknown;
+    /**
+     * User not found
+     */
+    404: unknown;
+    /**
+     * User is deleted
+     */
+    409: unknown;
+    /**
+     * Recent identity verification (step-up) required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResetUserPasswordResponses = {
+    /**
+     * Password reset; the temporary password is returned once
+     */
+    200: ResetUserPasswordResponse;
+};
+
+export type ResetUserPasswordResponse2 = ResetUserPasswordResponses[keyof ResetUserPasswordResponses];
 
 export type RestoreUserData = {
     body?: never;

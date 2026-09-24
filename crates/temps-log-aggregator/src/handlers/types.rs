@@ -7,7 +7,9 @@ use sea_orm::DatabaseConnection;
 use temps_core::AuditLogger;
 
 use crate::index::LineIndex;
-use crate::services::{LogMetadataService, LogSearchService, RetentionService, TailService};
+use crate::services::{
+    ChunkWriterService, LogMetadataService, LogSearchService, RetentionService, TailService,
+};
 use crate::store::manifest::ManifestRepo;
 use crate::store::LogLineStore;
 
@@ -35,6 +37,9 @@ pub struct LogAggregatorAppState {
     pub line_index: Arc<dyn LineIndex>,
     /// Manifest repository, for index coverage figures.
     pub manifests: Arc<ManifestRepo>,
+    /// Chunk writer, for the collection status the capabilities endpoint
+    /// reports (WAL recovery state and deferred generations).
+    pub chunk_writer: Arc<ChunkWriterService>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47,6 +52,7 @@ pub async fn create_log_aggregator_app_state(
     store: Arc<dyn LogLineStore>,
     db: Arc<DatabaseConnection>,
     line_index: Arc<dyn LineIndex>,
+    chunk_writer: Arc<ChunkWriterService>,
 ) -> Arc<LogAggregatorAppState> {
     let manifests = Arc::new(ManifestRepo::new(db.clone()));
     Arc::new(LogAggregatorAppState {
@@ -60,5 +66,6 @@ pub async fn create_log_aggregator_app_state(
         project_access_checker: None,
         line_index,
         manifests,
+        chunk_writer,
     })
 }

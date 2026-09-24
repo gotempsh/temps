@@ -326,6 +326,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 store,
                 db.clone(),
                 line_index,
+                chunk_writer.clone(),
             )
             .await;
             context.register_service(app_state);
@@ -676,6 +677,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             project_access_checker,
             line_index: old.line_index.clone(),
             manifests: old.manifests.clone(),
+            chunk_writer: old.chunk_writer.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 

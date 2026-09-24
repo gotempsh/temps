@@ -13648,6 +13648,37 @@
         ],
         "type": "string"
       },
+      "DeferredWalGeneration": {
+        "properties": {
+          "bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "What recovery could not read and what it did with the rest.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file_name",
+          "bytes"
+        ],
+        "type": "object"
+      },
       "DelRequest": {
         "description": "Request to delete keys",
         "properties": {
@@ -23804,10 +23835,14 @@
         "properties": {
           "analytics": {
             "$ref": "#/components/schemas/AnalyticsCapability"
+          },
+          "collection": {
+            "$ref": "#/components/schemas/LogCollectionCapability"
           }
         },
         "required": [
-          "analytics"
+          "analytics",
+          "collection"
         ],
         "type": "object"
       },
@@ -28284,6 +28319,88 @@
           }
         },
         "type": "object"
+      },
+      "LogCollectionCapability": {
+        "description": "Whether new container log lines are being collected right now. Separate\nfrom `analytics` because the two fail independently: after a restart the\nindex can be healthy while collection waits on WAL recovery, and without\nthis the explorer shows a histogram that simply stops.",
+        "properties": {
+          "collecting": {
+            "description": "`true` only in the `running` state.",
+            "type": "boolean"
+          },
+          "deferred": {
+            "description": "The oldest few deferred generations.",
+            "items": {
+              "$ref": "#/components/schemas/DeferredWalGeneration"
+            },
+            "type": "array"
+          },
+          "deferred_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_count": {
+            "description": "Generations recovery set aside because it could not replay them in\nfull. Collection runs regardless; their lines are missing from search\nuntil an operator retries them.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_dir": {
+            "description": "Directory holding them, on the server's filesystem.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "details_visible": {
+            "description": "`false` when the caller is not an instance administrator: `error`,\n`deferred_dir` and each generation's `reason` are then omitted, since\nthey carry server filesystem paths and raw I/O errors. State and\ncounts are always present, so a paused collector is never hidden.",
+            "type": "boolean"
+          },
+          "error": {
+            "description": "Why collection is paused, verbatim, for `retrying` and `stopped`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_at": {
+            "description": "When the next recovery pass starts, for `retrying`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "description": "When the current state began: recovery start for `recovering`,\nrecovery end for `running`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/LogCollectionState"
+          }
+        },
+        "required": [
+          "state",
+          "collecting",
+          "deferred_count",
+          "deferred_bytes",
+          "deferred",
+          "details_visible"
+        ],
+        "type": "object"
+      },
+      "LogCollectionState": {
+        "enum": [
+          "running",
+          "recovering",
+          "retrying",
+          "stopped"
+        ],
+        "type": "string"
       },
       "LogLevel": {
         "description": "Normalized log level",
@@ -39905,6 +40022,24 @@
         },
         "required": [
           "message"
+        ],
+        "type": "object"
+      },
+      "ResetUserPasswordResponse": {
+        "description": "Returned once when an administrator resets another user's password. The\ntemporary password is not stored in retrievable form, so this response is\nthe only place it ever appears. The user must replace it at next sign-in.",
+        "properties": {
+          "must_change_password": {
+            "description": "Always true: the user must choose a new password at next sign-in.",
+            "type": "boolean"
+          },
+          "temporary_password": {
+            "example": "Kp7#mW2qRz9!vN4xT8b$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "temporary_password",
+          "must_change_password"
         ],
         "type": "object"
       },
@@ -113169,7 +113304,6 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update application settings",
         "tags": [
           "Settings"
         ]
@@ -116773,6 +116907,63 @@
           }
         ],
         "summary": "Update user information (admin only)",
+        "tags": [
+          "Users"
+        ]
+      }
+    },
+    "/users/{user_id}/password": {
+      "post": {
+        "description": "The recovery path for a user who lost their password when outbound email\nis not configured. The user is signed out everywhere and must choose a new\npassword at next sign-in. The temporary password is returned once and\ncannot be retrieved again.",
+        "operationId": "reset_user_password",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetUserPasswordResponse"
+                }
+              }
+            },
+            "description": "Password reset; the temporary password is returned once"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "users:manage required, or attempted to reset your own password (use POST /users/me/password)"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "409": {
+            "description": "User is deleted"
+          },
+          "428": {
+            "description": "Recent identity verification (step-up) required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reset another user's password to a generated temporary one (admin only).",
         "tags": [
           "Users"
         ]

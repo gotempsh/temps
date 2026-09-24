@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildFilters,
+  describeCollection,
   parseDuration,
   toAnalyticsQuery,
   validateAttrPredicate,
@@ -193,4 +194,67 @@ describe('toAnalyticsQuery', () => {
     expect('page_size' in query).toBe(false)
     expect('attrs' in query).toBe(false)
   })
+})
+
+describe('describeCollection', () => {
+  const base = {
+    collecting: true,
+    details_visible: true,
+    deferred_count: 0,
+    deferred_bytes: 0,
+    deferred: [],
+  }
+
+  test('a running instance with nothing deferred is fine', () => {
+    const summary = describeCollection({ ...base, state: 'running' })
+    expect(summary.severity).toBe('ok')
+    expect(summary.details).toEqual([])
+  })
+
+  test('a paused instance says why and when it retries', () => {
+    const summary = describeCollection({
+      ...base,
+      state: 'retrying',
+      collecting: false,
+      error: 'object storage unreachable',
+      retry_at: '2026-01-01T00:10:00Z',
+    })
+    expect(summary.severity).toBe('error')
+    expect(summary.headline).toContain('paused')
+    expect(summary.details).toEqual([
+      'Error: object storage unreachable',
+      'Next attempt: 2026-01-01T00:10:00Z',
+    ])
+  })
+
+  test('deferred generations warn even while collecting, and name the overflow', () => {
+    const summary = describeCollection({
+      ...base,
+      state: 'running',
+      deferred_count: 3,
+      deferred_bytes: 3 * 1024 * 1024,
+      deferred_dir: '/data/logs/wal/deferred',
+      deferred: [{ file_name: 'a.b.sealed-wal', bytes: 1, reason: 'record fails its checksum' }],
+    })
+    expect(summary.severity).toBe('warn')
+    expect(summary.details[0]).toContain('3 WAL generation(s) (3.0 MiB)')
+    expect(summary.details[0]).toContain('/data/logs/wal/deferred')
+    expect(summary.details[1]).toBe('  a.b.sealed-wal: record fails its checksum')
+    expect(summary.details[2]).toBe('  …and 2 more')
+  })
+})
+
+test('describeCollection tells non-administrators where the details are', () => {
+  const summary = describeCollection({
+    state: 'stopped',
+    collecting: false,
+    details_visible: false,
+    deferred_count: 0,
+    deferred_bytes: 0,
+    deferred: [],
+  })
+  expect(summary.severity).toBe('error')
+  expect(summary.details).toEqual([
+    'An instance administrator can see the exact error and file locations.',
+  ])
 })
