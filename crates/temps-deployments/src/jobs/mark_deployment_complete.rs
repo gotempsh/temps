@@ -182,23 +182,28 @@ impl MarkDeploymentCompleteJob {
                 ))
             })?;
         let now = chrono::Utc::now();
-        let failed_deployment = deployments::ActiveModel {
-            id: sea_orm::ActiveValue::Unchanged(deployment.id),
-            state: Set("failed".to_string()),
-            finished_at: Set(Some(now)),
-            updated_at: Set(now),
-            cancelled_reason: Set(Some(reason.to_string())),
-            ..Default::default()
-        };
-        failed_deployment
-            .update(&transaction)
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to mark deployment {} unusable in environment {}: {}",
-                    self.deployment_id, environment_id, error
-                ))
-            })?;
+        // Cancellation and supersession can win while readiness is waiting.
+        // Preserve the terminal state and its original reason observed under
+        // the row lock; only a still-running candidate belongs to this gate.
+        if deployment.state == "running" {
+            let failed_deployment = deployments::ActiveModel {
+                id: sea_orm::ActiveValue::Unchanged(deployment.id),
+                state: Set("failed".to_string()),
+                finished_at: Set(Some(now)),
+                updated_at: Set(now),
+                cancelled_reason: Set(Some(reason.to_string())),
+                ..Default::default()
+            };
+            failed_deployment
+                .update(&transaction)
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to mark deployment {} unusable in environment {}: {}",
+                        self.deployment_id, environment_id, error
+                    ))
+                })?;
+        }
 
         let mut route_rollback = environments::Entity::update_many()
             .col_expr(
@@ -3436,6 +3441,96 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(rejected.state, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_reject_unusable_deployment_preserves_concurrent_cancellation() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "cancelled").await;
+        let cancellation_reason = "Cancelled because a newer push arrived";
+
+        let mut active_candidate: deployments::ActiveModel = candidate.clone().into();
+        active_candidate.cancelled_reason = Set(Some(cancellation_reason.to_string()));
+        active_candidate.update(db.as_ref()).await.unwrap();
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(candidate.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = make_job(db.clone(), candidate.id, Arc::new(RecordingDeployer::new()));
+        job.reject_unusable_deployment(env.id, Some(previous.id), "Late readiness failure", false)
+            .await
+            .unwrap();
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(previous.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "cancelled");
+        assert_eq!(
+            candidate.cancelled_reason.as_deref(),
+            Some(cancellation_reason)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_unusable_deployment_preserves_concurrent_supersession() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "stopped").await;
+        let supersession_reason = "Superseded by rollback deployment";
+
+        let mut active_candidate: deployments::ActiveModel = candidate.clone().into();
+        active_candidate.cancelled_reason = Set(Some(supersession_reason.to_string()));
+        active_candidate.update(db.as_ref()).await.unwrap();
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(candidate.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = make_job(db.clone(), candidate.id, Arc::new(RecordingDeployer::new()));
+        job.reject_unusable_deployment(env.id, Some(previous.id), "Late readiness failure", false)
+            .await
+            .unwrap();
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(previous.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "stopped");
+        assert_eq!(
+            candidate.cancelled_reason.as_deref(),
+            Some(supersession_reason)
+        );
     }
 
     #[tokio::test]

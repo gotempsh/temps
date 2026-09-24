@@ -2420,12 +2420,20 @@ impl DeploymentService {
             .lock(sea_orm::sea_query::LockType::Update)
             .one(&transaction)
             .await?
-            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Environment {environment_id} not found while reconciling static deployment {deployment_id}"
+                ))
+            })?;
         let deployment = deployments::Entity::find_by_id(deployment_id)
             .lock(sea_orm::sea_query::LockType::Update)
             .one(&transaction)
             .await?
-            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Deployment {deployment_id} not found while reconciling static completion for environment {environment_id}"
+                ))
+            })?;
 
         if environment.current_deployment_id != Some(deployment_id) {
             transaction.commit().await?;
