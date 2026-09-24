@@ -584,11 +584,10 @@ impl DoctorCommand {
         }
 
         // SeaORM connection (without running migrations)
-        let mut opt = sea_orm::ConnectOptions::new(&database_url);
+        let mut opt = temps_database::connect_options(&database_url);
         opt.max_connections(2)
             .min_connections(1)
-            .connect_timeout(CHECK_TIMEOUT)
-            .sqlx_logging(false);
+            .connect_timeout(CHECK_TIMEOUT);
 
         let db = match timeout(CHECK_TIMEOUT, sea_orm::Database::connect(opt)).await {
             Ok(Ok(db)) => db,

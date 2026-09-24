@@ -15,6 +15,27 @@ use tracing::debug;
 
 pub type DbConnection = DatabaseConnection;
 
+/// Statements slower than this are reported at WARN (`sqlx::query` target).
+const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// Sea-ORM connect options carrying Temps' SQL logging policy.
+///
+/// Every statement is logged at TRACE, so per-query SQL only appears when
+/// explicitly requested (`RUST_LOG=sqlx::query=trace`) and never floods a
+/// `RUST_LOG=info`/`debug` run. Sea-ORM's default logs every statement at
+/// INFO. Statements slower than [`SLOW_STATEMENT_THRESHOLD`] are still
+/// reported at WARN: `sqlx_logging(false)` would silence those too, and they
+/// are the only signal that a query is degrading.
+///
+/// Use this for every Postgres connection instead of `ConnectOptions::new`.
+pub fn connect_options(database_url: impl Into<String>) -> ConnectOptions {
+    let mut opt = ConnectOptions::new(database_url);
+    opt.sqlx_logging(true)
+        .sqlx_logging_level(log::LevelFilter::Trace)
+        .sqlx_slow_statements_logging_settings(log::LevelFilter::Warn, SLOW_STATEMENT_THRESHOLD);
+    opt
+}
+
 /// Default timeout for database connectivity check (5 seconds)
 const CONNECTIVITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -151,12 +172,11 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         .and_then(|v| v.parse().ok())
         .unwrap_or(600);
 
-    let mut opt = ConnectOptions::new(database_url);
+    let mut opt = connect_options(database_url);
     opt.max_connections(max_conn)
         .min_connections(min_conn)
         .connect_timeout(Duration::from_secs(acquire_timeout_secs))
-        .idle_timeout(Duration::from_secs(idle_timeout_secs))
-        .sqlx_logging(false);
+        .idle_timeout(Duration::from_secs(idle_timeout_secs));
 
     // Connect with timeout
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
@@ -205,7 +225,7 @@ pub async fn connect_without_migrations(database_url: &str) -> ServiceResult<Arc
         .await
         .map_err(ServiceError::Database)?;
 
-    let opt = ConnectOptions::new(database_url);
+    let opt = connect_options(database_url);
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
         Ok(Ok(db)) => db,
         Ok(Err(e)) => {
@@ -243,12 +263,10 @@ pub async fn connect_for_migrate(database_url: &str) -> ServiceResult<(Arc<DbCon
         .await
         .map_err(ServiceError::Database)?;
 
-    let mut opt = ConnectOptions::new(database_url);
+    let mut opt = connect_options(database_url);
     // Exactly one backend, kept alive for the run, so the PID below is the
     // backend that executes every migration statement.
-    opt.max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false);
+    opt.max_connections(1).min_connections(1);
 
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
         Ok(Ok(db)) => db,
@@ -329,7 +347,7 @@ async fn migration_backend_active(db: &DatabaseConnection, pid: i32) -> ServiceR
 /// captured PID; another legitimate `temps migrate` process is never swept by
 /// application name.
 pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceResult<()> {
-    let db = Database::connect(ConnectOptions::new(database_url))
+    let db = Database::connect(connect_options(database_url))
         .await
         .map_err(|e| {
             ServiceError::Database(format!("Failed to connect to cancel migration: {}", e))
@@ -1236,6 +1254,124 @@ mod tests {
         let (host, port) = parse_database_url("postgres://user:p%40ss@localhost:5432/db").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn connect_options_logs_statements_at_trace_and_slow_ones_at_warn() {
+        let opt = connect_options("postgres://localhost/db");
+        assert!(opt.get_sqlx_logging());
+        assert_eq!(opt.get_sqlx_logging_level(), log::LevelFilter::Trace);
+        assert_eq!(
+            opt.get_sqlx_slow_statements_logging_settings(),
+            (log::LevelFilter::Warn, SLOW_STATEMENT_THRESHOLD)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `queries` over a `connect_options` connection with a subscriber
+    /// using `filter`, returning everything it logged.
+    async fn capture_sql_logs(
+        database_url: &str,
+        filter: &str,
+        queries: &[&str],
+    ) -> anyhow::Result<String> {
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut opt = connect_options(database_url);
+        opt.max_connections(1).min_connections(1);
+        let db = Database::connect(opt).await?;
+        for query in queries {
+            db.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                (*query).to_owned(),
+            ))
+            .await?;
+        }
+        db.close().await?;
+
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone())?;
+        Ok(logs)
+    }
+
+    #[tokio::test]
+    async fn statements_stay_out_of_info_logs_but_slow_statements_warn() -> anyhow::Result<()> {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(testcontainers::core::ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error)
+                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping Docker-dependent SQL logging test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?.to_string();
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres@{host}:{port}/postgres");
+
+        // An operator running with RUST_LOG=info sees no per-query SQL, but
+        // still sees the query that crossed the slow threshold.
+        let info_logs = capture_sql_logs(
+            &database_url,
+            "info",
+            &[
+                "SELECT 'fast_marker'",
+                "SELECT pg_sleep(1.2), 'slow_marker'",
+            ],
+        )
+        .await?;
+        assert!(
+            !info_logs.contains("fast_marker"),
+            "fast statement leaked into INFO logs:\n{info_logs}"
+        );
+        assert!(
+            info_logs.contains("WARN") && info_logs.contains("slow_marker"),
+            "slow statement was not reported at WARN:\n{info_logs}"
+        );
+
+        // Per-query SQL is still available on explicit opt-in.
+        let trace_logs = capture_sql_logs(
+            &database_url,
+            "sqlx::query=trace",
+            &["SELECT 'fast_marker'"],
+        )
+        .await?;
+        assert!(
+            trace_logs.contains("TRACE") && trace_logs.contains("fast_marker"),
+            "statement missing from sqlx::query=trace logs:\n{trace_logs}"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

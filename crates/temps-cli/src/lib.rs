@@ -112,6 +112,10 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
         } else {
             format!("{extra},")
         };
+        // `sqlx::postgres::notice` re-emits server NOTICE/WARNING messages —
+        // TimescaleDB's schema advisories on every migration run (e.g.
+        // `column "id" should be used for segmenting`). They're not actionable
+        // at runtime, so they're hidden unless RUST_LOG asks for them.
         tracing_subscriber::EnvFilter::new(format!(
             "{extra}\
              temps_cli={level},\
@@ -184,6 +188,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_sandbox={level},\
              pingora=warn,\
              sqlx=warn,\
+             sqlx::postgres::notice=error,\
              sea_orm=warn,\
              sea_orm_migration=warn,\
              h2=warn,\
