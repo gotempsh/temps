@@ -9,6 +9,7 @@ import {
   createUser,
   deleteUser,
   restoreUser,
+  resetUserPassword,
   assignRole,
   removeRole,
   getCurrentUser,
@@ -42,6 +43,12 @@ interface RemoveOptions {
 
 interface RestoreOptions {
   id: string
+}
+
+interface ResetPasswordOptions {
+  id: string
+  json?: boolean
+  yes?: boolean
 }
 
 interface RoleOptions {
@@ -114,6 +121,16 @@ export function registerUsersCommands(program: Command): void {
     .description('Restore a deleted user')
     .requiredOption('--id <id>', 'User ID')
     .action(restoreUserAction)
+
+  users
+    .command('reset-password')
+    .description(
+      "Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in",
+    )
+    .requiredOption('--id <id>', 'User ID')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip confirmation prompt (for automation)')
+    .action(resetPasswordAction)
 
   users
     .command('role')
@@ -337,6 +354,53 @@ async function restoreUserAction(options: RestoreOptions): Promise<void> {
   })
 
   success('User restored')
+}
+
+async function resetPasswordAction(options: ResetPasswordOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid user ID')
+    return
+  }
+
+  if (!options.yes) {
+    warning('Their current password stops working and they are signed out of every browser session. Their API keys keep working.')
+    const confirmed = await promptConfirm({
+      message: `Reset the password of user ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const result = await withSpinner('Resetting password...', async () => {
+    const { data, error } = await resetUserPassword({
+      client,
+      path: { user_id: id },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? 'Failed to reset password')
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  success(`Password reset for user ${id}`)
+  keyValue('Temporary password', colors.bold(result.temporary_password))
+  newline()
+  info('Share it through a channel you trust. It is shown only once and cannot be retrieved later.')
+  info('The user must choose a new password the next time they sign in.')
+  newline()
 }
 
 async function manageRoles(options: RoleOptions): Promise<void> {

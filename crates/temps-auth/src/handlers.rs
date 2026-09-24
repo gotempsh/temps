@@ -3,10 +3,11 @@
 
 use super::AuthState;
 use crate::audit::{
-    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit,
-    MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
-    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
-    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
+    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
+    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit,
+    MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
+    StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit,
+    UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -39,9 +40,9 @@ use utoipa::{OpenApi, ToSchema};
 use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
-    MfaSetupResponse, MfaVerificationRequest, RouteRole, RouteUser, RouteUserWithRoles,
-    SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest,
-    UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
+    MfaSetupResponse, MfaVerificationRequest, ResetUserPasswordResponse, RouteRole, RouteUser,
+    RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest,
+    UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -806,6 +807,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}", delete(delete_user))
         .route("/users/{user_id}", patch(update_user))
         .route("/users/{user_id}/restore", post(restore_user))
+        .route("/users/{user_id}/password", post(reset_user_password))
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
@@ -1803,6 +1805,14 @@ impl From<UserServiceError> for Problem {
                     .with_title("Invalid Current Password")
                     .with_detail("The current password you entered is incorrect.")
             }
+            UserServiceError::PasswordResetOnDeletedUser { user_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("User Deleted")
+                    .with_detail(format!(
+                        "User {} is deleted. Restore the user before resetting their password.",
+                        user_id
+                    ))
+            }
         }
     }
 }
@@ -1817,13 +1827,14 @@ impl From<UserServiceError> for Problem {
         remove_role,
         update_user,
         restore_user,
+        reset_user_password,
         update_self,
         setup_mfa,
         verify_and_enable_mfa,
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -2498,6 +2509,96 @@ async fn restore_user(
     }
 
     Ok(Json(RouteUserWithRoles::from(restored_user)).into_response())
+}
+
+/// Reset another user's password to a generated temporary one (admin only).
+///
+/// The recovery path for a user who lost their password when outbound email
+/// is not configured. Every browser session of the user is revoked and they
+/// must choose a new password at next sign-in. API keys are deliberately left
+/// alone, matching `POST /users/me/password`: revoking them would silently
+/// break the user's automation. The temporary password is returned once and
+/// cannot be retrieved again.
+///
+/// Any `users:manage` principal may reset any other user, including another
+/// admin. That is the existing trust model for this permission (it can already
+/// delete users and change their roles); only resetting yourself is refused.
+#[utoipa::path(
+    tag = "Users",
+    post,
+    path = "/users/{user_id}/password",
+    responses(
+        (status = 200, description = "Password reset; the temporary password is returned once", body = ResetUserPasswordResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "users:manage required, or attempted to reset your own password (use POST /users/me/password)"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is deleted"),
+        (status = 428, description = "Recent identity verification (step-up) required"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("user_id" = i32, Path, description = "User ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn reset_user_password(
+    State(app_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(user_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // `users:manage` gate (+ no self-target) lives in authorize_admin_target.
+    // Callers change their own password via POST /users/me/password, which
+    // requires the current one.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied password reset by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ResetUserPassword { user_id },
+    )
+    .await?;
+
+    let (user, temporary_password) = app_state.user_service.admin_reset_password(user_id).await?;
+
+    info!(
+        "Admin {} reset the password of user {}",
+        auth.user_id(),
+        user_id
+    );
+
+    let audit = AdminPasswordResetAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        target_user_id: user_id,
+        username: user.name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    // The body carries a credential: keep it out of every cache.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(ResetUserPasswordResponse {
+            temporary_password,
+            must_change_password: user.must_change_password,
+        }),
+    )
+        .into_response())
 }
 
 #[utoipa::path(

@@ -128,6 +128,8 @@ function describe(
       return `Assigned role ${role ?? 'unknown'}${username ? ` to ${username}` : ''}`
     case 'ROLE_REMOVED':
       return `Removed role ${role ?? 'unknown'}${username ? ` from ${username}` : ''}`
+    case 'ADMIN_PASSWORD_RESET':
+      return `Reset the password of ${username ?? 'a user'}`
 
     // MFA
     case 'MFA_ENABLED':

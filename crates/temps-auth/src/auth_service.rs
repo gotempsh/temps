@@ -1902,6 +1902,99 @@ mod tests {
         auth_service.login(login).await.unwrap();
     }
 
+    /// Issue #1078: a user who lost their password (no email provider
+    /// configured) is recovered by an admin reset. The generated temporary
+    /// password must sign them in only as far as the forced password change,
+    /// revoke every existing session, invalidate any pending reset token, and
+    /// be rejected as the "new" password.
+    #[tokio::test]
+    async fn admin_password_reset_forces_change_at_next_sign_in() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "locked-out@example.com", "Forgotten123!").await;
+
+        let session_token = auth_service.create_session(user.id).await.unwrap();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some("stale-email-reset-token".to_string()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let (updated, temporary_password) =
+            user_service.admin_reset_password(user.id).await.unwrap();
+
+        assert!(updated.must_change_password);
+        assert!(updated.password_reset_token.is_none());
+        assert!(updated.password_reset_expires.is_none());
+        validate_password_complexity(&temporary_password).unwrap();
+
+        let remaining_sessions = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining_sessions, 0, "existing sessions must be revoked");
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+
+        // The old password no longer works; the temporary one does, but only
+        // reaches the forced-change state.
+        let old_login = auth_service
+            .login(LoginRequest {
+                email: "locked-out@example.com".to_string(),
+                password: "Forgotten123!".to_string(),
+            })
+            .await;
+        assert!(matches!(old_login, Err(UserAuthError::InvalidCredentials)));
+
+        let logged_in = auth_service
+            .login(LoginRequest {
+                email: "locked-out@example.com".to_string(),
+                password: temporary_password.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(logged_in.must_change_password);
+        assert!(matches!(
+            auth_service.create_session(user.id).await,
+            Err(AuthError::PasswordChangeRequired { .. })
+        ));
+
+        // The stale email-reset token was cleared by the admin reset.
+        let stale = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: "stale-email-reset-token".to_string(),
+                new_password: "Attacker123!".to_string(),
+            })
+            .await;
+        assert!(matches!(stale, Err(UserAuthError::InvalidToken)));
+
+        let change_token = auth_service
+            .create_required_password_change_token(user.id)
+            .await
+            .unwrap();
+        let reuse = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: change_token.clone(),
+                new_password: temporary_password.clone(),
+            })
+            .await;
+        assert!(matches!(reuse, Err(UserAuthError::SamePassword)));
+
+        let changed = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: change_token,
+                new_password: "MyOwnPassword456!".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(!changed.must_change_password);
+        auth_service.create_session(user.id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn email_reset_rejects_temporary_password_reuse() {
         let (db, auth_service, _) = setup_test_env().await;
