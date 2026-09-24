@@ -945,7 +945,7 @@ impl WorkflowPlanner {
     ///
     /// Returns an empty plan (no variables, no blockers) in single-node mode
     /// or when the project has no cross-node exposure at all.
-    async fn build_remote_environment_variables(
+    pub(crate) async fn build_remote_environment_variables(
         &self,
         project: &projects::Model,
         local_env_vars: &std::collections::HashMap<String, String>,

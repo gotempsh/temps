@@ -4462,6 +4462,7 @@ mod tests {
             docker_log_service,
             docker_handle,
             deployer,
+            Arc::new(MockImageBuilder),
             encryption_service.clone(),
         ));
 

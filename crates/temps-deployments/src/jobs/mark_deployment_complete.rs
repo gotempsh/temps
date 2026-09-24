@@ -139,6 +139,7 @@ impl MarkDeploymentCompleteJob {
         environment_id: i32,
         last_successful_deployment_id: Option<i32>,
         reason: &str,
+        restore_sleeping: bool,
     ) -> Result<(), WorkflowError> {
         let transaction = self.db.begin().await.map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
@@ -181,25 +182,30 @@ impl MarkDeploymentCompleteJob {
                 ))
             })?;
         let now = chrono::Utc::now();
-        let failed_deployment = deployments::ActiveModel {
-            id: sea_orm::ActiveValue::Unchanged(deployment.id),
-            state: Set("failed".to_string()),
-            finished_at: Set(Some(now)),
-            updated_at: Set(now),
-            cancelled_reason: Set(Some(reason.to_string())),
-            ..Default::default()
-        };
-        failed_deployment
-            .update(&transaction)
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to mark deployment {} unusable in environment {}: {}",
-                    self.deployment_id, environment_id, error
-                ))
-            })?;
+        // Cancellation and supersession can win while readiness is waiting.
+        // Preserve the terminal state and its original reason observed under
+        // the row lock; only a still-running candidate belongs to this gate.
+        if deployment.state == "running" {
+            let failed_deployment = deployments::ActiveModel {
+                id: sea_orm::ActiveValue::Unchanged(deployment.id),
+                state: Set("failed".to_string()),
+                finished_at: Set(Some(now)),
+                updated_at: Set(now),
+                cancelled_reason: Set(Some(reason.to_string())),
+                ..Default::default()
+            };
+            failed_deployment
+                .update(&transaction)
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to mark deployment {} unusable in environment {}: {}",
+                        self.deployment_id, environment_id, error
+                    ))
+                })?;
+        }
 
-        let route_update = environments::Entity::update_many()
+        let mut route_rollback = environments::Entity::update_many()
             .col_expr(
                 environments::Column::CurrentDeploymentId,
                 sea_orm::sea_query::Expr::value(last_successful_deployment_id),
@@ -209,17 +215,19 @@ impl MarkDeploymentCompleteJob {
                 sea_orm::sea_query::Expr::value(now),
             )
             .filter(environments::Column::Id.eq(environment_id))
-            .filter(
-                environments::Column::CurrentDeploymentId.eq(Some(self.deployment_id)),
-            )
-            .exec(&transaction)
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to restore the last usable route for deployment {} in environment {}: {}",
-                    self.deployment_id, environment_id, error
-                ))
-            })?;
+            .filter(environments::Column::CurrentDeploymentId.eq(Some(self.deployment_id)));
+        if restore_sleeping {
+            route_rollback = route_rollback.col_expr(
+                environments::Column::Sleeping,
+                sea_orm::sea_query::Expr::value(true),
+            );
+        }
+        let route_update = route_rollback.exec(&transaction).await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to restore the last usable route for deployment {} in environment {}: {}",
+                self.deployment_id, environment_id, error
+            ))
+        })?;
 
         transaction.commit().await.map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
@@ -806,6 +814,7 @@ impl MarkDeploymentCompleteJob {
                 environment_id,
                 last_successful_deployment_id,
                 &failure_reason,
+                false,
             )
             .await?;
 
@@ -840,14 +849,9 @@ impl MarkDeploymentCompleteJob {
         // this check it would wait for an ACK that can structurally never
         // arrive and revert every single deployment after the full 10s,
         // regardless of whether routing actually propagated fine.
-        let cluster_dns_enabled = match self.config_service.as_ref() {
-            Some(config_service) => config_service
-                .get_settings()
-                .await
-                .map(|settings| settings.cluster_dns.enabled)
-                .unwrap_or(false),
-            None => false,
-        };
+        let cluster_dns_enabled = self
+            .cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
+            .await?;
         if !cluster_dns_enabled {
             self.log(
                 "Cluster DNS is disabled — skipping the DNS-generation propagation check \
@@ -881,6 +885,7 @@ impl MarkDeploymentCompleteJob {
                 environment_id,
                 last_successful_deployment_id,
                 &failure_reason,
+                false,
             )
             .await?;
             return Err(WorkflowError::JobExecutionFailed(format!(
@@ -950,6 +955,76 @@ impl MarkDeploymentCompleteJob {
             )));
         }
 
+        // Wake sleeping environments and prove the resulting route generation
+        // is live everywhere before committing this deployment as completed.
+        // A sleeping-state update changes route membership, so the earlier
+        // route/worker barrier is no longer sufficient after this write.
+        let wake_time = chrono::Utc::now();
+        let sleeping_reset = environments::Entity::update_many()
+            .col_expr(
+                environments::Column::Sleeping,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .col_expr(
+                environments::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(wake_time),
+            )
+            .filter(environments::Column::Id.eq(environment_id))
+            .filter(environments::Column::Sleeping.eq(true))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to reset sleeping state for environment {environment_id}: {error}"
+                ))
+            })?;
+        if sleeping_reset.rows_affected > 0 {
+            let wake_result: Result<(), String> = async {
+                self.queue
+                    .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
+                        environment_id: Some(environment_id),
+                        deployment_id: Some(self.deployment_id),
+                    }))
+                    .await
+                    .map_err(|error| format!("requesting route reload: {error}"))?;
+                Self::wait_for_route_ready(
+                    &mut route_receiver,
+                    self.db.as_ref(),
+                    environment_id,
+                    self.deployment_id,
+                    std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
+                )
+                .await
+                .map_err(|error| format!("confirming control-plane route: {error}"))?;
+                Self::wait_for_worker_apply(
+                    self.db.as_ref(),
+                    std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+                    cluster_dns_enabled,
+                )
+                .await
+                .map_err(|error| format!("confirming worker routes: {error}"))?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = wake_result {
+                let failure_reason = format!(
+                    "Route propagation failed after waking environment {environment_id}: {error}"
+                );
+                self.reject_unusable_deployment(
+                    environment_id,
+                    last_successful_deployment_id,
+                    &failure_reason,
+                    true,
+                )
+                .await?;
+                return Err(WorkflowError::JobExecutionFailed(failure_reason));
+            }
+            info!(
+                "Reset sleeping state and confirmed routes for environment {}",
+                environment_id
+            );
+        }
+
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
         if !self
@@ -1015,35 +1090,6 @@ impl MarkDeploymentCompleteJob {
             "Project {} last_deployment updated to {}",
             deployment.project_id, now
         );
-
-        // Reset sleeping state if environment was sleeping (on-demand mode).
-        // A fresh deployment means containers are now running, so sleeping=false.
-        // Use a direct UPDATE to avoid issues with ActiveModel field tracking.
-        let sleeping_reset = environments::Entity::update_many()
-            .col_expr(
-                environments::Column::Sleeping,
-                sea_orm::sea_query::Expr::value(false),
-            )
-            .col_expr(
-                environments::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now),
-            )
-            .filter(environments::Column::Id.eq(environment_id))
-            .filter(environments::Column::Sleeping.eq(true))
-            .exec(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to reset sleeping state for environment {}: {}",
-                    environment_id, e
-                ))
-            })?;
-        if sleeping_reset.rows_affected > 0 {
-            info!(
-                "Reset sleeping state for environment {} after deployment",
-                environment_id
-            );
-        }
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
@@ -1185,7 +1231,7 @@ WHERE project.id = $2
     /// After the event fires, we verify against the database that the environment
     /// still points to our deployment_id (it could have been superseded by a
     /// concurrent deployment).
-    async fn wait_for_route_ready(
+    pub(crate) async fn wait_for_route_ready(
         receiver: &mut Box<dyn JobReceiver>,
         db: &DbConnection,
         environment_id: i32,
@@ -1357,7 +1403,7 @@ WHERE project.id = $2
     ///
     /// Only `nodes.status = 'active'` rows are gated — offline nodes
     /// aren't serving traffic so we don't block on them.
-    async fn wait_for_worker_apply(
+    pub(crate) async fn wait_for_worker_apply(
         db: &DbConnection,
         timeout: std::time::Duration,
         cluster_dns_enabled: bool,
@@ -1374,20 +1420,20 @@ WHERE project.id = $2
         // Statement::from_string is therefore safe here; no bound parameter is
         // needed because the identifier cannot be parameterised in PostgreSQL.
         let load_singleton = |table: &'static str| async move {
-            Gen::find_by_statement(Statement::from_string(
+            let row = Gen::find_by_statement(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!("SELECT current FROM {table} WHERE id = 1"),
             ))
             .one(db)
             .await
-            .ok()
-            .flatten()
-            .and_then(|g| g.current)
-            .unwrap_or(0)
+            .map_err(|error| format!("reading {table} generation: {error}"))?
+            .ok_or_else(|| format!("missing {table} singleton row (id=1)"))?;
+            row.current
+                .ok_or_else(|| format!("missing {table}.current generation (id=1)"))
         };
-        let route_gen: i64 = load_singleton("route_generation").await;
+        let route_gen: i64 = load_singleton("route_generation").await?;
         let dns_gen: i64 = if cluster_dns_enabled {
-            load_singleton("dns_generation").await
+            load_singleton("dns_generation").await?
         } else {
             0
         };
@@ -1474,6 +1520,52 @@ WHERE project.id = $2
                     }
                 }
                 return Err(reason);
+            }
+        }
+    }
+
+    async fn cluster_dns_enabled(&self) -> Result<bool, WorkflowError> {
+        let config_service = self.config_service.as_ref().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Cannot verify worker DNS propagation because ConfigService is not configured"
+                    .to_string(),
+            )
+        })?;
+        config_service
+            .get_settings()
+            .await
+            .map(|settings| settings.cluster_dns.enabled)
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load cluster DNS settings before worker propagation gate: {error}"
+                ))
+            })
+    }
+
+    /// Load the DNS propagation policy after route promotion. A configuration
+    /// error at this point is a failed readiness gate, so restore the previous
+    /// usable route with the same compare-and-swap protection as worker ACK
+    /// failures before returning the error to the workflow.
+    async fn cluster_dns_enabled_or_reject(
+        &self,
+        environment_id: i32,
+        last_successful_deployment_id: Option<i32>,
+    ) -> Result<bool, WorkflowError> {
+        match self.cluster_dns_enabled().await {
+            Ok(enabled) => Ok(enabled),
+            Err(error) => {
+                let reason =
+                    format!("Cluster DNS propagation gate could not be evaluated: {error}");
+                self.reject_unusable_deployment(
+                    environment_id,
+                    last_successful_deployment_id,
+                    &reason,
+                    false,
+                )
+                .await?;
+                Err(WorkflowError::JobExecutionFailed(format!(
+                    "{reason} — deployment rolled back"
+                )))
             }
         }
     }
@@ -2326,6 +2418,58 @@ WHERE project.id = $2
             .await
             .ok();
     }
+
+    async fn successful_job_result(
+        &self,
+        mut context: WorkflowContext,
+        output: MarkCompleteOutput,
+    ) -> JobResult {
+        // The deployment is already completed, routed, and its success event
+        // has been dispatched when mark_complete returns. Bookkeeping after
+        // that point must never turn the workflow into an error: static reuse
+        // reconciliation would otherwise repeat the success event and webhook
+        // or plugin consumers could execute twice.
+        if let Err(error) = context.set_output(
+            &self.job_id,
+            "completed_at",
+            output.completed_at.timestamp(),
+        ) {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record completed_at output after successful deployment completion"
+            );
+        }
+        if let Err(error) =
+            context.set_output(&self.job_id, "environment_id", output.environment_id)
+        {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record environment_id output after successful deployment completion"
+            );
+        }
+        if let Err(error) = context.set_output(&self.job_id, "deployment_id", self.deployment_id) {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record deployment_id output after successful deployment completion"
+            );
+        }
+
+        if let Err(error) = self
+            .log("Deployment marked as complete successfully".to_string())
+            .await
+        {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to write final completion log after success event dispatch"
+            );
+        }
+
+        JobResult::success(context)
+    }
 }
 
 #[async_trait]
@@ -2348,7 +2492,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
         vec![]
     }
 
-    async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+    async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         self.log(format!(
             "Marking deployment {} as complete",
             self.deployment_id
@@ -2357,19 +2501,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
 
         let output = self.mark_complete(&context).await?;
 
-        // Set job outputs
-        context.set_output(
-            &self.job_id,
-            "completed_at",
-            output.completed_at.timestamp(),
-        )?;
-        context.set_output(&self.job_id, "environment_id", output.environment_id)?;
-        context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
-
-        self.log("Deployment marked as complete successfully".to_string())
-            .await?;
-
-        Ok(JobResult::success(context))
+        Ok(self.successful_job_result(context, output).await)
     }
 
     async fn validate_prerequisites(
@@ -2486,6 +2618,9 @@ impl MarkDeploymentCompleteJobBuilder {
         let queue = self
             .queue
             .ok_or_else(|| WorkflowError::JobValidationFailed("queue is required".to_string()))?;
+        let config_service = self.config_service.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("config_service is required".to_string())
+        })?;
         let encryption_service = self.encryption_service.ok_or_else(|| {
             WorkflowError::JobValidationFailed("encryption_service is required".to_string())
         })?;
@@ -2505,9 +2640,7 @@ impl MarkDeploymentCompleteJobBuilder {
         if let Some(log_service) = self.log_service {
             job = job.with_log_service(log_service);
         }
-        if let Some(config_service) = self.config_service {
-            job = job.with_config_service(config_service);
-        }
+        job = job.with_config_service(config_service);
 
         Ok(job)
     }
@@ -2522,7 +2655,8 @@ impl Default for MarkDeploymentCompleteJobBuilder {
 #[cfg(test)]
 mod teardown_tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, PaginatorTrait};
+    use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase, PaginatorTrait, Value};
+    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
@@ -2533,6 +2667,77 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+
+    #[tokio::test]
+    async fn test_worker_barrier_fails_closed_when_route_generation_cannot_be_loaded() {
+        for (case, mock) in [
+            (
+                "database error",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("route generation unavailable".into())]),
+            ),
+            (
+                "missing row",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<BTreeMap<&str, Value>>::new()]),
+            ),
+            (
+                "null current",
+                MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![
+                    BTreeMap::from([("current", Value::BigInt(None))]),
+                ]]),
+            ),
+        ] {
+            let error = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::from_millis(1),
+                false,
+            )
+            .await
+            .expect_err("route generation must be known before acknowledging workers");
+            assert!(
+                error.contains("route_generation"),
+                "{case} lacked route generation context: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_barrier_fails_closed_when_dns_generation_cannot_be_loaded() {
+        let route_row = vec![BTreeMap::from([("current", Value::BigInt(Some(7)))])];
+        for (case, mock) in [
+            (
+                "database error",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([route_row.clone()])
+                    .append_query_errors([DbErr::Custom("dns generation unavailable".into())]),
+            ),
+            (
+                "missing row",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([route_row.clone(), Vec::new()]),
+            ),
+            (
+                "null current",
+                MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+                    route_row.clone(),
+                    vec![BTreeMap::from([("current", Value::BigInt(None))])],
+                ]),
+            ),
+        ] {
+            let error = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::from_millis(1),
+                true,
+            )
+            .await
+            .expect_err("DNS generation must be known before acknowledging workers");
+            assert!(
+                error.contains("dns_generation"),
+                "{case} lacked DNS generation context: {error}"
+            );
+        }
+    }
 
     /// Minimal ContainerDeployer that records stop/remove calls and otherwise
     /// no-ops. Used to assert that teardown stopped the expected containers
@@ -2691,6 +2896,16 @@ mod teardown_tests {
         deployment_id: i32,
         deployer: Arc<RecordingDeployer>,
     ) -> MarkDeploymentCompleteJob {
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                "postgresql://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
         MarkDeploymentCompleteJob::new(
             "mark-complete".to_string(),
             deployment_id,
@@ -2701,6 +2916,187 @@ mod teardown_tests {
                 "test-password",
             )),
         )
+        .with_config_service(config_service)
+    }
+
+    #[tokio::test]
+    async fn cluster_dns_gate_rejects_missing_config_service() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let job = MarkDeploymentCompleteJob::new(
+            "mark-complete".to_string(),
+            42,
+            db,
+            Arc::new(RecordingDeployer::new()),
+            Arc::new(NoopQueue),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )),
+        );
+
+        let error = job
+            .cluster_dns_enabled()
+            .await
+            .expect_err("missing ConfigService must fail closed");
+        assert!(error
+            .to_string()
+            .contains("ConfigService is not configured"));
+    }
+
+    #[test]
+    fn builder_requires_config_service() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let error = MarkDeploymentCompleteJobBuilder::new()
+            .deployment_id(42)
+            .db(db)
+            .container_deployer(Arc::new(RecordingDeployer::new()))
+            .queue(Arc::new(NoopQueue))
+            .encryption_service(Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )))
+            .build()
+            .expect_err("production builder must reject a missing ConfigService");
+        assert!(error.to_string().contains("config_service is required"));
+    }
+
+    #[tokio::test]
+    async fn cluster_dns_config_failure_restores_last_successful_route() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "running").await;
+
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(candidate.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = MarkDeploymentCompleteJob::new(
+            "mark-complete".to_string(),
+            candidate.id,
+            db.clone(),
+            Arc::new(RecordingDeployer::new()),
+            Arc::new(NoopQueue),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )),
+        );
+        let error = job
+            .cluster_dns_enabled_or_reject(env.id, Some(previous.id))
+            .await
+            .expect_err("missing configuration must reject the promoted deployment");
+        assert!(error.to_string().contains("deployment rolled back"));
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(previous.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "failed");
+        assert!(candidate
+            .cancelled_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("ConfigService is not configured")));
+    }
+
+    #[tokio::test]
+    async fn cluster_dns_config_failure_does_not_clobber_newer_route() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "running").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer", "completed").await;
+
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(newer.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = MarkDeploymentCompleteJob::new(
+            "mark-complete".to_string(),
+            candidate.id,
+            db.clone(),
+            Arc::new(RecordingDeployer::new()),
+            Arc::new(NoopQueue),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )),
+        );
+        job.cluster_dns_enabled_or_reject(env.id, Some(previous.id))
+            .await
+            .expect_err("missing configuration must reject the stale candidate");
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(newer.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "failed");
+    }
+
+    #[tokio::test]
+    async fn post_success_log_failure_does_not_fail_completed_job() -> Result<(), WorkflowError> {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let job = make_job(db, 42, Arc::new(RecordingDeployer::new()))
+            .with_log_id("post-success.log".to_string())
+            .with_log_service(Arc::new(temps_logs::LogService::new("/dev/null".into())));
+        let context = crate::test_utils::create_test_context(
+            "post-success-bookkeeping".to_string(),
+            42,
+            7,
+            9,
+        );
+        let completed_at = chrono::Utc::now();
+
+        let result = job
+            .successful_job_result(
+                context,
+                MarkCompleteOutput {
+                    completed_at,
+                    environment_id: 9,
+                },
+            )
+            .await;
+
+        assert_eq!(result.status, temps_core::JobStatus::Success);
+        assert_eq!(
+            result
+                .context
+                .get_output::<i32>("mark-complete", "deployment_id")?,
+            Some(42)
+        );
+        assert_eq!(
+            result
+                .context
+                .get_output::<i32>("mark-complete", "environment_id")?,
+            Some(9)
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2976,9 +3372,14 @@ mod teardown_tests {
 
         let deployer = Arc::new(RecordingDeployer::new());
         let job = make_job(db.clone(), current.id, deployer);
-        job.reject_unusable_deployment(env.id, Some(previous.id), "Public URL returned HTTP 503")
-            .await
-            .unwrap();
+        job.reject_unusable_deployment(
+            env.id,
+            Some(previous.id),
+            "Public URL returned HTTP 503",
+            true,
+        )
+        .await
+        .unwrap();
 
         let environment = environments::Entity::find_by_id(env.id)
             .one(db.as_ref())
@@ -2986,6 +3387,7 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(environment.current_deployment_id, Some(previous.id));
+        assert!(environment.sleeping);
 
         let deployment = deployments::Entity::find_by_id(current.id)
             .one(db.as_ref())
@@ -3021,7 +3423,7 @@ mod teardown_tests {
 
         let deployer = Arc::new(RecordingDeployer::new());
         let job = make_job(db.clone(), rejected.id, deployer);
-        job.reject_unusable_deployment(env.id, Some(previous.id), "HTTP 503")
+        job.reject_unusable_deployment(env.id, Some(previous.id), "HTTP 503", true)
             .await
             .unwrap();
 
@@ -3031,6 +3433,7 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(environment.current_deployment_id, Some(newer.id));
+        assert!(!environment.sleeping);
 
         let rejected = deployments::Entity::find_by_id(rejected.id)
             .one(db.as_ref())
@@ -3038,6 +3441,96 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(rejected.state, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_reject_unusable_deployment_preserves_concurrent_cancellation() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "cancelled").await;
+        let cancellation_reason = "Cancelled because a newer push arrived";
+
+        let mut active_candidate: deployments::ActiveModel = candidate.clone().into();
+        active_candidate.cancelled_reason = Set(Some(cancellation_reason.to_string()));
+        active_candidate.update(db.as_ref()).await.unwrap();
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(candidate.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = make_job(db.clone(), candidate.id, Arc::new(RecordingDeployer::new()));
+        job.reject_unusable_deployment(env.id, Some(previous.id), "Late readiness failure", false)
+            .await
+            .unwrap();
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(previous.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "cancelled");
+        assert_eq!(
+            candidate.cancelled_reason.as_deref(),
+            Some(cancellation_reason)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_unusable_deployment_preserves_concurrent_supersession() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let previous = insert_deployment(&db, project.id, env.id, "previous", "completed").await;
+        let candidate = insert_deployment(&db, project.id, env.id, "candidate", "stopped").await;
+        let supersession_reason = "Superseded by rollback deployment";
+
+        let mut active_candidate: deployments::ActiveModel = candidate.clone().into();
+        active_candidate.cancelled_reason = Set(Some(supersession_reason.to_string()));
+        active_candidate.update(db.as_ref()).await.unwrap();
+        let mut active_env: environments::ActiveModel = env.clone().into();
+        active_env.current_deployment_id = Set(Some(candidate.id));
+        active_env.update(db.as_ref()).await.unwrap();
+
+        let job = make_job(db.clone(), candidate.id, Arc::new(RecordingDeployer::new()));
+        job.reject_unusable_deployment(env.id, Some(previous.id), "Late readiness failure", false)
+            .await
+            .unwrap();
+
+        let environment = environments::Entity::find_by_id(env.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(previous.id));
+        let candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.state, "stopped");
+        assert_eq!(
+            candidate.cancelled_reason.as_deref(),
+            Some(supersession_reason)
+        );
     }
 
     #[tokio::test]
