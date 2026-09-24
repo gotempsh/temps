@@ -7,5 +7,6 @@ import { logEnvironmentLabel } from './log-environment'
 test('environment IDs display their slug without changing the filter value', () => {
   expect(logEnvironmentLabel('2', { '2': 'production' })).toBe('production')
   expect(logEnvironmentLabel('production', {})).toBe('production')
-  expect(logEnvironmentLabel('2', {})).toBe('Unknown environment')
+  expect(logEnvironmentLabel('2', {})).toBe('Unknown environment #2')
+  expect(logEnvironmentLabel('7', {})).not.toBe(logEnvironmentLabel('2', {}))
 })

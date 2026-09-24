@@ -136,8 +136,7 @@ for (const [query, visible] of [
       )
       expect(html.includes('aria-label="Log facets"')).toBe(visible)
       expect(html.includes('aria-expanded="true"')).toBe(visible)
-      if (visible)
-        expect(html).toContain('Counts across the whole time range')
+      if (visible) expect(html).toContain('Counts across the whole time range')
     } finally {
       if (previousWindow)
         Object.defineProperty(globalThis, 'window', previousWindow)
@@ -145,3 +144,53 @@ for (const [query, visible] of [
     }
   })
 }
+
+test('facet projects with no line on the loaded page are named from projectLabels', () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { location: { href: 'http://localhost/logs' } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <MemoryRouter initialEntries={['/logs?facets=1']}>
+        <LogExplorer
+          lines={[
+            {
+              container_id: 'sample',
+              line_id: '1',
+              stream: 'stdout',
+              timestamp: '2026-09-18T12:00:00Z',
+              level: 'INFO',
+              owner: 'web-app',
+              project_id: 1,
+              service: 'web',
+              env: '1',
+              message: 'hello',
+            },
+          ]}
+          facets={{
+            facets: {
+              project_id: [
+                { value: '1', count: 10 },
+                { value: '2', count: 5 },
+                { value: '42', count: 1 },
+              ],
+            },
+            partial: false,
+          }}
+          projectLabels={{ '2': 'worker-app', '42': 'Unknown project #42' }}
+          onFilter={() => {}}
+        />
+      </MemoryRouter>
+    )
+    expect(html).toContain('web-app')
+    expect(html).toContain('worker-app')
+    expect(html).toContain('Unknown project #42')
+    expect(html).not.toContain('Project 2<')
+  } finally {
+    if (previousWindow)
+      Object.defineProperty(globalThis, 'window', previousWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
