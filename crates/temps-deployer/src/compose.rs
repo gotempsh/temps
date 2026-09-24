@@ -12,6 +12,7 @@ use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_yaml::value::{Tag, TaggedValue};
 use serde_yaml::Value as YamlValue;
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
@@ -2793,6 +2794,25 @@ impl ComposeExecutor {
         } else {
             None
         };
+        // Inline port changes replace the repository and inherited ports.
+        // Compose normally appends port lists, and after this resolution the
+        // inline file is flattened away, so the later write-time strip cannot
+        // remove ports that came through `extends`. Reset them between the
+        // source and inline files while Compose still knows their provenance.
+        let port_reset = if let (Some(override_content), Some(_)) = (override_content, &inline) {
+            if let Some(content) = Self::port_reset_override(project_name, override_content)? {
+                let file = tempfile::Builder::new()
+                    .prefix(".temps-compose-port-reset-")
+                    .suffix(".yml")
+                    .tempfile_in(&base)?;
+                std::fs::write(file.path(), content)?;
+                Some(file)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let variables = tempfile::Builder::new()
             .prefix(".temps-compose-env-")
             .tempfile_in(&base)?;
@@ -2802,6 +2822,9 @@ impl ComposeExecutor {
             .arg(&base)
             .arg("-f")
             .arg(&input);
+        if let Some(reset) = &port_reset {
+            cmd.arg("-f").arg(reset.path());
+        }
         if let Some(inline) = inline {
             cmd.arg("-f").arg(inline);
         }
@@ -5636,6 +5659,46 @@ impl ComposeExecutor {
             project: project_name.to_string(),
             reason: format!("failed to serialize inline override after merging extends: {error}"),
         })
+    }
+
+    fn port_reset_override(
+        project_name: &str,
+        override_content: &str,
+    ) -> Result<Option<String>, ComposeError> {
+        let override_yaml =
+            Self::parse_compose_yaml(project_name, override_content, "compose override")?;
+        let Some(services) = Self::compose_services(&override_yaml) else {
+            return Ok(None);
+        };
+        let mut reset_services = Mapping::new();
+        for (name, service) in services {
+            if service.get("ports").is_none() {
+                continue;
+            }
+            let mut reset = Mapping::new();
+            reset.insert(
+                Value::String("ports".to_string()),
+                Value::Tagged(Box::new(TaggedValue {
+                    tag: Tag::new("!reset"),
+                    value: Value::Sequence(Vec::new()),
+                })),
+            );
+            reset_services.insert(name.clone(), Value::Mapping(reset));
+        }
+        if reset_services.is_empty() {
+            return Ok(None);
+        }
+        let mut root = Mapping::new();
+        root.insert(
+            Value::String("services".to_string()),
+            Value::Mapping(reset_services),
+        );
+        serde_yaml::to_string(&Value::Mapping(root))
+            .map(Some)
+            .map_err(|error| ComposeError::InvalidOverride {
+                project: project_name.to_string(),
+                reason: format!("failed to serialize port reset layer: {error}"),
+            })
     }
 
     fn parse_compose_yaml(
@@ -13626,6 +13689,101 @@ services:
             ComposeExecutor::without_duplicate_extends("test", source, different).unwrap(),
             different
         );
+    }
+
+    #[test]
+    fn port_reset_layer_targets_only_services_with_inline_ports() {
+        let inline = "services: {app: {ports: ['127.0.0.1:8194:8191']}, worker: {environment: {MODE: safe}}}";
+        let reset = ComposeExecutor::port_reset_override("test", inline)
+            .unwrap()
+            .unwrap();
+        assert!(reset.contains("!reset []"));
+        let yaml: Value = serde_yaml::from_str(&reset).unwrap();
+        assert!(yaml["services"]["app"].get("ports").is_some());
+        assert!(yaml["services"].get("worker").is_none());
+        assert!(ComposeExecutor::port_reset_override(
+            "test",
+            "services: {worker: {image: alpine}}"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_ports_replace_inherited_and_source_ports_during_resolution() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, ports: ['8191:8191']}}",
+        )
+        .unwrap();
+        let inline = "services: {app: {ports: ['127.0.0.1:8194:8191']}}";
+        for (source, disabled_checks) in [
+            (
+                "services: {app: {image: alpine, ports: ['127.0.0.1:8191:8191']}}",
+                Vec::new(),
+            ),
+            (
+                "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8192:8191']}}",
+                vec![PolicyCheck::Extends],
+            ),
+        ] {
+            let executor = executor_with_checks_disabled(&disabled_checks);
+            let (resolved, override_content) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert!(override_content.is_none());
+            let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+            let ports = yaml["services"]["app"]["ports"].as_sequence().unwrap();
+            assert_eq!(ports.len(), 1, "{resolved}");
+            assert_eq!(ports[0]["published"].as_str(), Some("8194"));
+            assert_eq!(ports[0]["host_ip"].as_str(), Some("127.0.0.1"));
+
+            let clear_inline = "services: {app: {ports: !reset []}}";
+            let (cleared, _) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(clear_inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let cleared: Value = serde_yaml::from_str(&cleared).unwrap();
+            assert!(cleared["services"]["app"].get("ports").is_none());
+
+            let public_inline = "services: {app: {ports: ['0.0.0.0:8194:8191']}}";
+            assert!(matches!(
+                executor
+                    .resolve_security_configuration(
+                        "temps-port-override-test",
+                        Some(root.path()),
+                        "compose.yml",
+                        source,
+                        Some(public_inline),
+                        &HashMap::new(),
+                    )
+                    .await,
+                Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "ports"
+            ));
+        }
     }
 
     #[tokio::test]
