@@ -345,6 +345,8 @@ After=network.target temps-proxy.service
 [Service]
 ExecStart=/usr/local/bin/temps serve --role=console \
   --console-address 0.0.0.0:3001 \
+  --proxy-address 127.0.0.1:80 \
+  --proxy-tls-address 127.0.0.1:443 \
   --database-url ${TEMPS_DATABASE_URL}
 Restart=on-failure
 RestartSec=3

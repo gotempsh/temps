@@ -453,6 +453,23 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
+fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<ResponseHeader> {
+    let mut response = ResponseHeader::build(301, None)?;
+    response.insert_header("Location", redirect_url)?;
+    response.insert_header("Content-Length", "0")?;
+    response.insert_header("X-Request-ID", request_id)?;
+    response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    Ok(response)
+}
+
+fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
+    // Applications must not be able to impersonate the pre-upstream redirect
+    // used by managed monitors to decide whether a local TLS follow-up is safe.
+    response.remove_header("X-Temps-Proxy-Https-Redirect");
+    response.remove_header("X-Temps-Proxy-Probe-Capable");
+}
+
 fn deployment_asset_scope(
     current_deployment_slug: &str,
     current_environment_id: i32,
@@ -3645,6 +3662,56 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn proxy_https_redirect_response_has_monitor_marker() {
+        let response = https_redirect_response("https://app.example.test/health", "request-1")
+            .expect("build HTTPS redirect response");
+        assert_eq!(response.status.as_u16(), 301);
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-https-redirect")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.test/health")
+        );
+    }
+
+    #[test]
+    fn application_cannot_spoof_proxy_https_redirect_marker() {
+        let mut response = ResponseHeader::build(302, None).expect("build application response");
+        response
+            .insert_header("X-Temps-Proxy-Https-Redirect", "1")
+            .expect("insert spoofed marker");
+        response
+            .insert_header("X-Temps-Proxy-Probe-Capable", "1")
+            .expect("insert spoofed capability");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get("x-temps-proxy-https-redirect")
+            .is_none());
+        assert!(response
+            .headers
+            .get("x-temps-proxy-probe-capable")
+            .is_none());
+    }
+
+    #[test]
     fn default_behaviour_follows_certificate_presence() {
         // No per-environment override → the pre-existing heuristic is unchanged:
         // hosts with a provisioned certificate are redirected, HTTP-only installs
@@ -5430,11 +5497,12 @@ impl ProxyHttp for LoadBalancer {
             );
 
             // Use 301 Permanent Redirect for HTTP→HTTPS
-            let mut resp = ResponseHeader::build(301, None)?;
-            resp.insert_header("Location", &redirect_url)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
+            let resp = https_redirect_response(&redirect_url, &ctx.request_id)?;
+            // Managed monitors use this marker to distinguish the proxy's
+            // pre-upstream protocol upgrade from an application's own 3xx.
+            // It carries no trust decision by itself: monitors still require
+            // a same-host HTTPS target and pin the follow-up to the configured
+            // local TLS listener.
             ctx.routing_status = "http_to_https_redirect".to_string();
 
             session.write_response_header(Box::new(resp), true).await?;
@@ -5459,6 +5527,7 @@ impl ProxyHttp for LoadBalancer {
             let mut resp = ResponseHeader::build(status_code, None)?;
             resp.insert_header("Location", &redirect_url)?;
             resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
             // Add CORS headers for redirect responses
             resp.insert_header("Access-Control-Allow-Origin", "*")?;
@@ -5820,6 +5889,9 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
+
+        strip_proxy_owned_response_headers(upstream_response);
+        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {

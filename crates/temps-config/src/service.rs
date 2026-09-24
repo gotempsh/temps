@@ -2297,7 +2297,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         deployment_slug: &str,
     ) -> Result<String, ConfigServiceError> {
+        self.get_deployment_url_by_slug_with_source(deployment_slug)
+            .await
+            .map(|(url, _)| url)
+    }
+
+    /// Get the deployment URL and whether an explicit external URL supplied
+    /// its transport scheme/port. Monitor routing consumes both values from a
+    /// single settings snapshot so public/manual checks do not gain a second
+    /// database failure path.
+    pub async fn get_deployment_url_by_slug_with_source(
+        &self,
+        deployment_slug: &str,
+    ) -> Result<(String, bool), ConfigServiceError> {
         let settings = self.get_settings().await?;
+        let uses_external_url = settings.external_url.is_some();
 
         // Determine protocol and port from external_url if set.
         //
@@ -2347,7 +2361,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             format!("{}://{}", protocol, hostname)
         };
 
-        Ok(url)
+        Ok((url, uses_external_url))
     }
 }
 
