@@ -141,6 +141,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // Wire telemetry for deploy-funnel events (rollback_triggered).
             deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
+            let runtime_resolver =
+                deployment_service.clone() as Arc<dyn temps_monitoring::ContainerRuntimeResolver>;
+            context.register_service(runtime_resolver);
 
             // Preserve uploaded archives until runtime cleanup succeeds, then
             // remove them before the project rows cascade away.

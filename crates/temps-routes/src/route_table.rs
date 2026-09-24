@@ -58,7 +58,7 @@ async fn resolve_node_private_address(
     } else {
         warn!(
             node_id,
-            "Node not found for container routing, treating as local"
+            "Node not found for container routing; remote backend will be skipped"
         );
         None
     }
@@ -69,7 +69,19 @@ fn build_backend_entry(
     container: &temps_entities::deployment_containers::Model,
     node_private_address: Option<&str>,
     runtime_context: &RuntimeContext,
-) -> BackendEntry {
+) -> Option<BackendEntry> {
+    if container.node_id.is_some() && node_private_address.is_none() {
+        return None;
+    }
+    // Host-routed and remote containers are reachable only through a live,
+    // Docker-discovered published port. Falling back to container_port could
+    // dial an unrelated process after the old binding was released.
+    if (node_private_address.is_some()
+        || runtime_context.execution_environment() == ExecutionEnvironment::Host)
+        && container.host_port.is_none()
+    {
+        return None;
+    }
     let address = build_container_backend_addr(
         &container.container_name,
         container.container_port,
@@ -77,11 +89,11 @@ fn build_backend_entry(
         node_private_address,
         runtime_context,
     );
-    BackendEntry {
+    Some(BackendEntry {
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
-    }
+    })
 }
 
 /// Build the route backend for an explicitly published Compose mapping.
@@ -161,6 +173,9 @@ fn build_public_compose_backend_entry(
     public_port: &ComposePublicPort,
     runtime_context: &RuntimeContext,
 ) -> Option<BackendEntry> {
+    if container.node_id.is_some() && node_private_address.is_none() {
+        return None;
+    }
     let address = build_public_compose_backend_addr(
         &container.container_name,
         container.container_port,
@@ -1044,11 +1059,11 @@ impl CachedPeerTable {
                                         port,
                                         self.runtime_context.as_ref(),
                                     ),
-                                    None => Some(build_backend_entry(
+                                    None => build_backend_entry(
                                         c,
                                         node_addr.as_deref(),
                                         self.runtime_context.as_ref(),
-                                    )),
+                                    ),
                                 };
                                 if let Some(entry) = entry {
                                     backend_entries.push(entry);
@@ -1312,11 +1327,16 @@ impl CachedPeerTable {
                                     self.db.as_ref(),
                                 )
                                 .await;
-                                backend_entries.push(build_backend_entry(
+                                if let Some(entry) = build_backend_entry(
                                     c,
                                     node_addr.as_deref(),
                                     self.runtime_context.as_ref(),
-                                ));
+                                ) {
+                                    backend_entries.push(entry);
+                                }
+                            }
+                            if backend_entries.is_empty() {
+                                continue;
                             }
                             BackendType::Upstream {
                                 backends: backend_entries,
@@ -1548,11 +1568,11 @@ impl CachedPeerTable {
                                     port,
                                     self.runtime_context.as_ref(),
                                 ),
-                                None => Some(build_backend_entry(
+                                None => build_backend_entry(
                                     c,
                                     node_addr.as_deref(),
                                     self.runtime_context.as_ref(),
-                                )),
+                                ),
                             };
                             if let Some(entry) = entry {
                                 backend_entries.push(entry);
@@ -1913,11 +1933,11 @@ impl CachedPeerTable {
                                     port,
                                     self.runtime_context.as_ref(),
                                 ),
-                                None => Some(build_backend_entry(
+                                None => build_backend_entry(
                                     c,
                                     node_addr.as_deref(),
                                     self.runtime_context.as_ref(),
-                                )),
+                                ),
                             };
                             if let Some(entry) = entry {
                                 backend_entries.push(entry);
@@ -3036,6 +3056,63 @@ mod tests {
             started_at: Some(now),
             cpu_limit_cores: None,
         }
+    }
+
+    #[test]
+    fn ordinary_remote_route_omits_container_without_live_host_mapping() {
+        let mut container = route_test_container(1, None, 5432);
+        container.host_port = None;
+
+        let entry = build_backend_entry(&container, Some("10.100.0.5"), &RuntimeContext::docker());
+
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn ordinary_remote_route_omits_container_when_node_lookup_fails() {
+        let mut container = route_test_container(1, None, 3000);
+        container.node_id = Some(42);
+
+        assert!(build_backend_entry(&container, None, &RuntimeContext::docker()).is_none());
+    }
+
+    #[test]
+    fn compose_remote_route_omits_container_when_node_lookup_fails() {
+        let mut container = route_test_container(1, Some("web"), 3000);
+        container.node_id = Some(42);
+        let public_port = ComposePublicPort {
+            service: "web".to_string(),
+            port: 3000,
+            published: Some(10_001),
+            health_check_path: None,
+        };
+
+        assert!(build_public_compose_backend_entry(
+            &container,
+            None,
+            &public_port,
+            &RuntimeContext::docker(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn ordinary_host_route_omits_container_without_live_host_mapping() {
+        let mut container = route_test_container(1, None, 5432);
+        container.host_port = None;
+
+        assert!(build_backend_entry(&container, None, &RuntimeContext::host()).is_none());
+    }
+
+    #[test]
+    fn ordinary_docker_network_route_keeps_unpublished_container() {
+        let mut container = route_test_container(1, None, 3000);
+        container.host_port = None;
+
+        let entry = build_backend_entry(&container, None, &RuntimeContext::docker())
+            .expect("Docker-network-local containers use their internal address");
+
+        assert_eq!(entry.address, "container-1:3000");
     }
 
     #[test]

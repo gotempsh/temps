@@ -41,6 +41,41 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
 
+fn parse_inspected_port_mappings(
+    ports: HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
+) -> Vec<PortMapping> {
+    let mut mappings = Vec::new();
+    for (port_key, bindings) in ports {
+        let Some((container_port, protocol)) = port_key.split_once('/') else {
+            continue;
+        };
+        let Ok(container_port) = container_port.parse() else {
+            continue;
+        };
+        let protocol = match protocol {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        for binding in bindings.unwrap_or_default() {
+            let Some(host_port) = binding
+                .host_port
+                .as_deref()
+                .and_then(|port| port.parse().ok())
+            else {
+                continue;
+            };
+            mappings.push(PortMapping {
+                host_port,
+                container_port,
+                protocol: protocol.clone(),
+                host_ip: binding.host_ip,
+            });
+        }
+    }
+    mappings
+}
+
 fn append_printable_log_utf8(output: &mut String, input: &str) {
     for character in input.chars() {
         if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
@@ -3703,33 +3738,8 @@ impl ContainerDeployer for DockerRuntime {
         let port_mappings = container
             .network_settings
             .and_then(|ns| ns.ports)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(port_key, bindings)| {
-                if let Some(bindings) = bindings {
-                    if let Some(binding) = bindings.first() {
-                        let parts: Vec<&str> = port_key.split('/').collect();
-                        if parts.len() == 2 {
-                            let container_port = parts[0].parse().ok()?;
-                            let protocol = match parts[1] {
-                                "tcp" => Protocol::Tcp,
-                                "udp" => Protocol::Udp,
-                                _ => Protocol::Tcp,
-                            };
-                            let host_port = binding.host_port.as_ref()?.parse().ok()?;
-
-                            return Some(PortMapping {
-                                host_port,
-                                container_port,
-                                protocol,
-                                host_ip: binding.host_ip.clone(),
-                            });
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
+            .map(parse_inspected_port_mappings)
+            .unwrap_or_default();
 
         let status =
             Self::map_container_status(&state.status.map(|s| s.to_string()).unwrap_or_default());
@@ -4254,6 +4264,33 @@ mod docker_tests {
     use tempfile::TempDir;
     use tokio::fs;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn inspected_ports_preserve_every_interface_binding() {
+        let ports = HashMap::from([(
+            "3000/tcp".to_string(),
+            Some(vec![
+                bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some("32001".to_string()),
+                },
+                bollard::models::PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some("32002".to_string()),
+                },
+            ]),
+        )]);
+
+        let mappings = parse_inspected_port_mappings(ports);
+
+        assert_eq!(mappings.len(), 2);
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("127.0.0.1") && mapping.host_port == 32001
+        }));
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("0.0.0.0") && mapping.host_port == 32002
+        }));
+    }
 
     /// ADR 045: the grant is evaluated here, by the process that builds the
     /// container, and it adds exactly one bind without relaxing anything else.

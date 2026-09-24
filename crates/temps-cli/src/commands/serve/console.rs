@@ -60,8 +60,8 @@ use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
 use temps_logs::LogsPlugin;
 use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
-    AlarmService, ContainerHealthConfig, ContainerHealthMonitor, DiskSpaceMonitor,
-    MonitoringPlugin, OutageDetectionService,
+    AlarmService, ContainerHealthConfig, ContainerHealthMonitor, ContainerRuntimeResolver,
+    DiskSpaceMonitor, MonitoringPlugin, OutageDetectionService,
 };
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
@@ -3976,12 +3976,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 }
             };
 
+            let runtime_resolver =
+                service_context.require_service::<dyn ContainerRuntimeResolver>();
             let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
                 container_deployer,
                 alarm_service.clone(),
                 ContainerHealthConfig::default(),
-            );
+            )
+            .with_runtime_resolver(runtime_resolver);
 
             if let Some(ms) = container_metrics_store {
                 health_monitor = health_monitor.with_metrics_store(ms);
