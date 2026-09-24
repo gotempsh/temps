@@ -971,7 +971,9 @@ function AddEnvironmentVariableDialog({
                   Include in Preview Environments
                 </Label>
                 <p className="text-sm text-muted-foreground">
-                  Automatically add this variable to preview environments
+                  Also apply this variable to current and future preview
+                  environments. Leave off to limit it to the selected
+                  environments.
                 </p>
               </div>
               <Switch
@@ -980,6 +982,17 @@ function AddEnvironmentVariableDialog({
                 onCheckedChange={setIncludeInPreview}
               />
             </div>
+            <p className="text-sm text-muted-foreground" role="status">
+              {selectedEnvironments.length === 0
+                ? 'No existing environments selected.'
+                : `Selected existing environments: ${allEnvironments
+                    .filter((env) => selectedEnvironments.includes(env.id))
+                    .map((env) => env.name)
+                    .join(', ')}.`}{' '}
+              {includeInPreview
+                ? 'Current and future preview environments are also included.'
+                : 'Other and future preview environments are excluded.'}
+            </p>
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">
                 <Label htmlFor="is-secret" className="text-sm font-medium">
