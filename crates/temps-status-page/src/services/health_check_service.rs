@@ -234,12 +234,26 @@ fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Op
     .flatten()
 }
 
-fn local_https_follow_up_url(requested_url: &str, response: &reqwest::Response) -> Option<String> {
-    proxy_https_redirect(requested_url, response).or_else(|| {
-        (!proxy_supports_probe_markers(response))
-            .then(|| same_host_https_redirect(requested_url, response))
-            .flatten()
-    })
+fn local_https_follow_up_url(
+    requested_url: &str,
+    response: &reqwest::Response,
+) -> Option<(String, bool)> {
+    proxy_https_redirect(requested_url, response)
+        .map(|url| (url, false))
+        .or_else(|| {
+            (!proxy_supports_probe_markers(response))
+                .then(|| same_host_https_redirect(requested_url, response))
+                .flatten()
+                .map(|url| (url, true))
+        })
+}
+
+fn https_follow_up_failure_status(legacy_ambiguous_redirect: bool) -> &'static str {
+    if legacy_ambiguous_redirect {
+        "degraded"
+    } else {
+        "major_outage"
+    }
 }
 
 #[derive(Clone)]
@@ -748,9 +762,10 @@ impl HealthCheckService {
                     // same-host protocol upgrade through the configured local
                     // TLS listener. All application-controlled cross-host
                     // redirects remain unfollowed.
-                    let response = if let Some(https_url) = is_local_probe
-                        .then(|| local_https_follow_up_url(&health_url, &response))
-                        .flatten()
+                    let response = if let Some((https_url, legacy_ambiguous_redirect)) =
+                        is_local_probe
+                            .then(|| local_https_follow_up_url(&health_url, &response))
+                            .flatten()
                     {
                         let Some(tls_listener) = local_tls_listener.as_deref() else {
                             // A proxy-owned redirect is emitted before the app is
@@ -803,12 +818,20 @@ impl HealthCheckService {
                                 response
                             }
                             Err(error) => {
+                                let status =
+                                    https_follow_up_failure_status(legacy_ambiguous_redirect);
                                 return Self::record_check(
                                     &db,
                                     probe.clone(),
-                                    "major_outage".to_string(),
+                                    status.to_string(),
                                     Some(total_response_time_ms),
-                                    Some(format!("Local HTTPS proxy probe failed: {error}")),
+                                    Some(if legacy_ambiguous_redirect {
+                                        format!(
+                                            "Legacy local proxy redirect could not be verified through HTTPS: {error}"
+                                        )
+                                    } else {
+                                        format!("Local HTTPS proxy probe failed: {error}")
+                                    }),
                                     &job_queue,
                                 )
                                 .await;
@@ -1683,9 +1706,11 @@ mod tests {
         assert!(response.status().is_redirection());
         assert!(!proxy_supports_probe_markers(&response));
         assert_eq!(
-            local_https_follow_up_url(logical_url, &response).as_deref(),
-            Some("https://old-proxy.invalid/health")
+            local_https_follow_up_url(logical_url, &response),
+            Some(("https://old-proxy.invalid/health".to_string(), true))
         );
+        assert_eq!(https_follow_up_failure_status(true), "degraded");
+        assert_eq!(https_follow_up_failure_status(false), "major_outage");
         server.await.expect("old proxy task completes");
     }
 
