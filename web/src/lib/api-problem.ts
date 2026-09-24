@@ -42,7 +42,7 @@ export function problemSetupPath(error: unknown): string | undefined {
 export function gitProviderSetupPath(error: unknown): string | undefined {
   const path = problemSetupPath(error)
   return path &&
-    /^\/projects\/[a-zA-Z0-9_-]+\/git\/change-repository$/.test(path)
+    /^\/projects\/[\p{L}\p{N}\p{M}_-]+\/git\/change-repository$/u.test(path)
     ? path
     : undefined
 }
