@@ -307,7 +307,10 @@ export default function GitProviderDetail() {
   }
 
   const getProviderIcon = () => (
-    <ProviderLogo providerType={provider.provider_type} className="h-6 w-6" />
+    <ProviderLogo
+      providerType={provider.provider_type}
+      className="h-4 w-4 shrink-0"
+    />
   )
 
   const getProviderDisplayName = () => {
