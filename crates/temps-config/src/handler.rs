@@ -3200,9 +3200,7 @@ async fn generate_join_token(
     // Store the hash in settings
     app_state
         .config_service
-        .update_setting_field(|s| {
-            s.multi_node.join_token_hash = Some(token_hash);
-        })
+        .set_join_token_hash(Some(token_hash))
         .await
         .map_err(|e| {
             error!("Failed to store join token hash: {}", e);
@@ -3256,9 +3254,7 @@ async fn revoke_join_token(
 
     app_state
         .config_service
-        .update_setting_field(|s| {
-            s.multi_node.join_token_hash = None;
-        })
+        .set_join_token_hash(None)
         .await
         .map_err(|e| {
             error!("Failed to revoke join token: {}", e);
