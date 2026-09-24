@@ -2462,6 +2462,21 @@ impl DeploymentService {
             .map_err(|route_error| DeploymentError::Other(format!(
                 "{reason}; completed deployment remained selected but route confirmation failed: {route_error}"
             )))?;
+            let cluster_dns_enabled = self
+                .config_service
+                .get_settings()
+                .await
+                .map(|settings| settings.cluster_dns.enabled)
+                .unwrap_or(false);
+            crate::jobs::MarkDeploymentCompleteJob::wait_for_worker_apply(
+                self.db.as_ref(),
+                std::time::Duration::from_secs(10),
+                cluster_dns_enabled,
+            )
+            .await
+            .map_err(|worker_error| DeploymentError::Other(format!(
+                "{reason}; completed deployment remained selected but workers did not apply its route generation: {worker_error}"
+            )))?;
 
             let url = if !completed_environment.host.is_empty() {
                 let scheme = self

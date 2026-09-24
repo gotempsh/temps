@@ -1043,6 +1043,41 @@ impl MarkDeploymentCompleteJob {
                 "Reset sleeping state for environment {} after deployment",
                 environment_id
             );
+            self.queue
+                .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(self.deployment_id),
+                }))
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to reload routes after waking environment {environment_id}: {error}"
+                    ))
+                })?;
+            Self::wait_for_route_ready(
+                &mut route_receiver,
+                self.db.as_ref(),
+                environment_id,
+                self.deployment_id,
+                std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to confirm routes after waking environment {environment_id}: {error}"
+                ))
+            })?;
+            Self::wait_for_worker_apply(
+                self.db.as_ref(),
+                std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+                cluster_dns_enabled,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Workers did not apply routes after waking environment {environment_id}: {error}"
+                ))
+            })?;
         }
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
@@ -1357,7 +1392,7 @@ WHERE project.id = $2
     ///
     /// Only `nodes.status = 'active'` rows are gated — offline nodes
     /// aren't serving traffic so we don't block on them.
-    async fn wait_for_worker_apply(
+    pub(crate) async fn wait_for_worker_apply(
         db: &DbConnection,
         timeout: std::time::Duration,
         cluster_dns_enabled: bool,
@@ -2326,6 +2361,58 @@ WHERE project.id = $2
             .await
             .ok();
     }
+
+    async fn successful_job_result(
+        &self,
+        mut context: WorkflowContext,
+        output: MarkCompleteOutput,
+    ) -> JobResult {
+        // The deployment is already completed, routed, and its success event
+        // has been dispatched when mark_complete returns. Bookkeeping after
+        // that point must never turn the workflow into an error: static reuse
+        // reconciliation would otherwise repeat the success event and webhook
+        // or plugin consumers could execute twice.
+        if let Err(error) = context.set_output(
+            &self.job_id,
+            "completed_at",
+            output.completed_at.timestamp(),
+        ) {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record completed_at output after successful deployment completion"
+            );
+        }
+        if let Err(error) =
+            context.set_output(&self.job_id, "environment_id", output.environment_id)
+        {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record environment_id output after successful deployment completion"
+            );
+        }
+        if let Err(error) = context.set_output(&self.job_id, "deployment_id", self.deployment_id) {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to record deployment_id output after successful deployment completion"
+            );
+        }
+
+        if let Err(error) = self
+            .log("Deployment marked as complete successfully".to_string())
+            .await
+        {
+            warn!(
+                deployment_id = self.deployment_id,
+                error = %error,
+                "Failed to write final completion log after success event dispatch"
+            );
+        }
+
+        JobResult::success(context)
+    }
 }
 
 #[async_trait]
@@ -2348,7 +2435,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
         vec![]
     }
 
-    async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+    async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         self.log(format!(
             "Marking deployment {} as complete",
             self.deployment_id
@@ -2357,19 +2444,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
 
         let output = self.mark_complete(&context).await?;
 
-        // Set job outputs
-        context.set_output(
-            &self.job_id,
-            "completed_at",
-            output.completed_at.timestamp(),
-        )?;
-        context.set_output(&self.job_id, "environment_id", output.environment_id)?;
-        context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
-
-        self.log("Deployment marked as complete successfully".to_string())
-            .await?;
-
-        Ok(JobResult::success(context))
+        Ok(self.successful_job_result(context, output).await)
     }
 
     async fn validate_prerequisites(
@@ -2701,6 +2776,48 @@ mod teardown_tests {
                 "test-password",
             )),
         )
+    }
+
+    #[tokio::test]
+    async fn post_success_log_failure_does_not_fail_completed_job() -> Result<(), WorkflowError> {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let job = make_job(db, 42, Arc::new(RecordingDeployer::new()))
+            .with_log_id("post-success.log".to_string())
+            .with_log_service(Arc::new(temps_logs::LogService::new("/dev/null".into())));
+        let context = crate::test_utils::create_test_context(
+            "post-success-bookkeeping".to_string(),
+            42,
+            7,
+            9,
+        );
+        let completed_at = chrono::Utc::now();
+
+        let result = job
+            .successful_job_result(
+                context,
+                MarkCompleteOutput {
+                    completed_at,
+                    environment_id: 9,
+                },
+            )
+            .await;
+
+        assert_eq!(result.status, temps_core::JobStatus::Success);
+        assert_eq!(
+            result
+                .context
+                .get_output::<i32>("mark-complete", "deployment_id")?,
+            Some(42)
+        );
+        assert_eq!(
+            result
+                .context
+                .get_output::<i32>("mark-complete", "environment_id")?,
+            Some(9)
+        );
+        Ok(())
     }
 
     #[tokio::test]
