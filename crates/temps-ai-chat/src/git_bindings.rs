@@ -576,6 +576,8 @@ mod tests {
             health_message: None,
             last_health_check_at: None,
             consecutive_health_failures: 0,
+            last_sync_error: None,
+            last_sync_error_at: None,
             created_at: now,
             updated_at: now,
         }

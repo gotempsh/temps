@@ -443,6 +443,11 @@ pub struct ConnectionResponse {
     #[schema(value_type = Option<String>, format = DateTime)]
     pub last_health_check_at: Option<UtcDateTime>,
     pub consecutive_health_failures: i32,
+    /// Why the most recent repository sync failed or timed out; null once a
+    /// sync succeeds.
+    pub last_sync_error: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_sync_error_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
@@ -480,6 +485,8 @@ impl From<git_provider_connections::Model> for ConnectionResponse {
             health_message: conn.health_message,
             last_health_check_at: conn.last_health_check_at,
             consecutive_health_failures: conn.consecutive_health_failures,
+            last_sync_error: conn.last_sync_error,
+            last_sync_error_at: conn.last_sync_error_at,
             created_at: conn.created_at,
             updated_at: conn.updated_at,
         }
@@ -853,6 +860,43 @@ pub async fn list_connections(
     }))
 }
 
+/// Get a single git provider connection
+///
+/// Returns the connection's account, sync and health state. Credential values
+/// are never included; `has_authenticated_credentials` reports only whether
+/// the connection can make authenticated provider requests.
+#[utoipa::path(
+    get,
+    path = "/git-connections/{connection_id}",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "Connection details", body = ConnectionResponse),
+        (status = 404, description = "Connection not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_connection(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(connection_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitConnectionsRead);
+
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+
+    Ok(Json(ConnectionResponse::from(connection)))
+}
+
 /// Start a repository sync for a connection
 ///
 /// Kicks off a background sync of the connection's repositories from the
@@ -996,7 +1040,7 @@ pub async fn list_repositories_by_connection(
     // Use repository service for fast database query instead of API calls
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: Some(connection_id),
         provider_id: None,
@@ -1009,11 +1053,10 @@ pub async fn list_repositories_by_connection(
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1245,7 +1288,7 @@ pub async fn list_synced_repositories(
     // Use repository service instead of direct database access
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: query.git_provider_connection_id,
         provider_id: None,
@@ -1258,11 +1301,10 @@ pub async fn list_synced_repositories(
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1640,7 +1682,7 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         .route("/git-connections", get(list_connections))
         .route(
             "/git-connections/{connection_id}",
-            delete(delete_connection),
+            get(get_connection).delete(delete_connection),
         )
         .route(
             "/git-connections/{connection_id}/deactivate",
@@ -1962,6 +2004,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         list_repositories_by_connection,
+        get_connection,
         list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
