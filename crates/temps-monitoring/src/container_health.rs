@@ -43,14 +43,6 @@ pub struct ContainerRuntimeResolutionError {
     pub reason: String,
 }
 
-#[derive(Debug, Error)]
-pub enum ContainerHealthMonitorInitError {
-    #[error(
-        "Container health monitoring requires a worker runtime resolver; ensure the deployments plugin registered ContainerRuntimeResolver"
-    )]
-    MissingRuntimeResolver,
-}
-
 /// Cached state for a container between health checks
 #[derive(Debug, Clone)]
 struct ContainerState {
@@ -187,15 +179,6 @@ impl ContainerHealthMonitor {
             container_states: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
         }
-    }
-
-    /// Construct the production monitor, where worker runtime resolution is a
-    /// required dependency. Returning an error here prevents a multi-node
-    /// installation from silently running without worker health checks.
-    pub fn require_runtime_resolver(
-        runtime_resolver: Option<Arc<dyn ContainerRuntimeResolver>>,
-    ) -> Result<Arc<dyn ContainerRuntimeResolver>, ContainerHealthMonitorInitError> {
-        runtime_resolver.ok_or(ContainerHealthMonitorInitError::MissingRuntimeResolver)
     }
 
     /// Attach a metrics store. When set, container resource metrics
@@ -429,39 +412,42 @@ impl ContainerHealthMonitor {
             )
         })?;
 
-        let stats = if matches!(
+        if matches!(
             info.status,
             temps_deployer::ContainerStatus::Exited | temps_deployer::ContainerStatus::Dead
         ) {
-            None
-        } else {
-            match tokio::time::timeout_at(
-                deadline,
-                deployer.get_container_stats(&container.container_id),
-            )
-            .await
-            {
-                Ok(Ok(stats)) => Some(stats),
-                Ok(Err(error)) => {
-                    debug!(container_id = container.id, %error, "Failed to get worker container stats");
-                    None
-                }
-                Err(_) => {
-                    warn!(
-                        container_id = container.id,
-                        node_id = container.node_id,
-                        timeout_ms = self.config.worker_check_timeout_ms,
-                        "Worker container runtime deadline expired while fetching stats"
-                    );
-                    None
-                }
-            }
-        };
+            self.process_container_info(container, deployment, &info)
+                .await;
+            return Ok(());
+        }
 
-        // Runtime I/O is complete before alarm/database side effects begin, so
-        // the deadline can never cancel or starve those side effects.
-        self.process_container_info(container, deployment, &info)
-            .await;
+        let ((), stats) = tokio::join!(
+            self.process_container_info(container, deployment, &info),
+            async {
+                match tokio::time::timeout_at(
+                    deadline,
+                    deployer.get_container_stats(&container.container_id),
+                )
+                .await
+                {
+                    Ok(Ok(stats)) => Some(stats),
+                    Ok(Err(error)) => {
+                        debug!(container_id = container.id, %error, "Failed to get worker container stats");
+                        None
+                    }
+                    Err(_) => {
+                        warn!(
+                            container_id = container.id,
+                            node_id = container.node_id,
+                            timeout_ms = self.config.worker_check_timeout_ms,
+                            "Worker container runtime deadline expired while fetching stats"
+                        );
+                        None
+                    }
+                }
+            },
+        );
+
         if let Some(stats) = stats {
             self.check_resource_stats(container, deployment, &stats)
                 .await;
@@ -1397,16 +1383,6 @@ mod tests {
             Arc::new(NoopNotificationService),
             Arc::new(NoopJobQueue),
         ))
-    }
-
-    #[test]
-    fn production_monitor_requires_worker_runtime_resolver() {
-        let result = ContainerHealthMonitor::require_runtime_resolver(None);
-
-        assert!(matches!(
-            result,
-            Err(ContainerHealthMonitorInitError::MissingRuntimeResolver)
-        ));
     }
 
     #[tokio::test]

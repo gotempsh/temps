@@ -3976,9 +3976,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 }
             };
 
-            let runtime_resolver = ContainerHealthMonitor::require_runtime_resolver(
-                service_context.get_service::<dyn ContainerRuntimeResolver>(),
-            )?;
+            let runtime_resolver =
+                service_context.require_service::<dyn ContainerRuntimeResolver>();
             let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
                 container_deployer,
