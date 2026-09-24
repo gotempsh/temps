@@ -44,13 +44,14 @@ sequenceDiagram
 
 ```bash
 # List recent deployments
-temps deployments list --project my-app
+bunx @temps-sdk/cli deployments list --project my-app
 
-# Rollback to previous deployment
-temps deployments rollback --project my-app
+# Rollback without --to: pick the target deployment from an interactive prompt
+bunx @temps-sdk/cli deployments rollback --project my-app
 
-# Rollback to specific deployment
-temps deployments rollback --project my-app --deployment-id abc123
+# Rollback to a specific deployment, skipping the deployment picker
+# (still asks for a yes/no confirmation before proceeding)
+bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
 
 ## How Rollbacks Work
@@ -84,8 +85,8 @@ temps deployments rollback --project my-app --deployment-id abc123
 When you detect issues immediately:
 
 ```bash
-# Rollback the latest deployment
-temps deployments rollback --project my-app --latest
+# Omitting --to opens an interactive prompt to pick the target deployment
+bunx @temps-sdk/cli deployments rollback --project my-app
 ```
 
 **Use when:**
@@ -94,42 +95,11 @@ temps deployments rollback --project my-app --latest
 - Critical errors appear immediately
 - Performance degrades significantly
 
-### Automatic Rollback
+### Failed deploys don't need a rollback
 
-Configure automatic rollback on failure:
+There's no separate, configurable "automatic rollback" feature to set up — but as long as a health-check path is configured, you get equivalent protection for free from how deploys work. A new deployment's containers must pass that health check before Temps switches routing to them; if the check fails, the deployment is marked failed and cleaned up, and whatever was previously running (if anything) simply keeps serving traffic the whole time — routing was never switched away from it. See [How rollbacks work](#how-rollbacks-work) above for the full process. If no health-check path is configured for the project, this check is skipped entirely and a broken container can go live — configure a health-check path so this protection actually applies.
 
-```yaml
-# Deployment configuration
-deployment:
-  auto_rollback:
-    enabled: true
-    conditions:
-      - health_check_fails: 3 # Rollback after 3 failed checks
-      - error_rate_threshold: 0.1 # 10% error rate
-      - response_time_threshold: 5000 # 5 seconds
-    delay: 60 # Wait 60 seconds before rolling back
-```
-
-**Use when:**
-
-- Deploying to production
-- Critical applications
-- Unattended deployments
-
-### Canary Rollback
-
-Roll back only a percentage of traffic:
-
-```bash
-# Rollback 50% of traffic to previous version
-temps deployments rollback --project my-app --canary 50
-```
-
-**Use when:**
-
-- Testing if the issue is resolved
-- Gradual migration back
-- A/B testing scenarios
+This means a manual rollback is only something you need for a deployment that passed its health checks (or has none configured) but is still broken in some way health checks don't catch (a bad business-logic bug, a misconfigured integration, and so on).
 
 ## Deployment History
 
@@ -139,33 +109,30 @@ See all your deployments and their status:
 
 ```bash
 # List all deployments
-temps deployments list --project my-app
+bunx @temps-sdk/cli deployments list --project my-app
 
 # Output:
-# ID       Status    Created              Version
-# abc123   ACTIVE    2024-01-15 10:30    v1.2.0
-# def456   STOPPED   2024-01-15 09:15    v1.1.9
-# ghi789   STOPPED   2024-01-15 08:00    v1.1.8
+# ID    Environment   Status     Branch   Commit    Created
+# 789   production    deployed   main     a1b2c3d   2024-01-15 10:30
+# 456   production    deployed   main     e4f5g6h   2024-01-15 09:15
+# 123   production    deployed   main     i7j8k9l   2024-01-15 08:00
 ```
 
 ### Compare Deployments
 
-See what changed between deployments:
+There's no dedicated CLI command for diffing two deployments. List them as JSON and compare the fields that matter (Git commit, environment variables, resource limits) yourself, or use the web UI:
 
 ```bash
-# Compare two deployments
-temps deployments compare \
-  --project my-app \
-  --deployment-1 abc123 \
-  --deployment-2 def456
+# List deployments with full details as JSON
+bunx @temps-sdk/cli deployments list --project my-app --json
 ```
 
 **Shows:**
 
-- Code changes (Git diff)
-- Environment variable changes
-- Resource limit changes
-- Configuration differences
+- Git commit info (hash, author, message) — not a full diff, just enough to identify which commit each deployment is running
+- Environment variables used by each deployment
+- CPU/memory limits and requests
+- Other deployment configuration (exposed port, auto-deploy setting, etc.)
 
 ## After Rollback
 
