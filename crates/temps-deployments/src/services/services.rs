@@ -2391,10 +2391,105 @@ impl DeploymentService {
             environment.id,
             Arc::new(crate::test_utils::MockLogWriter::new(0)),
         );
-        job.execute(context).await.map_err(|error| {
-            DeploymentError::Other(format!("Failed to complete static reuse: {error}"))
-        })?;
-        Ok(())
+        match job.execute(context).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.reconcile_static_completion_error(
+                    environment.id,
+                    deployment.id,
+                    environment.current_deployment_id,
+                    error,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_static_completion_error(
+        &self,
+        environment_id: i32,
+        deployment_id: i32,
+        previous_deployment_id: Option<i32>,
+        error: impl std::fmt::Display,
+    ) -> Result<(), DeploymentError> {
+        let reason = format!("Failed to complete static reuse: {error}");
+        let mut route_receiver = self.queue_service.subscribe();
+        let transaction = self.db.begin().await?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        if environment.current_deployment_id != Some(deployment_id) {
+            transaction.commit().await?;
+            return Err(DeploymentError::Other(reason));
+        }
+        if deployment.state == "completed" {
+            transaction.commit().await?;
+            warn!(
+                deployment_id,
+                environment_id,
+                error = %error,
+                "Static deployment completed and remains selected; treating a post-completion side-effect failure as success"
+            );
+            return Ok(());
+        }
+
+        let previous_is_usable = match previous_deployment_id {
+            Some(previous_id) => deployments::Entity::find_by_id(previous_id)
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::State.is_in(["completed", "deployed", "stopped"]))
+                .one(&transaction)
+                .await?
+                .is_some(),
+            None => true,
+        };
+        if !previous_is_usable {
+            transaction.commit().await?;
+            return Err(DeploymentError::Other(format!(
+                "{reason}; previous deployment is no longer usable, so the selected route was not changed"
+            )));
+        }
+
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(previous_deployment_id);
+        active_environment.update(&transaction).await?;
+        transaction.commit().await?;
+
+        self.queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: previous_deployment_id,
+                },
+            ))
+            .await
+            .map_err(|reload_error| DeploymentError::Other(format!(
+                "{reason}; restored the previous route in the database but failed to request a route reload: {reload_error}"
+            )))?;
+
+        if let Some(previous_id) = previous_deployment_id {
+            crate::jobs::MarkDeploymentCompleteJob::wait_for_route_ready(
+                &mut route_receiver,
+                self.db.as_ref(),
+                environment_id,
+                previous_id,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(|route_error| DeploymentError::Other(format!(
+                "{reason}; restored deployment {previous_id} but route confirmation failed: {route_error}"
+            )))?;
+        }
+
+        Err(DeploymentError::Other(reason))
     }
 
     pub async fn rollback_to_deployment(
@@ -7215,6 +7310,99 @@ mod tests {
         assert_ne!(
             persisted_environment.current_deployment_id,
             Some(candidate.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_post_completion_error_returns_success_when_release_is_live(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, previous) = setup_test_data(&db).await?;
+        let completed = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("completed-static-reuse".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            static_dir_location: Set(Some("cas/static/completed".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(completed.id));
+        active_environment.update(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        service
+            .reconcile_static_completion_error(
+                completed.environment_id,
+                completed.id,
+                Some(previous.id),
+                "project timestamp write failed",
+            )
+            .await?;
+
+        let persisted_environment = environments::Entity::find_by_id(completed.environment_id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("environment disappeared")?;
+        assert_eq!(
+            persisted_environment.current_deployment_id,
+            Some(completed.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_pre_completion_error_restores_previous_selected_release(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, previous) = setup_test_data(&db).await?;
+        let candidate = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("incomplete-static-reuse".to_string()),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            static_dir_location: Set(Some("cas/static/incomplete".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(candidate.id));
+        active_environment.update(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let result = service
+            .reconcile_static_completion_error(
+                candidate.environment_id,
+                candidate.id,
+                Some(previous.id),
+                "route confirmation log failed",
+            )
+            .await;
+        assert!(result.is_err());
+
+        let persisted_environment = environments::Entity::find_by_id(candidate.environment_id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("environment disappeared")?;
+        assert_eq!(
+            persisted_environment.current_deployment_id,
+            Some(previous.id)
         );
         Ok(())
     }

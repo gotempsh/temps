@@ -1185,7 +1185,7 @@ WHERE project.id = $2
     /// After the event fires, we verify against the database that the environment
     /// still points to our deployment_id (it could have been superseded by a
     /// concurrent deployment).
-    async fn wait_for_route_ready(
+    pub(crate) async fn wait_for_route_ready(
         receiver: &mut Box<dyn JobReceiver>,
         db: &DbConnection,
         environment_id: i32,

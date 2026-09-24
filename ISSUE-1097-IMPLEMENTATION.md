@@ -30,12 +30,15 @@ deployment running indefinitely.
   recover a pruned tag from a registry.
 - Static reuse passes through the normal generation fence and route reload
   confirmation before it is marked completed.
+- Completion errors are reconciled against the selected route: an already
+  completed live release remains successful, while an incomplete candidate
+  restores and confirms the prior usable route without overwriting newer work.
 - `DeploymentService` shares the scheduler, workflow planner, and image builder
   used by ordinary workflow execution.
 
 ## Verification
 
-- `cargo test --lib -p temps-deployments`: 941 passed, 0 failed, 3 ignored.
+- `cargo test --lib -p temps-deployments`: 943 passed, 0 failed, 3 ignored.
 - `cargo test --lib -p temps-deployments rollback -- --nocapture`: 11 passed.
 - Focused regressions passed for pruned local Git rebuild, cancellation
   preservation, static generation fencing, and confirmed static route reload.
