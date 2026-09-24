@@ -459,6 +459,7 @@ fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<Respo
     response.insert_header("Content-Length", "0")?;
     response.insert_header("X-Request-ID", request_id)?;
     response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
     Ok(response)
 }
 
@@ -466,6 +467,7 @@ fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // Applications must not be able to impersonate the pre-upstream redirect
     // used by managed monitors to decide whether a local TLS follow-up is safe.
     response.remove_header("X-Temps-Proxy-Https-Redirect");
+    response.remove_header("X-Temps-Proxy-Probe-Capable");
 }
 
 fn deployment_asset_scope(
@@ -3674,6 +3676,13 @@ mod https_redirect_tests {
         assert_eq!(
             response
                 .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
                 .get("location")
                 .and_then(|value| value.to_str().ok()),
             Some("https://app.example.test/health")
@@ -3686,12 +3695,19 @@ mod https_redirect_tests {
         response
             .insert_header("X-Temps-Proxy-Https-Redirect", "1")
             .expect("insert spoofed marker");
+        response
+            .insert_header("X-Temps-Proxy-Probe-Capable", "1")
+            .expect("insert spoofed capability");
 
         strip_proxy_owned_response_headers(&mut response);
 
         assert!(response
             .headers
             .get("x-temps-proxy-https-redirect")
+            .is_none());
+        assert!(response
+            .headers
+            .get("x-temps-proxy-probe-capable")
             .is_none());
     }
 
@@ -5511,6 +5527,7 @@ impl ProxyHttp for LoadBalancer {
             let mut resp = ResponseHeader::build(status_code, None)?;
             resp.insert_header("Location", &redirect_url)?;
             resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
             // Add CORS headers for redirect responses
             resp.insert_header("Access-Control-Allow-Origin", "*")?;
@@ -5874,6 +5891,7 @@ impl ProxyHttp for LoadBalancer {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
         strip_proxy_owned_response_headers(upstream_response);
+        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {
