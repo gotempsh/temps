@@ -950,6 +950,75 @@ impl MarkDeploymentCompleteJob {
             )));
         }
 
+        // Wake sleeping environments and prove the resulting route generation
+        // is live everywhere before committing this deployment as completed.
+        // A sleeping-state update changes route membership, so the earlier
+        // route/worker barrier is no longer sufficient after this write.
+        let wake_time = chrono::Utc::now();
+        let sleeping_reset = environments::Entity::update_many()
+            .col_expr(
+                environments::Column::Sleeping,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .col_expr(
+                environments::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(wake_time),
+            )
+            .filter(environments::Column::Id.eq(environment_id))
+            .filter(environments::Column::Sleeping.eq(true))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to reset sleeping state for environment {environment_id}: {error}"
+                ))
+            })?;
+        if sleeping_reset.rows_affected > 0 {
+            let wake_result: Result<(), String> = async {
+                self.queue
+                    .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
+                        environment_id: Some(environment_id),
+                        deployment_id: Some(self.deployment_id),
+                    }))
+                    .await
+                    .map_err(|error| format!("requesting route reload: {error}"))?;
+                Self::wait_for_route_ready(
+                    &mut route_receiver,
+                    self.db.as_ref(),
+                    environment_id,
+                    self.deployment_id,
+                    std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
+                )
+                .await
+                .map_err(|error| format!("confirming control-plane route: {error}"))?;
+                Self::wait_for_worker_apply(
+                    self.db.as_ref(),
+                    std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+                    cluster_dns_enabled,
+                )
+                .await
+                .map_err(|error| format!("confirming worker routes: {error}"))?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = wake_result {
+                let failure_reason = format!(
+                    "Route propagation failed after waking environment {environment_id}: {error}"
+                );
+                self.reject_unusable_deployment(
+                    environment_id,
+                    last_successful_deployment_id,
+                    &failure_reason,
+                )
+                .await?;
+                return Err(WorkflowError::JobExecutionFailed(failure_reason));
+            }
+            info!(
+                "Reset sleeping state and confirmed routes for environment {}",
+                environment_id
+            );
+        }
+
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
         if !self
@@ -1015,70 +1084,6 @@ impl MarkDeploymentCompleteJob {
             "Project {} last_deployment updated to {}",
             deployment.project_id, now
         );
-
-        // Reset sleeping state if environment was sleeping (on-demand mode).
-        // A fresh deployment means containers are now running, so sleeping=false.
-        // Use a direct UPDATE to avoid issues with ActiveModel field tracking.
-        let sleeping_reset = environments::Entity::update_many()
-            .col_expr(
-                environments::Column::Sleeping,
-                sea_orm::sea_query::Expr::value(false),
-            )
-            .col_expr(
-                environments::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now),
-            )
-            .filter(environments::Column::Id.eq(environment_id))
-            .filter(environments::Column::Sleeping.eq(true))
-            .exec(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to reset sleeping state for environment {}: {}",
-                    environment_id, e
-                ))
-            })?;
-        if sleeping_reset.rows_affected > 0 {
-            info!(
-                "Reset sleeping state for environment {} after deployment",
-                environment_id
-            );
-            self.queue
-                .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
-                    environment_id: Some(environment_id),
-                    deployment_id: Some(self.deployment_id),
-                }))
-                .await
-                .map_err(|error| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to reload routes after waking environment {environment_id}: {error}"
-                    ))
-                })?;
-            Self::wait_for_route_ready(
-                &mut route_receiver,
-                self.db.as_ref(),
-                environment_id,
-                self.deployment_id,
-                std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
-            )
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to confirm routes after waking environment {environment_id}: {error}"
-                ))
-            })?;
-            Self::wait_for_worker_apply(
-                self.db.as_ref(),
-                std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
-                cluster_dns_enabled,
-            )
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Workers did not apply routes after waking environment {environment_id}: {error}"
-                ))
-            })?;
-        }
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
@@ -1409,20 +1414,20 @@ WHERE project.id = $2
         // Statement::from_string is therefore safe here; no bound parameter is
         // needed because the identifier cannot be parameterised in PostgreSQL.
         let load_singleton = |table: &'static str| async move {
-            Gen::find_by_statement(Statement::from_string(
+            let row = Gen::find_by_statement(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!("SELECT current FROM {table} WHERE id = 1"),
             ))
             .one(db)
             .await
-            .ok()
-            .flatten()
-            .and_then(|g| g.current)
-            .unwrap_or(0)
+            .map_err(|error| format!("reading {table} generation: {error}"))?
+            .ok_or_else(|| format!("missing {table} singleton row (id=1)"))?;
+            row.current
+                .ok_or_else(|| format!("missing {table}.current generation (id=1)"))
         };
-        let route_gen: i64 = load_singleton("route_generation").await;
+        let route_gen: i64 = load_singleton("route_generation").await?;
         let dns_gen: i64 = if cluster_dns_enabled {
-            load_singleton("dns_generation").await
+            load_singleton("dns_generation").await?
         } else {
             0
         };
@@ -2597,7 +2602,8 @@ impl Default for MarkDeploymentCompleteJobBuilder {
 #[cfg(test)]
 mod teardown_tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, PaginatorTrait};
+    use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase, PaginatorTrait, Value};
+    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
@@ -2608,6 +2614,77 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+
+    #[tokio::test]
+    async fn test_worker_barrier_fails_closed_when_route_generation_cannot_be_loaded() {
+        for (case, mock) in [
+            (
+                "database error",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("route generation unavailable".into())]),
+            ),
+            (
+                "missing row",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<BTreeMap<&str, Value>>::new()]),
+            ),
+            (
+                "null current",
+                MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![
+                    BTreeMap::from([("current", Value::BigInt(None))]),
+                ]]),
+            ),
+        ] {
+            let error = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::from_millis(1),
+                false,
+            )
+            .await
+            .expect_err("route generation must be known before acknowledging workers");
+            assert!(
+                error.contains("route_generation"),
+                "{case} lacked route generation context: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_barrier_fails_closed_when_dns_generation_cannot_be_loaded() {
+        let route_row = vec![BTreeMap::from([("current", Value::BigInt(Some(7)))])];
+        for (case, mock) in [
+            (
+                "database error",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([route_row.clone()])
+                    .append_query_errors([DbErr::Custom("dns generation unavailable".into())]),
+            ),
+            (
+                "missing row",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([route_row.clone(), Vec::new()]),
+            ),
+            (
+                "null current",
+                MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+                    route_row.clone(),
+                    vec![BTreeMap::from([("current", Value::BigInt(None))])],
+                ]),
+            ),
+        ] {
+            let error = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::from_millis(1),
+                true,
+            )
+            .await
+            .expect_err("DNS generation must be known before acknowledging workers");
+            assert!(
+                error.contains("dns_generation"),
+                "{case} lacked DNS generation context: {error}"
+            );
+        }
+    }
 
     /// Minimal ContainerDeployer that records stop/remove calls and otherwise
     /// no-ops. Used to assert that teardown stopped the expected containers
