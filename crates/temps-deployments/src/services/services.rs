@@ -2292,16 +2292,48 @@ impl DeploymentService {
                 sea_orm::sea_query::Expr::value(Some(reason.clone())),
             )
             .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.is_in(["pending", "running", "creating"]))
             .exec(self.db.as_ref())
             .await;
 
         match update {
             Ok(result) if result.rows_affected == 1 => DeploymentError::Other(reason),
-            Ok(result) => DeploymentError::DatabaseError {
-                reason: format!(
-                    "{reason}; additionally failed to persist terminal state: expected one deployment row, updated {}",
-                    result.rows_affected
-                ),
+            Ok(_) => match deployments::Entity::find_by_id(deployment_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(deployment))
+                    if matches!(
+                        deployment.state.as_str(),
+                        "cancelled" | "stopped" | "completed" | "deployed" | "failed"
+                    ) =>
+                {
+                    DeploymentError::Other(format!(
+                        "{reason}; terminal state '{}' was preserved{}",
+                        deployment.state,
+                        deployment
+                            .cancelled_reason
+                            .as_deref()
+                            .map(|existing| format!(": {existing}"))
+                            .unwrap_or_default()
+                    ))
+                }
+                Ok(Some(deployment)) => DeploymentError::DatabaseError {
+                    reason: format!(
+                        "{reason}; additionally failed to persist terminal state from unexpected state '{}'",
+                        deployment.state
+                    ),
+                },
+                Ok(None) => DeploymentError::DatabaseError {
+                    reason: format!(
+                        "{reason}; additionally failed to persist terminal state because the deployment disappeared"
+                    ),
+                },
+                Err(read_error) => DeploymentError::DatabaseError {
+                    reason: format!(
+                        "{reason}; additionally failed to verify terminal state: {read_error}"
+                    ),
+                },
             },
             Err(update_error) => DeploymentError::DatabaseError {
                 reason: format!(
@@ -2311,21 +2343,58 @@ impl DeploymentService {
         }
     }
 
-    async fn activate_static_reuse(
+    async fn complete_static_reuse(
         &self,
-        environment: environments::Model,
-        deployment: deployments::Model,
-    ) -> Result<(), DbErr> {
-        let transaction = self.db.begin().await?;
-        let mut active_environment: environments::ActiveModel = environment.into();
-        active_environment.current_deployment_id = Set(Some(deployment.id));
-        active_environment.update(&transaction).await?;
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DeploymentError> {
+        let log_id = format!(
+            "{}/{}/{}/{:02}/{:02}/{:02}/{:02}/deployment-{}-job-mark_deployment_complete.log",
+            project.slug,
+            environment.slug,
+            now.format("%Y"),
+            now.format("%m"),
+            now.format("%d"),
+            now.format("%H"),
+            now.format("%M"),
+            deployment.id
+        );
+        self.log_service
+            .create_log_path(&log_id)
+            .await
+            .map_err(|error| {
+                DeploymentError::Other(format!(
+                    "Failed to create static completion log path: {error}"
+                ))
+            })?;
 
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.state = Set("completed".to_string());
-        active_deployment.finished_at = Set(Some(chrono::Utc::now()));
-        active_deployment.update(&transaction).await?;
-        transaction.commit().await
+        let job = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+            .job_id("mark_deployment_complete".to_string())
+            .deployment_id(deployment.id)
+            .db(self.db.clone())
+            .log_id(log_id)
+            .log_service(self.log_service.clone())
+            .container_deployer(self.deployer.clone())
+            .queue(self.queue_service.clone())
+            .config_service(self.config_service.clone())
+            .encryption_service(self.encryption_service.clone())
+            .build()
+            .map_err(|error| {
+                DeploymentError::Other(format!("Failed to create static completion job: {error}"))
+            })?;
+        let context = temps_core::WorkflowContext::new(
+            format!("static-reuse-{}", deployment.id),
+            deployment.id,
+            project.id,
+            environment.id,
+            Arc::new(crate::test_utils::MockLogWriter::new(0)),
+        );
+        job.execute(context).await.map_err(|error| {
+            DeploymentError::Other(format!("Failed to complete static reuse: {error}"))
+        })?;
+        Ok(())
     }
 
     pub async fn rollback_to_deployment(
@@ -2433,10 +2502,9 @@ impl DeploymentService {
                 .as_ref()
                 .is_some_and(|location| !location.is_empty())
         } else {
-            target_deployment
-                .image_name
-                .as_ref()
-                .is_some_and(|image| !image.is_empty())
+            target_deployment.image_name.as_ref().is_some_and(|image| {
+                !image.is_empty() && !image.starts_with(&format!("temps-{}:", project.slug))
+            })
         };
 
         if project.source_type == temps_entities::source_type::SourceType::Git
@@ -2648,7 +2716,12 @@ impl DeploymentService {
             info!("Rollback: Static preset detected - updating environment only");
 
             if let Err(error) = self
-                .activate_static_reuse(environment, rollback_deployment.clone())
+                .complete_static_reuse(
+                    &project,
+                    &environment,
+                    &rollback_deployment,
+                    now,
+                )
                 .await
             {
                 return Err(self
@@ -3261,7 +3334,7 @@ impl DeploymentService {
             info!("Promotion: Static preset detected — updating environment only");
 
             if let Err(error) = self
-                .activate_static_reuse(target_env, promoted_deployment.clone())
+                .complete_static_reuse(&project, &target_env, &promoted_deployment, now)
                 .await
             {
                 return Err(self
@@ -7060,6 +7133,7 @@ mod tests {
         .await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
         let promoted = deployment_service
             .promote_deployment(project.id, source.id, target_environment.id)
             .await?;
@@ -7082,12 +7156,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_reuse_cannot_activate_behind_a_newer_generation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _) = setup_test_data(&db).await?;
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.preset = Set(temps_entities::preset::Preset::Static);
+        active_project.update(db.as_ref()).await?;
+
+        let now = Utc::now();
+        let candidate = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("static-candidate".to_string()),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            static_dir_location: Set(Some("cas/static/candidate".to_string())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("newer-static-candidate".to_string()),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            static_dir_location: Set(Some("cas/static/newer".to_string())),
+            created_at: Set(now + chrono::Duration::seconds(1)),
+            updated_at: Set(now + chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let result = service
+            .complete_static_reuse(&project, &environment, &candidate, now)
+            .await;
+        assert!(result.is_err());
+
+        let persisted_candidate = deployments::Entity::find_by_id(candidate.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static candidate disappeared")?;
+        assert_eq!(persisted_candidate.state, "stopped");
+        let persisted_environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("environment disappeared")?;
+        assert_ne!(
+            persisted_environment.current_deployment_id,
+            Some(candidate.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reuse_setup_failure_persists_terminal_deployment_state(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (_project, _environment, deployment) = setup_test_data(&db).await?;
         let service = create_deployment_service_for_test(db.clone());
+
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("running".to_string());
+        let deployment = active_deployment.update(db.as_ref()).await?;
 
         let error = service
             .fail_reuse_deployment(
@@ -7114,6 +7256,38 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reuse_failure_preserves_existing_cancellation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("cancelled".to_string());
+        active_deployment.cancelled_reason = Set(Some("cancelled by user".to_string()));
+        active_deployment.finished_at = Set(Some(Utc::now()));
+        let deployment = active_deployment.update(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let error = service
+            .fail_reuse_deployment(deployment.id, "Failed after cancellation", "worker stopped")
+            .await;
+        assert!(error
+            .to_string()
+            .contains("terminal state 'cancelled' was preserved"));
+
+        let persisted = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("cancelled deployment disappeared")?;
+        assert_eq!(persisted.state, "cancelled");
+        assert_eq!(
+            persisted.cancelled_reason.as_deref(),
+            Some("cancelled by user")
+        );
+        Ok(())
+    }
+
     /// When the target deployment carries a git commit on a git-sourced
     /// project AND the stored image is gone (pruned), rollback should rebuild
     /// from source (enqueue a GitPushEvent) rather than fail. We assert it does
@@ -7122,7 +7296,7 @@ mod tests {
     /// pointer. The rebuild path enqueues an async job, so within the test the
     /// only deployments present are the originals — no extra image-reuse row.
     #[tokio::test]
-    async fn test_rollback_rebuilds_from_source_when_image_missing(
+    async fn test_rollback_rebuilds_pruned_local_git_image_from_recorded_source(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -7130,13 +7304,13 @@ mod tests {
         // setup_test_data creates a Git-source project (SourceType default).
         let (_project, _environment, target_deployment) = setup_test_data(&db).await?;
 
-        // Give the target a real git commit so it's rebuildable from source,
-        // and remove the durable image reference. A control-plane-local cache
-        // miss is no longer evidence that a worker cannot pull the artifact.
+        // A normal Git build stores a local-only image name. Once that image is
+        // pruned, no worker can pull it from a registry, so the recorded commit
+        // is the durable recovery source.
         let mut active: deployments::ActiveModel = target_deployment.clone().into();
         active.commit_sha = Set(Some("abc1234deadbeef".to_string()));
         active.branch_ref = Set(Some("main".to_string()));
-        active.image_name = Set(None);
+        active.image_name = Set(Some(format!("temps-test-project:{}", target_deployment.id)));
         let target_deployment = active.update(db.as_ref()).await?;
 
         let count_before = deployments::Entity::find()
@@ -7144,7 +7318,7 @@ mod tests {
             .count(db.as_ref())
             .await?;
 
-        // With no stored image reference, rollback must rebuild from source.
+        // A local-only generated image reference must rebuild from source.
         let deployment_service = create_deployment_service_for_rebuild(db.clone());
 
         let result = deployment_service
