@@ -492,8 +492,10 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         info: &temps_deployer::ContainerInfo,
     ) -> Result<(), DbErr> {
-        let host_port =
-            published_tcp_host_port(container.container_port, &info.ports).or(container.host_port);
+        // A successful runtime inspection is authoritative. If the expected
+        // TCP binding is absent, clear the recorded host port so the proxy
+        // cannot keep dialing a port that Docker may have reassigned.
+        let host_port = published_tcp_host_port(container.container_port, &info.ports);
         let port_changed = host_port != container.host_port;
         if !port_changed
             && container.started_at == info.started_at
@@ -1170,6 +1172,7 @@ mod tests {
         info_calls: AtomicUsize,
         stats_calls: AtomicUsize,
         block_info: AtomicBool,
+        fail_info: AtomicBool,
     }
 
     #[allow(dead_code)]
@@ -1203,6 +1206,7 @@ mod tests {
                 info_calls: AtomicUsize::new(0),
                 stats_calls: AtomicUsize::new(0),
                 block_info: AtomicBool::new(false),
+                fail_info: AtomicBool::new(false),
             }
         }
 
@@ -1234,6 +1238,10 @@ mod tests {
         fn block_container_info(&self) {
             self.block_info.store(true, Ordering::Relaxed);
         }
+
+        fn fail_container_info(&self) {
+            self.fail_info.store(true, Ordering::Relaxed);
+        }
     }
 
     #[async_trait]
@@ -1263,6 +1271,11 @@ mod tests {
             self.info_calls.fetch_add(1, Ordering::Relaxed);
             if self.block_info.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
+            }
+            if self.fail_info.load(Ordering::Relaxed) {
+                return Err(DeployerError::NetworkError(
+                    "transient inspection failure".to_string(),
+                ));
             }
             Ok(self.info.lock().await.clone())
         }
@@ -1562,8 +1575,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_port_reconciliation_ignores_unrelated_udp_zero_and_missing_ports() {
-        for ports in [
+    async fn authoritative_missing_mapping_clears_host_port_and_notifies_routes() {
+        let invalid_mappings = [
             vec![],
             vec![temps_deployer::PortMapping {
                 host_port: 32001,
@@ -1583,15 +1596,21 @@ mod tests {
                 protocol: temps_deployer::Protocol::Tcp,
                 host_ip: None,
             }],
-            vec![temps_deployer::PortMapping {
-                host_port: 8080,
-                container_port: 3000,
-                protocol: temps_deployer::Protocol::Tcp,
-                host_ip: None,
-            }],
-        ] {
+        ];
+
+        for ports in invalid_mappings {
             let container = make_container_model(1);
-            let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+            let mut updated = container.clone();
+            updated.host_port = None;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([[updated]])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
             let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
             let mut info = deployer.get_container_info("abc123").await.unwrap();
             info.ports = ports;
@@ -1601,16 +1620,48 @@ mod tests {
                 make_alarm_service(db.clone()),
                 ContainerHealthConfig::default(),
             );
+
             monitor
                 .persist_runtime_info(&container, &info)
                 .await
                 .unwrap();
             drop(monitor);
-            assert!(Arc::try_unwrap(db)
-                .unwrap()
-                .into_transaction_log()
-                .is_empty());
+
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let sql = format!("{transactions:?}");
+            assert!(
+                sql.contains("host_port"),
+                "host port must be cleared: {sql}"
+            );
+            assert!(sql.contains("pg_notify"), "routes must reload: {sql}");
+            assert_eq!(transactions.len(), 1, "clear and notify must be atomic");
         }
+    }
+
+    #[tokio::test]
+    async fn transient_inspection_failure_preserves_recorded_host_port() {
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.fail_container_info();
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        assert!(monitor
+            .check_container(&container, &deployment, monitor.deployer.as_ref())
+            .await
+            .is_err());
+        drop(monitor);
+
+        assert!(Arc::try_unwrap(db)
+            .unwrap()
+            .into_transaction_log()
+            .is_empty());
     }
 
     #[test]
@@ -1645,7 +1696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_port_notification_failure_rolls_back_for_retry() {
+    async fn missing_mapping_notification_failure_rolls_back_clear_for_retry() {
         let container = make_container_model(1);
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
@@ -1654,13 +1705,7 @@ mod tests {
                 .into_connection(),
         );
         let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
-        let mut info = deployer.get_container_info("abc123").await.unwrap();
-        info.ports = vec![temps_deployer::PortMapping {
-            host_port: 32001,
-            container_port: 3000,
-            protocol: temps_deployer::Protocol::Tcp,
-            host_ip: None,
-        }];
+        let info = deployer.get_container_info("abc123").await.unwrap();
         let monitor = ContainerHealthMonitor::new(
             db.clone(),
             deployer,

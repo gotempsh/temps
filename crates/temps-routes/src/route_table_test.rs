@@ -80,7 +80,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         test_db
-            .create_deployment_container(deployment.id, 9000, None)
+            .create_deployment_container(deployment.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -126,7 +126,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9001
         test_db
-            .create_deployment_container(deployment.id, 9001, None)
+            .create_deployment_container(deployment.id, 9001, Some(9001))
             .await?;
 
         // Create project custom domain
@@ -172,7 +172,7 @@ mod route_table_tests {
             .create_test_project_with_domain("project.example.com")
             .await?;
         test_db
-            .create_deployment_container(deployment.id, 9011, None)
+            .create_deployment_container(deployment.id, 9011, Some(9011))
             .await?;
 
         let wildcard = project_custom_domains::ActiveModel {
@@ -303,7 +303,7 @@ mod route_table_tests {
             .create_test_project_with_domain("test.example.com")
             .await?;
         test_db
-            .create_deployment_container(deployment.id, 9010, None)
+            .create_deployment_container(deployment.id, 9010, Some(9010))
             .await?;
 
         // A pre-existing row claiming the console hostname, plus a normal one
@@ -356,7 +356,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9002
         test_db
-            .create_deployment_container(deployment.id, 9002, None)
+            .create_deployment_container(deployment.id, 9002, Some(9002))
             .await?;
 
         // Create project custom domain with redirect
@@ -535,7 +535,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         let container = test_db
-            .create_deployment_container(deployment.id, 9000, None)
+            .create_deployment_container(deployment.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -557,6 +557,7 @@ mod route_table_tests {
         use temps_entities::deployment_containers;
         let mut container: deployment_containers::ActiveModel = container.into();
         container.container_port = Set(9999);
+        container.host_port = Set(Some(9999));
         let _container = container.update(test_db.db.as_ref()).await?;
 
         // Reload routes
@@ -583,7 +584,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         test_db
-            .create_deployment_container(deployment1.id, 9000, None)
+            .create_deployment_container(deployment1.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -616,7 +617,7 @@ mod route_table_tests {
 
         // Create deployment container for second deployment with port 9001
         test_db
-            .create_deployment_container(deployment2.id, 9001, None)
+            .create_deployment_container(deployment2.id, 9001, Some(9001))
             .await?;
 
         // Update environment to point to new deployment
@@ -713,6 +714,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-running-{}", deployment.id)),
             container_name: Set(format!("test-container-running-{}", deployment.id)),
             container_port: Set(9600),
+            host_port: Set(Some(9600)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),
             deployed_at: Set(now),
@@ -725,6 +727,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_name: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_port: Set(9601),
+            host_port: Set(Some(9601)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(None),
             deployed_at: Set(now),
@@ -737,6 +740,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
             container_port: Set(9602),
+            host_port: Set(Some(9602)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),
             deployed_at: Set(now),
