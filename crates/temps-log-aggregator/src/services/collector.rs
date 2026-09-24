@@ -56,8 +56,9 @@ pub struct CollectorService {
     chunk_writer: Arc<ChunkWriterService>,
     metadata_service: Arc<LogMetadataService>,
     /// DB handle used to resolve an imported external service's
-    /// `temps.service_name` label to its `external_services.id`. `None` in
-    /// tests that don't exercise external-service log collection.
+    /// `temps.service_name` label to its `external_services.id`, and to verify
+    /// a project-labelled container names a deployment this instance owns.
+    /// `None` in tests that don't exercise either.
     db: Option<Arc<sea_orm::DatabaseConnection>>,
     /// Broadcast channel for live tail subscribers
     tail_tx: broadcast::Sender<LogLine>,
@@ -300,6 +301,19 @@ impl CollectorService {
             .get(LABEL_DEPLOY_ID)
             .and_then(|id| id.parse::<i32>().ok());
 
+        if !self
+            .owns_project_container(container_id, project_id, &env, deploy_id)
+            .await?
+        {
+            debug!(
+                container_id,
+                project_id,
+                ?deploy_id,
+                "Skipping container whose sh.temps.* labels name a deployment this instance does not own"
+            );
+            return Ok(None);
+        }
+
         Ok(Some(ContainerContext {
             project_id,
             external_service_id: None,
@@ -308,6 +322,66 @@ impl CollectorService {
             container_id: container_id.to_string(),
             deploy_id,
         }))
+    }
+
+    /// Whether a `sh.temps.project_id`-labelled container belongs to THIS
+    /// instance. Labels are just strings on a Docker daemon that other Temps
+    /// instances, test suites and user workloads share, so a label naming a
+    /// project is not proof of ownership: the deployment it names must exist
+    /// here, under the same project and environment. Without that check, a
+    /// second instance's (or a test's) containers are collected under project
+    /// ids this instance has never heard of.
+    ///
+    /// Containers without a `sh.temps.deploy_id` label only need their project
+    /// to exist. With no DB handle (unit tests) nothing can be verified, so the
+    /// labels are trusted as before.
+    async fn owns_project_container(
+        &self,
+        container_id: &str,
+        project_id: i32,
+        env: &str,
+        deploy_id: Option<i32>,
+    ) -> Result<bool, LogAggregatorError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+
+        let Some(db) = self.db.as_ref() else {
+            return Ok(true);
+        };
+        let lookup_failed = |e: sea_orm::DbErr| LogAggregatorError::DockerStreamFailed {
+            container_id: container_id.to_string(),
+            reason: format!("Failed to verify project {project_id} ownership: {e}"),
+        };
+
+        let found = match deploy_id {
+            Some(deploy_id) => {
+                use temps_entities::deployments::{Column, Entity};
+                let mut query = Entity::find()
+                    .select_only()
+                    .column(Column::Id)
+                    .filter(Column::Id.eq(deploy_id))
+                    .filter(Column::ProjectId.eq(project_id));
+                if let Ok(environment_id) = env.parse::<i32>() {
+                    query = query.filter(Column::EnvironmentId.eq(environment_id));
+                }
+                query
+                    .into_tuple::<i32>()
+                    .one(db.as_ref())
+                    .await
+                    .map_err(lookup_failed)?
+            }
+            None => {
+                use temps_entities::projects::{Column, Entity};
+                Entity::find()
+                    .select_only()
+                    .column(Column::Id)
+                    .filter(Column::Id.eq(project_id))
+                    .into_tuple::<i32>()
+                    .one(db.as_ref())
+                    .await
+                    .map_err(lookup_failed)?
+            }
+        };
+        Ok(found.is_some())
     }
 
     /// Resolve an external-service container to its owning `external_services`
@@ -666,5 +740,64 @@ mod tests {
             .await
             .expect("resolution must not error");
         assert!(ctx.is_none(), "unresolved container must be skipped");
+    }
+
+    fn id_row(id: i32) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        std::collections::BTreeMap::from([("id", sea_orm::Value::Int(Some(id)))])
+    }
+
+    // The container's labels name a deployment that exists here under the same
+    // project and environment: it is ours, so it is collected.
+    #[tokio::test]
+    async fn test_owned_deployment_container_is_collected() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(7)]])
+            .into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+
+        let owned = collector
+            .owns_project_container("cid", 1, "1", Some(7))
+            .await
+            .expect("lookup must not error");
+        assert!(owned);
+    }
+
+    // Another Temps instance (or a test suite) on the same Docker daemon labels
+    // its containers `sh.temps.project_id=42`. No such deployment exists here,
+    // so its logs must not be collected under a project this instance lacks.
+    #[tokio::test]
+    async fn test_foreign_deployment_container_is_skipped() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
+            ])
+            .into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+
+        let owned = collector
+            .owns_project_container("cid", 42, "7", Some(3))
+            .await
+            .expect("lookup must not error");
+        assert!(
+            !owned,
+            "a deployment this instance does not own must be skipped"
+        );
+    }
+
+    // Without a deploy label the project itself must exist here.
+    #[tokio::test]
+    async fn test_unknown_project_without_deploy_label_is_skipped() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
+            ])
+            .into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+
+        let owned = collector
+            .owns_project_container("cid", 2, "default", None)
+            .await
+            .expect("lookup must not error");
+        assert!(!owned);
     }
 }

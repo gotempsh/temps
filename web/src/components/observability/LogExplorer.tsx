@@ -97,6 +97,7 @@ type FacetSection = {
 export function LogExplorer({
   lines,
   environmentLabels = {},
+  projectLabels = {},
   facets,
   facetsLoading,
   facetsError,
@@ -114,6 +115,12 @@ export function LogExplorer({
   attributesPanel,
 }: {
   environmentLabels?: Record<string, string>
+  /**
+   * Names for project ids that appear in the facets, resolved across the whole
+   * time range. Loaded lines alone can't name a project whose lines all fall
+   * outside the current page.
+   */
+  projectLabels?: Record<string, string>
   lines: GlobalLogLine[]
   facets?: GlobalLogFacetsResponse
   facetsLoading?: boolean
@@ -173,8 +180,7 @@ export function LogExplorer({
     serverMobileSnapshot
   )
   const wrapPreference = params.get('wrap')
-  const wrap =
-    wrapPreference === '1' || (wrapPreference !== '0' && isMobile)
+  const wrap = wrapPreference === '1' || (wrapPreference !== '0' && isMobile)
   const facetPreference = params.get('facets')
   const showFacets =
     facetPreference === '1' || (facetPreference !== '0' && isDesktop)
@@ -185,7 +191,8 @@ export function LogExplorer({
 
   // Facet values carry only an id and a count. Loaded lines are used purely to
   // put a human name on an id we already have — never to decide which values
-  // exist or how many there are; that is the store's answer now.
+  // exist or how many there are; that is the store's answer now. Ids with no
+  // line on this page are named by `projectLabels`.
   const names = useMemo(() => {
     const projects = new Map<string, string>()
     const nodes = new Map<string, string>()
@@ -226,7 +233,10 @@ export function LogExplorer({
       key: 'project_id',
       values: map(
         projectFacet,
-        (value) => names.projects.get(value) ?? `Project ${value}`
+        (value) =>
+          names.projects.get(value) ??
+          projectLabels[value] ??
+          `Project ${value}`
       ),
     },
     {
