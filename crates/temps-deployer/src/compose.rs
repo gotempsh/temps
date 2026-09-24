@@ -126,7 +126,8 @@ const MAX_COMPOSE_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 /// in [`ComposeExecutor::capability_denial_remediation`]. A UI reshuffle that
 /// updated only one of them would send half of users to a page that no longer
 /// exists.
-pub const ELEVATED_PERMISSIONS_SETTINGS_PATH: &str = "Project Settings → Git → Compose services";
+pub const ELEVATED_PERMISSIONS_SETTINGS_PATH: &str =
+    "Project Settings → Build & deploy → Build → Docker Compose → Compose services";
 
 /// Keys an inline override may not set because [`ComposeExecutor`]'s
 /// deploy-time security policy rejects them outright, wherever they appear.
@@ -594,6 +595,8 @@ fn safe_compose_config_failure(stderr: &[u8]) -> String {
         }
     } else if lower.contains("cannot extend service") && lower.contains("not found") {
         "An extends reference names a service missing from its referenced Compose file. Check the extends.file and extends.service settings.".to_string()
+    } else if lower.contains("depends on undefined service") {
+        "A service depends on another service that is not defined in the combined Compose project. Check inherited depends_on entries and excluded services.".to_string()
     } else if (lower.contains("env_file") || lower.contains("env file"))
         && (lower.contains("not found") || lower.contains("no such file"))
     {
@@ -2769,13 +2772,15 @@ impl ComposeExecutor {
                 override_content,
                 &self.policy,
             )?;
+            let override_content =
+                Self::without_duplicate_extends(project_name, content, override_content)?;
             Some(
                 tokio::time::timeout_at(
                     deadline,
                     self.snapshot_compose_document(
                         &canonical_root,
                         &base,
-                        override_content,
+                        &override_content,
                         &mut snapshots,
                     ),
                 )
@@ -5538,7 +5543,7 @@ impl ComposeExecutor {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Git → Advanced security settings for a trusted stack"
+                        "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -5577,7 +5582,7 @@ impl ComposeExecutor {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Git → Advanced security settings for a trusted stack"
+                        "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -5586,6 +5591,51 @@ impl ComposeExecutor {
         }
 
         Ok(())
+    }
+
+    /// Compose re-applies an inherited service when the same `extends` appears
+    /// in both input files. That can restore fields the repository file removed
+    /// with `!override`, such as an inherited `depends_on`. The repeated
+    /// reference adds no intended setting, so omit it from the inline file.
+    fn without_duplicate_extends(
+        project_name: &str,
+        compose_content: &str,
+        override_content: &str,
+    ) -> Result<String, ComposeError> {
+        let base = Self::parse_compose_yaml(project_name, compose_content, "compose file")?;
+        let mut override_yaml =
+            Self::parse_compose_yaml(project_name, override_content, "compose override")?;
+        let Some(base_services) = Self::compose_services(&base) else {
+            return Ok(override_content.to_string());
+        };
+        let Some(override_services) = override_yaml
+            .get_mut("services")
+            .and_then(Value::as_mapping_mut)
+        else {
+            return Ok(override_content.to_string());
+        };
+        let mut changed = false;
+        for (name, service) in override_services {
+            let Some(base_extends) = base_services.get(name).and_then(|base| base.get("extends"))
+            else {
+                continue;
+            };
+            let Some(fields) = service.as_mapping_mut() else {
+                continue;
+            };
+            let extends = Value::String("extends".to_string());
+            if fields.get(&extends) == Some(base_extends) {
+                fields.remove(&extends);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(override_content.to_string());
+        }
+        serde_yaml::to_string(&override_yaml).map_err(|error| ComposeError::InvalidOverride {
+            project: project_name.to_string(),
+            reason: format!("failed to serialize inline override after merging extends: {error}"),
+        })
     }
 
     fn parse_compose_yaml(
@@ -5638,7 +5688,7 @@ impl ComposeExecutor {
                 if policy.enforced(check) {
                     return Err(ComposeError::InvalidOverride {
                         project: project_name.to_string(),
-                        reason: format!("service '{service_name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Git → Advanced security settings for a trusted stack"),
+                        reason: format!("service '{service_name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"),
                     });
                 }
             }
@@ -5650,8 +5700,8 @@ impl ComposeExecutor {
                     reason: format!(
                         "service '{service_name}' cannot set '{key}' as an inline override; \
                          declare it in the repository compose file, or an instance administrator \
-                         can disable the Inline Fields check in Project Settings → Git → \
-                         Advanced security settings for a trusted stack"
+                         can disable the Inline Fields check in Project Settings → Build & deploy → \
+                         Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -12595,6 +12645,10 @@ services:
                 "extends reference names a service missing",
             ),
             (
+                "service \"web\" depends on undefined service \"repo-only-secret\": invalid compose project",
+                "depends on another service that is not defined",
+            ),
+            (
                 "error while interpolating services.web.image: required variable TOKEN is missing a value: repo-only-secret",
                 "Required Compose variable TOKEN has no value",
             ),
@@ -13552,6 +13606,84 @@ services:
         .unwrap();
         assert!(
             matches!(executor.resolve_security_configuration("temps-policy-test", Some(root.path()), "compose.yml", content, None, &HashMap::new()).await, Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "privileged")
+        );
+    }
+
+    #[test]
+    fn identical_extends_is_removed_from_inline_override_only() {
+        let source = "services: {app: {extends: {file: common.yml, service: base}}}";
+        let same = "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8191:8191']}}";
+        let normalized = ComposeExecutor::without_duplicate_extends("test", source, same).unwrap();
+        let yaml: Value = serde_yaml::from_str(&normalized).unwrap();
+        assert!(yaml["services"]["app"].get("extends").is_none());
+        assert_eq!(
+            yaml["services"]["app"]["ports"][0].as_str(),
+            Some("127.0.0.1:8191:8191")
+        );
+
+        let different = "services: {app: {extends: {file: other.yml, service: base}}}";
+        assert_eq!(
+            ComposeExecutor::without_duplicate_extends("test", source, different).unwrap(),
+            different
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_extends_in_inline_override_keeps_repository_dependency_override() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, depends_on: [redis]}}",
+        )
+        .unwrap();
+        let source = "services: {app: {extends: {file: common.yml, service: base}, depends_on: !override {warp: {condition: service_started}}}, warp: {image: alpine}}";
+        let inline = "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8191:8191']}}";
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let (resolved, override_content) = executor
+            .resolve_security_configuration(
+                "temps-duplicate-extends-test",
+                Some(root.path()),
+                "compose.yml",
+                source,
+                Some(inline),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(override_content.is_none());
+        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert!(yaml["services"]["app"]["depends_on"].get("redis").is_none());
+        assert!(yaml["services"]["app"]["depends_on"].get("warp").is_some());
+        assert_eq!(
+            yaml["services"]["app"]["ports"][0]["published"].as_str(),
+            Some("8191")
+        );
+
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, depends_on: [redis], privileged: true}}",
+        )
+        .unwrap();
+        let error = executor
+            .resolve_security_configuration(
+                "temps-duplicate-extends-test",
+                Some(root.path()),
+                "compose.yml",
+                source,
+                Some(inline),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "privileged")
         );
     }
 
