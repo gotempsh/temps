@@ -15,7 +15,7 @@ use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
     EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use temps_deployer::ContainerDeployer;
 use temps_entities::{deployment_containers, deployments};
@@ -73,6 +73,34 @@ struct ContainerCheckJob {
 }
 
 const MAX_CONCURRENT_CONTAINER_CHECKS: usize = 16;
+
+fn fair_order_jobs(jobs: Vec<ContainerCheckJob>) -> Vec<ContainerCheckJob> {
+    let mut buckets: Vec<(Option<i32>, VecDeque<ContainerCheckJob>)> = Vec::new();
+    for job in jobs {
+        if let Some((_, bucket)) = buckets
+            .iter_mut()
+            .find(|(node_id, _)| *node_id == job.container.node_id)
+        {
+            bucket.push_back(job);
+        } else {
+            buckets.push((job.container.node_id, VecDeque::from([job])));
+        }
+    }
+
+    let mut ordered = Vec::new();
+    loop {
+        let mut added = false;
+        for (_, bucket) in &mut buckets {
+            if let Some(job) = bucket.pop_front() {
+                ordered.push(job);
+                added = true;
+            }
+        }
+        if !added {
+            return ordered;
+        }
+    }
+}
 
 fn published_tcp_host_port(
     container_port: i32,
@@ -322,7 +350,7 @@ impl ContainerHealthMonitor {
     }
 
     async fn check_container_jobs(&self, jobs: Vec<ContainerCheckJob>) {
-        stream::iter(jobs)
+        stream::iter(fair_order_jobs(jobs))
             .for_each_concurrent(MAX_CONCURRENT_CONTAINER_CHECKS, |job| async move {
                 let result = if job.is_remote {
                     self.check_remote_container(
@@ -377,9 +405,10 @@ impl ContainerHealthMonitor {
         deployment: &deployments::Model,
         deployer: &dyn ContainerDeployer,
     ) -> Result<(), String> {
-        let deadline = tokio::time::Duration::from_millis(self.config.worker_check_timeout_ms);
+        let timeout = tokio::time::Duration::from_millis(self.config.worker_check_timeout_ms);
+        let deadline = tokio::time::Instant::now() + timeout;
         let info = tokio::time::timeout(
-            deadline,
+            timeout,
             deployer.get_container_info(&container.container_id),
         )
         .await
@@ -409,7 +438,7 @@ impl ContainerHealthMonitor {
         deployment: &deployments::Model,
         deployer: &dyn ContainerDeployer,
         info: temps_deployer::ContainerInfo,
-        stats_deadline: Option<tokio::time::Duration>,
+        stats_deadline: Option<tokio::time::Instant>,
     ) {
         // Check restart count
         self.check_restart_count(container, deployment, &info).await;
@@ -741,10 +770,10 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         deployment: &deployments::Model,
         deployer: &dyn ContainerDeployer,
-        deadline: Option<tokio::time::Duration>,
+        deadline: Option<tokio::time::Instant>,
     ) {
         let stats_result = match deadline {
-            Some(deadline) => match tokio::time::timeout(
+            Some(deadline) => match tokio::time::timeout_at(
                 deadline,
                 deployer.get_container_stats(&container.container_id),
             )
@@ -1364,22 +1393,25 @@ mod tests {
             make_alarm_service(db),
             config,
         );
-        let mut worker_container = make_container_model(1);
-        worker_container.node_id = Some(7);
         let local_container = make_container_model(2);
         let mut healthy_worker_container = make_container_model(3);
         healthy_worker_container.node_id = Some(8);
         let deployment = make_deployment_model();
-        let jobs = vec![
-            ContainerCheckJob {
+        let mut jobs = Vec::new();
+        for id in 10..27 {
+            let mut worker_container = make_container_model(id);
+            worker_container.node_id = Some(7);
+            jobs.push(ContainerCheckJob {
                 container: worker_container,
                 deployment: deployment.clone(),
                 deployer: slow_worker.clone(),
                 is_remote: true,
-            },
+            });
+        }
+        jobs.extend([
             ContainerCheckJob {
                 container: local_container,
-                deployment,
+                deployment: deployment.clone(),
                 deployer: healthy_local.clone(),
                 is_remote: false,
             },
@@ -1389,7 +1421,7 @@ mod tests {
                 deployer: healthy_worker.clone(),
                 is_remote: true,
             },
-        ];
+        ]);
 
         tokio::time::timeout(
             tokio::time::Duration::from_millis(100),
@@ -1398,7 +1430,7 @@ mod tests {
         .await
         .expect("slow worker must be bounded by its own deadline");
 
-        assert_eq!(slow_worker.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(slow_worker.info_calls.load(Ordering::Relaxed), 17);
         assert_eq!(healthy_local.info_calls.load(Ordering::Relaxed), 1);
         assert_eq!(healthy_local.stats_calls.load(Ordering::Relaxed), 1);
         assert_eq!(healthy_worker.info_calls.load(Ordering::Relaxed), 1);
