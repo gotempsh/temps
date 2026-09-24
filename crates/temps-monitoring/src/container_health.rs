@@ -393,7 +393,9 @@ impl ContainerHealthMonitor {
                 )
             })?;
 
-        self.process_container_info(container, deployment, deployer, info, None)
+        self.process_container_info(container, deployment, &info)
+            .await;
+        self.check_resource_usage(container, deployment, deployer)
             .await;
 
         Ok(())
@@ -427,8 +429,36 @@ impl ContainerHealthMonitor {
             )
         })?;
 
-        self.process_container_info(container, deployment, deployer, info, Some(deadline))
+        let stats = match tokio::time::timeout_at(
+            deadline,
+            deployer.get_container_stats(&container.container_id),
+        )
+        .await
+        {
+            Ok(Ok(stats)) => Some(stats),
+            Ok(Err(error)) => {
+                debug!(container_id = container.id, %error, "Failed to get worker container stats");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    container_id = container.id,
+                    node_id = container.node_id,
+                    timeout_ms = self.config.worker_check_timeout_ms,
+                    "Worker container runtime deadline expired while fetching stats"
+                );
+                None
+            }
+        };
+
+        // Runtime I/O is complete before alarm/database side effects begin, so
+        // the deadline can never cancel or starve those side effects.
+        self.process_container_info(container, deployment, &info)
             .await;
+        if let Some(stats) = stats {
+            self.check_resource_stats(container, deployment, &stats)
+                .await;
+        }
         Ok(())
     }
 
@@ -436,27 +466,21 @@ impl ContainerHealthMonitor {
         &self,
         container: &deployment_containers::Model,
         deployment: &deployments::Model,
-        deployer: &dyn ContainerDeployer,
-        info: temps_deployer::ContainerInfo,
-        stats_deadline: Option<tokio::time::Instant>,
+        info: &temps_deployer::ContainerInfo,
     ) {
         // Check restart count
-        self.check_restart_count(container, deployment, &info).await;
+        self.check_restart_count(container, deployment, info).await;
 
         // Persist runtime metadata (started_at, cpu_limit_cores) once they're
         // observed. These don't change while a container is running, so the
         // diff check in persist_runtime_info skips writes after the first hit.
-        if let Err(error) = self.persist_runtime_info(container, &info).await {
+        if let Err(error) = self.persist_runtime_info(container, info).await {
             error!(container_id = container.id, deployment_id = container.deployment_id,
                 %error, "Failed to persist container runtime information and refresh routes");
         }
 
         // Check container status (exited, dead, OOM)
-        self.check_container_status(container, deployment, &info)
-            .await;
-
-        // Check resource usage (CPU, memory)
-        self.check_resource_usage(container, deployment, deployer, stats_deadline)
+        self.check_container_status(container, deployment, info)
             .await;
     }
 
@@ -770,29 +794,8 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         deployment: &deployments::Model,
         deployer: &dyn ContainerDeployer,
-        deadline: Option<tokio::time::Instant>,
     ) {
-        let stats_result = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(
-                deadline,
-                deployer.get_container_stats(&container.container_id),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        container_id = container.id,
-                        node_id = container.node_id,
-                        timeout_ms = self.config.worker_check_timeout_ms,
-                        "Worker container stats request timed out"
-                    );
-                    return;
-                }
-            },
-            None => deployer.get_container_stats(&container.container_id).await,
-        };
-        let stats = match stats_result {
+        let stats = match deployer.get_container_stats(&container.container_id).await {
             Ok(s) => s,
             Err(e) => {
                 debug!(
@@ -803,6 +806,16 @@ impl ContainerHealthMonitor {
             }
         };
 
+        self.check_resource_stats(container, deployment, &stats)
+            .await;
+    }
+
+    async fn check_resource_stats(
+        &self,
+        container: &deployment_containers::Model,
+        deployment: &deployments::Model,
+        stats: &temps_deployer::ContainerStats,
+    ) {
         // Check CPU.
         //
         // `stats.cpu_percent` is the raw Docker number where 100% == one core, so
@@ -899,7 +912,7 @@ impl ContainerHealthMonitor {
         // Write container resource metrics to the metrics store (if configured).
         // This is non-fatal — metric write failures are logged as warnings only.
         if let Some(store) = &self.metrics_store {
-            self.write_container_metrics(store, container, deployment, &stats)
+            self.write_container_metrics(store, container, deployment, stats)
                 .await;
         }
     }
@@ -2003,7 +2016,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
+            .check_resource_usage(&container, &deployment, deployer.as_ref())
             .await;
 
         let counters = monitor.resource_counters.read().await;
@@ -2023,7 +2036,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
+            .check_resource_usage(&container, &deployment, deployer.as_ref())
             .await;
 
         let counters = monitor.resource_counters.read().await;
@@ -2041,7 +2054,7 @@ mod tests {
 
         let monitor = make_monitor(deployer.clone());
         monitor
-            .check_resource_usage(&container, &deployment, deployer.as_ref(), None)
+            .check_resource_usage(&container, &deployment, deployer.as_ref())
             .await;
 
         let counters = monitor.resource_counters.read().await;
