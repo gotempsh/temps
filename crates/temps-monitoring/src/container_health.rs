@@ -123,6 +123,29 @@ fn is_intentionally_stopped(status: Option<&str>) -> bool {
     status.is_some_and(|status| status == "stopped" || status.starts_with("retained:"))
 }
 
+/// Whether the container's exit is still covered by its intentional-stop
+/// marker. A user-stopped (`"stopped"`) container that Docker reports as
+/// started after the start we last recorded ran again since the stop — by
+/// hand or through a restart policy — so a new exit is a real crash even if
+/// the restart and the crash both fell between two polls. (Rows carry no
+/// stop timestamp, so a restart followed by another user stop inside a
+/// single poll interval is also treated as a crash — one alarm, rather than
+/// silently missing real crashes.)
+fn exit_is_intentional(
+    container: &deployment_containers::Model,
+    info: &temps_deployer::ContainerInfo,
+) -> bool {
+    if !is_intentionally_stopped(container.status.as_deref()) {
+        return false;
+    }
+    let restarted_since_stop = container.status.as_deref() == Some("stopped")
+        && matches!(
+            (container.started_at, info.started_at),
+            (Some(recorded), Some(observed)) if observed > recorded
+        );
+    !restarted_since_stop
+}
+
 /// Configuration for resource usage thresholds
 #[derive(Debug, Clone)]
 pub struct ContainerHealthConfig {
@@ -628,12 +651,13 @@ impl ContainerHealthMonitor {
                 // Persist the exit metadata first so the UI/API can surface
                 // *why* even if the alarm path is skipped (e.g. on-demand
                 // sleep).
-                self.persist_exit_info(container, info).await;
+                let intentional = exit_is_intentional(container, info);
+                self.persist_exit_info(container, info, intentional).await;
 
                 // A user-initiated stop (`stop_container`/`stop_all_containers`)
                 // and a failed deployment retained for log inspection are both
                 // stopped on purpose — an exit there is expected, not a crash.
-                if is_intentionally_stopped(container.status.as_deref()) {
+                if intentional {
                     debug!(
                         "Container {} ({}) is {} but was intentionally stopped (status: {:?}), skipping alarm",
                         container.id, container.container_name, status_str, container.status
@@ -772,11 +796,13 @@ impl ContainerHealthMonitor {
         &self,
         container: &deployment_containers::Model,
         info: &temps_deployer::ContainerInfo,
+        intentional: bool,
     ) {
         // Keep an intentional-stop marker: overwriting "stopped" or
         // "retained:*" with Docker's "exited" would erase why the container
-        // is down and turn the next poll's exit into a crash alarm.
-        let new_status = if is_intentionally_stopped(container.status.as_deref()) {
+        // is down and turn the next poll's exit into a crash alarm. A stale
+        // marker (the container ran again since) is replaced.
+        let new_status = if intentional {
             container.status.clone()
         } else {
             Some(info.status.to_string())
@@ -2484,8 +2510,19 @@ mod tests {
 
         /// Run one monitor poll with every container in `status`.
         async fn poll_with_status(&self, status: ContainerStatus) {
+            self.poll(status, None).await;
+        }
+
+        /// Run one monitor poll with every container in `status`, reporting
+        /// Docker's `started_at` as `started_at`.
+        async fn poll(
+            &self,
+            status: ContainerStatus,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) {
             let deployer = Arc::new(MockDeployer::new(0, status));
             {
+                deployer.info.lock().await.started_at = started_at;
                 let mut info = deployer.info.lock().await;
                 info.exit_code = Some(1);
                 info.exit_reason = Some("Exit code 1".to_string());
@@ -2651,5 +2688,49 @@ mod tests {
             .await;
 
         assert_eq!(reason, None, "an unreadable environment must still alarm");
+    }
+
+    #[tokio::test]
+    async fn crash_after_unobserved_restart_of_user_stopped_container_alarms() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        let stopped_run_started = chrono::Utc::now() - chrono::Duration::hours(1);
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(stopped_run_started)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        // Still the run the user stopped: no alarm.
+        fixture
+            .poll(ContainerStatus::Exited, Some(stopped_run_started))
+            .await;
+        assert!(fixture.alarms().await.is_empty());
+
+        // Started again and crashed between two polls: never seen running,
+        // but Docker's start time moved on.
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_run_started + chrono::Duration::minutes(30)),
+            )
+            .await;
+
+        let alarms = fixture.alarms().await;
+        assert_eq!(alarms.len(), 1, "the new run crashed: {alarms:?}");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("exited"));
     }
 }

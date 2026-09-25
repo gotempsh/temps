@@ -362,7 +362,10 @@ struct AlarmsBulkUpdatedAudit {
     context: AuditContext,
     project_id: Option<i32>,
     action: BulkAlarmActionRequest,
-    alarm_ids: Vec<i32>,
+    /// The explicit IDs the operator submitted, when not using a filter.
+    requested_alarm_ids: Option<Vec<i32>>,
+    /// The alarms whose state actually changed.
+    updated_alarm_ids: Vec<i32>,
     filter: Option<BulkAlarmFilter>,
 }
 
@@ -788,7 +791,8 @@ async fn run_bulk_alarm_update(
         },
         project_id,
         action: request.action,
-        alarm_ids: response.updated_ids.clone(),
+        requested_alarm_ids: request.alarm_ids,
+        updated_alarm_ids: response.updated_ids.clone(),
         filter: request.filter,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {

@@ -215,8 +215,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [severity, setSeverity] = useState<string>(ALL)
   const [alarmType, setAlarmType] = useState<string>(ALL)
   const [page, setPage] = useState(1)
-  const [rawSelection, setSelection] =
-    useState<AlarmSelection>(EMPTY_SELECTION)
+  const [rawSelection, setSelection] = useState<AlarmSelection>(EMPTY_SELECTION)
   // Filter-wide actions can touch alarms on other pages, so they are
   // confirmed first; explicit row selections run immediately.
   const [confirmAction, setConfirmAction] =
@@ -465,8 +464,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
             <p className="text-sm text-muted-foreground">
               Firing history across metrics, containers, uptime, and databases —
-              acknowledge or resolve from one place, one at a time or in bulk
-              by selecting rows.
+              acknowledge or resolve from one place, one at a time or in bulk by
+              selecting rows.
             </p>
           </div>
         )}
@@ -513,7 +512,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
         <Card>
           <CardContent className="p-3">
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-              <Select value={status} onValueChange={selectStatus}>
+              {/* Locked while a bulk action runs: a filter-wide action keeps
+                  working through the filters it started with. */}
+              <Select
+                value={status}
+                onValueChange={selectStatus}
+                disabled={bulk.isPending}
+              >
                 <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Status" />
                 </SelectTrigger>
@@ -525,7 +530,11 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 </SelectContent>
               </Select>
 
-              <Select value={severity} onValueChange={selectSeverity}>
+              <Select
+                value={severity}
+                onValueChange={selectSeverity}
+                disabled={bulk.isPending}
+              >
                 <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Severity" />
                 </SelectTrigger>
@@ -540,7 +549,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               <Select
                 value={alarmType}
                 onValueChange={selectAlarmType}
-                disabled={typeOptions.length === 0}
+                disabled={typeOptions.length === 0 || bulk.isPending}
               >
                 <SelectTrigger className="w-full sm:w-[200px]">
                   <SelectValue placeholder="Type" />
@@ -560,6 +569,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                   variant="ghost"
                   size="sm"
                   onClick={resetFilters}
+                  disabled={bulk.isPending}
                   className="ml-auto"
                 >
                   <X className="mr-1 h-4 w-4" />
@@ -873,7 +883,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               variant="outline"
               size="sm"
               onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page === 1 || alarmsLoading}
+              disabled={page === 1 || alarmsLoading || bulk.isPending}
             >
               Previous
             </Button>
@@ -881,7 +891,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               variant="outline"
               size="sm"
               onClick={() => setPage((p) => p + 1)}
-              disabled={page >= totalPages || alarmsLoading}
+              disabled={page >= totalPages || alarmsLoading || bulk.isPending}
             >
               Next
             </Button>

@@ -833,7 +833,11 @@ impl AlarmService {
         use std::collections::HashSet;
 
         let eligible = action.eligible_statuses();
-        let (target_ids, requested) = match &selector {
+        // Every fallible read happens before the write: once the UPDATE
+        // commits, a later error would skip the resolution jobs and the
+        // caller's audit record, and a retry could not restore them because
+        // the alarms are no longer eligible.
+        let (target_ids, requested, matching_before) = match &selector {
             BulkAlarmSelector::Ids(ids) => {
                 let mut ids = ids.clone();
                 ids.sort_unstable();
@@ -874,9 +878,19 @@ impl AlarmService {
                     });
                 }
                 let requested = ids.len() as u64;
-                (ids, requested)
+                (ids, requested, 0)
             }
             BulkAlarmSelector::Matching(filters) => {
+                let matching = alarms::Entity::find()
+                    .filter(project_id_filter(project_id))
+                    .filter(alarm_filters_condition(filters))
+                    .filter(alarms::Column::Status.is_in(eligible.iter().copied()))
+                    .count(self.db.as_ref())
+                    .await
+                    .map_err(|e| AlarmError::Database {
+                        operation: "count alarms matching bulk update filter".to_string(),
+                        reason: e.to_string(),
+                    })?;
                 let ids: Vec<i32> = alarms::Entity::find()
                     .select_only()
                     .column(alarms::Column::Id)
@@ -893,7 +907,7 @@ impl AlarmService {
                         operation: "select matching alarms for bulk update".to_string(),
                         reason: e.to_string(),
                     })?;
-                (ids, 0)
+                (ids, 0, matching)
             }
         };
 
@@ -932,22 +946,11 @@ impl AlarmService {
             })?;
         updated.sort_by_key(|alarm| alarm.id);
 
-        // Advisory only: counted after the update, so alarms fired or
-        // transitioned concurrently can make it drift. Callers loop until it
-        // reaches zero, and every round re-selects from the live table.
-        let remaining = match &selector {
-            BulkAlarmSelector::Ids(_) => 0,
-            BulkAlarmSelector::Matching(filters) => alarms::Entity::find()
-                .filter(project_id_filter(project_id))
-                .filter(alarm_filters_condition(filters))
-                .filter(alarms::Column::Status.is_in(eligible.iter().copied()))
-                .count(self.db.as_ref())
-                .await
-                .map_err(|e| AlarmError::Database {
-                    operation: "count alarms remaining after bulk update".to_string(),
-                    reason: e.to_string(),
-                })?,
-        };
+        // Advisory only: derived from the count taken before the update, so
+        // alarms fired or transitioned concurrently can make it drift.
+        // Callers loop until it reaches zero, and every round re-selects
+        // from the live table.
+        let remaining = matching_before.saturating_sub(updated.len() as u64);
 
         info!(
             project_id = ?project_id,
