@@ -113437,6 +113437,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Update application settings",
         "tags": [
           "Settings"
         ]

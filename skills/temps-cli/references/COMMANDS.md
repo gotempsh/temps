@@ -2623,6 +2623,7 @@ Manage platform users
 - `me` - Show current user info
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
+- `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
