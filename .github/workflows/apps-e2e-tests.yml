@@ -110,8 +110,11 @@ jobs:
           docker run -d --name temps-e2e-registry -p 5111:5000 registry:2
           docker compose -p temps-e2e -f apps/temps-e2e/docker-compose.e2e.yml up -d
           timeout 90 bash -c 'until nc -z localhost 14000 && nc -z localhost 8056 && nc -z localhost 1025 && nc -z localhost 8025 && nc -z localhost 9092; do sleep 2; done'
-          docker run --rm --network temps-e2e_default --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
-            -c 'until mc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb --ignore-existing backup/temps-e2e-backups'
+          # The compose `minio` service runs RustFS (MinIO's images are no
+          # longer published); `rc` is its mc-compatible client.
+          docker run --rm --network temps-e2e_default --entrypoint /bin/sh \
+            rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699 \
+            -c 'until rc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; rc mb --ignore-existing backup/temps-e2e-backups'
 
       - name: Build immutable MariaDB WAL-G recovery image
         if: matrix.shard == 'recovery'
@@ -173,7 +176,8 @@ jobs:
             > /tmp/temps-scenarios.log 2>&1 &
           echo $! > /tmp/temps-scenarios.pid
           timeout 180 bash -c 'until curl -sf http://localhost:5002/ >/dev/null; do sleep 2; done'
-          # WAL-G runs inside managed-service containers. Put MinIO on the
+          # WAL-G runs inside managed-service containers. Put the S3 fixture
+          # (compose service `minio`, running RustFS) on the
           # same network so endpoint resolution uses its container address
           # instead of host.docker.internal, which plain Linux Docker does
           # not define for arbitrary managed-service containers.

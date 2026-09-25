@@ -6,7 +6,7 @@
 //! This drives the **real** engine + provider code paths against **real**
 //! containers - no mocks of the backup/restore mechanics:
 //!
-//!   1. Boot MinIO (S3) + create a bucket.
+//!   1. Boot RustFS (S3) + create a bucket.
 //!   2. Boot the WAL-G-enabled MariaDB image with binary logging on.
 //!   3. Stand up a Postgres test DB with the real schema (`TestDatabase`),
 //!      then insert an `external_services` row (config encrypted with the
@@ -52,8 +52,13 @@ const DEFAULT_MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 // EncryptionService instance, so encrypt-here / decrypt-in-engine round-trips.
 const MASTER_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ROOT_PASSWORD: &str = "pitr-root-pw-1234"; // >= 8 chars, no quotes/backslashes
-const MINIO_ACCESS_KEY: &str = "minioadmin";
-const MINIO_SECRET_KEY: &str = "minioadmin";
+                                                 // RustFS replaced MinIO here: MinIO withdrew its public images.
+                                                 // Pinned by digest (the multi-arch index of the 1.0.0 tag), matching the CI
+                                                 // pre-pull, so a re-pushed tag cannot change what this test runs.
+const RUSTFS_IMAGE: &str =
+    "rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff";
+const S3_ACCESS_KEY: &str = "rustfsadmin";
+const S3_SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "pitr-test-bucket";
 const E2E_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
@@ -163,11 +168,23 @@ async fn pull_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (name, tag) = image.split_once(':').unwrap_or((image, "latest"));
+    // A `name@digest` or `name:tag@digest` reference goes whole into
+    // `from_image`: the Engine rejects a digest passed as part of `tag`
+    // (`tag=1.0.0@sha256:...`). Splitting on the first ':' would also cut a
+    // registry port (`host:5000/repo`), so the tag is the part after the last
+    // ':' only when that part has no '/'.
+    let (from_image, tag) = if image.contains('@') {
+        (image, None)
+    } else {
+        match image.rsplit_once(':') {
+            Some((name, tag)) if !tag.contains('/') => (name, Some(tag)),
+            _ => (image, Some("latest")),
+        }
+    };
     let mut stream = docker.create_image(
         Some(bollard::query_parameters::CreateImageOptions {
-            from_image: Some(name.to_string()),
-            tag: Some(tag.to_string()),
+            from_image: Some(from_image.to_string()),
+            tag: tag.map(str::to_string),
             ..Default::default()
         }),
         None,
@@ -210,25 +227,52 @@ fn find_available_port(start: u16) -> Option<u16> {
     (start..start + 200).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
-/// Boot a MinIO container, returning (host_port, container_name, guard).
+/// Poll RustFS's unauthenticated `GET /health` until it answers 200.
+/// RustFS logs nothing to stdout/stderr once ready, so a fixed sleep or a
+/// log-message wait would be guesswork.
+async fn wait_for_s3_ready(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        let probe = async {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            stream
+                .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await?;
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await?;
+            Ok::<_, std::io::Error>(buf)
+        };
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_secs(2), probe).await {
+            let status_line =
+                String::from_utf8_lossy(buf.split(|b| *b == b'\n').next().unwrap_or_default())
+                    .into_owned();
+            if status_line.split_whitespace().nth(1) == Some("200") {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+/// Boot a RustFS (S3-compatible) container, returning
+/// (host_port, container_name, guard).
 /// Skips (None) on failure so the test can bail gracefully.
-async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
-    if pull_image(docker, "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
-        .await
-        .is_err()
-    {
-        eprintln!("Could not pull MinIO image, skipping");
+async fn boot_s3_server(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
+    if pull_image(docker, RUSTFS_IMAGE).await.is_err() {
+        eprintln!("Could not pull RustFS image, skipping");
         return None;
     }
     let port = find_available_port(9100)?;
-    let name = format!("temps-test-pitr-minio-{}", uuid::Uuid::new_v4());
+    let name = format!("temps-test-pitr-rustfs-{}", uuid::Uuid::new_v4());
 
     let config = bollard::models::ContainerCreateBody {
-        image: Some("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
-        cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+        image: Some(RUSTFS_IMAGE.to_string()),
+        // The image's default cmd already serves `/data`.
         env: Some(vec![
-            format!("MINIO_ROOT_USER={MINIO_ACCESS_KEY}"),
-            format!("MINIO_ROOT_PASSWORD={MINIO_SECRET_KEY}"),
+            format!("RUSTFS_ACCESS_KEY={S3_ACCESS_KEY}"),
+            format!("RUSTFS_SECRET_KEY={S3_SECRET_KEY}"),
         ]),
         host_config: Some(bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([(
@@ -263,7 +307,7 @@ async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
     let guard = ContainerGuard {
         docker: docker.clone(),
         id: created.id.clone(),
-        label: "minio".to_string(),
+        label: "rustfs".to_string(),
     };
     docker
         .start_container(
@@ -273,12 +317,14 @@ async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
         .await
         .ok()?;
 
-    // Give MinIO a moment to bind its port.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    if !wait_for_s3_ready(port).await {
+        eprintln!("RustFS on 127.0.0.1:{port} not healthy after 60s, skipping");
+        return None;
+    }
     Some((port, name, guard))
 }
 
-/// Build a host-side S3 client against the local MinIO. Returns None when the
+/// Build a host-side S3 client against the local RustFS. Returns None when the
 /// AWS SDK panics constructing its TrustStore (some minimal CI hosts).
 fn build_s3_client(port: u16) -> Option<aws_sdk_s3::Client> {
     let conf = aws_sdk_s3::Config::builder()
@@ -286,11 +332,11 @@ fn build_s3_client(port: u16) -> Option<aws_sdk_s3::Client> {
         .region(Region::new("us-east-1"))
         .behavior_version_latest()
         .credentials_provider(aws_sdk_s3::config::Credentials::new(
-            MINIO_ACCESS_KEY,
-            MINIO_SECRET_KEY,
+            S3_ACCESS_KEY,
+            S3_SECRET_KEY,
             None,
             None,
-            "minio",
+            "rustfs",
         ))
         .force_path_style(true)
         .build();
@@ -399,7 +445,7 @@ async fn boot_default_mariadb_source(
 async fn boot_mariadb_source(
     docker: &Docker,
     service_name: &str,
-    minio_container_name: &str,
+    s3_container_name: &str,
     launch_image: &str,
 ) -> Option<(String, u16, ContainerGuard)> {
     let port = find_available_port(33060)?;
@@ -418,11 +464,9 @@ async fn boot_mariadb_source(
         ]),
         host_config: Some(bollard::models::HostConfig {
             // Docker's default bridge does not provide automatic DNS. Link
-            // the MinIO name returned by `resolve_endpoint_for_container` so
+            // the RustFS name returned by `resolve_endpoint_for_container` so
             // WAL-G can stream directly to the test object store.
-            links: Some(vec![format!(
-                "{minio_container_name}:{minio_container_name}"
-            )]),
+            links: Some(vec![format!("{s3_container_name}:{s3_container_name}")]),
             port_bindings: Some(HashMap::from([(
                 "3306/tcp".to_string(),
                 Some(vec![bollard::models::PortBinding {
@@ -543,14 +587,14 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
     };
     let pool = test_db.connection_arc();
 
-    let Some((minio_port, minio_container_name, _minio_guard)) = boot_minio(&docker).await else {
+    let Some((s3_port, s3_container_name, _s3_guard)) = boot_s3_server(&docker).await else {
         return;
     };
-    let Some(s3_client) = build_s3_client(minio_port) else {
+    let Some(s3_client) = build_s3_client(s3_port) else {
         return;
     };
     if let Err(e) = s3_client.create_bucket().bucket(BUCKET).send().await {
-        eprintln!("Could not create MinIO bucket, skipping: {e}");
+        eprintln!("Could not create RustFS bucket, skipping: {e}");
         return;
     }
 
@@ -559,7 +603,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         .expect("resolve the MariaDB WAL-G test image to an immutable image ID");
     let service_name = format!("pitr{}", uuid::Uuid::new_v4().simple());
     let Some((container_name, mariadb_port, _mariadb_guard)) =
-        boot_mariadb_source(&docker, &service_name, &minio_container_name, &launch_image).await
+        boot_mariadb_source(&docker, &service_name, &s3_container_name, &launch_image).await
     else {
         return;
     };
@@ -570,7 +614,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
     run_pitr_flow(
         &docker,
         &s3_client,
-        minio_port,
+        s3_port,
         pool,
         &service_name,
         &container_name,
@@ -585,7 +629,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
 async fn run_pitr_flow(
     docker: &Docker,
     s3_client: &aws_sdk_s3::Client,
-    minio_port: u16,
+    s3_port: u16,
     pool_arc: Arc<temps_database::DbConnection>,
     service_name: &str,
     container_name: &str,
@@ -619,13 +663,13 @@ async fn run_pitr_flow(
         name: Set("pitr-s3".to_string()),
         bucket_name: Set(BUCKET.to_string()),
         region: Set("us-east-1".to_string()),
-        // Host-side clients reach MinIO through this mapped port. The physical
-        // engine resolves the same endpoint to the linked MinIO container so
+        // Host-side clients reach RustFS through this mapped port. The physical
+        // engine resolves the same endpoint to the linked RustFS container so
         // WAL-G streams the base backup directly without a host-side copy.
-        endpoint: Set(Some(format!("http://127.0.0.1:{minio_port}"))),
+        endpoint: Set(Some(format!("http://127.0.0.1:{s3_port}"))),
         bucket_path: Set(String::new()),
-        access_key_id: Set(encryption.encrypt_string(MINIO_ACCESS_KEY)?),
-        secret_key: Set(encryption.encrypt_string(MINIO_SECRET_KEY)?),
+        access_key_id: Set(encryption.encrypt_string(S3_ACCESS_KEY)?),
+        secret_key: Set(encryption.encrypt_string(S3_SECRET_KEY)?),
         force_path_style: Set(Some(true)),
         is_default: Set(true),
         ..Default::default()
@@ -770,7 +814,7 @@ async fn run_pitr_flow(
 
     // Run the REAL binlog archiver.
     // The archiver FLUSHes binary logs (closing the active segment) and ships
-    // the now-closed segments to MinIO. Run it twice so the segment that
+    // the now-closed segments to RustFS. Run it twice so the segment that
     // contains B and C is closed by a later FLUSH and then shipped.
     let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(docker.clone()));
     let mariadb_config = parse_mariadb_config(service_name, mariadb_port, immutable_image);
@@ -826,9 +870,9 @@ async fn run_pitr_flow(
         m
     };
     let s3_credentials = S3Credentials {
-        access_key_id: MINIO_ACCESS_KEY.to_string(),
-        secret_key: MINIO_SECRET_KEY.to_string(),
-        // MinIO here is reached with a long-lived credential, like every
+        access_key_id: S3_ACCESS_KEY.to_string(),
+        secret_key: S3_SECRET_KEY.to_string(),
+        // RustFS here is reached with a long-lived credential, like every
         // operator-configured source.
         session_token: None,
         region: "us-east-1".to_string(),
@@ -951,7 +995,7 @@ async fn run_pitr_flow(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Everything the extra E2E flows need: a live Docker daemon, a migrated
-/// Postgres test DB, a MinIO with `BUCKET` created, and a running MariaDB
+/// Postgres test DB, a RustFS with `BUCKET` created, and a running MariaDB
 /// source container with binary logging on.
 ///
 /// The `_*_guard` fields are RAII container reapers — they must be held for the
@@ -961,8 +1005,8 @@ struct E2eEnv {
     docker: Docker,
     _test_db: temps_database::test_utils::TestDatabase,
     pool: Arc<temps_database::DbConnection>,
-    minio_port: u16,
-    _minio_guard: ContainerGuard,
+    s3_port: u16,
+    _s3_guard: ContainerGuard,
     s3_client: aws_sdk_s3::Client,
     service_name: String,
     container_name: String,
@@ -1001,17 +1045,17 @@ async fn setup_e2e_env(name_prefix: &str, use_walg_image: bool) -> Option<E2eEnv
     };
     let pool = test_db.connection_arc();
 
-    let (minio_port, minio_container_name, minio_guard) = boot_minio(&docker).await?;
-    let s3_client = build_s3_client(minio_port)?;
+    let (s3_port, s3_container_name, s3_guard) = boot_s3_server(&docker).await?;
+    let s3_client = build_s3_client(s3_port)?;
     if let Err(e) = s3_client.create_bucket().bucket(BUCKET).send().await {
-        eprintln!("Could not create MinIO bucket, skipping: {e}");
+        eprintln!("Could not create RustFS bucket, skipping: {e}");
         return None;
     }
 
     let service_name = format!("{name_prefix}{}", uuid::Uuid::new_v4().simple());
     let (container_name, mariadb_port, mariadb_guard) = if use_walg_image {
         let (launch_image, _immutable_image) = resolve_mariadb_image(&docker).await.ok()?;
-        boot_mariadb_source(&docker, &service_name, &minio_container_name, &launch_image).await?
+        boot_mariadb_source(&docker, &service_name, &s3_container_name, &launch_image).await?
     } else {
         boot_default_mariadb_source(&docker, &service_name).await?
     };
@@ -1021,8 +1065,8 @@ async fn setup_e2e_env(name_prefix: &str, use_walg_image: bool) -> Option<E2eEnv
         docker,
         _test_db: test_db,
         pool,
-        minio_port,
-        _minio_guard: minio_guard,
+        s3_port,
+        _s3_guard: s3_guard,
         s3_client,
         service_name,
         container_name,
@@ -1039,7 +1083,7 @@ async fn seed_service_rows(
     encryption: &EncryptionService,
     service_name: &str,
     mariadb_port: u16,
-    minio_port: u16,
+    s3_port: u16,
 ) -> anyhow::Result<(
     temps_entities::external_services::Model,
     temps_entities::s3_sources::Model,
@@ -1064,10 +1108,10 @@ async fn seed_service_rows(
         name: Set("pitr-s3".to_string()),
         bucket_name: Set(BUCKET.to_string()),
         region: Set("us-east-1".to_string()),
-        endpoint: Set(Some(format!("http://127.0.0.1:{minio_port}"))),
+        endpoint: Set(Some(format!("http://127.0.0.1:{s3_port}"))),
         bucket_path: Set(String::new()),
-        access_key_id: Set(encryption.encrypt_string(MINIO_ACCESS_KEY)?),
-        secret_key: Set(encryption.encrypt_string(MINIO_SECRET_KEY)?),
+        access_key_id: Set(encryption.encrypt_string(S3_ACCESS_KEY)?),
+        secret_key: Set(encryption.encrypt_string(S3_SECRET_KEY)?),
         force_path_style: Set(Some(true)),
         is_default: Set(true),
         ..Default::default()
@@ -1294,7 +1338,7 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
         &encryption,
         service_name,
         env.mariadb_port,
-        env.minio_port,
+        env.s3_port,
     )
     .await?;
 
@@ -1688,7 +1732,7 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
         &encryption,
         service_name,
         env.mariadb_port,
-        env.minio_port,
+        env.s3_port,
     )
     .await?;
 
@@ -1744,7 +1788,7 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
             .send()
             .await
             .is_ok(),
-        "dump object must exist in MinIO at {dump_location}"
+        "dump object must exist in RustFS at {dump_location}"
     );
     // This is the exact predicate `credential_propagation_gates` keys off to
     // decide (false, false) for MariaDB — assert it on the REAL produced key.
@@ -1765,8 +1809,8 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
         m
     };
     let s3_credentials = S3Credentials {
-        access_key_id: MINIO_ACCESS_KEY.to_string(),
-        secret_key: MINIO_SECRET_KEY.to_string(),
+        access_key_id: S3_ACCESS_KEY.to_string(),
+        secret_key: S3_SECRET_KEY.to_string(),
         session_token: None,
         region: "us-east-1".to_string(),
         endpoint: decrypted_s3_source.endpoint.clone(),

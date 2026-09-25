@@ -5641,7 +5641,7 @@ mod tests {
         );
     }
 
-    // `flavor = "multi_thread"` is required because `MinioTestContainer`'s
+    // `flavor = "multi_thread"` is required because `S3TestContainer`'s
     // `Drop` impl calls `tokio::task::block_in_place`, which panics on the
     // default current-thread runtime.
     #[cfg(feature = "docker-tests")]
@@ -5673,7 +5673,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     async fn run_postgres_backup_and_restore_to_s3() {
         use super::super::test_utils::{
-            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
         };
 
         // Check if Docker is available
@@ -5692,7 +5692,7 @@ mod tests {
         }
 
         // Start MinIO container for S3 operations
-        let minio = match MinioTestContainer::start(docker.clone(), "postgres-backup-test").await {
+        let minio = match S3TestContainer::start(docker.clone(), "postgres-backup-test").await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();
@@ -6524,7 +6524,7 @@ mod tests {
         // to enable native roots but no valid root certificates parsed!".
         // We wrap construction in `catch_unwind` and skip the test on that
         // specific panic — mirroring the pattern in
-        // `externalsvc/test_utils.rs::MinioTestContainer::start`.
+        // `externalsvc/test_utils.rs::S3TestContainer::start`.
         let s3_client = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let aws_creds = aws_sdk_s3::config::Credentials::new("k", "s", None, None, "test");
             let conf = aws_sdk_s3::Config::builder()

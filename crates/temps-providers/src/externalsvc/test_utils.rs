@@ -3,8 +3,12 @@
 
 //! Test utilities for external services backup and restore tests
 //!
-//! This module provides utilities to set up MinIO (S3-compatible storage) containers
+//! This module provides utilities to set up RustFS (S3-compatible storage) containers
 //! and mock entities for testing backup and restore functionality across all external services.
+//!
+//! The S3 test server used to be MinIO; MinIO no longer publishes its images
+//! (quay.io and Docker Hub both stopped serving them), so fresh CI runners
+//! could not pull it and every backup integration test failed at startup.
 
 use anyhow::Result;
 
@@ -18,8 +22,22 @@ mod docker_utils {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// MinIO container configuration and client
-    pub struct MinioTestContainer {
+    /// Image for the throwaway S3 server. Shares the production default so
+    /// tests exercise the server that new services actually run.
+    const S3_TEST_IMAGE: &str = crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
+
+    /// Name prefix of the test S3 containers, used by the orphan sweep.
+    const S3_TEST_CONTAINER_PREFIX: &str = "temps-test-rustfs-";
+
+    /// Name prefix used while the test server was MinIO; still swept so
+    /// leftovers from older runs get cleaned up.
+    const LEGACY_S3_TEST_CONTAINER_PREFIX: &str = "temps-test-minio-";
+
+    /// How long to wait for the S3 API to answer after the container starts.
+    const S3_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// RustFS (S3-compatible) test container configuration and client
+    pub struct S3TestContainer {
         pub container_id: String,
         pub port: u16,
         pub access_key: String,
@@ -30,25 +48,23 @@ mod docker_utils {
         docker: Arc<Docker>,
     }
 
-    impl MinioTestContainer {
-        /// Start a MinIO container and set up S3 client and bucket
+    impl S3TestContainer {
+        /// Start a RustFS container and set up S3 client and bucket
         pub async fn start(docker: Arc<Docker>, bucket_name: &str) -> Result<Self> {
-            use bollard::query_parameters::CreateImageOptions;
-            use futures::StreamExt;
+            // Sweep stale test S3 containers left behind by a killed previous
+            // test run. The sweep is state/age aware so a test that starts
+            // multiple S3 instances does not delete its own first container
+            // when creating the second one.
+            sweep_orphan_test_containers(&docker, S3_TEST_CONTAINER_PREFIX).await;
+            sweep_orphan_test_containers(&docker, LEGACY_S3_TEST_CONTAINER_PREFIX).await;
 
-            // Sweep stale `temps-test-minio-*` containers left behind by a
-            // killed previous test run. The sweep is state/age aware so a test
-            // that starts multiple MinIO instances does not delete its own
-            // first container when creating the second one.
-            sweep_orphan_test_containers(&docker, "temps-test-minio-").await;
-
-            // Find available port for MinIO - use random offset to avoid parallel test conflicts
+            // Find available port - use random offset to avoid parallel test conflicts
             let random_offset = rand::random::<u16>() % 1000;
             let port = find_available_port(9000 + random_offset)?;
-            let access_key = "minioadmin";
-            let secret_key = "minioadmin";
+            let access_key = "rustfsadmin";
+            let secret_key = "rustfsadmin";
 
-            println!("Starting MinIO container on port {}...", port);
+            println!("Starting RustFS container on port {}...", port);
 
             // Join the same app network the real Postgres/Redis/S3/MongoDB
             // service containers use (see `ensure_network_exists`) so
@@ -61,33 +77,25 @@ mod docker_utils {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
 
-            // Pull MinIO image
-            let mut pull_stream = docker.create_image(
-                Some(CreateImageOptions {
-                    from_image: Some(
-                        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
-                    ),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            );
-            while let Some(result) = pull_stream.next().await {
-                result.map_err(|e| anyhow::anyhow!("Failed to pull MinIO image: {}", e))?;
-            }
+            // Pull the RustFS image (falls back to a local copy if the
+            // registry is unreachable).
+            crate::utils::pull_image_with_retry(&docker, S3_TEST_IMAGE, None)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to pull RustFS image: {}", e))?;
 
             // Create container
             let container_name = format!(
-                "temps-test-minio-{}-{}",
+                "{}{}-{}",
+                S3_TEST_CONTAINER_PREFIX,
                 chrono::Utc::now().timestamp(),
                 rand::random::<u32>()
             );
-            let minio_config = bollard::models::ContainerCreateBody {
-                image: Some("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
-                cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+            // RustFS serves `/data` with the image's default command.
+            let s3_config = bollard::models::ContainerCreateBody {
+                image: Some(S3_TEST_IMAGE.to_string()),
                 env: Some(vec![
-                    format!("MINIO_ROOT_USER={}", access_key),
-                    format!("MINIO_ROOT_PASSWORD={}", secret_key),
+                    format!("RUSTFS_ACCESS_KEY={}", access_key),
+                    format!("RUSTFS_SECRET_KEY={}", secret_key),
                 ]),
                 host_config: Some(bollard::models::HostConfig {
                     port_bindings: Some(HashMap::from([(
@@ -115,10 +123,10 @@ mod docker_utils {
                             .name(&container_name)
                             .build(),
                     ),
-                    minio_config,
+                    s3_config,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to create MinIO container: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to create RustFS container: {}", e))?;
 
             docker
                 .start_container(
@@ -126,18 +134,15 @@ mod docker_utils {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to start MinIO container: {}", e))?;
-
-            // Wait for MinIO to be ready
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            println!("✓ MinIO container started: {}", container.id);
+                .map_err(|e| anyhow::anyhow!("Failed to start RustFS container: {}", e))?;
+            println!("✓ RustFS container started: {}", container.id);
 
             let s3_config = aws_sdk_s3::Config::builder()
                 .endpoint_url(format!("http://localhost:{}", port))
                 .region(Region::new("us-east-1"))
                 .behavior_version_latest()
                 .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    access_key, secret_key, None, None, "minio",
+                    access_key, secret_key, None, None, "rustfs",
                 ))
                 .force_path_style(true)
                 .build();
@@ -173,6 +178,34 @@ mod docker_utils {
                     ));
                 }
             };
+
+            // Wait until the S3 API answers instead of sleeping a fixed time:
+            // too short flakes on a slow runner, too long wastes every test.
+            let deadline = tokio::time::Instant::now() + S3_READY_TIMEOUT;
+            loop {
+                match s3_client.list_buckets().send().await {
+                    Ok(_) => break,
+                    Err(e) if tokio::time::Instant::now() >= deadline => {
+                        let _ = docker
+                            .remove_container(
+                                &container.id,
+                                Some(bollard::query_parameters::RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                        return Err(anyhow::anyhow!(
+                            "RustFS container did not become ready within {:?}: {:?}",
+                            S3_READY_TIMEOUT,
+                            e
+                        ));
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                }
+            }
+            println!("✓ RustFS S3 API is ready");
 
             // Create bucket
             s3_client
@@ -226,7 +259,7 @@ mod docker_utils {
         /// container, and `run_walg_backup_push` resolves the endpoint via
         /// `S3Credentials::resolve_endpoint_for_container` before use. That
         /// resolver specifically detects `localhost`/`127.0.0.1` and looks up
-        /// this MinIO container by name on the shared app network (see
+        /// this S3 test container by name on the shared app network (see
         /// `ensure_network_exists` above), only falling back to
         /// `host.docker.internal` if it can't find it. Hardcoding
         /// `host.docker.internal` here bypassed that lookup entirely and
@@ -246,11 +279,11 @@ mod docker_utils {
             }
         }
 
-        /// Stop and remove the MinIO container
+        /// Stop and remove the RustFS container
         pub async fn cleanup(&self) -> Result<()> {
             use bollard::query_parameters::{RemoveContainerOptions, StopContainerOptions};
 
-            println!("Cleaning up MinIO container...");
+            println!("Cleaning up RustFS container...");
 
             let _ = self
                 .docker
@@ -275,14 +308,14 @@ mod docker_utils {
                 )
                 .await;
 
-            println!("✓ MinIO container cleaned up");
+            println!("✓ RustFS container cleaned up");
             Ok(())
         }
     }
 
-    impl Drop for MinioTestContainer {
+    impl Drop for S3TestContainer {
         fn drop(&mut self) {
-            // Synchronously clean up the MinIO container to prevent leaks on panic.
+            // Synchronously clean up the RustFS container to prevent leaks on panic.
             // Uses the same block_in_place pattern as TestDatabase for reliability.
             let container_id = self.container_id.clone();
             let docker = Arc::clone(&self.docker);
@@ -315,7 +348,7 @@ mod docker_utils {
                     });
                 } else {
                     eprintln!(
-                        "Warning: Cannot clean up MinIO container {} (no tokio runtime available)",
+                        "Warning: Cannot clean up RustFS container {} (no tokio runtime available)",
                         container_id
                     );
                 }
@@ -323,7 +356,7 @@ mod docker_utils {
 
             if result.is_err() {
                 eprintln!(
-                    "Warning: Cleanup panicked for MinIO container {} (runtime may be shutting down)",
+                    "Warning: Cleanup panicked for RustFS container {} (runtime may be shutting down)",
                     self.container_id
                 );
             }
@@ -349,7 +382,7 @@ mod docker_utils {
 
     /// Best-effort removal of stale test containers whose names start with
     /// `name_prefix`. Used by integration helpers (e.g.
-    /// `MinioTestContainer::start`) to keep dev machines and CI runners from
+    /// `S3TestContainer::start`) to keep dev machines and CI runners from
     /// accumulating leaked containers when a test panics before reaching its
     /// cleanup path.
     ///
@@ -418,7 +451,7 @@ mod docker_utils {
 }
 
 #[cfg(feature = "docker-tests")]
-pub use docker_utils::MinioTestContainer;
+pub use docker_utils::S3TestContainer;
 
 /// Create a mock backup record for testing
 pub fn create_mock_backup(subpath: &str) -> temps_entities::backups::Model {
@@ -524,7 +557,7 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    async fn test_minio_container_lifecycle() {
+    async fn test_s3_container_lifecycle() {
         use bollard::Docker;
         use std::sync::Arc;
 
@@ -543,8 +576,8 @@ mod tests {
             return;
         }
 
-        // Start MinIO container
-        let minio = match MinioTestContainer::start(docker.clone(), "test-bucket").await {
+        // Start the RustFS container
+        let minio = match S3TestContainer::start(docker.clone(), "test-bucket").await {
             Ok(m) => m,
             Err(e) => {
                 // If it's a certificate error, skip test gracefully (common on systems without configured root certificates)
@@ -553,7 +586,7 @@ mod tests {
                     || error_msg.contains("TrustStore")
                     || error_msg.contains("panicked")
                 {
-                    println!("Skipping MinIO test: TLS certificate issue");
+                    println!("Skipping S3 container test: TLS certificate issue");
                     println!(
                         "   Reason: {}",
                         error_msg.lines().next().unwrap_or(&error_msg)
@@ -562,7 +595,7 @@ mod tests {
                     println!("   On macOS: Use Keychain Access to manage certificates");
                     return;
                 }
-                panic!("Failed to start MinIO container: {}", e);
+                panic!("Failed to start RustFS container: {}", e);
             }
         };
 
