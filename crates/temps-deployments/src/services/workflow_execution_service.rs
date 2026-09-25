@@ -3441,6 +3441,13 @@ impl WorkflowExecutionService {
         // state determine eligibility, not the container status. Keep failure
         // history intact while removing these containers after a newer success.
         // Prioritize unattempted rows, then rotate timestamped retries fairly.
+        //
+        // Terminal "stopped"/"cancelled" deployments are swept here too: the
+        // capped scan above excludes them, so a container row a teardown
+        // failed to retire would otherwise stay live forever — an orphaned
+        // container on the host that nothing routes to or ever removes. This
+        // query only matches live rows, so it stays bounded by leaked
+        // containers rather than by deployment history.
         const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
         const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
         let retained_failed = deployment_containers::Entity::find()
@@ -3448,7 +3455,7 @@ impl WorkflowExecutionService {
             .filter(deployment_containers::Column::DeletedAt.is_null())
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.eq("failed"))
+            .filter(deployments::Column::State.is_in(["failed", "stopped", "cancelled"]))
             .filter(
                 Condition::any()
                     .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
@@ -4998,6 +5005,37 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // A superseded deployment that was flipped to "stopped" while its
+        // container removal failed left a live row behind. The capped scan
+        // above never revisits "stopped" deployments, so this sweep must
+        // retire it — otherwise the exited container lingers on the host
+        // indefinitely.
+        let stopped_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("stopped-deployment".to_string()),
+            state: Set("stopped".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(20)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let leaked_container = deployment_containers::ActiveModel {
+            deployment_id: Set(stopped_deployment.id),
+            container_id: Set("leaked-stopped-container".to_string()),
+            container_name: Set("leaked-stopped-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         // Older failed deployments and interrupted cleanup need not have the
         // retained prefix. They must still be selected by the failure sweep.
         let mut legacy_containers = Vec::new();
@@ -5163,6 +5201,16 @@ mod tests {
             .expect("retained container row still exists");
         assert!(retained_refreshed.deleted_at.is_some());
         assert_eq!(retained_refreshed.status.as_deref(), Some("deleted"));
+
+        let leaked_refreshed = deployment_containers::Entity::find_by_id(leaked_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("leaked container row still exists");
+        assert!(
+            leaked_refreshed.deleted_at.is_some(),
+            "a live row under a stopped deployment must be removed by the sweep"
+        );
+        assert_eq!(leaked_refreshed.status.as_deref(), Some("deleted"));
 
         let retry_refreshed = deployment_containers::Entity::find_by_id(retry_container.id)
             .one(db.as_ref())

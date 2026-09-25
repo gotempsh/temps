@@ -2312,6 +2312,7 @@ WHERE project.id = $2
         .await
         .ok();
 
+        let mut incomplete_teardowns = 0usize;
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
             self.log(format!(
@@ -2369,9 +2370,12 @@ WHERE project.id = $2
                     )
                     .await;
                     match result {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => true,
                         Ok(Err(error)) => {
-                            self.log(error).await.ok();
+                            self.log(format!("{error} — will retry on next sweep"))
+                                .await
+                                .ok();
+                            false
                         }
                         Err(_) => {
                             self.log(format!(
@@ -2380,20 +2384,37 @@ WHERE project.id = $2
                             ))
                             .await
                             .ok();
+                            false
                         }
                     }
                 }
             });
-            futures::future::join_all(teardowns).await;
+            let torn_down = futures::future::join_all(teardowns).await;
 
-            // Flip the deployment to a terminal "stopped" state so it is no
-            // longer matched by the scan above. This is what bounds the teardown
-            // query as deployment history grows — without it, every completed
-            // deployment would be re-scanned on every subsequent deploy forever.
-            // We do NOT touch "failed" deployments (excluded by the filter) and
-            // the rollback target finder (`find_last_successful_deployment`) only
-            // ever needs the most-recent completed deployment, which is the new
-            // current one — never a deployment we are stopping here.
+            // A container whose removal failed keeps its live row, so the
+            // deployment must stay in a swept state for the next deploy to
+            // retry it. Flipping it to "stopped" here would drop it out of
+            // every sweep for good, leaving an orphaned container behind.
+            if torn_down.contains(&false) {
+                self.log(format!(
+                    "Deployment {} still has containers that could not be removed; leaving it as '{}' so the next deployment retries its teardown",
+                    deployment_id, deployment.state
+                ))
+                .await
+                .ok();
+                incomplete_teardowns += 1;
+                continue;
+            }
+
+            // Flip the fully torn-down deployment to a terminal "stopped" state
+            // so it is no longer matched by the scan above. This is what bounds
+            // the teardown query as deployment history grows — without it,
+            // every completed deployment would be re-scanned on every
+            // subsequent deploy forever. We do NOT touch "failed" deployments
+            // (excluded by the filter) and the rollback target finder
+            // (`find_last_successful_deployment`) only ever needs the
+            // most-recent completed deployment, which is the new current one —
+            // never a deployment we are stopping here.
             let mut active_deployment: deployments::ActiveModel = deployment.into();
             active_deployment.state = Set("stopped".to_string());
             active_deployment.updated_at = Set(chrono::Utc::now());
@@ -2414,9 +2435,14 @@ WHERE project.id = $2
             .ok();
         }
 
-        self.log("All previous deployments torn down successfully".to_string())
-            .await
-            .ok();
+        let summary = if incomplete_teardowns == 0 {
+            "All previous deployments torn down successfully".to_string()
+        } else {
+            format!(
+                "{incomplete_teardowns} previous deployment(s) could not be fully torn down and will be retried by the next deployment"
+            )
+        };
+        self.log(summary).await.ok();
     }
 
     async fn successful_job_result(
@@ -2745,6 +2771,8 @@ mod teardown_tests {
     struct RecordingDeployer {
         stopped: Arc<StdMutex<Vec<String>>>,
         removed: Arc<StdMutex<Vec<String>>>,
+        /// When set, `remove_container` fails like a busy/unreachable daemon.
+        fail_remove: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDeployer {
@@ -2752,6 +2780,7 @@ mod teardown_tests {
             Self {
                 stopped: Arc::new(StdMutex::new(Vec::new())),
                 removed: Arc::new(StdMutex::new(Vec::new())),
+                fail_remove: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2781,6 +2810,11 @@ mod teardown_tests {
             Ok(())
         }
         async fn remove_container(&self, id: &str) -> Result<(), DeployerError> {
+            if self.fail_remove.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DeployerError::Other(format!(
+                    "removal of container {id} is already in progress"
+                )));
+            }
             self.removed.lock().unwrap().push(id.to_string());
             Ok(())
         }
@@ -3634,6 +3668,77 @@ mod teardown_tests {
             1,
             "stopped deployment must not be re-torn-down on the next pass"
         );
+    }
+
+    /// Regression: a previous deployment whose container could not be removed
+    /// used to be flipped to "stopped" anyway. "stopped" deployments are never
+    /// swept again, so the container row stayed live forever and the health
+    /// monitor reported the leftover exited container as a crash on every
+    /// poll. The deployment must stay sweepable until teardown succeeds.
+    #[tokio::test]
+    async fn test_failed_teardown_keeps_previous_deployment_sweepable() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let prev = insert_deployment(&db, project.id, env.id, "prev-deploy", "completed").await;
+        let prev_container = insert_container(&db, prev.id, "prev-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db.clone(), new.id, deployer.clone());
+
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let prev_after = deployments::Entity::find_by_id(prev.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prev_after.state, "completed",
+            "a deployment with an unremoved container must stay in the teardown sweep"
+        );
+        let row = deployment_containers::Entity::find_by_id(prev_container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_none(), "the container still exists");
+
+        // The next deployment's sweep retries and, once removal succeeds,
+        // retires both the container row and the deployment.
+        deployer
+            .fail_remove
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert_eq!(
+            deployer.removed.lock().unwrap().as_slice(),
+            ["prev-container"]
+        );
+        let row = deployment_containers::Entity::find_by_id(prev_container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+        let prev_after = deployments::Entity::find_by_id(prev.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev_after.state, "stopped");
     }
 
     /// "failed" deployments are never torn down — error history is preserved.
