@@ -6,14 +6,22 @@
 
 Why this exists: an unguarded Swatinem/rust-cache step in a workflow that
 runs on pull_request writes one copy of the cache per open PR ref. The
-repo's GitHub Actions cache pool is a single 10GB LRU space shared across
-ALL refs/branches/PRs, so a handful of duplicated ~300MB+ caches is enough
-to evict the much larger shared `temps-musl-fast-*` build cache, turning
+repo's GitHub Actions cache pool is a single LRU space (10GB when this was
+written, 50GB now) shared across ALL refs/branches/PRs, and writes are only
+readable from the ref that made them and its descendants, so a handful of
+duplicated caches is enough to evict the much larger shared
+`temps-musl-fast-*` build cache, turning
 every musl binary build into a ~80min cold compile instead of an
 incremental one. This has happened twice (dependency-scan.yml's
 cargo-audit job, network-kernel-tests.yml's unit job) -- this check exists
 so a third occurrence fails CI instead of silently degrading every
 pipeline for days before someone notices.
+
+The same applies to every other step that saves on its own: the combined
+`actions/cache` step (use `actions/cache/restore` + a `main`-only
+`actions/cache/save`) and `oven-sh/setup-bun`, which caches the Bun binary
+after the job unless `no-cache` is set. Reusable (`workflow_call`) workflows
+count as pull_request workflows, since rust-tests.yml calls them from PRs.
 
 The fix for PR workflows is to save only from main. Publishing release runs
 are tag-scoped, so the release workflow stays entirely read-only; manual dry
@@ -25,6 +33,13 @@ import sys
 from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+# The only `no-cache` values that keep setup-bun from saving on non-main refs.
+# Checking the value, not just the key, catches `no-cache: false` or an
+# inverted expression, which would save a PR-scoped copy again.
+SETUP_BUN_NO_CACHE = re.compile(
+    r"^\s*no-cache:\s*(?:true|\$\{\{\s*github\.ref\s*!=\s*'refs/heads/main'\s*\}\})\s*$",
+    re.MULTILINE,
+)
 RELEASE_WORKFLOW = WORKFLOWS_DIR / "release.yml"
 
 
@@ -32,11 +47,13 @@ def workflow_triggers_on_pull_request(text: str) -> bool:
     on_block_match = re.search(r"^on:\s*$", text, re.MULTILINE)
     if not on_block_match:
         # `on: push` one-liner etc. -- not our pattern, but check anyway.
-        return "pull_request" in text.split("\njobs:")[0]
+        header = text.split("\njobs:")[0]
+        return "pull_request" in header or "workflow_call" in header
     on_block_start = on_block_match.end()
     jobs_match = re.search(r"^jobs:", text[on_block_start:], re.MULTILINE)
     on_block_end = on_block_start + (jobs_match.start() if jobs_match else len(text))
-    return "pull_request" in text[on_block_start:on_block_end]
+    on_block = text[on_block_start:on_block_end]
+    return "pull_request" in on_block or "workflow_call" in on_block
 
 
 def find_unguarded_cache_steps(text: str) -> list[int]:
@@ -73,6 +90,19 @@ def find_unguarded_cache_steps(text: str) -> list[int]:
         block = "\n".join(lines[i:block_end])
         if "save-if:" not in block:
             violations.append(i + 1)
+    return violations
+
+
+def find_unguarded_self_saving_steps(text: str) -> list[int]:
+    """Return lines of steps that save a cache from any ref that misses."""
+    lines = text.splitlines()
+    violations = []
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*(?:-\s+)?uses:\s*actions/cache@", line):
+            violations.append(i + 1)
+        if re.search(r"^\s*(?:-\s+)?uses:\s*oven-sh/setup-bun@", line):
+            if not SETUP_BUN_NO_CACHE.search(step_block(lines, i)):
+                violations.append(i + 1)
     return violations
 
 
@@ -129,6 +159,11 @@ def find_release_cache_writes(text: str) -> list[int]:
             if not re.search(r"^\s*save-if:\s*(?:false|\$\{\{\s*false\s*\}\})\s*$", block, re.MULTILINE):
                 violations.append(i + 1)
 
+        if re.search(r"^\s*(?:-\s+)?uses:\s*oven-sh/setup-bun@", line):
+            block = step_block(lines, i)
+            if not re.search(r"^\s*no-cache:\s*true\s*$", block, re.MULTILINE):
+                violations.append(i + 1)
+
         # These Docker setup actions write small Actions cache entries unless
         # their implicit caches are explicitly disabled.
         implicit_cache_actions = {
@@ -147,12 +182,28 @@ def find_release_cache_writes(text: str) -> list[int]:
 
 def main() -> int:
     failures = []
+    self_saving = []
     for wf in sorted(WORKFLOWS_DIR.glob("*.yml")):
         text = wf.read_text()
         if not workflow_triggers_on_pull_request(text):
             continue
         for line_no in find_unguarded_cache_steps(text):
             failures.append(f"{wf.relative_to(WORKFLOWS_DIR.parent.parent)}:{line_no}")
+        for line_no in find_unguarded_self_saving_steps(text):
+            self_saving.append(f"{wf.relative_to(WORKFLOWS_DIR.parent.parent)}:{line_no}")
+
+    if self_saving:
+        print(
+            "Cache step(s) in pull_request-reachable workflow(s) that save from "
+            "any ref -- split `actions/cache` into `actions/cache/restore` plus "
+            "an `actions/cache/save` with `if: github.ref == 'refs/heads/main'`, "
+            "and give `oven-sh/setup-bun` "
+            "`no-cache: ${{ github.ref != 'refs/heads/main' }}`:",
+            file=sys.stderr,
+        )
+        for f in self_saving:
+            print(f"  {f}", file=sys.stderr)
+        return 1
 
     if failures:
         print(
@@ -171,7 +222,8 @@ def main() -> int:
         print(
             "Cache write(s) in release workflow -- use "
             "`actions/cache/restore`, set `Swatinem/rust-cache` to "
-            "`save-if: false`, disable Docker setup caches, and remove "
+            "`save-if: false`, set `oven-sh/setup-bun` to `no-cache: true`, "
+            "disable Docker setup caches, and remove "
             "BuildKit `type=gha` exports:",
             file=sys.stderr,
         )
