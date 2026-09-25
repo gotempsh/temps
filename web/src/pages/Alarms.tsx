@@ -73,6 +73,7 @@ import {
   isRowSelected,
   isSelectable,
   pageCheckState,
+  pruneSelection,
   selectableIds,
   selectionCount,
   toggleRow,
@@ -214,7 +215,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [severity, setSeverity] = useState<string>(ALL)
   const [alarmType, setAlarmType] = useState<string>(ALL)
   const [page, setPage] = useState(1)
-  const [selection, setSelection] = useState<AlarmSelection>(EMPTY_SELECTION)
+  const [rawSelection, setSelection] =
+    useState<AlarmSelection>(EMPTY_SELECTION)
   // Filter-wide actions can touch alarms on other pages, so they are
   // confirmed first; explicit row selections run immediately.
   const [confirmAction, setConfirmAction] =
@@ -274,14 +276,14 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     return Object.keys(summary?.by_type ?? {}).sort()
   }, [summary])
 
-  const invalidate = () => {
+  const invalidate = (path: { project_id: number } = projectPath) => {
     // Built from `path` only (no `query`) so partial matching invalidates
     // every page/filter variant for this project, not just the current one.
     queryClient.invalidateQueries({
-      queryKey: listProjectAlarmsQueryKey({ path: projectPath }),
+      queryKey: listProjectAlarmsQueryKey({ path }),
     })
     queryClient.invalidateQueries({
-      queryKey: getProjectAlarmsSummaryQueryKey({ path: projectPath }),
+      queryKey: getProjectAlarmsSummaryQueryKey({ path }),
     })
   }
 
@@ -317,35 +319,55 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   })
 
   const bulk = useMutation({
-    mutationFn: async (body: BulkAlarmRequest): Promise<BulkTotals> => {
+    // The project is part of the variables so a project switch mid-request
+    // can't redirect later rounds or the cache invalidation elsewhere.
+    mutationFn: async ({
+      path,
+      body,
+    }: {
+      path: { project_id: number }
+      body: BulkAlarmRequest
+    }): Promise<BulkTotals> => {
       const totals: BulkTotals = { updated: 0, skipped: 0, remaining: 0 }
       for (let round = 0; round < MAX_BULK_ROUNDS; round++) {
-        const { data: result } = await bulkUpdateProjectAlarms({
-          path: projectPath,
-          body,
-          throwOnError: true,
-        })
-        totals.updated += result.updated
-        totals.skipped += result.skipped
-        totals.remaining = result.remaining
-        if (result.remaining === 0 || result.updated === 0) break
+        try {
+          const { data: result } = await bulkUpdateProjectAlarms({
+            path,
+            body,
+            throwOnError: true,
+          })
+          totals.updated += result.updated
+          totals.skipped += result.skipped
+          totals.remaining = result.remaining
+          if (result.remaining === 0 || result.updated === 0) break
+        } catch (error) {
+          // Earlier rounds already committed; say how far it got.
+          if (totals.updated === 0) throw error
+          throw new Error(
+            `${bulkSuccessMessage(body.action, totals)}, then failed: ${getErrorMessage(error)}`
+          )
+        }
       }
       return totals
     },
-    onSuccess: (totals, body) => {
+    onSuccess: (totals, { body }) => {
       toast.success(bulkSuccessMessage(body.action, totals), {
         description:
           totals.remaining > 0
             ? `${totals.remaining} more matching alarm(s) remain — run it again to continue.`
             : undefined,
       })
-      setSelection(EMPTY_SELECTION)
-      invalidate()
+      // Keep a filter-wide selection while work remains, so "run it again"
+      // is one click instead of re-selecting everything.
+      setSelection(
+        totals.remaining > 0 && body.filter != null
+          ? { kind: 'all-matching' }
+          : EMPTY_SELECTION
+      )
     },
-    onError: (error: unknown, body) =>
-      toast.error(
-        getErrorMessage(error, `Failed to ${body.action} alarms`)
-      ),
+    onError: (error: unknown, { body }) =>
+      toast.error(getErrorMessage(error, `Failed to ${body.action} alarms`)),
+    onSettled: (_data, _error, { path }) => invalidate(path),
   })
 
   const runBulk = (action: BulkAlarmActionRequest) => {
@@ -353,18 +375,22 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       setConfirmAction(action)
       return
     }
-    bulk.mutate(bulkRequestFor(action, selection, {}))
+    bulk.mutate({
+      path: projectPath,
+      body: bulkRequestFor(action, selection, {}),
+    })
   }
 
   const confirmBulk = () => {
     if (confirmAction == null) return
-    bulk.mutate(
-      bulkRequestFor(confirmAction, selection, {
+    bulk.mutate({
+      path: projectPath,
+      body: bulkRequestFor(confirmAction, selection, {
         status: status === ALL ? undefined : status,
         severity: severity === ALL ? undefined : severity,
         alarmType: alarmType === ALL ? undefined : alarmType,
-      })
-    )
+      }),
+    })
     setConfirmAction(null)
   }
 
@@ -374,6 +400,12 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   }, [effectiveProjectId, status, severity, alarmType, page])
 
   const items = useMemo(() => data?.items ?? [], [data])
+  // Rows resolved in the meantime (their own row action, or a refetch that
+  // picked up someone else's change) drop out of the selection.
+  const selection = useMemo(
+    () => pruneSelection(rawSelection, items),
+    [rawSelection, items]
+  )
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
@@ -443,7 +475,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             effectiveProjectId != null ? String(effectiveProjectId) : undefined
           }
           onValueChange={(v) => selectProject(Number(v))}
-          disabled={projectsLoading || projects.length === 0}
+          disabled={projectsLoading || projects.length === 0 || bulk.isPending}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
             <SelectValue placeholder="Select a project…" />
@@ -562,7 +594,12 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 size="sm"
                 disabled={
                   isMutating ||
-                  !actionAppliesTo('acknowledge', selection, items)
+                  !actionAppliesTo(
+                    'acknowledge',
+                    selection,
+                    items,
+                    status === ALL ? undefined : status
+                  )
                 }
                 onClick={() => runBulk('acknowledge')}
               >
@@ -573,7 +610,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 variant="outline"
                 size="sm"
                 disabled={
-                  isMutating || !actionAppliesTo('resolve', selection, items)
+                  isMutating ||
+                  !actionAppliesTo(
+                    'resolve',
+                    selection,
+                    items,
+                    status === ALL ? undefined : status
+                  )
                 }
                 onClick={() => runBulk('resolve')}
               >
@@ -688,7 +731,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                         checked={isRowSelected(selection, alarm)}
                         disabled={!isSelectable(alarm) || isMutating}
                         onCheckedChange={() =>
-                          setSelection(toggleRow(selection, alarm.id))
+                          setSelection(toggleRow(selection, alarm.id, items))
                         }
                       />
                     </TableCell>

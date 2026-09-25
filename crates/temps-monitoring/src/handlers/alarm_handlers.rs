@@ -778,24 +778,24 @@ async fn run_bulk_alarm_update(
         .map_err(Problem::from)?;
     let response = BulkAlarmResponse::new(request.action, outcome);
 
-    if response.updated > 0 {
-        let audit = AlarmsBulkUpdatedAudit {
-            context: AuditContext {
-                user_id,
-                ip_address: Some(metadata.ip_address.clone()),
-                user_agent: metadata.user_agent.clone(),
-            },
-            project_id,
-            action: request.action,
-            alarm_ids: response.updated_ids.clone(),
-            filter: request.filter,
-        };
-        if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-            error!(
-                "Failed to create audit log for bulk alarm {:?} in project {:?}: {}",
-                request.action, project_id, e
-            );
-        }
+    // Audited even when nothing changed: the attempt itself (and its
+    // filter) is part of the record.
+    let audit = AlarmsBulkUpdatedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        action: request.action,
+        alarm_ids: response.updated_ids.clone(),
+        filter: request.filter,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for bulk alarm {:?} in project {:?}: {}",
+            request.action, project_id, e
+        );
     }
 
     Ok(response)

@@ -10,6 +10,7 @@ import {
   EMPTY_SELECTION,
   isRowSelected,
   pageCheckState,
+  pruneSelection,
   selectionCount,
   toggleRow,
   togglePage,
@@ -40,7 +41,7 @@ describe('page selection', () => {
   })
 
   test('a partial selection is indeterminate and toggling it selects the page', () => {
-    const partial = toggleRow(EMPTY_SELECTION, 1)
+    const partial = toggleRow(EMPTY_SELECTION, 1, page)
     expect(pageCheckState(partial, page)).toBe('indeterminate')
     expect(selectionCount(togglePage(partial, page))).toBe(2)
   })
@@ -60,14 +61,14 @@ describe('select all matching', () => {
     const full = togglePage(EMPTY_SELECTION, page)
     expect(canSelectAllMatching(full, page, 40)).toBe(true)
     expect(canSelectAllMatching(full, page, page.length)).toBe(false)
-    expect(canSelectAllMatching(toggleRow(EMPTY_SELECTION, 1), page, 40)).toBe(
+    expect(canSelectAllMatching(toggleRow(EMPTY_SELECTION, 1, page), page, 40)).toBe(
       false
     )
   })
 
-  test('unchecking a row narrows back to explicit rows', () => {
-    const narrowed = toggleRow({ kind: 'all-matching' }, 1)
-    expect(narrowed.kind).toBe('ids')
+  test('unchecking a row keeps the other visible rows and drops that one', () => {
+    const narrowed = toggleRow({ kind: 'all-matching' }, 1, page)
+    expect(narrowed).toEqual({ kind: 'ids', ids: new Set([2]) })
     expect(selectionCount({ kind: 'all-matching' })).toBeNull()
   })
 })
@@ -95,9 +96,44 @@ describe('bulk requests', () => {
   })
 
   test('acknowledge only applies when a firing alarm is selected', () => {
-    const ackedOnly = toggleRow(EMPTY_SELECTION, 2)
+    const ackedOnly = toggleRow(EMPTY_SELECTION, 2, page)
     expect(actionAppliesTo('acknowledge', ackedOnly, page)).toBe(false)
     expect(actionAppliesTo('resolve', ackedOnly, page)).toBe(true)
     expect(actionAppliesTo('resolve', EMPTY_SELECTION, page)).toBe(false)
+  })
+})
+
+describe('pruneSelection', () => {
+  test('drops rows that are no longer visible or became resolved', () => {
+    const selection = { kind: 'ids' as const, ids: new Set([1, 2, 42]) }
+    const refreshed = [alarm(1, 'firing'), alarm(2, 'resolved')]
+    expect(pruneSelection(selection, refreshed)).toEqual({
+      kind: 'ids',
+      ids: new Set([1]),
+    })
+  })
+
+  test('keeps an unchanged selection and a filter-wide one as-is', () => {
+    const selection = { kind: 'ids' as const, ids: new Set([1]) }
+    expect(pruneSelection(selection, page)).toBe(selection)
+    const all = { kind: 'all-matching' as const }
+    expect(pruneSelection(all, page)).toBe(all)
+  })
+})
+
+describe('filter-wide actions respect the status filter', () => {
+  const all = { kind: 'all-matching' as const }
+  test('acknowledge is pointless when only acknowledged alarms match', () => {
+    expect(actionAppliesTo('acknowledge', all, page, 'acknowledged')).toBe(false)
+    expect(actionAppliesTo('resolve', all, page, 'acknowledged')).toBe(true)
+  })
+
+  test('nothing applies to resolved alarms', () => {
+    expect(actionAppliesTo('acknowledge', all, page, 'resolved')).toBe(false)
+    expect(actionAppliesTo('resolve', all, page, 'resolved')).toBe(false)
+  })
+
+  test('both apply with no status filter', () => {
+    expect(actionAppliesTo('acknowledge', all, page)).toBe(true)
   })
 })

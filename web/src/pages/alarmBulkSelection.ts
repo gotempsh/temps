@@ -42,13 +42,38 @@ export function isRowSelected(selection: AlarmSelection, alarm: AlarmResponse): 
   return selection.kind === 'all-matching' || selection.ids.has(alarm.id)
 }
 
-export function toggleRow(selection: AlarmSelection, alarmId: number): AlarmSelection {
+export function toggleRow(
+  selection: AlarmSelection,
+  alarmId: number,
+  items: readonly AlarmResponse[]
+): AlarmSelection {
   // Unchecking a row while "all matching" is active narrows back to the
-  // explicit rows the user can see, rather than silently keeping the filter.
-  const ids = new Set(selection.kind === 'ids' ? selection.ids : [])
+  // selectable rows the user can see, minus the one they unchecked — never
+  // silently keeping the filter-wide selection.
+  const ids = new Set(
+    selection.kind === 'ids' ? selection.ids : selectableIds(items)
+  )
   if (ids.has(alarmId)) ids.delete(alarmId)
   else ids.add(alarmId)
   return { kind: 'ids', ids }
+}
+
+/**
+ * Drop selected IDs that are no longer actionable on the current page — e.g.
+ * an alarm resolved by its own row action or by someone else and picked up by
+ * the periodic refetch. A bulk action must only touch rows the user can see
+ * as selected.
+ */
+export function pruneSelection(
+  selection: AlarmSelection,
+  items: readonly AlarmResponse[]
+): AlarmSelection {
+  if (selection.kind === 'all-matching') return selection
+  const visible = new Set(selectableIds(items))
+  const ids = [...selection.ids].filter((id) => visible.has(id))
+  return ids.length === selection.ids.size
+    ? selection
+    : { kind: 'ids', ids: new Set(ids) }
 }
 
 /** Header checkbox state for the visible page. */
@@ -114,9 +139,15 @@ export function bulkRequestFor(
 export function actionAppliesTo(
   action: BulkAlarmActionRequest,
   selection: AlarmSelection,
-  items: readonly AlarmResponse[]
+  items: readonly AlarmResponse[],
+  statusFilter?: string
 ): boolean {
-  if (selection.kind === 'all-matching') return true
+  if (selection.kind === 'all-matching') {
+    // The server only acknowledges firing alarms and only resolves active
+    // ones, so a status filter can rule the action out entirely.
+    if (statusFilter === 'resolved') return false
+    return !(action === 'acknowledge' && statusFilter === 'acknowledged')
+  }
   if (selection.ids.size === 0) return false
   if (action === 'resolve') return true
   // Only firing alarms can be acknowledged.

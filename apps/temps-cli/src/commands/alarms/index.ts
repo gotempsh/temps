@@ -204,6 +204,9 @@ async function resolveScope(options: ScopeOptions): Promise<AlarmScope> {
     }
     return { kind: 'system' }
   }
+  if (options.project && options.projectId) {
+    throw new Error('Pass --project or --project-id, not both')
+  }
   const projectId = parseOptionalId(options.projectId, '--project-id')
   if (projectId !== undefined) {
     return { kind: 'project', projectId }
@@ -248,8 +251,8 @@ function statusColor(status: string): string {
 async function listAlarmsAction(options: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
-  const scope = await resolveScope(options)
 
+  // Validate every numeric flag before any network call.
   const query = {
     ...(options.status && { status: options.status }),
     ...(options.severity && { severity: options.severity }),
@@ -259,13 +262,14 @@ async function listAlarmsAction(options: ListOptions): Promise<void> {
     ...(options.page && { page: parseOptionalId(options.page, '--page') }),
     ...(options.pageSize && { page_size: parseOptionalId(options.pageSize, '--page-size') }),
   }
+  const scope = await resolveScope(options)
 
   const list = await withSpinner('Fetching alarms...', async (): Promise<AlarmListResponse> => {
     const { data, error } = scope.kind === 'system'
       ? await listSystemAlarms({ client, query })
       : await listProjectAlarms({ client, path: { project_id: scope.projectId }, query })
     if (error || !data) {
-      throw new Error(getErrorMessage(error) ?? 'Failed to list alarms')
+      throw new Error(error ? getErrorMessage(error) : 'The server returned no response body')
     }
     return data
   })
@@ -307,7 +311,7 @@ async function summaryAction(options: SummaryOptions): Promise<void> {
       ? await getSystemAlarmsSummary({ client })
       : await getProjectAlarmsSummary({ client, path: { project_id: scope.projectId } })
     if (error || !data) {
-      throw new Error(getErrorMessage(error) ?? 'Failed to get alarm summary')
+      throw new Error(error ? getErrorMessage(error) : 'The server returned no response body')
     }
     return data
   })
@@ -335,7 +339,7 @@ async function sendBulk(scope: AlarmScope, body: BulkAlarmRequest): Promise<Bulk
     ? await bulkUpdateSystemAlarms({ client, body })
     : await bulkUpdateProjectAlarms({ client, path: { project_id: scope.projectId }, body })
   if (error || !data) {
-    throw new Error(getErrorMessage(error) ?? 'Bulk alarm update failed')
+    throw new Error(error ? getErrorMessage(error) : 'The server returned no response body')
   }
   return data
 }
@@ -356,7 +360,16 @@ async function bulkAction(
     // `--all` is capped server-side per request; keep going until nothing
     // matching is left, bounded so a still-firing source can't loop forever.
     for (let round = 0; round < MAX_BULK_ROUNDS; round++) {
-      const result = await sendBulk(scope, body)
+      let result: BulkAlarmResponse
+      try {
+        result = await sendBulk(scope, body)
+      } catch (error) {
+        // Earlier rounds already committed — report how far it got.
+        if (totals.updated === 0) throw error
+        throw new Error(
+          `${verb}ed ${totals.updated} alarm(s) in ${scopeLabel(scope)}, then failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
       totals.updated += result.updated
       totals.skipped += result.skipped
       totals.remaining = result.remaining

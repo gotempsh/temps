@@ -815,8 +815,9 @@ impl AlarmService {
     /// learns when its selection was stale. Alarms already in (or past) the
     /// target state are skipped, matching the single-alarm endpoints.
     ///
-    /// The transition is one guarded `UPDATE … RETURNING` in a transaction,
-    /// so concurrent single-alarm actions cannot double-transition a row.
+    /// The transition is one guarded `UPDATE … RETURNING` (the status filter
+    /// is re-checked by the statement itself), so concurrent single-alarm
+    /// actions cannot double-transition a row.
     /// Resolving emits an `AlarmResolved` job per alarm for integrations, but
     /// does not send a per-alarm recovery notification: an operator clearing
     /// a backlog is not a recovery, and hundreds of "resolved" messages would
@@ -828,7 +829,8 @@ impl AlarmService {
         action: BulkAlarmAction,
         user_id: i32,
     ) -> Result<BulkAlarmOutcome, AlarmError> {
-        use sea_orm::{sea_query::Expr, QuerySelect, TransactionTrait};
+        use sea_orm::{sea_query::Expr, QuerySelect};
+        use std::collections::HashSet;
 
         let eligible = action.eligible_statuses();
         let (target_ids, requested) = match &selector {
@@ -851,7 +853,7 @@ impl AlarmService {
                         ),
                     });
                 }
-                let in_scope: Vec<i32> = alarms::Entity::find()
+                let in_scope: HashSet<i32> = alarms::Entity::find()
                     .select_only()
                     .column(alarms::Column::Id)
                     .filter(project_id_filter(project_id))
@@ -862,13 +864,10 @@ impl AlarmService {
                     .map_err(|e| AlarmError::Database {
                         operation: format!("load {} alarm(s) for bulk update", ids.len()),
                         reason: e.to_string(),
-                    })?;
-                if in_scope.len() != ids.len() {
-                    let missing = ids
-                        .iter()
-                        .find(|id| !in_scope.contains(id))
-                        .copied()
-                        .unwrap_or_default();
+                    })?
+                    .into_iter()
+                    .collect();
+                if let Some(&missing) = ids.iter().find(|id| !in_scope.contains(id)) {
                     return Err(AlarmError::NotFound {
                         alarm_id: missing,
                         project_id,
@@ -924,24 +923,18 @@ impl AlarmService {
                 .col_expr(alarms::Column::ResolvedAt, Expr::value(Some(now))),
         };
 
-        let txn = self.db.begin().await.map_err(|e| AlarmError::Database {
-            operation: format!("begin bulk {action:?} of {} alarm(s)", target_ids.len()),
-            reason: e.to_string(),
-        })?;
-        let mut updated =
-            update
-                .exec_with_returning(&txn)
-                .await
-                .map_err(|e| AlarmError::Database {
-                    operation: format!("bulk {action:?} of {} alarm(s)", target_ids.len()),
-                    reason: e.to_string(),
-                })?;
-        txn.commit().await.map_err(|e| AlarmError::Database {
-            operation: format!("commit bulk {action:?} of {} alarm(s)", target_ids.len()),
-            reason: e.to_string(),
-        })?;
+        let mut updated = update
+            .exec_with_returning(self.db.as_ref())
+            .await
+            .map_err(|e| AlarmError::Database {
+                operation: format!("bulk {action:?} of {} alarm(s)", target_ids.len()),
+                reason: e.to_string(),
+            })?;
         updated.sort_by_key(|alarm| alarm.id);
 
+        // Advisory only: counted after the update, so alarms fired or
+        // transitioned concurrently can make it drift. Callers loop until it
+        // reaches zero, and every round re-selects from the live table.
         let remaining = match &selector {
             BulkAlarmSelector::Ids(_) => 0,
             BulkAlarmSelector::Matching(filters) => alarms::Entity::find()
