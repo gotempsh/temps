@@ -12,8 +12,8 @@
 use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use futures::{stream, StreamExt};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, Statement, TransactionTrait,
+    sea_query::Expr, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -730,9 +730,38 @@ impl ContainerHealthMonitor {
                     );
                 }
             }
+            temps_deployer::ContainerStatus::Running
+                if container.status.as_deref() == Some("stopped") =>
+            {
+                // A user-stopped container is running again (started by
+                // hand, or by Docker's restart policy). Drop the stale
+                // marker, otherwise its next crash would be mistaken for
+                // the earlier intentional stop and never alarm.
+                self.clear_user_stop_marker(container).await;
+            }
             _ => {
                 // Container is in a healthy state, nothing to do
             }
+        }
+    }
+
+    /// Replace a `"stopped"` marker with `"running"`. Conditional on the
+    /// marker still being there so a concurrent stop is never overwritten.
+    async fn clear_user_stop_marker(&self, container: &deployment_containers::Model) {
+        let result = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container.id))
+            .filter(deployment_containers::Column::Status.eq("stopped"))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            error!(
+                "Failed to clear stopped marker for running container {} ({}): {}",
+                container.id, container.container_name, e
+            );
         }
     }
 
@@ -2450,7 +2479,12 @@ mod tests {
 
         /// Run one monitor poll with every container reported as exited(1).
         async fn poll_with_exited_containers(&self) {
-            let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+            self.poll_with_status(ContainerStatus::Exited).await;
+        }
+
+        /// Run one monitor poll with every container in `status`.
+        async fn poll_with_status(&self, status: ContainerStatus) {
+            let deployer = Arc::new(MockDeployer::new(0, status));
             {
                 let mut info = deployer.info.lock().await;
                 info.exit_code = Some(1);
@@ -2555,5 +2589,67 @@ mod tests {
             );
             assert_eq!(row.exit_code, Some(1));
         }
+    }
+
+    #[tokio::test]
+    async fn restarted_user_stopped_container_alarms_on_its_next_crash() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+
+        // Started again (by hand or by Docker's restart policy).
+        fixture.poll_with_status(ContainerStatus::Running).await;
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+
+        fixture.poll_with_exited_containers().await;
+        let alarms = fixture.alarms().await;
+        assert_eq!(
+            alarms.len(),
+            1,
+            "a crash after the restart is a real crash: {alarms:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exited_container_of_environment_without_current_deployment_does_not_alarm() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        // No `serve`: the environment has no current deployment at all.
+        let deployment = fixture.deployment("app-1", "completed").await;
+        fixture.container(&deployment, "running").await;
+
+        fixture.poll_with_exited_containers().await;
+
+        assert!(fixture.alarms().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_environment_does_not_silence_an_exit() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Exited)),
+            make_alarm_service(db),
+            ContainerHealthConfig::default(),
+        );
+
+        let reason = monitor
+            .exit_not_alarmable_reason(&make_deployment_model())
+            .await;
+
+        assert_eq!(reason, None, "an unreadable environment must still alarm");
     }
 }
