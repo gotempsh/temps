@@ -11,9 +11,10 @@
 //
 // Bounds and failure policy:
 // - At most `maxPending` distinct instances are queued (constant memory). Past
-//   that, new instances are dropped and counted, and the count is logged on the
-//   next flush. Nothing is lost for good: every later event from a dropped
-//   instance enqueues it again.
+//   that, enqueues of new instances are rejected and counted (per enqueue, not
+//   per distinct instance — tracking distinct IDs would itself be unbounded),
+//   and the count is logged on the next flush. Nothing is lost for good: every
+//   later event from a rejected instance enqueues it again.
 // - A failed flush is logged and its batch discarded for the same reason, so
 //   the queue's size never depends on database availability.
 // - Flushes never overlap. `stop()` flushes whatever is pending on shutdown.
@@ -40,7 +41,7 @@ export const DEFAULT_BACKFILL_OPTIONS: CountryBackfillerOptions = {
 
 export class CountryBackfiller implements CountryBackfillQueue {
   private pending = new Map<string, string>();
-  private dropped = 0;
+  private rejected = 0;
   private flushing: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
@@ -58,7 +59,7 @@ export class CountryBackfiller implements CountryBackfillQueue {
     for (const id of anonymousIds) {
       if (this.pending.has(id)) continue;
       if (this.pending.size >= this.opts.maxPending) {
-        this.dropped++;
+        this.rejected++;
         continue;
       }
       this.pending.set(id, country);
@@ -77,12 +78,12 @@ export class CountryBackfiller implements CountryBackfillQueue {
   }
 
   private async flushOnce(): Promise<void> {
-    if (this.dropped > 0) {
-      log("warn", "backfill", "queue full; instances dropped until their next event", {
-        dropped: this.dropped,
+    if (this.rejected > 0) {
+      log("warn", "backfill", "queue full; enqueues rejected (each instance re-queues on its next event)", {
+        rejected_enqueues: this.rejected,
         max_pending: this.opts.maxPending,
       });
-      this.dropped = 0;
+      this.rejected = 0;
     }
     if (this.pending.size === 0) return;
 

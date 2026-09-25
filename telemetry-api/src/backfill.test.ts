@@ -51,7 +51,7 @@ describe("CountryBackfiller", () => {
     expect(calls().length).toBe(0);
   });
 
-  it("bounds the queue, drops the overflow and reports it on the next flush", async () => {
+  it("bounds the queue, rejects the overflow and reports it on the next flush", async () => {
     const warn = spyOn(console, "error").mockImplementation(() => {});
     const { pool, calls } = makePool();
     const b = new CountryBackfiller(pool, { maxPending: 2, intervalMs: 60_000 });
@@ -61,7 +61,7 @@ describe("CountryBackfiller", () => {
     const line = JSON.parse(warn.mock.calls[0]![0] as string);
     warn.mockRestore();
 
-    expect(line).toMatchObject({ level: "warn", component: "backfill", dropped: 2, max_pending: 2 });
+    expect(line).toMatchObject({ level: "warn", component: "backfill", rejected_enqueues: 2, max_pending: 2 });
     expect(calls()[0]![1]).toEqual([["inst_1", "inst_2"], ["US", "US"]]);
   });
 

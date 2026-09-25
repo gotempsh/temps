@@ -7,6 +7,7 @@ import { createStatsRoutes } from "./routes/stats.js";
 import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
 import { CountryBackfiller } from "./backfill.js";
+import { gracefulShutdown } from "./shutdown.js";
 import { errorFields, log } from "./log.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
@@ -79,15 +80,19 @@ async function main() {
 
   log("info", "server", "temps telemetry API listening", { port: server.port });
 
-  // On a platform stop, flush queued backfills before exiting.
+  // On a platform stop: drain in-flight requests, flush the backfill queue,
+  // then exit (see shutdown.ts for why the order matters).
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
     process.once(signal, () => {
-      log("info", "server", "shutting down; flushing country backfill", {
-        signal,
-        pending: backfill.pendingCount,
-      });
-      server.stop();
-      void backfill.stop().finally(() => process.exit(0));
+      void gracefulShutdown(
+        {
+          stopServer: () => server.stop(),
+          stopBackfill: () => backfill.stop(),
+          pendingBackfill: () => backfill.pendingCount,
+          exit: (code) => process.exit(code),
+        },
+        signal
+      );
     });
   }
 }
