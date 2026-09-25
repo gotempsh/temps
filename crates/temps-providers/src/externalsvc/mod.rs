@@ -39,6 +39,7 @@ pub mod postgres_cluster;
 pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
+pub mod rc_client;
 pub mod redis;
 pub mod restore_image;
 pub mod rustfs;
@@ -799,10 +800,11 @@ pub fn aws_session_token_env(session_token: Option<&str>) -> Option<String> {
 }
 
 /// Bytes that cannot appear literally in the userinfo of an `MC_HOST_<alias>`
-/// URL.
+/// / `RC_HOST_<alias>` URL.
 ///
-/// `mc` parses that variable with Go's `net/url`, which percent-decodes
-/// userinfo, so every byte that would otherwise terminate the authority
+/// `mc` parses that variable with Go's `net/url`, and `rc` (the RustFS client
+/// that replaced it) with a URL parser; both percent-decode userinfo (verified:
+/// rc rejects a raw `/` in the secret and accepts `%2F`), so every byte that would otherwise terminate the authority
 /// (`/ ? #`), separate the userinfo from the host (`@`), or separate the three
 /// credential fields (`:`) has to be escaped — as does `%` itself, being the
 /// escape character. `[`/`]` are gen-delims that Go rejects outright in
@@ -825,9 +827,11 @@ const MC_USERINFO_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTR
     .add(b'@')
     .add(b'[')
     .add(b']')
+    .add(b'\\')
     .add(b' ');
 
-/// Percent-encode one credential field for splicing into an `MC_HOST_*` URL.
+/// Percent-encode one credential field for splicing into an `MC_HOST_*` /
+/// `RC_HOST_*` URL.
 ///
 /// Returns `Cow::Borrowed` — the identical bytes — for anything that needs no
 /// escaping, which is every ordinary access key and secret key.
@@ -835,9 +839,15 @@ fn encode_mc_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
     percent_encoding::utf8_percent_encode(value, MC_USERINFO_ESCAPE).into()
 }
 
-/// The credential segment of an `MC_HOST_<alias>` URL.
+/// The credential segment of an `MC_HOST_<alias>` / `RC_HOST_<alias>` URL.
 ///
-/// `mc` takes `<scheme>://<access key>:<secret key>[:<session token>]@<host>`.
+/// The name predates the move from MinIO's `mc` to the RustFS client `rc`;
+/// both take the same userinfo format, and `temps-backup` still calls this.
+/// `rc` has no session-token field (it would read `secret:token` as the
+/// secret), so rc callers pass `None` here and send the token with `-H`
+/// instead — see `rc_client`.
+///
+/// `mc`/`rc` take `<scheme>://<access key>:<secret key>[:<session token>]@<host>`.
 /// The session token is a third colon-separated field rather than an
 /// environment variable, because `mc` does not read `AWS_SESSION_TOKEN` at all.
 /// A long-lived credential produces the two-field form byte-for-byte as before.
@@ -881,8 +891,9 @@ pub fn redact_sensitive_output(output: &str, sensitive_values: &[&str]) -> Strin
 /// `external_service_backups.error_message` / `restore_runs.error`, or an API
 /// response.
 ///
-/// `mc` echoes the credential-bearing `MC_HOST_*` URL it failed to use straight
-/// into stderr, and that stderr is logged, persisted and surfaced. Each call
+/// `mc` echoed the credential-bearing `MC_HOST_*` URL it failed to use straight
+/// into stderr (`rc` has not been seen to, but the redaction stays so a client
+/// change cannot start leaking credentials), and that stderr is logged, persisted and surfaced. Each call
 /// site that captures external-client output therefore has to know *every*
 /// secret that could appear in it. Hand-rolled arrays drifted the moment a new
 /// credential field (the STS session token) was added, so this type is the one
@@ -950,52 +961,6 @@ impl<'a> SensitiveValues<'a> {
         }
         self.values.push(std::borrow::Cow::Borrowed(value));
     }
-}
-
-/// An `MC_HOST_<alias>` entry that gives an mc alias a session token.
-///
-/// `mc alias set <alias> <url> <access key> <secret key>` has no positional
-/// slot for a session token, so an alias configured that way cannot use a
-/// temporary credential at all. `MC_HOST_<alias>` can, and mc resolves it ahead
-/// of its config file — so emitting this alongside the existing `alias set`
-/// call upgrades the alias in place.
-///
-/// KNOWN GAP (temporary credentials only — left for the ADR author, since it
-/// needs a decision about the whole mc invocation flow rather than a patch
-/// here): when no `--api` flag is passed, `mc alias set` auto-probes the
-/// endpoint by `Stat`-ing a random bucket with the *positional* credentials and
-/// accepts only `BucketDoesNotExist` or `AccessDenied`. It builds that probe
-/// client from the CLI arguments alone — `MC_HOST_*` is consulted when an alias
-/// is *resolved*, never while it is being set — so a key pair that needs a
-/// session token gets `InvalidAccessKeyId` and mc exits non-zero before the
-/// override is ever read. Every path here that runs `alias set` and checks its
-/// exit code therefore fails first. Long-lived credentials (every
-/// operator-configured source) are unaffected, as are the paths that pass
-/// credentials exclusively through `MC_HOST_*`
-/// (`S3Service::restore_in_place`, `S3MirrorEngine`).
-///
-/// Returns `None` when there is no session token, which is every long-lived
-/// operator-configured credential: nothing is added to the container
-/// environment and the `mc alias set` path behaves exactly as it always has.
-pub fn mc_host_alias_override(
-    alias: &str,
-    endpoint: &str,
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-) -> Option<String> {
-    let token = session_token.filter(|token| !token.is_empty())?;
-    let (scheme, hostpath) = if let Some(rest) = endpoint.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        ("http", endpoint)
-    };
-    Some(format!(
-        "MC_HOST_{alias}={scheme}://{}@{hostpath}",
-        mc_host_credential(access_key, secret_key, Some(token))
-    ))
 }
 
 impl S3Credentials {
@@ -2394,15 +2359,6 @@ mod temporary_credential_tests {
     }
 
     #[test]
-    fn mc_host_alias_override_escapes_the_session_token_too() {
-        assert_eq!(
-            mc_host_alias_override("bkp", "https://s3.example.test", "k", "s", Some("a/b"))
-                .as_deref(),
-            Some("MC_HOST_bkp=https://k:s:a%2Fb@s3.example.test")
-        );
-    }
-
-    #[test]
     fn sensitive_values_redacts_every_credential_field_including_the_token() {
         let sensitive = SensitiveValues::new()
             .credential("live-key", "live-secret", None)
@@ -2466,38 +2422,6 @@ mod temporary_credential_tests {
             .redact("AKIAOPERATOR / operator-secret / sts-session-token");
 
         assert_eq!(redacted, "*** / *** / ***");
-    }
-
-    #[test]
-    fn mc_host_alias_override_is_absent_without_a_session_token() {
-        assert_eq!(
-            mc_host_alias_override("backup-source", "https://s3.example.test", "k", "s", None),
-            None
-        );
-    }
-
-    #[test]
-    fn mc_host_alias_override_preserves_the_endpoint_scheme() {
-        assert_eq!(
-            mc_host_alias_override(
-                "backup-source",
-                "https://s3.example.test",
-                "k",
-                "s",
-                Some("token")
-            )
-            .as_deref(),
-            Some("MC_HOST_backup-source=https://k:s:token@s3.example.test")
-        );
-        assert_eq!(
-            mc_host_alias_override("bkp", "http://minio:9000", "k", "s", Some("token")).as_deref(),
-            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
-        );
-        // A bare host:port keeps the historical plain-HTTP assumption.
-        assert_eq!(
-            mc_host_alias_override("bkp", "minio:9000", "k", "s", Some("token")).as_deref(),
-            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
-        );
     }
 
     #[test]

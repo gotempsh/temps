@@ -405,7 +405,7 @@ program
 program
   .command('s3-restore-scenario')
   .description(
-    'S3/MinIO managed-service restore: provision a real MinIO service with known credentials, upload pre-backup objects, mirror-backup via mc, diverge (add + delete), restore in-place with --overwrite --remove, and verify via the platform data-browser API that the live bucket exactly matches the backup-time state (deleted object restored, post-backup object gone)',
+    'S3/MinIO managed-service restore: provision a real MinIO service with known credentials, upload pre-backup objects, mirror-backup via rc (RustFS CLI), diverge (add + delete), restore in-place with --overwrite --remove, and verify via the platform data-browser API that the live bucket exactly matches the backup-time state (deleted object restored, post-backup object gone)',
   )
   .option('--minio-endpoint <url>', 'backup-destination MinIO S3 API endpoint (must already have the bucket)', 'http://localhost:9092')
   .option('--minio-bucket <name>', 'backup-destination bucket (must already exist)', 'temps-e2e-backups')

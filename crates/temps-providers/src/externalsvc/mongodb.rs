@@ -4531,7 +4531,7 @@ mod tests {
     /// This test uses MongoDB and MinIO (S3-compatible) containers
     /// Demonstrates the use of test_utils for backup/restore testing
     ///
-    /// `flavor = "multi_thread"` is required because `MinioTestContainer`'s
+    /// `flavor = "multi_thread"` is required because `S3TestContainer`'s
     /// `Drop` impl calls `tokio::task::block_in_place`, which panics on the
     /// default current-thread runtime.
     #[cfg(feature = "docker-tests")]
@@ -4554,7 +4554,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     async fn run_mongodb_backup_and_restore_to_s3() {
         use super::super::test_utils::{
-            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
         };
         use futures::TryStreamExt;
 
@@ -4586,7 +4586,7 @@ mod tests {
 
         // Step 1 & 2: Start MinIO container and set up S3 (using test utilities)
         println!("Step 1: Starting MinIO container and setting up S3...");
-        let minio = match MinioTestContainer::start(docker.clone(), "test-backups").await {
+        let minio = match S3TestContainer::start(docker.clone(), "test-backups").await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();

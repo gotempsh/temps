@@ -1604,13 +1604,17 @@ This starts:
   web UI + REST API (`GET /api/v1/messages`) on `http://localhost:8025`. Same
   image already proven for this in `crates/temps-notifications`'s Rust
   integration tests.
-- **MinIO** (`minio/minio`) — S3-compatible target for `backup-restore-scenario`.
-  S3 API on `http://localhost:9092` (not MinIO's own default of 9000 — see
-  the compose file comment for why), console on `http://localhost:9093`.
-  Same image + credentials (`minioadmin`/`minioadmin`) already proven in
-  `crates/temps-backup`'s own testcontainers-based Rust integration tests.
-  Create the bucket once before running the scenario:
-  `docker exec <minio-container> mc alias set local http://localhost:9000 minioadmin minioadmin && docker exec <minio-container> mc mb local/temps-e2e-backups`.
+- **S3 target** (compose service `minio`, image `rustfs/rustfs`) — S3-compatible
+  target for `backup-restore-scenario` and the other backup scenarios. It runs
+  RustFS because MinIO no longer publishes images; the service keeps the
+  `minio` name and `minioadmin`/`minioadmin` credentials so the scenarios'
+  `--minio-*` flags stay unchanged. S3 API on `http://localhost:9092` (not
+  the default 9000 — see the compose file comment for why), console on
+  `http://localhost:9093`. The same image is used by `crates/temps-backup`'s
+  own Rust integration tests.
+  Create the bucket once before running the scenario (`rc` is RustFS's
+  mc-compatible CLI; the server image does not ship a client):
+  `docker run --rm --network temps-e2e_default -e RC_HOST_local=http://minioadmin:minioadmin@minio:9000 rustfs/rc:v0.1.36 mb --ignore-existing local/temps-e2e-backups`.
   Since `temps serve` runs natively on the host (not in a container), point
   `--minio-endpoint` at `http://localhost:9092` — the default — not
   `host.docker.internal`, which only resolves from inside a container.

@@ -363,6 +363,13 @@ pub async fn run_one_shot(
         result = wait_stream.next() => {
             match result {
                 Some(Ok(resp)) => resp.status_code,
+                // bollard reports a container that exited non-zero as an
+                // `Err(DockerContainerWaitError { code, .. })`, not as an
+                // `Ok` response with that status. That is a normal "command
+                // failed" outcome, not a failed wait: surface it as the exit
+                // code so the caller gets the captured stderr/stdout tails
+                // instead of an opaque `WaitFailed`.
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
                 Some(Err(e)) => {
                     if let Some(h) = log_handle {
                         h.abort();

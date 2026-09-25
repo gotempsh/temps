@@ -119,6 +119,18 @@ fn is_terminal_pull_error(e: &bollard::errors::Error) -> bool {
 /// Returns `Err(String)` with the image name and last error already folded
 /// in, so callers can pass it straight to their existing error type/message
 /// via `.map_err(...)` without needing to know the retry happened.
+///
+/// Registry unavailable, image already on the host: when every pull attempt
+/// fails but the exact reference is already present locally, this logs a
+/// warning and returns `Ok(())` so the caller runs the local copy. Every
+/// caller pulls only to make sure the image is there before creating or
+/// recreating a container from it, so a local copy satisfies all of them.
+/// Without this, an upstream withdrawal (MinIO pulled every
+/// `quay.io/minio/*` and Docker Hub `minio/*` image in 2026) or a registry
+/// outage stops services from even restarting on hosts that already hold the
+/// image. The cost is that a moved tag is not refreshed while the registry
+/// is failing, which the warning makes visible. A digest-pinned reference is
+/// only found locally when the digest matches, so pinning still holds.
 pub(crate) async fn pull_image_with_retry(
     docker: &Docker,
     image: &str,
@@ -152,6 +164,13 @@ pub(crate) async fn pull_image_with_retry(
 
         let is_last_attempt = attempt + 1 >= retry.max_attempts;
         if is_terminal_pull_error(&e) || is_last_attempt {
+            if docker.inspect_image(image).await.is_ok() {
+                warn!(
+                    "Failed to pull image '{}' ({}); using the copy already present on this host",
+                    image, e
+                );
+                return Ok(());
+            }
             warn!("Failed to pull image '{}': {}", image, e);
             return Err(format!("failed to pull image '{}': {}", image, e));
         }
@@ -217,6 +236,54 @@ mod tests {
         assert!(
             err.contains("temps-nonexistent-image-fixture:does-not-exist"),
             "error should name the image that failed to pull: {err}"
+        );
+    }
+
+    /// A registry failure must not stop a service whose image is already on
+    /// the host. The reference below exists only locally (tagged from
+    /// busybox), so every pull fails with "not found" from Docker Hub.
+    #[tokio::test]
+    async fn test_pull_image_with_retry_falls_back_to_a_local_image() {
+        use bollard::query_parameters::{RemoveImageOptions, TagImageOptionsBuilder};
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+        if pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .is_err()
+        {
+            println!("busybox:latest unavailable, skipping");
+            return;
+        }
+
+        let repo = "temps-local-only-image-fixture";
+        let tag = format!("t{}", rand::random::<u32>());
+        let local_only = format!("{repo}:{tag}");
+        docker
+            .tag_image(
+                "busybox:latest",
+                Some(TagImageOptionsBuilder::new().repo(repo).tag(&tag).build()),
+            )
+            .await
+            .expect("tagging busybox locally should succeed");
+
+        let result = pull_image_with_retry(&docker, &local_only, None).await;
+
+        let _ = docker
+            .remove_image(&local_only, None::<RemoveImageOptions>, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "a failed pull of an image present locally must fall back to it: {result:?}"
         );
     }
 

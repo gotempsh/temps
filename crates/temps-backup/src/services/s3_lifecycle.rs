@@ -760,37 +760,43 @@ mod tests {
         }
     }
 
+    /// Round-trips tag-filtered lifecycle rules against a real S3-compatible
+    /// server (RustFS, pinned). This used to run against MinIO too; MinIO's
+    /// public images are gone, and RustFS is the object store Temps itself
+    /// provisions, so it is the one that matters.
     #[tokio::test]
-    async fn test_lifecycle_against_minio() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping MinIO lifecycle test");
+    async fn test_lifecycle_against_rustfs() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping RustFS lifecycle test: {e}");
+                return;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping RustFS lifecycle test: {e}");
             return;
         }
-        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+        use crate::test_rustfs::{
+            rustfs_container_request, wait_for_rustfs_ready, RUSTFS_ACCESS_KEY, RUSTFS_S3_PORT,
+            RUSTFS_SECRET_KEY,
+        };
+        use testcontainers::runners::AsyncRunner;
 
-        let container =
-            match GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
-                .with_env_var("MINIO_ROOT_USER", "minioadmin")
-                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    println!("Failed to start MinIO container ({}), skipping", e);
-                    return;
-                }
-            };
-
-        let port = container
-            .get_host_port_ipv4(9000)
+        let container = rustfs_container_request()
+            .start()
             .await
-            .expect("Failed to get MinIO port");
+            .expect("Failed to start RustFS container");
+        let port = container
+            .get_host_port_ipv4(RUSTFS_S3_PORT)
+            .await
+            .expect("Failed to get RustFS port");
+        wait_for_rustfs_ready(port)
+            .await
+            .expect("RustFS did not become healthy");
         let endpoint = format!("http://localhost:{}", port);
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-        let client = test_s3_client(&endpoint, "minioadmin", "minioadmin");
+        let client = test_s3_client(&endpoint, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY);
         let bucket = "lifecycle-test";
         client
             .create_bucket()
@@ -800,57 +806,8 @@ mod tests {
             .expect("Failed to create bucket");
 
         assert_lifecycle_roundtrip(&client, bucket, &[7, 30, 90]).await;
-    }
-
-    #[tokio::test]
-    async fn test_lifecycle_against_rustfs() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping RustFS lifecycle test");
-            return;
-        }
-        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
-
-        // RustFS is API-compatible with MinIO; default access/secret is
-        // `rustfsadmin` per the project's quickstart docs. The S3 port is
-        // 9000, same as MinIO.
-        let container = match GenericImage::new("rustfs/rustfs", "latest")
-            .with_env_var("RUSTFS_ROOT_USER", "rustfsadmin")
-            .with_env_var("RUSTFS_ROOT_PASSWORD", "rustfsadmin")
-            .start()
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                println!(
-                    "Failed to start RustFS container ({}) — image may not be \
-                     available on this host, skipping",
-                    e
-                );
-                return;
-            }
-        };
-
-        let port = match container.get_host_port_ipv4(9000).await {
-            Ok(p) => p,
-            Err(e) => {
-                println!("RustFS port mapping failed ({}), skipping", e);
-                return;
-            }
-        };
-        let endpoint = format!("http://localhost:{}", port);
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        let client = test_s3_client(&endpoint, "rustfsadmin", "rustfsadmin");
-        let bucket = "lifecycle-test";
-        if let Err(e) = client.create_bucket().bucket(bucket).send().await {
-            println!(
-                "Failed to create RustFS bucket ({}), skipping — likely the \
-                 image isn't running or the credentials differ on this version",
-                e
-            );
-            return;
-        }
-
+        // A second reconcile with a different retention set must replace the
+        // rules, not append to them.
         assert_lifecycle_roundtrip(&client, bucket, &[14, 60]).await;
     }
 
