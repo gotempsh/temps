@@ -5,6 +5,7 @@
 //!
 //! Deploys built container images to target environments
 
+use super::image_source::DeployImageSource;
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -486,6 +487,12 @@ pub struct DeployImageJob {
     log_stream_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional: directly provided image tag (for external/pre-built images, bypasses BuildImageJob lookup)
     external_image_tag: Option<String>,
+    /// Where the image lives, and so how a remote worker obtains it. Separate
+    /// from `external_image_tag`, which only says "don't look up a build job":
+    /// uploads, rollbacks and promotions hand over a tag directly yet may only
+    /// exist on the control plane. `None` (job configs written before this
+    /// field existed) is resolved by [`DeployImageSource::resolve`].
+    image_source: Option<DeployImageSource>,
     /// Docker log rotation config to prevent unbounded log growth
     log_config: Option<ContainerLogConfig>,
     /// Encryption service for decrypting node tokens during remote deployments
@@ -495,10 +502,24 @@ pub struct DeployImageJob {
     /// Local image builder — used to `save_image()` before transferring to remote nodes
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
     /// Registry credentials to forward to a worker's `POST /agent/images/pull`
-    /// when the deployed image is registry-sourced (`external_image_tag` is
-    /// set). `None` when the registry needs no auth, or when the image is a
-    /// control-plane-local build and this path is unused.
+    /// when the deployed image is registry-sourced
+    /// ([`DeployImageSource::Registry`]). `None` when the registry needs no
+    /// auth, or when the image is control-plane-local and this path is unused.
     registry_credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+}
+
+/// What the control plane's own Docker can tell a deploy job about an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlPlaneImage {
+    /// The image is in the control plane's Docker and can be exported.
+    Present,
+    /// The control plane's Docker answered, but not with this image (pruned,
+    /// never loaded, or the daemon could not be queried). Carries the reason.
+    Absent(String),
+    /// This process has no Docker daemon (control-plane serve profile).
+    DockerUnavailable(String),
+    /// No image builder is wired at all.
+    NoImageBuilder,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +592,7 @@ impl DeployImageJob {
             deployment_id: None,
             log_stream_task: Arc::new(Mutex::new(None)),
             external_image_tag: None,
+            image_source: None,
             log_config: None,
             encryption_service: None,
             config_service: None,
@@ -637,6 +659,82 @@ impl DeployImageJob {
     pub fn with_external_image_tag(mut self, image_tag: String) -> Self {
         self.external_image_tag = Some(image_tag);
         self
+    }
+
+    /// Declare where the deployed image lives. See [`DeployImageSource`].
+    pub fn with_image_source(mut self, image_source: DeployImageSource) -> Self {
+        self.image_source = Some(image_source);
+        self
+    }
+
+    /// The source this job acts on for `image_tag`: the declared one, with a
+    /// reserved `temps.internal/` ref always treated as control-plane-local.
+    fn resolved_image_source(&self, image_tag: &str) -> DeployImageSource {
+        DeployImageSource::resolve(
+            image_tag,
+            self.image_source,
+            self.external_image_tag.is_some(),
+        )
+    }
+
+    /// Whether this process runs workloads on its own Docker (full serve
+    /// profile). `false` in the control-plane profile.
+    fn local_workloads_enabled(&self) -> bool {
+        self.node_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.local_workloads_enabled())
+            .unwrap_or(true)
+    }
+
+    /// What the control plane's own Docker can tell us about `image_tag`.
+    async fn control_plane_image(&self, image_tag: &str) -> ControlPlaneImage {
+        let Some(image_builder) = self.image_builder.as_ref() else {
+            return ControlPlaneImage::NoImageBuilder;
+        };
+        match image_builder.inspect_image(image_tag).await {
+            Ok(_) => ControlPlaneImage::Present,
+            Err(temps_deployer::BuilderError::DockerUnavailable(e)) => {
+                ControlPlaneImage::DockerUnavailable(e.to_string())
+            }
+            Err(e) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    "Image not available in the control plane's Docker: {}",
+                    e
+                );
+                ControlPlaneImage::Absent(e.to_string())
+            }
+        }
+    }
+
+    /// Why a control-plane-local image cannot be exported to a worker, or
+    /// `None` when it can. Each reason names its own remedy: a control plane
+    /// with Docker disabled needs a registry (or the full profile), while one
+    /// whose Docker simply lost the image (pruned) needs it re-uploaded.
+    async fn control_plane_export_blocker(&self, image_tag: &str) -> Option<String> {
+        const USE_A_REGISTRY: &str = "Push the image to a registry and deploy it by reference \
+             (`temps deploy:image`), or run the control plane with the full profile.";
+        match self.control_plane_image(image_tag).await {
+            ControlPlaneImage::Present => None,
+            ControlPlaneImage::NoImageBuilder => Some(format!(
+                "this control plane has no image builder (Docker is disabled here), so \
+                 nothing can export it. {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::DockerUnavailable(e) => Some(format!(
+                "this control plane has no Docker daemon to export it from ({e}). \
+                 {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::Absent(e) if !self.local_workloads_enabled() => Some(format!(
+                "this control plane runs no local workloads (control-plane profile), so it \
+                 has no Docker daemon to export it from ({e}). {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::Absent(e) => Some(format!(
+                "the control plane's Docker no longer holds it — it may have been pruned \
+                 ({e}). Re-upload the image (`temps deploy:local-image`) or redeploy to \
+                 rebuild it, or push it to a registry and deploy it by reference \
+                 (`temps deploy:image`)."
+            )),
+        }
     }
 
     pub fn with_config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
@@ -876,15 +974,18 @@ impl DeployImageJob {
     /// Ensure the image exists on a remote node, transferring it if needed.
     ///
     /// 1. Checks if the image already exists on the remote node (via agent API).
-    /// 2. If the image is registry-sourced (`external_image_tag` is set), asks
-    ///    the worker to pull it directly from the registry via
-    ///    `POST /agent/images/pull` — no Docker daemon is needed on the
-    ///    control plane for this path (control-plane serve profile).
-    /// 3. Otherwise (a control-plane-local build — only reachable in the full
-    ///    profile, since control-plane-profile git builds are refused before
-    ///    this job ever runs) saves the image as a tar on the control plane
-    ///    (`docker save`) and streams it to the remote agent
-    ///    (`POST /agent/images/import`), cleaning up the local tar afterward.
+    /// 2. How it gets there depends on [`DeployImageSource`], never on whether
+    ///    the tag was handed over directly:
+    ///    - **Registry**: the worker pulls it itself (`POST /agent/images/pull`)
+    ///      — no Docker daemon is needed on the control plane (control-plane
+    ///      serve profile). If that pull fails and the control plane's Docker
+    ///      holds the image (e.g. `PullExternalImageJob` pulled it there), it
+    ///      is transferred from the control plane instead.
+    ///    - **Control-plane-local** (uploads, `temps.internal/` refs, images
+    ///      built on the control plane): no registry can serve it, so it is
+    ///      saved as a tar on the control plane (`docker save`) and streamed to
+    ///      the agent (`POST /agent/images/import`). A control plane that
+    ///      cannot export it fails here with the remedy, before any pull.
     async fn ensure_image_on_remote(
         &self,
         image_tag: &str,
@@ -933,47 +1034,101 @@ impl DeployImageJob {
             }
         }
 
-        // Registry-sourced image: the worker pulls it itself. This is the
-        // only path available in the control-plane profile (no CP Docker
-        // daemon), and is strictly cheaper than save+stream in the full
-        // profile too — no local disk tar, no double transfer through the
-        // control plane's network link.
-        if self.external_image_tag.is_some() {
-            self.log(
-                context,
-                format!(
-                    "Requesting node '{}' pull '{}' directly from its registry...",
-                    node_name, image_tag
-                ),
-            )
-            .await?;
+        match self.resolved_image_source(image_tag) {
+            DeployImageSource::Registry => {
+                // The worker pulls it itself. This is the only path available
+                // in the control-plane profile (no CP Docker daemon), and is
+                // strictly cheaper than save+stream in the full profile too —
+                // no local disk tar, no double transfer through the control
+                // plane's network link.
+                self.log(
+                    context,
+                    format!(
+                        "Pulling registry image '{}' on node '{}'...",
+                        image_tag, node_name
+                    ),
+                )
+                .await?;
 
-            return match remote
-                .pull_image_from_registry(image_tag, self.registry_credentials.clone())
-                .await
-            {
-                Ok(_image_id) => {
-                    self.log(
-                        context,
-                        format!(
-                            "Image '{}' pulled on node '{}' successfully",
-                            image_tag, node_name
-                        ),
-                    )
-                    .await?;
-                    Ok(())
-                }
-                Err(e) => {
+                let pull_error = match remote
+                    .pull_image_from_registry(image_tag, self.registry_credentials.clone())
+                    .await
+                {
+                    Ok(_image_id) => {
+                        self.log(
+                            context,
+                            format!(
+                                "Image '{}' pulled on node '{}' successfully",
+                                image_tag, node_name
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(e) => e,
+                };
+
+                if !matches!(
+                    self.control_plane_image(image_tag).await,
+                    ControlPlaneImage::Present
+                ) {
                     let msg = format!(
                         "Failed to pull image '{}' from registry on node '{}': {}",
-                        image_tag, node_name, e
+                        image_tag, node_name, pull_error
                     );
                     self.log(context, format!("ERROR: {}", msg)).await?;
-                    Err(WorkflowError::JobExecutionFailed(msg))
+                    return Err(WorkflowError::JobExecutionFailed(msg));
                 }
-            };
+
+                self.log_at(
+                    context,
+                    LogLevel::Warning,
+                    format!(
+                        "WARNING: Registry pull of '{}' failed on node '{}' ({}); \
+                         falling back to transfer from control plane",
+                        image_tag, node_name, pull_error
+                    ),
+                )
+                .await?;
+            }
+            DeployImageSource::ControlPlaneLocal => {
+                if let Some(reason) = self.control_plane_export_blocker(image_tag).await {
+                    let msg = format!(
+                        "Failed to deliver image '{}' to node '{}': it exists only in the \
+                         control plane's local image store (an uploaded image or one built \
+                         on the control plane), which no registry can serve, and {}",
+                        image_tag, node_name, reason
+                    );
+                    self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                        .await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
+                }
+
+                self.log(
+                    context,
+                    format!(
+                        "Transferring control-plane-local image '{}' to node '{}' via import...",
+                        image_tag, node_name
+                    ),
+                )
+                .await?;
+            }
         }
 
+        self.transfer_image_via_import(image_tag, remote, node_name, context)
+            .await
+    }
+
+    /// Save `image_tag` from the control plane's Docker (`docker save`) and
+    /// stream it to the remote agent (`POST /agent/images/import`), cleaning up
+    /// the local tar afterward.
+    async fn transfer_image_via_import(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         let image_builder = match self.image_builder.as_ref() {
             Some(b) => b,
             None => {
@@ -1048,7 +1203,17 @@ impl DeployImageJob {
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
         let level = Self::detect_log_level(&message);
+        self.log_at(context, level, message).await
+    }
 
+    /// [`Self::log`] with an explicit level, for messages whose wording the
+    /// keyword-based [`Self::detect_log_level`] would misclassify.
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
@@ -3021,6 +3186,7 @@ pub struct DeployImageJobBuilder {
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     external_image_tag: Option<String>,
+    image_source: Option<DeployImageSource>,
     log_config: Option<ContainerLogConfig>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
@@ -3113,6 +3279,7 @@ impl DeployImageJobBuilder {
             log_id: None,
             log_service: None,
             external_image_tag: None,
+            image_source: None,
             log_config: None,
             encryption_service: None,
             config_service: None,
@@ -3243,6 +3410,23 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Declare where the deployed image lives, which decides how a remote
+    /// worker obtains it. See [`DeployImageSource`].
+    pub fn image_source(mut self, image_source: DeployImageSource) -> Self {
+        self.image_source = Some(image_source);
+        self
+    }
+
+    /// Apply the image source the planner recorded in a `DeployImageJob` job
+    /// config. A config written before the field existed leaves it unset, and
+    /// the job derives it (see [`DeployImageSource::resolve`]).
+    pub fn image_source_from_job_config(self, config: &serde_json::Value) -> Self {
+        match DeployImageSource::from_job_config(config) {
+            Some(image_source) => self.image_source(image_source),
+            None => self,
+        }
+    }
+
     /// Set Docker log rotation config to prevent unbounded log growth
     pub fn container_log_config(mut self, log_config: ContainerLogConfig) -> Self {
         self.log_config = Some(log_config);
@@ -3319,7 +3503,7 @@ impl DeployImageJobBuilder {
     }
 
     /// Set registry credentials for a worker's direct registry pull, when the
-    /// deployed image is registry-sourced (`external_image_tag`) and needs
+    /// deployed image is registry-sourced ([`DeployImageSource::Registry`]) and needs
     /// authentication. See [`DeployImageJob::with_registry_credentials`].
     pub fn registry_credentials(
         mut self,
@@ -3373,6 +3557,9 @@ impl DeployImageJobBuilder {
         }
         if let Some(external_image_tag) = self.external_image_tag {
             job = job.with_external_image_tag(external_image_tag);
+        }
+        if let Some(image_source) = self.image_source {
+            job = job.with_image_source(image_source);
         }
         if let Some(log_config) = self.log_config {
             job = job.with_log_config(log_config);
@@ -5345,6 +5532,10 @@ mod tests {
     /// stubbing it out.
     struct RecordingImageBuilder {
         save_image_called: Arc<AtomicBool>,
+        /// Whether the control plane's Docker holds the image. When `true`,
+        /// `inspect_image` reports it as `linux/amd64`; tests pair that with a
+        /// `linux/amd64` remote so the platform check needs no agent call.
+        has_image: bool,
     }
 
     #[async_trait]
@@ -5409,6 +5600,18 @@ mod tests {
             &self,
             image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            if self.has_image {
+                return Ok(temps_deployer::ImageInfo {
+                    id: "sha256:local".to_string(),
+                    architecture: "amd64".to_string(),
+                    os: "linux".to_string(),
+                    platform: "linux/amd64".to_string(),
+                    size_bytes: 0,
+                    tags: vec![image_name.to_string()],
+                    created: None,
+                    working_dir: None,
+                });
+            }
             // Reported as not found so `verify_image_platform_for_node` takes
             // its graceful skip path — platform matching isn't what this test
             // is proving.
@@ -5558,7 +5761,10 @@ mod tests {
                 "token".to_string(),
                 "worker-1".to_string(),
             )
-            .unwrap(),
+            .unwrap()
+            // The builder reports the image as present (linux/amd64); a known
+            // node platform keeps the architecture check off the mock agent.
+            .with_platform(Some("linux/amd64".to_string())),
         );
 
         let container_deployer: Arc<dyn ContainerDeployer> =
@@ -5567,6 +5773,7 @@ mod tests {
         let save_image_called = Arc::new(AtomicBool::new(false));
         job.image_builder = Some(Arc::new(RecordingImageBuilder {
             save_image_called: save_image_called.clone(),
+            has_image: true,
         }));
         // No external_image_tag: this is the BuildImageJob-driven path.
 
@@ -5579,6 +5786,479 @@ mod tests {
         assert!(
             save_image_called.load(Ordering::SeqCst),
             "expected the local image builder's save_image to be called for a local build"
+        );
+    }
+
+    const UPLOADED_IMAGE: &str = "temps.internal/project-1/environment-2/upload-0f3c9a:immutable";
+    const REGISTRY_IMAGE: &str = "ghcr.io/example-org/app:v1";
+
+    /// Agent endpoints hit, in order: `exists`, `pull`, `import`, or the raw
+    /// request line for anything else.
+    type AgentRequestLog = Arc<Mutex<Vec<String>>>;
+
+    fn agent_request_kind(request_text: &str) -> String {
+        let path = request_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        if path.starts_with("/agent/images/") && path.ends_with("/exists") {
+            "exists".to_string()
+        } else if path.starts_with("/agent/images/pull") {
+            "pull".to_string()
+        } else if path.starts_with("/agent/images/import") {
+            "import".to_string()
+        } else {
+            request_text.lines().next().unwrap_or_default().to_string()
+        }
+    }
+
+    /// Mock agent that records every request it receives. The image is never
+    /// already on the node; `/pull` answers with `pull_response`; `/import`
+    /// succeeds. Unexpected requests are answered with an error and recorded,
+    /// so the test's sequence assertion reports them instead of a hang.
+    async fn spawn_recording_agent(
+        pull_response: (&'static str, &'static str),
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
+        let requests: AgentRequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        // More slots than any expected sequence needs, so an unexpected extra
+        // request is still recorded rather than refused.
+        let agent_url = spawn_sequenced_agent(6, move |request_text| {
+            let kind = agent_request_kind(request_text);
+            recorded
+                .lock()
+                .expect("agent request log")
+                .push(kind.clone());
+            match kind.as_str() {
+                "exists" => ("200 OK", r#"{"success":true,"data":false}"#.to_string()),
+                "pull" => (pull_response.0, pull_response.1.to_string()),
+                "import" => (
+                    "200 OK",
+                    r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
+                ),
+                _ => (
+                    "404 Not Found",
+                    r#"{"success":false,"data":null,"error":"unexpected request"}"#.to_string(),
+                ),
+            }
+        })
+        .await;
+
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                agent_url,
+                "token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            // Known platform, so the pre-transfer architecture check never
+            // needs to ask the mock agent's health endpoint.
+            .with_platform(Some("linux/amd64".to_string())),
+        );
+        (remote, requests)
+    }
+
+    const PULL_OK: (&str, &str) = (
+        "200 OK",
+        r#"{"success":true,"data":{"image_id":"sha256:pulled","digest":null}}"#,
+    );
+    const PULL_FAILS: (&str, &str) = (
+        "500 Internal Server Error",
+        r#"{"success":false,"data":null,"error":"manifest unknown"}"#,
+    );
+
+    fn assert_agent_requests(requests: &AgentRequestLog, expected: &[&str], why: &str) {
+        let seen = requests.lock().expect("agent request log").clone();
+        assert_eq!(seen, expected, "{why}");
+    }
+
+    fn uploaded_image_job(
+        image_source: Option<DeployImageSource>,
+        builder: Option<RecordingImageBuilder>,
+    ) -> DeployImageJob {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job =
+            job_with_target(container_deployer).with_external_image_tag(UPLOADED_IMAGE.to_string());
+        if let Some(image_source) = image_source {
+            job = job.with_image_source(image_source);
+        }
+        if let Some(builder) = builder {
+            job.image_builder = Some(Arc::new(builder));
+        }
+        job
+    }
+
+    /// Regression: an uploaded image (`temps deploy:local-image`) is deployed
+    /// with a directly-handed tag, exactly like a registry image, but lives only
+    /// in the control plane's Docker. A remote replica must receive it via
+    /// save+stream; asking the worker to pull `temps.internal/...` failed with
+    /// "lookup temps.internal: no such host".
+    #[tokio::test]
+    async fn ensure_image_on_remote_imports_uploaded_image_instead_of_pulling() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-upload".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import"],
+            "an uploaded image must be imported, never pulled from a registry",
+        );
+        result.expect("an uploaded image must be transferred to the worker via import");
+        assert!(
+            save_image_called.load(Ordering::SeqCst),
+            "expected the uploaded image to be exported from the control plane"
+        );
+    }
+
+    /// Job configs planned before `image_source` existed carry only
+    /// `use_external_image: true`. A `temps.internal/` ref must still be
+    /// treated as control-plane-local, so deployments already queued when the
+    /// fix ships don't hit the same failure.
+    #[tokio::test]
+    async fn ensure_image_on_remote_imports_reserved_ref_from_legacy_config() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        // No image source declared; even an explicit `Registry` would be
+        // overridden for a reserved ref (see `DeployImageSource::resolve`).
+        let job = uploaded_image_job(
+            None,
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-legacy".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import"],
+            "a reserved temps.internal ref from a legacy config must be imported, never pulled",
+        );
+        result.expect("a reserved temps.internal ref must be transferred via import");
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A registry image is pulled by the worker itself; the control plane is
+    /// not involved.
+    #[tokio::test]
+    async fn ensure_image_on_remote_pulls_registry_image_on_node() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: true,
+        }));
+        let context = crate::test_utils::create_test_context("wf-pull".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "a registry image must be pulled by the node",
+        );
+        result.expect("registry pull should succeed");
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A registry image whose pull fails on the worker (registry unreachable
+    /// from that node, missing credentials there, ...) is still deliverable
+    /// when the control plane's Docker holds a copy — `PullExternalImageJob`
+    /// pulled it there in the full profile.
+    #[tokio::test]
+    async fn ensure_image_on_remote_falls_back_to_import_when_registry_pull_fails() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: true,
+        }));
+        let context = crate::test_utils::create_test_context("wf-fallback".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull", "import"],
+            "a failed registry pull must fall back to importing the control plane's copy",
+        );
+        result.expect("a failed registry pull must fall back to the control plane's copy");
+        assert!(
+            save_image_called.load(Ordering::SeqCst),
+            "expected the fallback to export the control plane's copy"
+        );
+    }
+
+    /// Without a local copy there is nothing to fall back to: the pull error
+    /// is reported as before, and no export is attempted.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reports_pull_failure_without_local_copy() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: false,
+        }));
+        let context = crate::test_utils::create_test_context("wf-pull-fail".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "with no local copy the deploy must stop after the failed pull",
+        );
+        let message = result
+            .expect_err("a failed pull with no local copy must fail the deploy")
+            .to_string();
+        assert!(
+            message.contains("Failed to pull image 'ghcr.io/example-org/app:v1'")
+                && message.contains("manifest unknown"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A control-plane-local image on a control plane with no image builder
+    /// (Docker disabled) fails with the registry remedy — and never tries a
+    /// pull that is guaranteed to fail with a confusing DNS error.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_local_image_without_image_builder() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let job = uploaded_image_job(Some(DeployImageSource::ControlPlaneLocal), None);
+        let context = crate::test_utils::create_test_context("wf-no-builder".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("a control-plane-local image cannot be delivered without a builder")
+            .to_string();
+        assert!(
+            message.contains("Failed to deliver image")
+                && message.contains("exists only in the control plane's local image store")
+                && message.contains("no image builder (Docker is disabled here)")
+                && message.contains("temps deploy:image"),
+            "error should explain the cause and the remedy: {message}"
+        );
+    }
+
+    /// Control-plane serve profile (`local_workloads_enabled = false`): the
+    /// image builder is wired but its Docker does not hold the image, so the
+    /// deploy is refused explicitly instead of attempting a registry pull.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_local_image_on_control_plane_profile() {
+        use crate::services::{NodeScheduler, NodeService};
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let scheduler = Arc::new(
+            NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_workloads_enabled(false),
+        );
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: false,
+            }),
+        )
+        .with_node_scheduler(scheduler);
+        let context = crate::test_utils::create_test_context("wf-cp-profile".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("the control-plane profile cannot export a local image")
+            .to_string();
+        assert!(
+            message.contains("control-plane profile")
+                && message.contains("no Docker daemon to export it from"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// Full profile, Docker available, but the image is gone from the control
+    /// plane (pruned): the error says so and points at re-uploading, instead
+    /// of blaming a missing Docker daemon.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reports_pruned_local_image() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: false,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-pruned".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("a pruned local image cannot be delivered")
+            .to_string();
+        assert!(
+            message.contains("may have been pruned")
+                && message.contains("temps deploy:local-image")
+                && !message.contains("no Docker daemon"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// The refusal and fallback messages are logged at their real level; the
+    /// keyword-based classifier alone would file "ERROR: …" under info.
+    #[test]
+    fn delivery_messages_are_not_misclassified_by_keyword_detection() {
+        assert_eq!(
+            DeployImageJob::detect_log_level(
+                "ERROR: Failed to deliver image 'x' to node 'y': it exists only in the \
+                 control plane's local image store"
+            ),
+            LogLevel::Error
+        );
+    }
+
+    fn external_image_job_from_config(config: &serde_json::Value) -> DeployImageJob {
+        let image = config["image_name"]
+            .as_str()
+            .expect("image_name")
+            .to_string();
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .build_job_id("verify_local_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .external_image_tag(image)
+        .image_source_from_job_config(config)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .expect("deploy job builds")
+    }
+
+    /// The execution service hands the planned job config to the builder via
+    /// `image_source_from_job_config`; the recorded source must reach the job.
+    #[test]
+    fn builder_applies_image_source_from_job_config() {
+        // A non-reserved tag, so only the recorded source can make it local.
+        let local = serde_json::json!({
+            "image_name": "example-app-1666:latest",
+            "use_external_image": true,
+            "image_source": "control_plane_local",
+        });
+        let job = external_image_job_from_config(&local);
+        assert_eq!(job.image_source, Some(DeployImageSource::ControlPlaneLocal));
+        assert_eq!(
+            job.resolved_image_source("example-app-1666:latest"),
+            DeployImageSource::ControlPlaneLocal
+        );
+
+        let registry = serde_json::json!({
+            "image_name": REGISTRY_IMAGE,
+            "use_external_image": true,
+            "image_source": "registry",
+        });
+        let job = external_image_job_from_config(&registry);
+        assert_eq!(job.image_source, Some(DeployImageSource::Registry));
+        assert_eq!(
+            job.resolved_image_source(REGISTRY_IMAGE),
+            DeployImageSource::Registry
+        );
+    }
+
+    /// Configs planned before the field existed leave the source unset; the
+    /// job then derives it from the tag.
+    #[test]
+    fn builder_leaves_image_source_unset_for_legacy_job_config() {
+        let legacy = serde_json::json!({
+            "image_name": UPLOADED_IMAGE,
+            "use_external_image": true,
+        });
+        let job = external_image_job_from_config(&legacy);
+        assert_eq!(job.image_source, None);
+        assert_eq!(
+            job.resolved_image_source(UPLOADED_IMAGE),
+            DeployImageSource::ControlPlaneLocal
+        );
+
+        let legacy_registry = serde_json::json!({
+            "image_name": REGISTRY_IMAGE,
+            "use_external_image": true,
+        });
+        let job = external_image_job_from_config(&legacy_registry);
+        assert_eq!(
+            job.resolved_image_source(REGISTRY_IMAGE),
+            DeployImageSource::Registry
         );
     }
 }
