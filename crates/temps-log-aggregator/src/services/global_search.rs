@@ -146,6 +146,16 @@ pub struct GlobalLogFacetsResponse {
     /// point of a facet is that a user can trust it to surface values they
     /// have never seen on screen.
     pub partial: bool,
+    /// Display names for the returned `project_id` values, keyed by value.
+    /// Resolved here, under the log access that produced the facets, so a
+    /// caller who may read these logs can tell the projects apart without
+    /// also needing permission to read projects — the same names search
+    /// lines carry as `owner`. A returned value missing from this map names a
+    /// project this instance no longer has.
+    pub project_names: BTreeMap<String, String>,
+    /// Display names for the returned `external_service_id` values; see
+    /// `project_names`.
+    pub external_service_names: BTreeMap<String, String>,
 }
 
 /// Fields returned when a facet request does not name any.
@@ -293,9 +303,27 @@ impl LogSearchService {
         fields.dedup();
 
         let result = self.store.facets(&query, &fields).await?;
+        let names = self
+            .resolve_names(
+                facet_ids(&result.fields, FacetField::Project),
+                facet_ids(&result.fields, FacetField::ExternalService),
+            )
+            .await?;
+        let mut project_names = BTreeMap::new();
+        let mut external_service_names = BTreeMap::new();
+        for ((is_service, id), name) in names {
+            let target = if is_service {
+                &mut external_service_names
+            } else {
+                &mut project_names
+            };
+            target.insert(id.to_string(), name);
+        }
         Ok(GlobalLogFacetsResponse {
             facets: result.fields,
             partial: result.partial,
+            project_names,
+            external_service_names,
         })
     }
 
@@ -440,13 +468,26 @@ impl LogSearchService {
         &self,
         records: &[crate::store::LogLineRecord],
     ) -> Result<HashMap<(bool, i32), String>, LogAggregatorError> {
+        self.resolve_names(
+            records.iter().filter_map(|r| r.project_id).collect(),
+            records
+                .iter()
+                .filter_map(|r| r.external_service_id)
+                .collect(),
+        )
+        .await
+    }
+
+    /// Names for the given project and external-service ids, keyed like
+    /// [`owner_key`]. Ids with no row are simply absent.
+    async fn resolve_names(
+        &self,
+        mut project_ids: Vec<i32>,
+        mut service_ids: Vec<i32>,
+    ) -> Result<HashMap<(bool, i32), String>, LogAggregatorError> {
         let mut owners = HashMap::new();
-        if records.is_empty() {
-            return Ok(owners);
-        }
         let db = self.metadata_service.db.as_ref();
 
-        let mut project_ids: Vec<i32> = records.iter().filter_map(|r| r.project_id).collect();
         project_ids.sort_unstable();
         project_ids.dedup();
         if !project_ids.is_empty() {
@@ -465,10 +506,6 @@ impl LogSearchService {
             }
         }
 
-        let mut service_ids: Vec<i32> = records
-            .iter()
-            .filter_map(|r| r.external_service_id)
-            .collect();
         service_ids.sort_unstable();
         service_ids.dedup();
         if !service_ids.is_empty() {
@@ -491,6 +528,16 @@ impl LogSearchService {
     }
 }
 
+/// The numeric ids among one id-valued facet's values.
+fn facet_ids(facets: &BTreeMap<String, Vec<FacetValue>>, field: FacetField) -> Vec<i32> {
+    facets
+        .get(field.as_str())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.value.parse().ok())
+        .collect()
+}
+
 /// `(is_external_service, id)` key into the owner-name lookup.
 pub(crate) fn owner_key(record: &crate::store::LogLineRecord) -> (bool, i32) {
     match record.external_service_id {
@@ -509,6 +556,22 @@ mod tests {
             "end_time": "2026-01-02T00:00:00Z",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn facet_ids_reads_only_the_named_fields_numeric_values() {
+        let value = |value: &str| FacetValue {
+            value: value.into(),
+            count: 1,
+        };
+        let facets = BTreeMap::from([
+            ("project_id".to_string(), vec![value("3"), value("12")]),
+            ("external_service_id".to_string(), vec![value("5")]),
+            ("env".to_string(), vec![value("7")]),
+        ]);
+        assert_eq!(facet_ids(&facets, FacetField::Project), vec![3, 12]);
+        assert_eq!(facet_ids(&facets, FacetField::ExternalService), vec![5]);
+        assert!(facet_ids(&facets, FacetField::Node).is_empty());
     }
 
     #[test]

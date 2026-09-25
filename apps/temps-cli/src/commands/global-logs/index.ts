@@ -222,6 +222,35 @@ interface GlobalLogFacetsResponse {
   facets: Record<string, FacetValue[]>
   /** True when a value list was capped or the aggregation timed out. */
   partial: boolean
+  /** Names for the returned `project_id` values, keyed by value. */
+  project_names?: Record<string, string>
+  /** Names for the returned `external_service_id` values, keyed by value. */
+  external_service_names?: Record<string, string>
+}
+
+/**
+ * The display name for an id-valued facet value (`project_id`,
+ * `external_service_id`), or `undefined` for fields whose values are already
+ * readable. The server names every id it still has, so an id it could not
+ * name belongs to something this instance no longer has — except project 0,
+ * which marks lines from a standalone database service.
+ */
+export function facetValueName(
+  result: Pick<GlobalLogFacetsResponse, 'project_names' | 'external_service_names'>,
+  field: string,
+  value: string,
+): string | undefined {
+  const names =
+    field === 'project_id'
+      ? result.project_names
+      : field === 'external_service_id'
+        ? result.external_service_names
+        : undefined
+  if (!names) return undefined
+  // Standalone database services are stored under project_id 0: no owning
+  // project, not a deleted one.
+  if (field === 'project_id' && value === '0') return 'none (database service)'
+  return names[value] ?? 'unknown (no longer exists)'
 }
 
 interface AttributeKeysResponse {
@@ -278,8 +307,113 @@ interface AnalyticsCapability {
   forget_backlog: number
 }
 
+type LogCollectionState = 'running' | 'recovering' | 'retrying' | 'stopped'
+
+interface DeferredWalGeneration {
+  file_name: string
+  bytes: number
+  deferred_at?: string | null
+  reason?: string | null
+}
+
+interface LogCollectionCapability {
+  state: LogCollectionState
+  collecting: boolean
+  since?: string | null
+  error?: string | null
+  retry_at?: string | null
+  deferred_count: number
+  deferred_bytes: number
+  deferred: DeferredWalGeneration[]
+  deferred_dir?: string | null
+  /** Set when the deferred directory could not be read; counts are then unknown. */
+  deferred_error?: string | null
+  /** False for non-admins: error, deferred_dir and reasons are withheld. */
+  details_visible: boolean
+}
+
 interface GlobalLogCapabilities {
   analytics: AnalyticsCapability
+  /** Absent on servers that predate collection status. */
+  collection?: LogCollectionCapability
+}
+
+export interface CollectionSummary {
+  /** `ok` collecting, `warn` collecting with deferred WAL, `error` paused. */
+  severity: 'ok' | 'warn' | 'error'
+  headline: string
+  details: string[]
+}
+
+function formatBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`
+}
+
+/**
+ * What an operator needs to read about log collection: whether new lines are
+ * arriving at all, and if not, the server's own reason and what happens next.
+ */
+export function describeCollection(collection: LogCollectionCapability): CollectionSummary {
+  const details: string[] = []
+  let severity: CollectionSummary['severity'] = 'ok'
+  let headline: string
+  switch (collection.state) {
+    case 'running':
+      headline = 'Collecting container logs'
+      break
+    case 'recovering':
+      severity = 'warn'
+      headline = `Replaying the log WAL from before the last restart${
+        collection.since ? ` (since ${collection.since})` : ''
+      }; new lines are collected once it finishes`
+      break
+    case 'retrying':
+      severity = 'error'
+      headline = 'Log collection is paused: WAL recovery failed and will retry'
+      if (collection.error) details.push(`Error: ${collection.error}`)
+      if (collection.retry_at) details.push(`Next attempt: ${collection.retry_at}`)
+      break
+    case 'stopped':
+      severity = 'error'
+      headline = 'Log collection is paused until temps is restarted: WAL recovery gave up'
+      if (collection.error) details.push(`Error: ${collection.error}`)
+      break
+  }
+  if (!collection.details_visible && severity !== 'ok') {
+    details.push('An instance administrator can see the exact error and file locations.')
+  }
+  if (collection.deferred_count > 0) {
+    if (severity === 'ok') severity = 'warn'
+    details.push(
+      `${collection.deferred_count.toLocaleString()} WAL generation(s) (${formatBytes(
+        collection.deferred_bytes,
+      )}) could not be replayed and were set aside${
+        collection.deferred_dir ? ` in ${collection.deferred_dir}` : ''
+      }; their lines are missing from search`,
+    )
+    for (const generation of collection.deferred) {
+      details.push(`  ${generation.file_name}: ${generation.reason ?? 'no reason recorded'}`)
+    }
+    if (collection.deferred.length < collection.deferred_count) {
+      details.push(
+        `  …and ${(collection.deferred_count - collection.deferred.length).toLocaleString()} more`,
+      )
+    }
+  }
+  if (collection.deferred_error) {
+    if (severity === 'ok') severity = 'warn'
+    details.push(
+      `Could not check for WAL generations set aside by recovery: ${collection.deferred_error}`,
+    )
+  }
+  return { severity, headline, details }
 }
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
@@ -446,7 +580,7 @@ export function registerGlobalLogsCommands(program: Command): void {
   logs
     .command('capabilities')
     .description(
-      'Whether attribute facets, histograms and aggregates are available on this instance',
+      'Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available',
     )
     .option('--json', 'Output in JSON format')
     .action(capabilitiesAction)
@@ -740,10 +874,19 @@ async function facetsAction(options: FacetsOptions): Promise<void> {
   for (const [field, values] of entries) {
     newline()
     header(field)
+    const named = facetValueName(result, field, '') !== undefined
     printTable(
       values,
       [
         { header: 'Value', accessor: (v: FacetValue) => v.value },
+        ...(named
+          ? [
+              {
+                header: 'Name',
+                accessor: (v: FacetValue) => facetValueName(result, field, v.value) ?? '',
+              },
+            ]
+          : []),
         {
           header: 'Lines',
           accessor: (v: FacetValue) => v.count.toLocaleString(),
@@ -994,13 +1137,24 @@ async function capabilitiesAction(options: { json?: boolean }): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const result = await withSpinner('Checking log analytics capabilities...', () =>
+  const result = await withSpinner('Checking log collection and analytics...', () =>
     fetchAnalytics<GlobalLogCapabilities>('/logs/global/capabilities', {}),
   )
 
   if (options.json) {
     json(result)
     return
+  }
+
+  newline()
+  header(`${icons.info} Log collection`)
+  if (result.collection) {
+    const summary = describeCollection(result.collection)
+    const print = summary.severity === 'ok' ? info : warning
+    print(summary.headline)
+    for (const detail of summary.details) info(detail)
+  } else {
+    info('Unknown: this server does not report collection status (upgrade temps to see it)')
   }
 
   const analytics = result.analytics

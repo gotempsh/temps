@@ -6328,6 +6328,16 @@ export type DatabaseMetricsRow = {
  */
 export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
 
+export type DeferredWalGeneration = {
+    bytes: number;
+    deferred_at?: string | null;
+    file_name: string;
+    /**
+     * What recovery could not read and what it did with the rest.
+     */
+    reason?: string | null;
+};
+
 /**
  * Request to delete keys
  */
@@ -10960,6 +10970,7 @@ export type GlobalEventStatsResponse = {
  */
 export type GlobalLogCapabilities = {
     analytics: AnalyticsCapability;
+    collection: LogCollectionCapability;
 };
 
 /**
@@ -10977,6 +10988,13 @@ export type GlobalLogFacetsRequest = GlobalLogSearchRequest & {
  */
 export type GlobalLogFacetsResponse = {
     /**
+     * Display names for the returned `external_service_id` values; see
+     * `project_names`.
+     */
+    external_service_names: {
+        [key: string]: string;
+    };
+    /**
      * Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values
      * are ordered by count, descending.
      */
@@ -10990,6 +11008,17 @@ export type GlobalLogFacetsResponse = {
      * have never seen on screen.
      */
     partial: boolean;
+    /**
+     * Display names for the returned `project_id` values, keyed by value.
+     * Resolved here, under the log access that produced the facets, so a
+     * caller who may read these logs can tell the projects apart without
+     * also needing permission to read projects — the same names search
+     * lines carry as `owner`. A returned value missing from this map names a
+     * project this instance no longer has.
+     */
+    project_names: {
+        [key: string]: string;
+    };
 };
 
 /**
@@ -12928,6 +12957,64 @@ export type LocationInfo = {
     country?: string | null;
     region?: string | null;
 };
+
+/**
+ * Whether new container log lines are being collected right now. Separate
+ * from `analytics` because the two fail independently: after a restart the
+ * index can be healthy while collection waits on WAL recovery, and without
+ * this the explorer shows a histogram that simply stops.
+ */
+export type LogCollectionCapability = {
+    /**
+     * `true` only in the `running` state.
+     */
+    collecting: boolean;
+    /**
+     * The oldest few deferred generations.
+     */
+    deferred: Array<DeferredWalGeneration>;
+    deferred_bytes: number;
+    /**
+     * Generations recovery set aside because it could not replay them in
+     * full. Collection runs regardless; their lines are missing from search
+     * until an operator retries them.
+     */
+    deferred_count: number;
+    /**
+     * Directory holding them, on the server's filesystem.
+     */
+    deferred_dir?: string | null;
+    /**
+     * Set when that directory could not be read: the deferred counts and
+     * list are then empty because they are unknown, not because nothing
+     * was deferred.
+     */
+    deferred_error?: string | null;
+    /**
+     * `false` when the caller is not an instance administrator: `error`,
+     * `deferred_dir` and each generation's `reason` are then omitted, and
+     * `deferred_error` is generic, since they carry server filesystem paths
+     * and raw I/O errors. State and
+     * counts are always present, so a paused collector is never hidden.
+     */
+    details_visible: boolean;
+    /**
+     * Why collection is paused, verbatim, for `retrying` and `stopped`.
+     */
+    error?: string | null;
+    /**
+     * When the next recovery pass starts, for `retrying`.
+     */
+    retry_at?: string | null;
+    /**
+     * When the current state began: recovery start for `recovering`,
+     * recovery end for `running`.
+     */
+    since?: string | null;
+    state: LogCollectionState;
+};
+
+export type LogCollectionState = 'running' | 'recovering' | 'retrying' | 'stopped';
 
 /**
  * Normalized log level

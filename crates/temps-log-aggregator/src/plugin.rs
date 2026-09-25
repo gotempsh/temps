@@ -326,6 +326,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 store,
                 db.clone(),
                 line_index,
+                chunk_writer.clone(),
             )
             .await;
             context.register_service(app_state);
@@ -676,6 +677,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             project_access_checker,
             line_index: old.line_index.clone(),
             manifests: old.manifests.clone(),
+            chunk_writer: old.chunk_writer.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 
@@ -846,13 +848,8 @@ fn spawn_local_container_discovery(
                 Ok(ids) => {
                     let count = ids.len();
                     for id in ids {
-                        if let Err(e) = startup_collector.start_streaming(&id).await {
-                            tracing::warn!(
-                                container_id = %id,
-                                error = %e,
-                                "Failed to start streaming for existing container"
-                            );
-                        }
+                        // Runs (and logs its own failures) in the background.
+                        startup_collector.start_streaming_with_retry(&id).await;
                     }
                     tracing::info!(
                         container_count = count,
@@ -925,14 +922,11 @@ fn spawn_local_container_discovery(
                                     container_id = container_id,
                                     "Docker event: container started"
                                 );
-                                if let Err(e) = events_collector.start_streaming(container_id).await
-                                {
-                                    tracing::debug!(
-                                        container_id = container_id,
-                                        error = %e,
-                                        "Failed to start streaming (may not have temps labels)"
-                                    );
-                                }
+                                // Runs (and logs its own failures) in the background, so
+                                // this task never waits on an inspect or a DB lookup.
+                                events_collector
+                                    .start_streaming_with_retry(container_id)
+                                    .await;
                             }
                             "stop" | "die" | "kill" => {
                                 tracing::debug!(
