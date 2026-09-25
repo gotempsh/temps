@@ -538,68 +538,234 @@ struct FailedContainerCandidate {
     node_id: Option<i32>,
 }
 
-/// Check that a `docker save` archive holds exactly the image `expected_id`.
+/// Upper bound on any metadata file read from a `docker save` archive
+/// (`manifest.json`, `index.json`, a nested index blob). Real ones are a few
+/// KiB; this only stops a malformed archive from being buffered whole.
+const MAX_SAVED_ARCHIVE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many nested image indexes are opened when looking for an image.
+const MAX_SAVED_ARCHIVE_NESTED_INDEXES: usize = 16;
+
+/// Check that a `docker save` archive contains the image `expected_id`.
 ///
-/// Both archive layouts name each image's config blob after its digest —
-/// which *is* the image ID: legacy `"Config": "<hex>.json"` and OCI
-/// (Docker 25+) `"Config": "blobs/sha256/<hex>"`. Reads `manifest.json` by
-/// scanning the archive once, on a blocking thread.
+/// `expected_id` is the ID the control plane's Docker reported for the tag
+/// just before export (`image_identity`). What that ID is depends on the
+/// daemon's image store, and so does where the archive records it:
+///
+/// - **Classic store**: the ID is the image config digest, which names a
+///   `manifest.json` `Config` entry — `"<hex>.json"` (legacy layout) or
+///   `"blobs/sha256/<hex>"` (OCI layout, Docker 25+).
+/// - **containerd store**: the ID is the image's manifest or index digest,
+///   listed in the OCI `index.json` (`manifests[].digest`), or — for an
+///   index nested under it — in that index blob. One level of nesting is read.
+///
+/// The archive may hold several entries (a multi-platform image, one per
+/// platform); it is accepted when the verified image is among them. It is
+/// rejected only when the ID appears nowhere, i.e. the tag was re-pointed to
+/// different content between verification and export.
 async fn verify_saved_image_id(
     tar_path: &std::path::Path,
     expected_id: &str,
 ) -> Result<(), String> {
     let tar_path = tar_path.to_path_buf();
-    let config_ids = tokio::task::spawn_blocking(move || saved_image_config_ids(&tar_path))
+    let expected = digest_hex(expected_id).to_string();
+    tokio::task::spawn_blocking(move || saved_archive_contains_image(&tar_path, &expected))
         .await
-        .map_err(|e| format!("archive inspection task failed: {e}"))??;
-    let expected = expected_id.trim().trim_start_matches("sha256:");
-    match config_ids.as_slice() {
-        [only] if only == expected => Ok(()),
-        [only] => Err(format!("archive contains image sha256:{only}")),
-        [] => Err("archive manifest names no image".to_string()),
-        many => Err(format!(
-            "archive contains {} images, expected one",
-            many.len()
-        )),
+        .map_err(|e| format!("archive inspection task failed: {e}"))?
+}
+
+/// The hex part of `sha256:<hex>` (or of a bare `<hex>`).
+fn digest_hex(value: &str) -> &str {
+    let value = value.trim();
+    value.rsplit(':').next().unwrap_or(value)
+}
+
+#[derive(Deserialize)]
+struct SavedManifestEntry {
+    #[serde(rename = "Config")]
+    config: String,
+}
+
+#[derive(Deserialize)]
+struct SavedOciIndex {
+    #[serde(default)]
+    manifests: Vec<SavedOciDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct SavedOciDescriptor {
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    digest: String,
+}
+
+impl SavedOciDescriptor {
+    fn is_index(&self) -> bool {
+        matches!(
+            self.media_type.as_str(),
+            "application/vnd.oci.image.index.v1+json"
+                | "application/vnd.docker.distribution.manifest.list.v2+json"
+        )
     }
 }
 
-/// The image IDs (hex, without `sha256:`) listed in a `docker save`
-/// archive's `manifest.json`.
-fn saved_image_config_ids(tar_path: &std::path::Path) -> Result<Vec<String>, String> {
-    #[derive(Deserialize)]
-    struct SavedManifestEntry {
-        #[serde(rename = "Config")]
-        config: String,
+/// Image identities named by an archive's top-level metadata.
+#[derive(Default)]
+struct SavedArchiveMetadata {
+    has_metadata: bool,
+    /// `manifest.json` `Config` digests (hex).
+    config_ids: Vec<String>,
+    /// `index.json` descriptors.
+    index_manifests: Vec<SavedOciDescriptor>,
+}
+
+fn saved_archive_contains_image(tar_path: &std::path::Path, expected: &str) -> Result<(), String> {
+    let metadata = read_saved_archive_metadata(tar_path)?;
+    if !metadata.has_metadata {
+        return Err("archive has neither manifest.json nor index.json".to_string());
+    }
+    let mut seen: Vec<String> = metadata.config_ids.clone();
+    seen.extend(
+        metadata
+            .index_manifests
+            .iter()
+            .map(|descriptor| digest_hex(&descriptor.digest).to_string()),
+    );
+    if seen.iter().any(|id| id == expected) {
+        return Ok(());
     }
 
+    let nested: Vec<String> = metadata
+        .index_manifests
+        .iter()
+        .filter(|descriptor| descriptor.is_index())
+        .map(|descriptor| digest_hex(&descriptor.digest).to_string())
+        .take(MAX_SAVED_ARCHIVE_NESTED_INDEXES)
+        .collect();
+    if !nested.is_empty() {
+        for index in read_saved_archive_blobs(tar_path, &nested)? {
+            let index: SavedOciIndex = serde_json::from_slice(&index)
+                .map_err(|e| format!("invalid nested image index in archive: {e}"))?;
+            for descriptor in index.manifests {
+                let id = digest_hex(&descriptor.digest).to_string();
+                if id == expected {
+                    return Ok(());
+                }
+                seen.push(id);
+            }
+        }
+    }
+
+    const SHOWN: usize = 8;
+    let listed: Vec<String> = seen
+        .iter()
+        .take(SHOWN)
+        .map(|id| format!("sha256:{id}"))
+        .collect();
+    Err(if seen.is_empty() {
+        "archive metadata names no image".to_string()
+    } else {
+        format!(
+            "archive contains only {}{}",
+            listed.join(", "),
+            if seen.len() > SHOWN { ", ..." } else { "" }
+        )
+    })
+}
+
+/// Read a metadata entry, refusing anything implausibly large.
+fn read_saved_archive_entry<R: std::io::Read>(
+    entry: tar::Entry<'_, R>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let size = entry.header().size().unwrap_or(0);
+    if size > MAX_SAVED_ARCHIVE_METADATA_BYTES {
+        return Err(format!("{name} in archive is too large ({size} bytes)"));
+    }
+    let mut buf = Vec::with_capacity(size as usize);
+    entry
+        .take(MAX_SAVED_ARCHIVE_METADATA_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot read {name} from archive: {e}"))?;
+    Ok(buf)
+}
+
+fn open_saved_archive(tar_path: &std::path::Path) -> Result<tar::Archive<std::fs::File>, String> {
     let file = std::fs::File::open(tar_path)
         .map_err(|e| format!("cannot open archive {}: {e}", tar_path.display()))?;
-    let mut archive = tar::Archive::new(file);
+    Ok(tar::Archive::new(file))
+}
+
+fn saved_archive_entry_path<R: std::io::Read>(entry: &tar::Entry<'_, R>) -> Option<String> {
+    entry.path().ok().map(|path| {
+        let path = path.to_string_lossy();
+        path.trim_start_matches("./").to_string()
+    })
+}
+
+/// One pass over the archive for `manifest.json` and `index.json`.
+fn read_saved_archive_metadata(tar_path: &std::path::Path) -> Result<SavedArchiveMetadata, String> {
+    let mut archive = open_saved_archive(tar_path)?;
     let entries = archive
         .entries()
         .map_err(|e| format!("cannot read archive {}: {e}", tar_path.display()))?;
+    let mut metadata = SavedArchiveMetadata::default();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot read archive entry: {e}"))?;
-        let is_manifest = entry
-            .path()
-            .map(|path| path.as_os_str() == "manifest.json")
-            .unwrap_or(false);
-        if !is_manifest {
-            continue;
+        match saved_archive_entry_path(&entry).as_deref() {
+            Some("manifest.json") => {
+                let bytes = read_saved_archive_entry(entry, "manifest.json")?;
+                let manifest: Vec<SavedManifestEntry> = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid manifest.json in archive: {e}"))?;
+                metadata
+                    .config_ids
+                    .extend(manifest.into_iter().map(|entry| {
+                        let file_name = entry.config.rsplit('/').next().unwrap_or(&entry.config);
+                        file_name.trim_end_matches(".json").to_string()
+                    }));
+                metadata.has_metadata = true;
+            }
+            Some("index.json") => {
+                let bytes = read_saved_archive_entry(entry, "index.json")?;
+                let index: SavedOciIndex = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid index.json in archive: {e}"))?;
+                metadata.index_manifests.extend(index.manifests);
+                metadata.has_metadata = true;
+            }
+            _ => {}
         }
-        let manifest: Vec<SavedManifestEntry> = serde_json::from_reader(entry)
-            .map_err(|e| format!("invalid manifest.json in archive: {e}"))?;
-        return Ok(manifest
-            .into_iter()
-            .map(|entry| {
-                let config = entry.config;
-                let file_name = config.rsplit('/').next().unwrap_or(&config);
-                file_name.trim_end_matches(".json").to_string()
-            })
-            .collect());
     }
-    Err("archive has no manifest.json".to_string())
+    Ok(metadata)
+}
+
+/// A second pass reading only the `blobs/sha256/<hex>` entries named in
+/// `digests` (nested image indexes). Missing blobs are simply absent.
+fn read_saved_archive_blobs(
+    tar_path: &std::path::Path,
+    digests: &[String],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut archive = open_saved_archive(tar_path)?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("cannot read archive {}: {e}", tar_path.display()))?;
+    let mut blobs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read archive entry: {e}"))?;
+        let Some(path) = saved_archive_entry_path(&entry) else {
+            continue;
+        };
+        let Some(hex) = path.strip_prefix("blobs/sha256/") else {
+            continue;
+        };
+        if digests.iter().any(|digest| digest == hex) {
+            blobs.push(read_saved_archive_entry(entry, &path)?);
+            if blobs.len() == digests.len() {
+                break;
+            }
+        }
+    }
+    Ok(blobs)
 }
 
 fn lock_deployment_state<'a, T>(
@@ -766,6 +932,13 @@ impl DeployImageJob {
     /// A tag match alone is never accepted — the tag may have been re-pointed
     /// on the control plane since this deployment resolved it, and exporting
     /// it would run a different image on the worker instead of failing.
+    ///
+    /// Every ID compared here comes from the same daemon's `inspect`, so it is
+    /// the same kind of digest on both sides whatever the image store: the
+    /// config digest on the classic store, the manifest/index digest on the
+    /// containerd store (`PullExternalImageJob` records the same field). The
+    /// returned ID is what [`verify_saved_image_id`] then looks for in the
+    /// exported archive, which records both kinds.
     async fn verified_control_plane_copy(
         &self,
         image_tag: &str,
@@ -5804,22 +5977,59 @@ mod tests {
         }
     }
 
+    /// Write a tar archive with the given `(path, contents)` entries.
+    fn write_archive(path: &std::path::Path, entries: &[(&str, Vec<u8>)]) -> std::io::Result<()> {
+        let mut builder = tar::Builder::new(std::fs::File::create(path)?);
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, contents.as_slice())?;
+        }
+        builder.finish()
+    }
+
+    fn manifest_json(configs: &[&str]) -> Vec<u8> {
+        serde_json::Value::Array(
+            configs
+                .iter()
+                .map(|config| {
+                    serde_json::json!({
+                        "Config": config,
+                        "RepoTags": ["example/app:v1"],
+                        "Layers": [],
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+        .into_bytes()
+    }
+
+    fn oci_index_json(descriptors: &[(&str, &str)]) -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": descriptors
+                .iter()
+                .map(|(media_type, digest)| serde_json::json!({
+                    "mediaType": media_type,
+                    "digest": digest,
+                    "size": 1,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+
     /// Write a minimal `docker save` archive whose `manifest.json` names one
     /// image with the given `Config` path.
     fn write_saved_image_archive(path: &std::path::Path, config: &str) -> std::io::Result<()> {
-        let manifest = serde_json::json!([{
-            "Config": config,
-            "RepoTags": ["example/app:v1"],
-            "Layers": [],
-        }])
-        .to_string();
-        let mut builder = tar::Builder::new(std::fs::File::create(path)?);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(manifest.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder.append_data(&mut header, "manifest.json", manifest.as_bytes())?;
-        builder.finish()
+        write_archive(path, &[("manifest.json", manifest_json(&[config]))])
     }
 
     fn job_with_target(container_deployer: Arc<dyn ContainerDeployer>) -> DeployImageJob {
@@ -6322,27 +6532,156 @@ mod tests {
         assert!(!save_image_called.load(Ordering::SeqCst));
     }
 
+    fn temp_archive(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("temps-saved-{label}-{}.tar", uuid::Uuid::new_v4()))
+    }
+
     #[tokio::test]
-    async fn verify_saved_image_id_accepts_only_the_verified_image() {
-        let dir = std::env::temp_dir();
-        let oci = dir.join(format!("temps-saved-oci-{}.tar", uuid::Uuid::new_v4()));
+    async fn verify_saved_image_id_accepts_single_image_in_either_layout() {
+        let oci = temp_archive("oci");
         write_saved_image_archive(&oci, "blobs/sha256/abc123").unwrap();
-        let legacy = dir.join(format!("temps-saved-legacy-{}.tar", uuid::Uuid::new_v4()));
+        let legacy = temp_archive("legacy");
         write_saved_image_archive(&legacy, "abc123.json").unwrap();
-        let garbage = dir.join(format!("temps-saved-garbage-{}.tar", uuid::Uuid::new_v4()));
-        std::fs::write(&garbage, b"not a tar").unwrap();
 
         assert_eq!(verify_saved_image_id(&oci, "sha256:abc123").await, Ok(()));
         assert_eq!(verify_saved_image_id(&legacy, "abc123").await, Ok(()));
-        let err = verify_saved_image_id(&oci, "sha256:def456")
+
+        for path in [oci, legacy] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A multi-platform export lists one entry per platform; the verified
+    /// image being among them is enough.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_multi_entry_manifest_containing_image() {
+        let archive = temp_archive("multi");
+        write_archive(
+            &archive,
+            &[(
+                "manifest.json",
+                manifest_json(&["aaa111.json", "abc123.json", "bbb222.json"]),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_saved_image_id(&archive, "sha256:abc123").await,
+            Ok(())
+        );
+        let _ = std::fs::remove_file(archive);
+    }
+
+    /// containerd image store: the image ID Docker reports is the manifest /
+    /// index digest, recorded in `index.json`, not a `manifest.json` Config.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_index_digest_from_containerd_store() {
+        let archive = temp_archive("containerd");
+        write_archive(
+            &archive,
+            &[
+                ("blobs/sha256/cfg001", b"{}".to_vec()),
+                (
+                    "index.json",
+                    oci_index_json(&[(OCI_INDEX, "sha256:idx999")]),
+                ),
+                ("manifest.json", manifest_json(&["blobs/sha256/cfg001"])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_saved_image_id(&archive, "sha256:idx999").await,
+            Ok(())
+        );
+        let _ = std::fs::remove_file(archive);
+    }
+
+    /// A top-level index whose nested index lists the verified manifest.
+    /// The nested blob precedes `index.json` in the archive, as `docker save`
+    /// writes blobs first.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_manifest_in_nested_index() {
+        let archive = temp_archive("nested");
+        write_archive(
+            &archive,
+            &[
+                (
+                    "blobs/sha256/top777",
+                    oci_index_json(&[
+                        (OCI_MANIFEST, "sha256:plat01"),
+                        (OCI_MANIFEST, "sha256:plat02"),
+                    ]),
+                ),
+                (
+                    "index.json",
+                    oci_index_json(&[(OCI_INDEX, "sha256:top777")]),
+                ),
+                (
+                    "manifest.json",
+                    manifest_json(&["blobs/sha256/cfg01", "blobs/sha256/cfg02"]),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_saved_image_id(&archive, "sha256:plat02").await,
+            Ok(())
+        );
+        let _ = std::fs::remove_file(archive);
+    }
+
+    /// The tag was re-pointed between verification and export: the archive's
+    /// metadata never names the verified image.
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_archive_without_the_image() {
+        let archive = temp_archive("other");
+        write_archive(
+            &archive,
+            &[
+                (
+                    "blobs/sha256/top777",
+                    oci_index_json(&[(OCI_MANIFEST, "sha256:plat01")]),
+                ),
+                (
+                    "index.json",
+                    oci_index_json(&[(OCI_INDEX, "sha256:top777")]),
+                ),
+                ("manifest.json", manifest_json(&["blobs/sha256/cfg01"])),
+            ],
+        )
+        .unwrap();
+
+        let err = verify_saved_image_id(&archive, "sha256:def456")
             .await
             .expect_err("a re-pointed tag exports a different image");
-        assert!(err.contains("sha256:abc123"), "{err}");
+        assert!(
+            err.contains("sha256:cfg01") && err.contains("sha256:top777"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(archive);
+    }
+
+    #[tokio::test]
+    async fn verify_saved_image_id_errors_on_unreadable_archives() {
+        let garbage = temp_archive("garbage");
+        std::fs::write(&garbage, b"not a tar").unwrap();
         assert!(verify_saved_image_id(&garbage, "sha256:abc123")
             .await
             .is_err());
 
-        for path in [oci, legacy, garbage] {
+        let empty = temp_archive("no-metadata");
+        write_archive(&empty, &[("blobs/sha256/abc123", b"{}".to_vec())]).unwrap();
+        let err = verify_saved_image_id(&empty, "sha256:abc123")
+            .await
+            .expect_err("an archive without metadata proves nothing");
+        assert!(
+            err.contains("neither manifest.json nor index.json"),
+            "{err}"
+        );
+
+        for path in [garbage, empty] {
             let _ = std::fs::remove_file(path);
         }
     }

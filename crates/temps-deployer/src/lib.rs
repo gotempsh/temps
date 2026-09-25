@@ -866,6 +866,10 @@ pub trait ImageBuilder: Send + Sync {
 
     /// The identity of the image `image_name` currently resolves to.
     ///
+    /// `id` is whatever the daemon reports as the image ID: the config digest
+    /// on Docker's classic image store, the manifest/index digest on the
+    /// containerd image store. Compare it only with IDs from the same daemon.
+    ///
     /// Callers that must not trust a tag alone (a tag can be re-pointed at any
     /// time) compare this with an identity recorded earlier. The default
     /// reports only the image ID; implementations backed by a daemon that
