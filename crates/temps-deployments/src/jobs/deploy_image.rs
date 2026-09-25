@@ -539,39 +539,48 @@ struct FailedContainerCandidate {
 }
 
 /// Upper bound on any metadata file read from a `docker save` archive
-/// (`manifest.json`, `index.json`, a nested index blob). Real ones are a few
-/// KiB; this only stops a malformed archive from being buffered whole.
+/// (`manifest.json`, `index.json`). Real ones are a few KiB; this only stops
+/// a malformed archive from being buffered whole.
 const MAX_SAVED_ARCHIVE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
-/// How many nested image indexes are opened when looking for an image.
-const MAX_SAVED_ARCHIVE_NESTED_INDEXES: usize = 16;
-
-/// Check that a `docker save` archive contains the image `expected_id`.
+/// Check that, in a `docker save` archive, the exported tag `image_tag`
+/// names the image `expected_id` — the ID the control plane's Docker reported
+/// for that tag just before export (`image_identity`).
 ///
-/// `expected_id` is the ID the control plane's Docker reported for the tag
-/// just before export (`image_identity`). What that ID is depends on the
-/// daemon's image store, and so does where the archive records it:
+/// The worker's import binds `image_tag` to whatever the archive says the tag
+/// names, so that is the only thing checked: an ID merely *present* in the
+/// archive (another tag's entry, a nested index) proves nothing about the tag.
 ///
-/// - **Classic store**: the ID is the image config digest, which names a
-///   `manifest.json` `Config` entry — `"<hex>.json"` (legacy layout) or
-///   `"blobs/sha256/<hex>"` (OCI layout, Docker 25+).
-/// - **containerd store**: the ID is the image's manifest or index digest,
-///   listed in the OCI `index.json` (`manifests[].digest`), or — for an
-///   index nested under it — in that index blob. One level of nesting is read.
+/// An archive names a tag in up to two places, each recording a different
+/// kind of digest:
 ///
-/// The archive may hold several entries (a multi-platform image, one per
-/// platform); it is accepted when the verified image is among them. It is
-/// rejected only when the ID appears nowhere, i.e. the tag was re-pointed to
-/// different content between verification and export.
+/// - `manifest.json` entries whose `RepoTags` contain the tag → their
+///   `Config` digest (`<hex>.json` or `blobs/sha256/<hex>`). This is the image
+///   ID on Docker's classic image store.
+/// - OCI `index.json` descriptors annotated with the tag
+///   (`io.containerd.image.name`, or `org.opencontainers.image.ref.name` as a
+///   full reference or bare tag) → their `digest`. This is the image ID on the
+///   containerd image store — the index digest for a multi-platform image.
+///
+/// Which kind `inspect` reported depends on the daemon's store, so the
+/// archive is accepted when, in one of those places, the tag is named and
+/// every entry naming it records exactly `expected_id`. It is rejected when
+/// the tag is not named at all, or names anything else (the tag was
+/// re-pointed between verification and export).
 async fn verify_saved_image_id(
     tar_path: &std::path::Path,
+    image_tag: &str,
     expected_id: &str,
 ) -> Result<(), String> {
     let tar_path = tar_path.to_path_buf();
+    let image_tag = image_tag.to_string();
     let expected = digest_hex(expected_id).to_string();
-    tokio::task::spawn_blocking(move || saved_archive_contains_image(&tar_path, &expected))
-        .await
-        .map_err(|e| format!("archive inspection task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let metadata = read_saved_archive_metadata(&tar_path)?;
+        saved_archive_tag_matches(&metadata, &image_tag, &expected)
+    })
+    .await
+    .map_err(|e| format!("archive inspection task failed: {e}"))?
 }
 
 /// The hex part of `sha256:<hex>` (or of a bare `<hex>`).
@@ -580,10 +589,58 @@ fn digest_hex(value: &str) -> &str {
     value.rsplit(':').next().unwrap_or(value)
 }
 
+/// Canonical `registry/repository:tag` form of an image reference, so that
+/// Docker's familiar names compare equal to fully qualified ones:
+/// `nginx:1.27` ≡ `docker.io/library/nginx:1.27`, `app` ≡
+/// `docker.io/library/app:latest`. Digest references keep their digest.
+fn normalize_image_ref(reference: &str) -> String {
+    let reference = reference.trim();
+    let (name, suffix) = match reference.split_once('@') {
+        Some((name, digest)) => (name, format!("@{digest}")),
+        None => {
+            let last_segment_start = reference.rfind('/').map_or(0, |i| i + 1);
+            match reference[last_segment_start..].rfind(':') {
+                Some(i) => {
+                    let split = last_segment_start + i;
+                    (&reference[..split], format!(":{}", &reference[split + 1..]))
+                }
+                None => (reference, ":latest".to_string()),
+            }
+        }
+    };
+    let (registry, repository) = match name.split_once('/') {
+        Some((first, rest))
+            if first.contains('.') || first.contains(':') || first == "localhost" =>
+        {
+            (first.to_ascii_lowercase(), rest.to_string())
+        }
+        _ => ("docker.io".to_string(), name.to_string()),
+    };
+    let registry = if registry == "index.docker.io" {
+        "docker.io".to_string()
+    } else {
+        registry
+    };
+    let repository = if registry == "docker.io" && !repository.contains('/') {
+        format!("library/{repository}")
+    } else {
+        repository
+    };
+    format!("{registry}/{repository}{suffix}")
+}
+
+/// The tag part of a normalized reference (`latest` in `…/app:latest`).
+fn normalized_ref_tag(normalized: &str) -> Option<&str> {
+    let last_segment = normalized.rsplit('/').next()?;
+    last_segment.split_once(':').map(|(_, tag)| tag)
+}
+
 #[derive(Deserialize)]
 struct SavedManifestEntry {
     #[serde(rename = "Config")]
     config: String,
+    #[serde(rename = "RepoTags", default)]
+    repo_tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -594,83 +651,96 @@ struct SavedOciIndex {
 
 #[derive(Deserialize)]
 struct SavedOciDescriptor {
-    #[serde(rename = "mediaType", default)]
-    media_type: String,
     digest: String,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
 }
 
+const CONTAINERD_IMAGE_NAME_ANNOTATION: &str = "io.containerd.image.name";
+const OCI_REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+
 impl SavedOciDescriptor {
-    fn is_index(&self) -> bool {
-        matches!(
-            self.media_type.as_str(),
-            "application/vnd.oci.image.index.v1+json"
-                | "application/vnd.docker.distribution.manifest.list.v2+json"
-        )
+    /// Whether this descriptor's annotations name `normalized_tag`.
+    ///
+    /// `io.containerd.image.name` is the full reference. The OCI
+    /// `ref.name` may be a full reference or — as Docker writes it — just the
+    /// tag; a bare tag is only trusted when there is no containerd name to
+    /// contradict it.
+    fn names(&self, normalized_tag: &str) -> bool {
+        if let Some(name) = self.annotations.get(CONTAINERD_IMAGE_NAME_ANNOTATION) {
+            return normalize_image_ref(name) == normalized_tag;
+        }
+        match self.annotations.get(OCI_REF_NAME_ANNOTATION) {
+            Some(ref_name) if ref_name.contains('/') || ref_name.contains(':') => {
+                normalize_image_ref(ref_name) == normalized_tag
+            }
+            Some(bare_tag) => normalized_ref_tag(normalized_tag) == Some(bare_tag.trim()),
+            None => false,
+        }
     }
 }
 
-/// Image identities named by an archive's top-level metadata.
+/// Top-level metadata of a `docker save` archive.
 #[derive(Default)]
 struct SavedArchiveMetadata {
     has_metadata: bool,
-    /// `manifest.json` `Config` digests (hex).
-    config_ids: Vec<String>,
-    /// `index.json` descriptors.
-    index_manifests: Vec<SavedOciDescriptor>,
+    manifest_entries: Vec<SavedManifestEntry>,
+    index_descriptors: Vec<SavedOciDescriptor>,
 }
 
-fn saved_archive_contains_image(tar_path: &std::path::Path, expected: &str) -> Result<(), String> {
-    let metadata = read_saved_archive_metadata(tar_path)?;
+fn saved_archive_tag_matches(
+    metadata: &SavedArchiveMetadata,
+    image_tag: &str,
+    expected: &str,
+) -> Result<(), String> {
     if !metadata.has_metadata {
         return Err("archive has neither manifest.json nor index.json".to_string());
     }
-    let mut seen: Vec<String> = metadata.config_ids.clone();
-    seen.extend(
-        metadata
-            .index_manifests
-            .iter()
-            .map(|descriptor| digest_hex(&descriptor.digest).to_string()),
-    );
-    if seen.iter().any(|id| id == expected) {
+    let tag = normalize_image_ref(image_tag);
+
+    // `manifest.json`: config digests of the entries tagged `image_tag`.
+    let manifest_ids: Vec<String> = metadata
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .repo_tags
+                .iter()
+                .flatten()
+                .any(|repo_tag| normalize_image_ref(repo_tag) == tag)
+        })
+        .map(|entry| {
+            let file_name = entry.config.rsplit('/').next().unwrap_or(&entry.config);
+            digest_hex(file_name.trim_end_matches(".json")).to_string()
+        })
+        .collect();
+    // `index.json`: digests of the descriptors annotated with `image_tag`.
+    let index_ids: Vec<String> = metadata
+        .index_descriptors
+        .iter()
+        .filter(|descriptor| descriptor.names(&tag))
+        .map(|descriptor| digest_hex(&descriptor.digest).to_string())
+        .collect();
+
+    if manifest_ids.is_empty() && index_ids.is_empty() {
+        return Err(format!("archive does not name {image_tag}"));
+    }
+    let all_expected = |ids: &[String]| !ids.is_empty() && ids.iter().all(|id| id == expected);
+    if all_expected(&manifest_ids) || all_expected(&index_ids) {
         return Ok(());
     }
 
-    let nested: Vec<String> = metadata
-        .index_manifests
-        .iter()
-        .filter(|descriptor| descriptor.is_index())
-        .map(|descriptor| digest_hex(&descriptor.digest).to_string())
-        .take(MAX_SAVED_ARCHIVE_NESTED_INDEXES)
-        .collect();
-    if !nested.is_empty() {
-        for index in read_saved_archive_blobs(tar_path, &nested)? {
-            let index: SavedOciIndex = serde_json::from_slice(&index)
-                .map_err(|e| format!("invalid nested image index in archive: {e}"))?;
-            for descriptor in index.manifests {
-                let id = digest_hex(&descriptor.digest).to_string();
-                if id == expected {
-                    return Ok(());
-                }
-                seen.push(id);
-            }
-        }
-    }
-
-    const SHOWN: usize = 8;
-    let listed: Vec<String> = seen
-        .iter()
-        .take(SHOWN)
+    let mut named: Vec<String> = manifest_ids
+        .into_iter()
+        .chain(index_ids)
         .map(|id| format!("sha256:{id}"))
         .collect();
-    Err(if seen.is_empty() {
-        "archive metadata names no image".to_string()
-    } else {
-        format!(
-            "archive contains only {}{}",
-            listed.join(", "),
-            if seen.len() > SHOWN { ", ..." } else { "" }
-        )
-    })
+    named.sort();
+    named.dedup();
+    Err(format!(
+        "in the archive {image_tag} names {} instead",
+        named.join(", ")
+    ))
 }
 
 /// Read a metadata entry, refusing anything implausibly large.
@@ -691,81 +761,40 @@ fn read_saved_archive_entry<R: std::io::Read>(
     Ok(buf)
 }
 
-fn open_saved_archive(tar_path: &std::path::Path) -> Result<tar::Archive<std::fs::File>, String> {
-    let file = std::fs::File::open(tar_path)
-        .map_err(|e| format!("cannot open archive {}: {e}", tar_path.display()))?;
-    Ok(tar::Archive::new(file))
-}
-
-fn saved_archive_entry_path<R: std::io::Read>(entry: &tar::Entry<'_, R>) -> Option<String> {
-    entry.path().ok().map(|path| {
-        let path = path.to_string_lossy();
-        path.trim_start_matches("./").to_string()
-    })
-}
-
 /// One pass over the archive for `manifest.json` and `index.json`.
 fn read_saved_archive_metadata(tar_path: &std::path::Path) -> Result<SavedArchiveMetadata, String> {
-    let mut archive = open_saved_archive(tar_path)?;
+    let file = std::fs::File::open(tar_path)
+        .map_err(|e| format!("cannot open archive {}: {e}", tar_path.display()))?;
+    let mut archive = tar::Archive::new(file);
     let entries = archive
         .entries()
         .map_err(|e| format!("cannot read archive {}: {e}", tar_path.display()))?;
     let mut metadata = SavedArchiveMetadata::default();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot read archive entry: {e}"))?;
-        match saved_archive_entry_path(&entry).as_deref() {
+        let path = entry
+            .path()
+            .ok()
+            .map(|path| path.to_string_lossy().trim_start_matches("./").to_string());
+        match path.as_deref() {
             Some("manifest.json") => {
                 let bytes = read_saved_archive_entry(entry, "manifest.json")?;
                 let manifest: Vec<SavedManifestEntry> = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("invalid manifest.json in archive: {e}"))?;
-                metadata
-                    .config_ids
-                    .extend(manifest.into_iter().map(|entry| {
-                        let file_name = entry.config.rsplit('/').next().unwrap_or(&entry.config);
-                        file_name.trim_end_matches(".json").to_string()
-                    }));
+                metadata.manifest_entries.extend(manifest);
                 metadata.has_metadata = true;
             }
             Some("index.json") => {
                 let bytes = read_saved_archive_entry(entry, "index.json")?;
                 let index: SavedOciIndex = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("invalid index.json in archive: {e}"))?;
-                metadata.index_manifests.extend(index.manifests);
+                metadata.index_descriptors.extend(index.manifests);
                 metadata.has_metadata = true;
             }
             _ => {}
         }
     }
     Ok(metadata)
-}
-
-/// A second pass reading only the `blobs/sha256/<hex>` entries named in
-/// `digests` (nested image indexes). Missing blobs are simply absent.
-fn read_saved_archive_blobs(
-    tar_path: &std::path::Path,
-    digests: &[String],
-) -> Result<Vec<Vec<u8>>, String> {
-    let mut archive = open_saved_archive(tar_path)?;
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("cannot read archive {}: {e}", tar_path.display()))?;
-    let mut blobs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read archive entry: {e}"))?;
-        let Some(path) = saved_archive_entry_path(&entry) else {
-            continue;
-        };
-        let Some(hex) = path.strip_prefix("blobs/sha256/") else {
-            continue;
-        };
-        if digests.iter().any(|digest| digest == hex) {
-            blobs.push(read_saved_archive_entry(entry, &path)?);
-            if blobs.len() == digests.len() {
-                break;
-            }
-        }
-    }
-    Ok(blobs)
 }
 
 fn lock_deployment_state<'a, T>(
@@ -937,8 +966,8 @@ impl DeployImageJob {
     /// the same kind of digest on both sides whatever the image store: the
     /// config digest on the classic store, the manifest/index digest on the
     /// containerd store (`PullExternalImageJob` records the same field). The
-    /// returned ID is what [`verify_saved_image_id`] then looks for in the
-    /// exported archive, which records both kinds.
+    /// returned ID is what [`verify_saved_image_id`] then requires the
+    /// exported tag to name in the archive, which records both kinds.
     async fn verified_control_plane_copy(
         &self,
         image_tag: &str,
@@ -1490,7 +1519,9 @@ impl DeployImageJob {
         }
 
         if let Some(expected_image_id) = expected_image_id {
-            if let Err(reason) = verify_saved_image_id(&tar_path, expected_image_id).await {
+            if let Err(reason) =
+                verify_saved_image_id(&tar_path, image_tag, expected_image_id).await
+            {
                 if let Err(e) = tokio::fs::remove_file(&tar_path).await {
                     tracing::warn!("Failed to clean up image tar {:?}: {}", tar_path, e);
                 }
@@ -5917,13 +5948,13 @@ mod tests {
 
         async fn save_image(
             &self,
-            _image_name: &str,
+            image_name: &str,
             output_path: &std::path::Path,
         ) -> Result<(), temps_deployer::BuilderError> {
             self.save_image_called.store(true, Ordering::SeqCst);
-            // A real (tiny) `docker save` archive of the image this builder
-            // reports (`sha256:local`), OCI layout.
-            write_saved_image_archive(output_path, "blobs/sha256/local")
+            // A real (tiny) `docker save` archive in which the saved tag names
+            // the image this builder reports (`sha256:local`), OCI layout.
+            write_saved_image_archive(output_path, image_name, "blobs/sha256/local")
                 .map_err(temps_deployer::BuilderError::IoError)?;
             Ok(())
         }
@@ -5990,14 +6021,15 @@ mod tests {
         builder.finish()
     }
 
-    fn manifest_json(configs: &[&str]) -> Vec<u8> {
+    /// `manifest.json` with one entry per `(Config, RepoTags)`.
+    fn manifest_json(entries: &[(&str, &[&str])]) -> Vec<u8> {
         serde_json::Value::Array(
-            configs
+            entries
                 .iter()
-                .map(|config| {
+                .map(|(config, repo_tags)| {
                     serde_json::json!({
                         "Config": config,
-                        "RepoTags": ["example/app:v1"],
+                        "RepoTags": repo_tags,
                         "Layers": [],
                     })
                 })
@@ -6007,15 +6039,20 @@ mod tests {
         .into_bytes()
     }
 
-    fn oci_index_json(descriptors: &[(&str, &str)]) -> Vec<u8> {
+    /// OCI `index.json` with one descriptor per `(digest, annotations)`.
+    fn oci_index_json(descriptors: &[(&str, &[(&str, &str)])]) -> Vec<u8> {
         serde_json::json!({
             "schemaVersion": 2,
             "manifests": descriptors
                 .iter()
-                .map(|(media_type, digest)| serde_json::json!({
-                    "mediaType": media_type,
+                .map(|(digest, annotations)| serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
                     "digest": digest,
                     "size": 1,
+                    "annotations": annotations
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), serde_json::Value::from(*v)))
+                        .collect::<serde_json::Map<_, _>>(),
                 }))
                 .collect::<Vec<_>>(),
         })
@@ -6023,13 +6060,17 @@ mod tests {
         .into_bytes()
     }
 
-    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
-
-    /// Write a minimal `docker save` archive whose `manifest.json` names one
-    /// image with the given `Config` path.
-    fn write_saved_image_archive(path: &std::path::Path, config: &str) -> std::io::Result<()> {
-        write_archive(path, &[("manifest.json", manifest_json(&[config]))])
+    /// Write a minimal `docker save` archive whose `manifest.json` tags one
+    /// image (`config`) with `tag`.
+    fn write_saved_image_archive(
+        path: &std::path::Path,
+        tag: &str,
+        config: &str,
+    ) -> std::io::Result<()> {
+        write_archive(
+            path,
+            &[("manifest.json", manifest_json(&[(config, &[tag])]))],
+        )
     }
 
     fn job_with_target(container_deployer: Arc<dyn ContainerDeployer>) -> DeployImageJob {
@@ -6536,154 +6577,236 @@ mod tests {
         std::env::temp_dir().join(format!("temps-saved-{label}-{}.tar", uuid::Uuid::new_v4()))
     }
 
+    const TAG: &str = "ghcr.io/example-org/app:v1";
+    const OTHER_TAG: &str = "ghcr.io/example-org/app:v2";
+
+    async fn verify_archive(
+        entries: &[(&str, Vec<u8>)],
+        tag: &str,
+        expected: &str,
+    ) -> Result<(), String> {
+        let archive = temp_archive("verify");
+        write_archive(&archive, entries).unwrap();
+        let result = verify_saved_image_id(&archive, tag, expected).await;
+        let _ = std::fs::remove_file(archive);
+        result
+    }
+
     #[tokio::test]
-    async fn verify_saved_image_id_accepts_single_image_in_either_layout() {
-        let oci = temp_archive("oci");
-        write_saved_image_archive(&oci, "blobs/sha256/abc123").unwrap();
-        let legacy = temp_archive("legacy");
-        write_saved_image_archive(&legacy, "abc123.json").unwrap();
-
-        assert_eq!(verify_saved_image_id(&oci, "sha256:abc123").await, Ok(()));
-        assert_eq!(verify_saved_image_id(&legacy, "abc123").await, Ok(()));
-
-        for path in [oci, legacy] {
-            let _ = std::fs::remove_file(path);
+    async fn verify_saved_image_id_accepts_classic_single_entry_in_either_layout() {
+        for config in ["blobs/sha256/abc123", "abc123.json"] {
+            assert_eq!(
+                verify_archive(
+                    &[("manifest.json", manifest_json(&[(config, &[TAG])]))],
+                    TAG,
+                    "sha256:abc123"
+                )
+                .await,
+                Ok(()),
+                "{config}"
+            );
         }
     }
 
-    /// A multi-platform export lists one entry per platform; the verified
-    /// image being among them is enough.
+    /// Several entries; only the one tagged with the exported tag matters.
     #[tokio::test]
-    async fn verify_saved_image_id_accepts_multi_entry_manifest_containing_image() {
-        let archive = temp_archive("multi");
-        write_archive(
-            &archive,
-            &[(
-                "manifest.json",
-                manifest_json(&["aaa111.json", "abc123.json", "bbb222.json"]),
-            )],
-        )
-        .unwrap();
-
+    async fn verify_saved_image_id_accepts_tagged_entry_among_others() {
+        let manifest = manifest_json(&[
+            ("aaa111.json", &[OTHER_TAG]),
+            ("abc123.json", &[TAG]),
+            ("bbb222.json", &[]),
+        ]);
         assert_eq!(
-            verify_saved_image_id(&archive, "sha256:abc123").await,
+            verify_archive(&[("manifest.json", manifest)], TAG, "sha256:abc123").await,
             Ok(())
         );
-        let _ = std::fs::remove_file(archive);
     }
 
-    /// containerd image store: the image ID Docker reports is the manifest /
-    /// index digest, recorded in `index.json`, not a `manifest.json` Config.
+    /// The expected image is in the archive, but under another tag: the
+    /// exported tag names something else, which is what the worker would run.
     #[tokio::test]
-    async fn verify_saved_image_id_accepts_index_digest_from_containerd_store() {
-        let archive = temp_archive("containerd");
-        write_archive(
-            &archive,
-            &[
-                ("blobs/sha256/cfg001", b"{}".to_vec()),
-                (
-                    "index.json",
-                    oci_index_json(&[(OCI_INDEX, "sha256:idx999")]),
-                ),
-                ("manifest.json", manifest_json(&["blobs/sha256/cfg001"])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            verify_saved_image_id(&archive, "sha256:idx999").await,
-            Ok(())
-        );
-        let _ = std::fs::remove_file(archive);
-    }
-
-    /// A top-level index whose nested index lists the verified manifest.
-    /// The nested blob precedes `index.json` in the archive, as `docker save`
-    /// writes blobs first.
-    #[tokio::test]
-    async fn verify_saved_image_id_accepts_manifest_in_nested_index() {
-        let archive = temp_archive("nested");
-        write_archive(
-            &archive,
-            &[
-                (
-                    "blobs/sha256/top777",
-                    oci_index_json(&[
-                        (OCI_MANIFEST, "sha256:plat01"),
-                        (OCI_MANIFEST, "sha256:plat02"),
-                    ]),
-                ),
-                (
-                    "index.json",
-                    oci_index_json(&[(OCI_INDEX, "sha256:top777")]),
-                ),
-                (
-                    "manifest.json",
-                    manifest_json(&["blobs/sha256/cfg01", "blobs/sha256/cfg02"]),
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            verify_saved_image_id(&archive, "sha256:plat02").await,
-            Ok(())
-        );
-        let _ = std::fs::remove_file(archive);
-    }
-
-    /// The tag was re-pointed between verification and export: the archive's
-    /// metadata never names the verified image.
-    #[tokio::test]
-    async fn verify_saved_image_id_rejects_archive_without_the_image() {
-        let archive = temp_archive("other");
-        write_archive(
-            &archive,
-            &[
-                (
-                    "blobs/sha256/top777",
-                    oci_index_json(&[(OCI_MANIFEST, "sha256:plat01")]),
-                ),
-                (
-                    "index.json",
-                    oci_index_json(&[(OCI_INDEX, "sha256:top777")]),
-                ),
-                ("manifest.json", manifest_json(&["blobs/sha256/cfg01"])),
-            ],
-        )
-        .unwrap();
-
-        let err = verify_saved_image_id(&archive, "sha256:def456")
+    async fn verify_saved_image_id_rejects_expected_image_under_another_tag() {
+        let manifest = manifest_json(&[("abc123.json", &[OTHER_TAG]), ("def456.json", &[TAG])]);
+        let err = verify_archive(&[("manifest.json", manifest)], TAG, "sha256:abc123")
             .await
-            .expect_err("a re-pointed tag exports a different image");
+            .expect_err("the exported tag names a different image");
+        assert!(err.contains("names sha256:def456"), "{err}");
+    }
+
+    /// containerd store: the tag-annotated index descriptor carries the image
+    /// (index) digest; the per-platform manifest.json configs differ from it.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_containerd_index_named_by_tag() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[(
+                    "sha256:idx999",
+                    &[
+                        (CONTAINERD_IMAGE_NAME_ANNOTATION, TAG),
+                        (OCI_REF_NAME_ANNOTATION, "v1"),
+                    ],
+                )]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[
+                    ("blobs/sha256/cfgamd", &[TAG]),
+                    ("blobs/sha256/cfgarm", &[TAG]),
+                ]),
+            ),
+        ];
+        assert_eq!(verify_archive(&entries, TAG, "sha256:idx999").await, Ok(()));
+    }
+
+    /// Docker's OCI layout on the classic store: index.json names the tag with
+    /// a manifest digest (a different kind), manifest.json with the config
+    /// digest that `inspect` reported.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_classic_config_in_oci_layout() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[("sha256:man555", &[(OCI_REF_NAME_ANNOTATION, "v1")])]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("blobs/sha256/abc123", &[TAG])]),
+            ),
+        ];
+        assert_eq!(verify_archive(&entries, TAG, "sha256:abc123").await, Ok(()));
+    }
+
+    /// The reported race: the tag was re-pointed to a new index that still
+    /// references the verified image in a nested index. Only what the tag
+    /// names counts, so this is rejected.
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_expected_image_only_in_nested_index() {
+        let entries = [
+            (
+                "blobs/sha256/new777",
+                oci_index_json(&[("sha256:idx999", &[])]),
+            ),
+            (
+                "index.json",
+                oci_index_json(&[("sha256:new777", &[(CONTAINERD_IMAGE_NAME_ANNOTATION, TAG)])]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("blobs/sha256/cfgnew", &[TAG])]),
+            ),
+        ];
+        let err = verify_archive(&entries, TAG, "sha256:idx999")
+            .await
+            .expect_err("the tag names a different index");
+        assert!(err.contains("sha256:new777"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_archive_not_naming_the_tag() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[(
+                    "sha256:abc123",
+                    &[(CONTAINERD_IMAGE_NAME_ANNOTATION, OTHER_TAG)],
+                )]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("abc123.json", &[OTHER_TAG])]),
+            ),
+        ];
+        let err = verify_archive(&entries, TAG, "sha256:abc123")
+            .await
+            .expect_err("the archive never names the exported tag");
         assert!(
-            err.contains("sha256:cfg01") && err.contains("sha256:top777"),
+            err.contains("does not name ghcr.io/example-org/app:v1"),
             "{err}"
         );
-        let _ = std::fs::remove_file(archive);
+    }
+
+    /// Docker writes familiar names (`nginx:1.27`); the export may be asked
+    /// for the fully qualified form, and vice versa.
+    #[tokio::test]
+    async fn verify_saved_image_id_normalizes_docker_hub_references() {
+        let manifest = manifest_json(&[("abc123.json", &["nginx:1.27"])]);
+        assert_eq!(
+            verify_archive(
+                &[("manifest.json", manifest.clone())],
+                "docker.io/library/nginx:1.27",
+                "sha256:abc123"
+            )
+            .await,
+            Ok(())
+        );
+        let index = oci_index_json(&[(
+            "sha256:idx999",
+            &[(
+                CONTAINERD_IMAGE_NAME_ANNOTATION,
+                "docker.io/library/nginx:1.27",
+            )],
+        )]);
+        assert_eq!(
+            verify_archive(&[("index.json", index)], "nginx:1.27", "sha256:idx999").await,
+            Ok(())
+        );
+        // A different repository with the same tag is not the same reference.
+        assert!(verify_archive(
+            &[("manifest.json", manifest)],
+            "ghcr.io/example-org/nginx:1.27",
+            "sha256:abc123"
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn normalize_image_ref_canonicalizes_references() {
+        assert_eq!(
+            normalize_image_ref("nginx"),
+            "docker.io/library/nginx:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("nginx:1.27"),
+            "docker.io/library/nginx:1.27"
+        );
+        assert_eq!(
+            normalize_image_ref("index.docker.io/library/nginx:1.27"),
+            "docker.io/library/nginx:1.27"
+        );
+        assert_eq!(normalize_image_ref("org/app:v1"), "docker.io/org/app:v1");
+        assert_eq!(normalize_image_ref(TAG), TAG);
+        assert_eq!(
+            normalize_image_ref("localhost:5000/app"),
+            "localhost:5000/app:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("temps.internal/project-1/environment-2/upload-0f3c9a:immutable"),
+            "temps.internal/project-1/environment-2/upload-0f3c9a:immutable"
+        );
     }
 
     #[tokio::test]
     async fn verify_saved_image_id_errors_on_unreadable_archives() {
         let garbage = temp_archive("garbage");
         std::fs::write(&garbage, b"not a tar").unwrap();
-        assert!(verify_saved_image_id(&garbage, "sha256:abc123")
+        assert!(verify_saved_image_id(&garbage, TAG, "sha256:abc123")
             .await
             .is_err());
+        let _ = std::fs::remove_file(garbage);
 
-        let empty = temp_archive("no-metadata");
-        write_archive(&empty, &[("blobs/sha256/abc123", b"{}".to_vec())]).unwrap();
-        let err = verify_saved_image_id(&empty, "sha256:abc123")
-            .await
-            .expect_err("an archive without metadata proves nothing");
+        let err = verify_archive(
+            &[("blobs/sha256/abc123", b"{}".to_vec())],
+            TAG,
+            "sha256:abc123",
+        )
+        .await
+        .expect_err("an archive without metadata proves nothing");
         assert!(
             err.contains("neither manifest.json nor index.json"),
             "{err}"
         );
-
-        for path in [garbage, empty] {
-            let _ = std::fs::remove_file(path);
-        }
     }
 
     /// Without a local copy there is nothing to fall back to: the pull error
