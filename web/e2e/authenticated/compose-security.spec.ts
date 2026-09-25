@@ -100,7 +100,7 @@ test('Compose policy exceptions require acknowledgment and persist independently
     ).not.toBeChecked()
     await search.fill('no-matching-policy')
     await expect(
-      page.getByText('No security checks match your search.')
+      page.getByText('No security checks match these filters.')
     ).toBeVisible()
     await search.fill('volumes')
     await page.setViewportSize({ width: 390, height: 844 })
