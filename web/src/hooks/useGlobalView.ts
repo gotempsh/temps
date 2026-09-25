@@ -17,13 +17,19 @@ import {
 
 export function useGlobalView() {
   const [params, setParams] = useSearchParams()
-  const [now] = useState(Date.now)
+  const [now, setNow] = useState(Date.now)
   const window = useMemo(
     () => readObservationWindow(params, now),
     [params, now]
   )
   useEffect(() => {
-    if (params.get('from') !== window.from || params.get('to') !== window.to) {
+    if (
+      (window.range === 'custom' &&
+        (params.get('from') !== window.from ||
+          params.get('to') !== window.to)) ||
+      (window.range !== 'custom' && (params.has('from') || params.has('to'))) ||
+      params.get('range') !== window.range
+    ) {
       setParams((current) => normalizeObservationWindow(current, now), {
         replace: true,
       })
@@ -33,8 +39,14 @@ export function useGlobalView() {
     setParams((current) => patchObservationFilters(current, values), {
       replace: true,
     })
-  const setTimeRange = (value: DateTimeRangeValue) =>
-    patch({ range: value.preset, from: value.from, to: value.to })
+  const setTimeRange = (value: DateTimeRangeValue) => {
+    if (value.preset !== 'custom') setNow(Date.parse(value.to))
+    patch({
+      range: value.preset,
+      from: value.preset === 'custom' ? value.from : undefined,
+      to: value.preset === 'custom' ? value.to : undefined,
+    })
+  }
   const setRange = (range: QuickTimeRange) =>
     setTimeRange(quickTimeRange(range))
   return {
@@ -54,9 +66,14 @@ export function useGlobalView() {
       }),
     setCursor: (cursor?: string) =>
       setParams((current) => {
-        // Freeze the request window together with its cursor, before the
-        // normalization effect can run on this navigation.
+        // A cursor belongs to one exact window. Freeze a relative preset
+        // before attaching it so a later reload cannot reuse a stale cursor.
         const next = normalizeObservationWindow(current, now)
+        if (cursor && window.range !== 'custom') {
+          next.set('from', window.from)
+          next.set('to', window.to)
+          next.set('range', 'custom')
+        }
         if (cursor) next.set('cursor', cursor)
         else next.delete('cursor')
         return next
