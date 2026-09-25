@@ -202,6 +202,7 @@ export default function GlobalLogs() {
       <LogCollectionNotice
         collection={capabilities.data?.collection}
         statusError={capabilities.error}
+        statusUpdatedAt={capabilities.dataUpdatedAt || undefined}
         onRetry={() => void capabilities.refetch()}
       />
       <LogExplorer

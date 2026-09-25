@@ -25,48 +25,82 @@ function when(iso: string | null | undefined): string | undefined {
  * looks exactly like a quiet fleet: the histogram simply stops. Renders
  * nothing while collection is running and nothing was set aside, and says
  * so when the status itself could not be fetched rather than implying
- * everything is fine.
+ * everything is fine — including when an earlier fetch succeeded and its
+ * now-unverified status is still cached.
  */
 export function LogCollectionNotice({
   collection,
   statusError,
+  statusUpdatedAt,
   onRetry,
 }: {
   collection: LogCollectionCapability | undefined
-  /** The capabilities request failed; `collection` is then unknown. */
+  /**
+   * The latest capabilities request failed. `collection`, if present, is
+   * the last status that was fetched successfully and may be out of date.
+   */
   statusError?: Error | null
+  /** When `collection` was fetched, in epoch milliseconds. */
+  statusUpdatedAt?: number
   onRetry?: () => void
 }) {
-  if (!collection) {
-    if (!statusError) return null
-    return (
-      <Callout tone="warning" title="Log collection status is unavailable">
-        <p>
-          Temps could not report whether new log lines are being collected, so
-          a quiet histogram may not mean a quiet fleet.
-        </p>
-        <p className="mt-1 break-words font-mono text-xs">
-          {statusError.message}
-        </p>
-        {onRetry ? (
-          <Button
-            variant="link"
-            size="sm"
-            className="mt-1 h-auto p-0 text-xs underline"
-            onClick={onRetry}
-          >
-            Try again
-          </Button>
-        ) : null}
-      </Callout>
-    )
-  }
+  if (!collection && !statusError) return null
   return (
     <div className="space-y-3">
-      <CollectionStateNotice collection={collection} />
-      <DeferredGenerationsNotice collection={collection} />
-      <DeferredListingNotice collection={collection} />
+      {statusError ? (
+        <StatusUnavailableNotice
+          error={statusError}
+          lastKnownAt={collection ? statusUpdatedAt : undefined}
+          hasLastKnown={Boolean(collection)}
+          onRetry={onRetry}
+        />
+      ) : null}
+      {collection ? (
+        <>
+          <CollectionStateNotice collection={collection} />
+          <DeferredGenerationsNotice collection={collection} />
+          <DeferredListingNotice collection={collection} />
+        </>
+      ) : null}
     </div>
+  )
+}
+
+function StatusUnavailableNotice({
+  error,
+  hasLastKnown,
+  lastKnownAt,
+  onRetry,
+}: {
+  error: Error
+  hasLastKnown: boolean
+  lastKnownAt: number | undefined
+  onRetry?: () => void
+}) {
+  const since = lastKnownAt ? new Date(lastKnownAt).toLocaleString() : undefined
+  return (
+    <Callout tone="warning" title="Log collection status is unavailable">
+      <p>
+        Temps could not report whether new log lines are being collected, so a
+        quiet histogram may not mean a quiet fleet.
+        {hasLastKnown
+          ? ` Any collection status below is the last one Temps reported${
+              since ? ` (${since})` : ''
+            } and may be out of date.`
+          : ''}
+      </p>
+      <p className="mt-1 break-words font-mono text-xs">{error.message}</p>
+      {onRetry ? (
+        <Button
+          variant="link"
+          size="sm"
+          className="mt-1 h-auto p-0 text-xs underline"
+          onClick={onRetry}
+        >
+          Try again
+        </Button>
+      ) : null}
+    </Callout>
   )
 }
 
@@ -202,8 +236,8 @@ function DeferredListingNotice({
     >
       <p>
         Collection status is shown above, but files recovery could not replay
-        are not counted, so some older lines may be missing from search
-        without a warning here.
+        are not counted, so some older lines may be missing from search without
+        a warning here.
       </p>
       <p className="mt-1 break-words font-mono text-xs">
         {collection.deferred_error}

@@ -89,7 +89,7 @@ test('a failed status request is shown instead of implying collection is fine', 
       collection={undefined}
       statusError={new Error('Request failed with status 502')}
       onRetry={() => {}}
-    />,
+    />
   )
   expect(markup).toContain('Log collection status is unavailable')
   expect(markup).toContain('Request failed with status 502')
@@ -101,6 +101,23 @@ test('an unreadable deferred directory is reported alongside the running state',
     ...running,
     deferred_error: 'IO error: Permission denied',
   })
-  expect(markup).toContain('Could not check for log files set aside by recovery')
+  expect(markup).toContain(
+    'Could not check for log files set aside by recovery'
+  )
   expect(markup).toContain('Permission denied')
+})
+
+test('a failed refresh is shown even when an earlier status is still cached', () => {
+  const markup = renderToStaticMarkup(
+    <LogCollectionNotice
+      collection={running}
+      statusError={new Error('Request failed with status 502')}
+      statusUpdatedAt={Date.UTC(2026, 0, 1)}
+      onRetry={() => {}}
+    />
+  )
+  expect(markup).toContain('Log collection status is unavailable')
+  expect(markup).toContain('Request failed with status 502')
+  expect(markup).toContain('may be out of date')
+  expect(markup).toContain('Try again')
 })
