@@ -6545,6 +6545,133 @@
         ],
         "type": "object"
       },
+      "BulkAlarmActionRequest": {
+        "description": "Lifecycle transition for `POST .../alarms/bulk`.",
+        "enum": [
+          "acknowledge",
+          "resolve"
+        ],
+        "type": "string"
+      },
+      "BulkAlarmFilter": {
+        "description": "Filters selecting \"every alarm matching\" for a bulk update. Same\nsemantics as the list endpoint's query parameters.",
+        "properties": {
+          "alarm_type": {
+            "description": "Filter by alarm type (e.g. `container_crash`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "description": "Filter by deployment ID.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Filter by environment ID.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "severity": {
+            "description": "Filter by severity: `info`, `warning`, or `critical`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Filter by status: `firing` or `acknowledged`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "BulkAlarmRequest": {
+        "description": "Request body for `POST .../alarms/bulk`. Provide exactly one of\n`alarm_ids` or `filter`.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkAlarmActionRequest"
+          },
+          "alarm_ids": {
+            "description": "Explicit alarms to update (at most 1000).",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BulkAlarmFilter",
+                "description": "Update every alarm matching these filters, up to 1000 per request.\nUse `{}` to match all active alarms in scope."
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "BulkAlarmResponse": {
+        "description": "Result of a bulk alarm update.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkAlarmActionRequest"
+          },
+          "remaining": {
+            "description": "Matching alarms left for a follow-up request because this one hit the\nper-request limit. Always 0 when `alarm_ids` was used.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Requested alarms already in (or past) the target state.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated": {
+            "description": "Number of alarms that changed state.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_ids": {
+            "description": "IDs of the alarms that changed state.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "updated",
+          "updated_ids",
+          "skipped",
+          "remaining"
+        ],
+        "type": "object"
+      },
       "BulkJobProjectStatus": {
         "description": "Where one project has got to inside a bulk job.\n\n`switching` and `backfilling` are separate on purpose: the switch is cheap,\natomic and egresses nothing, while the backfill can run for hours and costs\nmoney. An operator watching a stuck job needs to know which of the two it is\nstuck in, and a project that failed after switching is *not* rolled back\n(ADR-042 §7) — so the two must be distinguishable after the fact too.",
         "enum": [
@@ -95515,6 +95642,69 @@
         ]
       }
     },
+    "/projects/{project_id}/alarms/bulk": {
+      "post": {
+        "operationId": "bulkUpdateProjectAlarms",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAlarmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAlarmResponse"
+                }
+              }
+            },
+            "description": "Alarms updated"
+          },
+          "400": {
+            "description": "Invalid selection or filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "An alarm in alarm_ids is not in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Acknowledge or resolve many alarms of a project at once — either the\nexplicit `alarm_ids` or every alarm matching `filter`.",
+        "tags": [
+          "Alarms"
+        ]
+      }
+    },
     "/projects/{project_id}/alarms/summary": {
       "get": {
         "operationId": "getProjectAlarmsSummary",
@@ -115259,6 +115449,57 @@
           }
         ],
         "summary": "List host/control-plane-wide alarms with optional filters.",
+        "tags": [
+          "Alarms"
+        ]
+      }
+    },
+    "/system/alarms/bulk": {
+      "post": {
+        "operationId": "bulkUpdateSystemAlarms",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAlarmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAlarmResponse"
+                }
+              }
+            },
+            "description": "Alarms updated"
+          },
+          "400": {
+            "description": "Invalid selection or filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "An alarm in alarm_ids is not a system alarm"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Acknowledge or resolve many system alarms at once — either the explicit\n`alarm_ids` or every system alarm matching `filter`.",
         "tags": [
           "Alarms"
         ]

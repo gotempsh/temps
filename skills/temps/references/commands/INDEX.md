@@ -58,6 +58,7 @@ syntax may have changed.
 - [`email-domains`](email-domains.md)
 - [`email-providers`](email-providers.md)
 - [`incidents`](incidents.md)
+- [`alarms`](alarms.md)
 - [`emails`](emails.md)
 - [`load-balancer`](load-balancer.md)
 - [`migrate`](migrate.md)

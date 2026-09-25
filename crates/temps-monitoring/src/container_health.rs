@@ -12,8 +12,8 @@
 use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use futures::{stream, StreamExt};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, Statement, TransactionTrait,
+    sea_query::Expr, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -114,6 +114,47 @@ fn published_tcp_host_port(
             (interface_rank, host_ip, port.host_port)
         })
         .map(|port| i32::from(port.host_port))
+}
+
+/// Whether a `deployment_containers.status` records that the container was
+/// stopped on purpose: by the user (`"stopped"`) or retained after a failed
+/// deployment for log inspection (`"retained:*"`).
+fn is_intentionally_stopped(status: Option<&str>) -> bool {
+    status.is_some_and(|status| status == "stopped" || status.starts_with("retained:"))
+}
+
+/// Truncate a timestamp to the microsecond precision Postgres stores.
+/// Docker reports nanoseconds, so comparing a live Docker timestamp with its
+/// own stored copy would otherwise see the copy as older (or different) by
+/// the discarded sub-microsecond part.
+fn at_db_precision(
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::SubsecRound;
+    timestamp.map(|timestamp| timestamp.trunc_subsecs(6))
+}
+
+/// Whether the container's exit is still covered by its intentional-stop
+/// marker. A user-stopped (`"stopped"`) container that Docker reports as
+/// started after the stop ran again since — by hand or through a restart
+/// policy — so a new exit is a real crash even if the restart and the crash
+/// both fell between two polls. The stop time is the row's `finished_at`,
+/// written by the stop itself; rows stopped before that was recorded fall
+/// back to the last start the monitor saw.
+fn exit_is_intentional(
+    container: &deployment_containers::Model,
+    info: &temps_deployer::ContainerInfo,
+) -> bool {
+    if !is_intentionally_stopped(container.status.as_deref()) {
+        return false;
+    }
+    let stopped_at = at_db_precision(container.finished_at.or(container.started_at));
+    let restarted_since_stop = container.status.as_deref() == Some("stopped")
+        && matches!(
+            (stopped_at, at_db_precision(info.started_at)),
+            (Some(stopped_at), Some(started_at)) if started_at > stopped_at
+        );
+    !restarted_since_stop
 }
 
 /// Configuration for resource usage thresholds
@@ -491,7 +532,7 @@ impl ContainerHealthMonitor {
         let host_port = published_tcp_host_port(container.container_port, &info.ports);
         let port_changed = host_port != container.host_port;
         if !port_changed
-            && container.started_at == info.started_at
+            && at_db_precision(container.started_at) == at_db_precision(info.started_at)
             && container.cpu_limit_cores == info.cpu_limit_cores
         {
             return Ok(());
@@ -621,15 +662,31 @@ impl ContainerHealthMonitor {
                 // Persist the exit metadata first so the UI/API can surface
                 // *why* even if the alarm path is skipped (e.g. on-demand
                 // sleep).
-                self.persist_exit_info(container, info).await;
+                let intentional = exit_is_intentional(container, info);
+                self.persist_exit_info(container, info, intentional).await;
 
-                // Skip alarm if this is an on-demand environment that was intentionally
-                // put to sleep. The on-demand manager stops containers on idle — that's
-                // expected, not an error.
-                if self.is_on_demand_sleeping(deployment.environment_id).await {
+                // A user-initiated stop (`stop_container`/`stop_all_containers`)
+                // and a failed deployment retained for log inspection are both
+                // stopped on purpose — an exit there is expected, not a crash.
+                if intentional {
                     debug!(
-                        "Container {} ({}) is {} but environment {} is on-demand sleeping, skipping alarm",
-                        container.id, container.container_name, status_str, deployment.environment_id
+                        "Container {} ({}) is {} but was intentionally stopped (status: {:?}), skipping alarm",
+                        container.id, container.container_name, status_str, container.status
+                    );
+                    return;
+                }
+
+                // Only the deployment currently serving the environment is
+                // expected to be running. A container row left live under a
+                // superseded deployment (e.g. its teardown failed) is an
+                // orphan awaiting cleanup by the next deployment's sweep;
+                // alarming on it every poll cycle would page forever about a
+                // container nobody routes to. It also covers on-demand
+                // environments that were intentionally put to sleep.
+                if let Some(reason) = self.exit_not_alarmable_reason(deployment).await {
+                    debug!(
+                        "Container {} ({}) is {} but {}, skipping alarm",
+                        container.id, container.container_name, status_str, reason
                     );
                     return;
                 }
@@ -708,9 +765,38 @@ impl ContainerHealthMonitor {
                     );
                 }
             }
+            temps_deployer::ContainerStatus::Running
+                if container.status.as_deref() == Some("stopped") =>
+            {
+                // A user-stopped container is running again (started by
+                // hand, or by Docker's restart policy). Drop the stale
+                // marker, otherwise its next crash would be mistaken for
+                // the earlier intentional stop and never alarm.
+                self.clear_user_stop_marker(container).await;
+            }
             _ => {
                 // Container is in a healthy state, nothing to do
             }
+        }
+    }
+
+    /// Replace a `"stopped"` marker with `"running"`. Conditional on the
+    /// marker still being there so a concurrent stop is never overwritten.
+    async fn clear_user_stop_marker(&self, container: &deployment_containers::Model) {
+        let result = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container.id))
+            .filter(deployment_containers::Column::Status.eq("stopped"))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            error!(
+                "Failed to clear stopped marker for running container {} ({}): {}",
+                container.id, container.container_name, e
+            );
         }
     }
 
@@ -721,14 +807,30 @@ impl ContainerHealthMonitor {
         &self,
         container: &deployment_containers::Model,
         info: &temps_deployer::ContainerInfo,
+        intentional: bool,
     ) {
-        let new_status = Some(info.status.to_string());
+        // Keep an intentional-stop marker: overwriting "stopped" or
+        // "retained:*" with Docker's "exited" would erase why the container
+        // is down and turn the next poll's exit into a crash alarm. A stale
+        // marker (the container ran again since) is replaced.
+        let new_status = if intentional {
+            container.status.clone()
+        } else {
+            Some(info.status.to_string())
+        };
+        // While the marker stands, `finished_at` is the stop time the
+        // restart check compares against: never erase it with a missing value.
+        let finished_at = if intentional {
+            info.finished_at.or(container.finished_at)
+        } else {
+            info.finished_at
+        };
         let unchanged = container.status == new_status
             && container.exit_code == info.exit_code
             && container.exit_reason == info.exit_reason
             && container.oom_killed == info.oom_killed
             && container.error_message == info.error_message
-            && container.finished_at == info.finished_at;
+            && container.finished_at == finished_at;
         if unchanged {
             return;
         }
@@ -740,7 +842,7 @@ impl ContainerHealthMonitor {
             exit_reason: Set(info.exit_reason.clone()),
             oom_killed: Set(info.oom_killed),
             error_message: Set(info.error_message.clone()),
-            finished_at: Set(info.finished_at),
+            finished_at: Set(finished_at),
             ..Default::default()
         };
 
@@ -755,18 +857,49 @@ impl ContainerHealthMonitor {
         }
     }
 
-    /// Check if an environment is currently sleeping (on-demand scale-to-zero).
-    /// When sleeping=true, containers were intentionally stopped — not a crash.
-    async fn is_on_demand_sleeping(&self, environment_id: i32) -> bool {
+    /// Returns why an exited container of `deployment` must not raise an
+    /// alarm, based on a live read of its environment: the environment is
+    /// on-demand sleeping (scale-to-zero stops containers on idle), was
+    /// deleted, or is served by a different deployment. Returns `None` when
+    /// the exit is unexpected — including when the environment cannot be
+    /// read, since an unreadable state must not silence a real crash.
+    async fn exit_not_alarmable_reason(&self, deployment: &deployments::Model) -> Option<String> {
         use temps_entities::environments;
 
-        match environments::Entity::find_by_id(environment_id)
+        let env = match environments::Entity::find_by_id(deployment.environment_id)
             .one(self.db.as_ref())
             .await
         {
-            Ok(Some(env)) => env.sleeping,
-            _ => false,
+            Ok(Some(env)) => env,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    environment_id = deployment.environment_id,
+                    %error,
+                    "Failed to read environment while evaluating a container exit; alarming"
+                );
+                return None;
+            }
+        };
+        if env.sleeping {
+            return Some(format!(
+                "environment {} is on-demand sleeping",
+                deployment.environment_id
+            ));
         }
+        if env.deleted_at.is_some() {
+            return Some(format!(
+                "environment {} was deleted",
+                deployment.environment_id
+            ));
+        }
+        if env.current_deployment_id != Some(deployment.id) {
+            return Some(format!(
+                "deployment {} is not the environment's current deployment ({:?})",
+                deployment.id, env.current_deployment_id
+            ));
+        }
+        None
     }
 
     /// Check if a deployment is currently paused. Always a live read (never
@@ -2258,5 +2391,443 @@ mod tests {
             !counters.contains_key(&(2, "high_cpu")),
             "Counter for container 2 should be pruned"
         );
+    }
+
+    // ── Exit alarms against a real database ───────────────────────────
+    //
+    // Regression coverage for container-exit alarms that kept firing every
+    // poll cycle for a long-superseded deployment's container (exited days
+    // earlier, while a much newer deployment served traffic).
+    // The monitor treated every non-deleted `deployment_containers` row as
+    // "expected to be running", so any row whose teardown was missed paged
+    // forever.
+
+    struct ExitFixture {
+        _database: temps_database::test_utils::TestDatabase,
+        db: Arc<sea_orm::DatabaseConnection>,
+        environment_id: i32,
+    }
+
+    async fn exit_fixture() -> Option<ExitFixture> {
+        use sea_orm::ActiveModelTrait;
+        use temps_entities::{
+            environments, preset::Preset, projects, upstream_config::UpstreamList,
+        };
+
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping container exit alarm test: Docker runtime unavailable");
+                return None;
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        };
+        let db = database.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("app".to_string()),
+            slug: Set("app".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("app".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("app.example.com".to_string()),
+            subdomain: Set("app.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        Some(ExitFixture {
+            _database: database,
+            db,
+            environment_id: environment.id,
+        })
+    }
+
+    impl ExitFixture {
+        async fn deployment(&self, slug: &str, state: &str) -> deployments::Model {
+            use sea_orm::ActiveModelTrait;
+            let environment = temps_entities::environments::Entity::find_by_id(self.environment_id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            deployments::ActiveModel {
+                project_id: Set(environment.project_id),
+                environment_id: Set(self.environment_id),
+                slug: Set(slug.to_string()),
+                state: Set(state.to_string()),
+                metadata: Set(Some(deployments::DeploymentMetadata::default())),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .unwrap()
+        }
+
+        async fn serve(&self, deployment: &deployments::Model) {
+            use sea_orm::ActiveModelTrait;
+            temps_entities::environments::ActiveModel {
+                id: Set(self.environment_id),
+                current_deployment_id: Set(Some(deployment.id)),
+                ..Default::default()
+            }
+            .update(self.db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        async fn container(
+            &self,
+            deployment: &deployments::Model,
+            status: &str,
+        ) -> deployment_containers::Model {
+            use sea_orm::ActiveModelTrait;
+            deployment_containers::ActiveModel {
+                deployment_id: Set(deployment.id),
+                container_id: Set(format!("{}-container", deployment.slug)),
+                container_name: Set(deployment.slug.clone()),
+                container_port: Set(3000),
+                status: Set(Some(status.to_string())),
+                created_at: Set(chrono::Utc::now()),
+                deployed_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .unwrap()
+        }
+
+        /// Run one monitor poll with every container reported as exited(1).
+        async fn poll_with_exited_containers(&self) {
+            self.poll_with_status(ContainerStatus::Exited).await;
+        }
+
+        /// Run one monitor poll with every container in `status`.
+        async fn poll_with_status(&self, status: ContainerStatus) {
+            self.poll(status, None).await;
+        }
+
+        /// Run one monitor poll with every container in `status`, reporting
+        /// Docker's `started_at` as `started_at`.
+        async fn poll(
+            &self,
+            status: ContainerStatus,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) {
+            let deployer = Arc::new(MockDeployer::new(0, status));
+            {
+                deployer.info.lock().await.started_at = started_at;
+                let mut info = deployer.info.lock().await;
+                info.exit_code = Some(1);
+                info.exit_reason = Some("Exit code 1".to_string());
+            }
+            let monitor = ContainerHealthMonitor::new(
+                self.db.clone(),
+                deployer,
+                make_alarm_service(self.db.clone()),
+                ContainerHealthConfig::default(),
+            );
+            monitor.check_all_containers().await.unwrap();
+        }
+
+        async fn alarms(&self) -> Vec<temps_entities::alarms::Model> {
+            temps_entities::alarms::Entity::find()
+                .all(self.db.as_ref())
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn exited_container_of_superseded_deployment_does_not_alarm() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        // app-1 was superseded long ago but its row was never retired;
+        // app-8 is what the environment serves now.
+        let superseded = fixture.deployment("app-1", "stopped").await;
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let orphan = fixture.container(&superseded, "exited").await;
+
+        fixture.poll_with_exited_containers().await;
+        fixture.poll_with_exited_containers().await;
+
+        let alarms = fixture.alarms().await;
+        assert!(
+            alarms.is_empty(),
+            "a superseded deployment's exited container must not page: {alarms:?}"
+        );
+        // Exit metadata is still recorded so the UI can show why it is down.
+        let row = deployment_containers::Entity::find_by_id(orphan.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn exited_container_of_current_deployment_still_alarms() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "running").await;
+
+        fixture.poll_with_exited_containers().await;
+
+        let alarms = fixture.alarms().await;
+        assert_eq!(alarms.len(), 1, "the serving container crashed: {alarms:?}");
+        assert_eq!(alarms[0].alarm_type, "container_crash");
+        assert_eq!(alarms[0].container_id, Some(container.id));
+        assert_eq!(alarms[0].deployment_id, Some(current.id));
+    }
+
+    #[tokio::test]
+    async fn user_stopped_container_does_not_alarm_and_keeps_its_status() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let stopped = fixture.container(&current, "stopped").await;
+        let retained = fixture
+            .container(
+                &fixture.deployment("app-9", "failed").await,
+                "retained:stopped-after-failed-readiness",
+            )
+            .await;
+
+        fixture.poll_with_exited_containers().await;
+        fixture.poll_with_exited_containers().await;
+
+        assert!(fixture.alarms().await.is_empty());
+        for (id, status) in [
+            (stopped.id, "stopped"),
+            (retained.id, "retained:stopped-after-failed-readiness"),
+        ] {
+            let row = deployment_containers::Entity::find_by_id(id)
+                .one(fixture.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.status.as_deref(),
+                Some(status),
+                "the poll must not overwrite an intentional stop with Docker's state"
+            );
+            assert_eq!(row.exit_code, Some(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn restarted_user_stopped_container_alarms_on_its_next_crash() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+
+        // Started again (by hand or by Docker's restart policy).
+        fixture.poll_with_status(ContainerStatus::Running).await;
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+
+        fixture.poll_with_exited_containers().await;
+        let alarms = fixture.alarms().await;
+        assert_eq!(
+            alarms.len(),
+            1,
+            "a crash after the restart is a real crash: {alarms:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exited_container_of_environment_without_current_deployment_does_not_alarm() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        // No `serve`: the environment has no current deployment at all.
+        let deployment = fixture.deployment("app-1", "completed").await;
+        fixture.container(&deployment, "running").await;
+
+        fixture.poll_with_exited_containers().await;
+
+        assert!(fixture.alarms().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_environment_does_not_silence_an_exit() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Exited)),
+            make_alarm_service(db),
+            ContainerHealthConfig::default(),
+        );
+
+        let reason = monitor
+            .exit_not_alarmable_reason(&make_deployment_model())
+            .await;
+
+        assert_eq!(reason, None, "an unreadable environment must still alarm");
+    }
+
+    /// A timestamp `ago` in the past with a sub-microsecond component, the
+    /// way Docker reports container start and finish times.
+    fn docker_precision_timestamp(ago: chrono::Duration) -> chrono::DateTime<chrono::Utc> {
+        use chrono::SubsecRound;
+        (chrono::Utc::now() - ago).trunc_subsecs(0) + chrono::Duration::nanoseconds(123_456_789)
+    }
+
+    #[tokio::test]
+    async fn crash_after_unobserved_restart_of_user_stopped_container_alarms() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        // Nanosecond precision, like Docker's `StartedAt`: Postgres keeps
+        // only microseconds, so the stored copy is truncated.
+        let stopped_run_started = docker_precision_timestamp(chrono::Duration::hours(1));
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(stopped_run_started)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        // Still the run the user stopped: no alarm.
+        fixture
+            .poll(ContainerStatus::Exited, Some(stopped_run_started))
+            .await;
+        assert!(fixture.alarms().await.is_empty());
+
+        // Started again and crashed between two polls: never seen running,
+        // but Docker's start time moved on.
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_run_started + chrono::Duration::minutes(30)),
+            )
+            .await;
+
+        let alarms = fixture.alarms().await;
+        assert_eq!(alarms.len(), 1, "the new run crashed: {alarms:?}");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("exited"));
+    }
+
+    #[tokio::test]
+    async fn restart_then_user_stop_between_polls_does_not_alarm() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        let last_seen_start = chrono::Utc::now() - chrono::Duration::hours(1);
+        let stopped_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(last_seen_start)),
+            finished_at: Set(Some(stopped_at)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        // Restarted after the last poll, then stopped by the user before the
+        // next one: Docker's start time is newer than the recorded start but
+        // older than the stop.
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_at - chrono::Duration::minutes(1)),
+            )
+            .await;
+
+        assert!(fixture.alarms().await.is_empty());
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+    }
+
+    #[tokio::test]
+    async fn crash_after_restart_following_recorded_stop_alarms() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        let stopped_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(stopped_at - chrono::Duration::hours(1))),
+            finished_at: Set(Some(stopped_at)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_at + chrono::Duration::minutes(1)),
+            )
+            .await;
+
+        assert_eq!(fixture.alarms().await.len(), 1);
     }
 }

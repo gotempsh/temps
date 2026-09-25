@@ -2939,6 +2939,75 @@ export type BulkActivationProjectEstimateResponse = {
 };
 
 /**
+ * Lifecycle transition for `POST .../alarms/bulk`.
+ */
+export type BulkAlarmActionRequest = 'acknowledge' | 'resolve';
+
+/**
+ * Filters selecting "every alarm matching" for a bulk update. Same
+ * semantics as the list endpoint's query parameters.
+ */
+export type BulkAlarmFilter = {
+    /**
+     * Filter by alarm type (e.g. `container_crash`).
+     */
+    alarm_type?: string | null;
+    /**
+     * Filter by deployment ID.
+     */
+    deployment_id?: number | null;
+    /**
+     * Filter by environment ID.
+     */
+    environment_id?: number | null;
+    /**
+     * Filter by severity: `info`, `warning`, or `critical`.
+     */
+    severity?: string | null;
+    /**
+     * Filter by status: `firing` or `acknowledged`.
+     */
+    status?: string | null;
+};
+
+/**
+ * Request body for `POST .../alarms/bulk`. Provide exactly one of
+ * `alarm_ids` or `filter`.
+ */
+export type BulkAlarmRequest = {
+    action: BulkAlarmActionRequest;
+    /**
+     * Explicit alarms to update (at most 1000).
+     */
+    alarm_ids?: Array<number> | null;
+    filter?: null | BulkAlarmFilter;
+};
+
+/**
+ * Result of a bulk alarm update.
+ */
+export type BulkAlarmResponse = {
+    action: BulkAlarmActionRequest;
+    /**
+     * Matching alarms left for a follow-up request because this one hit the
+     * per-request limit. Always 0 when `alarm_ids` was used.
+     */
+    remaining: number;
+    /**
+     * Requested alarms already in (or past) the target state.
+     */
+    skipped: number;
+    /**
+     * Number of alarms that changed state.
+     */
+    updated: number;
+    /**
+     * IDs of the alarms that changed state.
+     */
+    updated_ids: Array<number>;
+};
+
+/**
  * Where one project has got to inside a bulk job.
  *
  * `switching` and `backfilling` are separate on purpose: the switch is cheap,
@@ -48813,6 +48882,50 @@ export type ListProjectAlarmsResponses = {
 
 export type ListProjectAlarmsResponse = ListProjectAlarmsResponses[keyof ListProjectAlarmsResponses];
 
+export type BulkUpdateProjectAlarmsData = {
+    body: BulkAlarmRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/bulk';
+};
+
+export type BulkUpdateProjectAlarmsErrors = {
+    /**
+     * Invalid selection or filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * An alarm in alarm_ids is not in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BulkUpdateProjectAlarmsResponses = {
+    /**
+     * Alarms updated
+     */
+    200: BulkAlarmResponse;
+};
+
+export type BulkUpdateProjectAlarmsResponse = BulkUpdateProjectAlarmsResponses[keyof BulkUpdateProjectAlarmsResponses];
+
 export type GetProjectAlarmsSummaryData = {
     body?: never;
     path: {
@@ -61313,6 +61426,45 @@ export type ListSystemAlarmsResponses = {
 };
 
 export type ListSystemAlarmsResponse = ListSystemAlarmsResponses[keyof ListSystemAlarmsResponses];
+
+export type BulkUpdateSystemAlarmsData = {
+    body: BulkAlarmRequest;
+    path?: never;
+    query?: never;
+    url: '/system/alarms/bulk';
+};
+
+export type BulkUpdateSystemAlarmsErrors = {
+    /**
+     * Invalid selection or filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * An alarm in alarm_ids is not a system alarm
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BulkUpdateSystemAlarmsResponses = {
+    /**
+     * Alarms updated
+     */
+    200: BulkAlarmResponse;
+};
+
+export type BulkUpdateSystemAlarmsResponse = BulkUpdateSystemAlarmsResponses[keyof BulkUpdateSystemAlarmsResponses];
 
 export type GetSystemAlarmsSummaryData = {
     body?: never;

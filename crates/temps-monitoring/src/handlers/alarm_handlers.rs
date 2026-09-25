@@ -13,6 +13,7 @@
 //! GET  /projects/{project_id}/alarms/summary      — counts by status/severity/type
 //! POST /projects/{project_id}/alarms/{alarm_id}/acknowledge
 //! POST /projects/{project_id}/alarms/{alarm_id}/resolve
+//! POST /projects/{project_id}/alarms/bulk            — ack/resolve many at once
 //! ```
 
 use std::sync::Arc;
@@ -33,7 +34,10 @@ use temps_core::{
 use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::alarm_service::{AlarmError, AlarmFilters, AlarmService, AlarmSummary, AlarmType};
+use crate::alarm_service::{
+    AlarmError, AlarmFilters, AlarmService, AlarmSummary, AlarmType, BulkAlarmAction,
+    BulkAlarmOutcome, BulkAlarmSelector, MAX_BULK_ALARM_UPDATE,
+};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -69,6 +73,10 @@ impl From<AlarmError> for Problem {
 
             AlarmError::Queue { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
+                .with_detail(error.to_string()),
+
+            AlarmError::InvalidBulkRequest { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Bulk Alarm Request")
                 .with_detail(error.to_string()),
         }
     }
@@ -207,9 +215,185 @@ pub struct SilenceAlarmRequest {
     pub duration_hours: i64,
 }
 
+/// Lifecycle transition for `POST .../alarms/bulk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkAlarmActionRequest {
+    /// Mark firing alarms as acknowledged.
+    Acknowledge,
+    /// Mark firing or acknowledged alarms as resolved.
+    Resolve,
+}
+
+impl From<BulkAlarmActionRequest> for BulkAlarmAction {
+    fn from(action: BulkAlarmActionRequest) -> Self {
+        match action {
+            BulkAlarmActionRequest::Acknowledge => BulkAlarmAction::Acknowledge,
+            BulkAlarmActionRequest::Resolve => BulkAlarmAction::Resolve,
+        }
+    }
+}
+
+/// Filters selecting "every alarm matching" for a bulk update. Same
+/// semantics as the list endpoint's query parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct BulkAlarmFilter {
+    /// Filter by alarm type (e.g. `container_crash`).
+    pub alarm_type: Option<String>,
+    /// Filter by status: `firing` or `acknowledged`.
+    pub status: Option<String>,
+    /// Filter by severity: `info`, `warning`, or `critical`.
+    pub severity: Option<String>,
+    /// Filter by environment ID.
+    pub environment_id: Option<i32>,
+    /// Filter by deployment ID.
+    pub deployment_id: Option<i32>,
+}
+
+/// Request body for `POST .../alarms/bulk`. Provide exactly one of
+/// `alarm_ids` or `filter`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BulkAlarmRequest {
+    pub action: BulkAlarmActionRequest,
+    /// Explicit alarms to update (at most 1000).
+    pub alarm_ids: Option<Vec<i32>>,
+    /// Update every alarm matching these filters, up to 1000 per request.
+    /// Use `{}` to match all active alarms in scope.
+    pub filter: Option<BulkAlarmFilter>,
+}
+
+/// Result of a bulk alarm update.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BulkAlarmResponse {
+    pub action: BulkAlarmActionRequest,
+    /// Number of alarms that changed state.
+    pub updated: u64,
+    /// IDs of the alarms that changed state.
+    pub updated_ids: Vec<i32>,
+    /// Requested alarms already in (or past) the target state.
+    pub skipped: u64,
+    /// Matching alarms left for a follow-up request because this one hit the
+    /// per-request limit. Always 0 when `alarm_ids` was used.
+    pub remaining: u64,
+}
+
+impl BulkAlarmResponse {
+    fn new(action: BulkAlarmActionRequest, outcome: BulkAlarmOutcome) -> Self {
+        Self {
+            action,
+            updated: outcome.updated_ids.len() as u64,
+            updated_ids: outcome.updated_ids,
+            skipped: outcome.skipped,
+            remaining: outcome.remaining,
+        }
+    }
+}
+
+fn parse_alarm_type_filter(value: Option<&str>) -> Result<Option<AlarmType>, Problem> {
+    match value {
+        Some(s) => AlarmType::parse_alarm_type(s).map(Some).ok_or_else(|| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid alarm_type")
+                .with_detail(format!("Unknown alarm type: {}", s))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_status_filter(
+    value: Option<&str>,
+) -> Result<Option<crate::alarm_service::AlarmStatus>, Problem> {
+    match value {
+        Some("firing") => Ok(Some(crate::alarm_service::AlarmStatus::Firing)),
+        Some("acknowledged") => Ok(Some(crate::alarm_service::AlarmStatus::Acknowledged)),
+        Some("resolved") => Ok(Some(crate::alarm_service::AlarmStatus::Resolved)),
+        Some(s) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid status")
+            .with_detail(format!(
+                "Unknown alarm status '{}': must be firing, acknowledged, or resolved",
+                s
+            ))),
+        None => Ok(None),
+    }
+}
+
+fn parse_severity_filter(
+    value: Option<&str>,
+) -> Result<Option<crate::alarm_service::AlarmSeverity>, Problem> {
+    match value {
+        Some("info") => Ok(Some(crate::alarm_service::AlarmSeverity::Info)),
+        Some("warning") => Ok(Some(crate::alarm_service::AlarmSeverity::Warning)),
+        Some("critical") => Ok(Some(crate::alarm_service::AlarmSeverity::Critical)),
+        Some(s) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid severity")
+            .with_detail(format!(
+                "Unknown severity '{}': must be info, warning, or critical",
+                s
+            ))),
+        None => Ok(None),
+    }
+}
+
+/// Validate a bulk request body into the service selector.
+fn bulk_selector(request: &BulkAlarmRequest) -> Result<BulkAlarmSelector, Problem> {
+    match (&request.alarm_ids, &request.filter) {
+        (Some(ids), None) => Ok(BulkAlarmSelector::Ids(ids.clone())),
+        (None, Some(filter)) => Ok(BulkAlarmSelector::Matching(AlarmFilters {
+            environment_id: filter.environment_id,
+            deployment_id: filter.deployment_id,
+            alarm_type: parse_alarm_type_filter(filter.alarm_type.as_deref())?,
+            status: parse_status_filter(filter.status.as_deref())?,
+            severity: parse_severity_filter(filter.severity.as_deref())?,
+        })),
+        (Some(_), Some(_)) | (None, None) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Bulk Alarm Request")
+            .with_detail(format!(
+                "Provide exactly one of `alarm_ids` (at most {MAX_BULK_ALARM_UPDATE}) or `filter`"
+            ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Audit structs
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct AlarmsBulkUpdatedAudit {
+    context: AuditContext,
+    project_id: Option<i32>,
+    action: BulkAlarmActionRequest,
+    /// The explicit IDs the operator submitted, when not using a filter.
+    requested_alarm_ids: Option<Vec<i32>>,
+    /// The alarms whose state actually changed.
+    updated_alarm_ids: Vec<i32>,
+    filter: Option<BulkAlarmFilter>,
+}
+
+impl AuditOperation for AlarmsBulkUpdatedAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            BulkAlarmActionRequest::Acknowledge => "ALARMS_BULK_ACKNOWLEDGED".to_string(),
+            BulkAlarmActionRequest::Resolve => "ALARMS_BULK_RESOLVED".to_string(),
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize AlarmsBulkUpdatedAudit: {}", e))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct AlarmAcknowledgedAudit {
@@ -337,50 +521,9 @@ pub async fn list_project_alarms(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    // Parse optional alarm_type filter
-    let alarm_type_filter = match &params.alarm_type {
-        Some(s) => match AlarmType::parse_alarm_type(s) {
-            Some(t) => Some(t),
-            None => {
-                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Invalid alarm_type")
-                    .with_detail(format!("Unknown alarm type: {}", s)));
-            }
-        },
-        None => None,
-    };
-
-    // Parse optional status filter
-    let status_filter = match params.status.as_deref() {
-        Some("firing") => Some(crate::alarm_service::AlarmStatus::Firing),
-        Some("acknowledged") => Some(crate::alarm_service::AlarmStatus::Acknowledged),
-        Some("resolved") => Some(crate::alarm_service::AlarmStatus::Resolved),
-        Some(s) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid status")
-                .with_detail(format!(
-                    "Unknown alarm status '{}': must be firing, acknowledged, or resolved",
-                    s
-                )));
-        }
-        None => None,
-    };
-
-    // Parse optional severity filter
-    let severity_filter = match params.severity.as_deref() {
-        Some("info") => Some(crate::alarm_service::AlarmSeverity::Info),
-        Some("warning") => Some(crate::alarm_service::AlarmSeverity::Warning),
-        Some("critical") => Some(crate::alarm_service::AlarmSeverity::Critical),
-        Some(s) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid severity")
-                .with_detail(format!(
-                    "Unknown severity '{}': must be info, warning, or critical",
-                    s
-                )));
-        }
-        None => None,
-    };
+    let alarm_type_filter = parse_alarm_type_filter(params.alarm_type.as_deref())?;
+    let status_filter = parse_status_filter(params.status.as_deref())?;
+    let severity_filter = parse_severity_filter(params.severity.as_deref())?;
 
     let filters = AlarmFilters {
         environment_id: params.environment_id,
@@ -621,6 +764,82 @@ pub async fn silence_alarm(
     Ok(StatusCode::OK)
 }
 
+/// Shared body of the project and system bulk endpoints: run the update and
+/// audit it. Audit failure is logged and never fails the request.
+async fn run_bulk_alarm_update(
+    state: &AlarmAppState,
+    project_id: Option<i32>,
+    user_id: i32,
+    metadata: &RequestMetadata,
+    request: BulkAlarmRequest,
+) -> Result<BulkAlarmResponse, Problem> {
+    let selector = bulk_selector(&request)?;
+    let outcome = state
+        .alarm_service
+        .bulk_update_alarms(project_id, selector, request.action.into(), user_id)
+        .await
+        .map_err(Problem::from)?;
+    let response = BulkAlarmResponse::new(request.action, outcome);
+
+    // Audited even when nothing changed: the attempt itself (and its
+    // filter) is part of the record.
+    let audit = AlarmsBulkUpdatedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        action: request.action,
+        requested_alarm_ids: request.alarm_ids,
+        updated_alarm_ids: response.updated_ids.clone(),
+        filter: request.filter,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for bulk alarm {:?} in project {:?}: {}",
+            request.action, project_id, e
+        );
+    }
+
+    Ok(response)
+}
+
+/// Acknowledge or resolve many alarms of a project at once — either the
+/// explicit `alarm_ids` or every alarm matching `filter`.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/alarms/bulk",
+    tag = "Alarms",
+    operation_id = "bulkUpdateProjectAlarms",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    request_body = BulkAlarmRequest,
+    responses(
+        (status = 200, description = "Alarms updated", body = BulkAlarmResponse),
+        (status = 400, description = "Invalid selection or filter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "An alarm in alarm_ids is not in this project"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn bulk_update_project_alarms(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path(project_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<BulkAlarmRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let response =
+        run_bulk_alarm_update(&state, Some(project_id), auth.user_id(), &metadata, request).await?;
+    Ok(Json(response))
+}
+
 // ---------------------------------------------------------------------------
 // System alarms — host/control-plane-wide alarms with no associated project
 // (disk space, worker node offline/resource pressure). Gated on
@@ -653,47 +872,9 @@ pub async fn list_system_alarms(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    let alarm_type_filter = match &params.alarm_type {
-        Some(s) => match AlarmType::parse_alarm_type(s) {
-            Some(t) => Some(t),
-            None => {
-                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Invalid alarm_type")
-                    .with_detail(format!("Unknown alarm type: {}", s)));
-            }
-        },
-        None => None,
-    };
-
-    let status_filter = match params.status.as_deref() {
-        Some("firing") => Some(crate::alarm_service::AlarmStatus::Firing),
-        Some("acknowledged") => Some(crate::alarm_service::AlarmStatus::Acknowledged),
-        Some("resolved") => Some(crate::alarm_service::AlarmStatus::Resolved),
-        Some(s) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid status")
-                .with_detail(format!(
-                    "Unknown alarm status '{}': must be firing, acknowledged, or resolved",
-                    s
-                )));
-        }
-        None => None,
-    };
-
-    let severity_filter = match params.severity.as_deref() {
-        Some("info") => Some(crate::alarm_service::AlarmSeverity::Info),
-        Some("warning") => Some(crate::alarm_service::AlarmSeverity::Warning),
-        Some("critical") => Some(crate::alarm_service::AlarmSeverity::Critical),
-        Some(s) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid severity")
-                .with_detail(format!(
-                    "Unknown severity '{}': must be info, warning, or critical",
-                    s
-                )));
-        }
-        None => None,
-    };
+    let alarm_type_filter = parse_alarm_type_filter(params.alarm_type.as_deref())?;
+    let status_filter = parse_status_filter(params.status.as_deref())?;
+    let severity_filter = parse_severity_filter(params.severity.as_deref())?;
 
     let filters = AlarmFilters {
         environment_id: params.environment_id,
@@ -906,6 +1087,36 @@ pub async fn silence_system_alarm(
     Ok(StatusCode::OK)
 }
 
+/// Acknowledge or resolve many system alarms at once — either the explicit
+/// `alarm_ids` or every system alarm matching `filter`.
+#[utoipa::path(
+    post,
+    path = "/system/alarms/bulk",
+    tag = "Alarms",
+    operation_id = "bulkUpdateSystemAlarms",
+    request_body = BulkAlarmRequest,
+    responses(
+        (status = 200, description = "Alarms updated", body = BulkAlarmResponse),
+        (status = 400, description = "Invalid selection or filter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "An alarm in alarm_ids is not a system alarm"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn bulk_update_system_alarms(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<BulkAlarmRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    let response = run_bulk_alarm_update(&state, None, auth.user_id(), &metadata, request).await?;
+    Ok(Json(response))
+}
+
 // ---------------------------------------------------------------------------
 // Route configuration
 // ---------------------------------------------------------------------------
@@ -916,6 +1127,10 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         .route(
             "/projects/{project_id}/alarms/summary",
             get(get_project_alarms_summary),
+        )
+        .route(
+            "/projects/{project_id}/alarms/bulk",
+            post(bulk_update_project_alarms),
         )
         .route(
             "/projects/{project_id}/alarms/{alarm_id}/acknowledge",
@@ -931,6 +1146,7 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         )
         .route("/system/alarms", get(list_system_alarms))
         .route("/system/alarms/summary", get(get_system_alarms_summary))
+        .route("/system/alarms/bulk", post(bulk_update_system_alarms))
         .route(
             "/system/alarms/{alarm_id}/acknowledge",
             post(acknowledge_system_alarm),
@@ -957,17 +1173,23 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         acknowledge_alarm,
         resolve_alarm,
         silence_alarm,
+        bulk_update_project_alarms,
         list_system_alarms,
         get_system_alarms_summary,
         acknowledge_system_alarm,
         resolve_system_alarm,
         silence_system_alarm,
+        bulk_update_system_alarms,
     ),
     components(schemas(
         AlarmResponse,
         AlarmListResponse,
         AlarmSummaryResponse,
         SilenceAlarmRequest,
+        BulkAlarmRequest,
+        BulkAlarmActionRequest,
+        BulkAlarmFilter,
+        BulkAlarmResponse,
     )),
     info(
         title = "Alarms API",
@@ -1345,5 +1567,63 @@ mod tests {
             .paths
             .paths
             .contains_key("/projects/{project_id}/alarms/{alarm_id}/resolve"));
+    }
+
+    #[test]
+    fn bulk_request_requires_exactly_one_selector() {
+        let request =
+            |alarm_ids: Option<Vec<i32>>, filter: Option<BulkAlarmFilter>| BulkAlarmRequest {
+                action: BulkAlarmActionRequest::Resolve,
+                alarm_ids,
+                filter,
+            };
+        assert!(bulk_selector(&request(None, None)).is_err());
+        assert!(bulk_selector(&request(Some(vec![1]), Some(BulkAlarmFilter::default()))).is_err());
+        assert!(matches!(
+            bulk_selector(&request(Some(vec![1, 2]), None)),
+            Ok(BulkAlarmSelector::Ids(ids)) if ids == vec![1, 2]
+        ));
+        assert!(matches!(
+            bulk_selector(&request(None, Some(BulkAlarmFilter::default()))),
+            Ok(BulkAlarmSelector::Matching(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_request_rejects_unknown_filter_values() {
+        for filter in [
+            BulkAlarmFilter {
+                alarm_type: Some("not_a_type".to_string()),
+                ..Default::default()
+            },
+            BulkAlarmFilter {
+                status: Some("sleeping".to_string()),
+                ..Default::default()
+            },
+            BulkAlarmFilter {
+                severity: Some("urgent".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let result = bulk_selector(&BulkAlarmRequest {
+                action: BulkAlarmActionRequest::Acknowledge,
+                alarm_ids: None,
+                filter: Some(filter),
+            });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn bulk_request_action_uses_snake_case_on_the_wire() {
+        let request: BulkAlarmRequest = serde_json::from_str(
+            r#"{"action":"acknowledge","filter":{"alarm_type":"container_crash"}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.action, BulkAlarmActionRequest::Acknowledge);
+        assert_eq!(
+            request.filter.and_then(|f| f.alarm_type).as_deref(),
+            Some("container_crash")
+        );
     }
 }
