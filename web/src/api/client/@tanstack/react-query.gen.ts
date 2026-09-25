@@ -17988,6 +17988,9 @@ export const getSettingsOptions = (options?: Options<GetSettingsData>) => queryO
     queryKey: getSettingsQueryKey(options)
 });
 
+/**
+ * Update application settings
+ */
 export const updateSettingsMutation = (options?: Partial<Options<UpdateSettingsData>>): UseMutationOptions<UpdateSettingsResponse, DefaultError, Options<UpdateSettingsData>> => {
     const mutationOptions: UseMutationOptions<UpdateSettingsResponse, DefaultError, Options<UpdateSettingsData>> = {
         mutationFn: async (fnOptions) => {

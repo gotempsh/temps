@@ -106,9 +106,17 @@ export default function GitConnectionDetail() {
 
   // Typing a search restarts at page 1; the URL keeps the committed term.
   useEffect(() => {
-    if (debouncedSearch !== list.search)
-      url.patch({ q: debouncedSearch || undefined, page: undefined })
+    const term = debouncedSearch.trim()
+    if (term !== list.search)
+      url.patch({ q: term || undefined, page: undefined })
   }, [debouncedSearch]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The URL can change underneath the box (a followed `?q=` link, back/forward).
+  // Adopt it, so the next keystroke edits the term actually being shown rather
+  // than writing a stale one back. Our own debounced commits already match.
+  useEffect(() => {
+    if (list.search !== debouncedSearch.trim()) setSearchInput(list.search)
+  }, [list.search]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const providerQuery = useQuery({
     ...getGitProviderOptions({ path: { provider_id: providerId } }),
@@ -147,6 +155,17 @@ export default function GitConnectionDetail() {
     placeholderData: keepPreviousData,
   })
 
+  // A shared or stale `?page=` can point past the last page; land on the last
+  // one that has rows instead of an empty table with no way back.
+  const lastPage = repositoriesQuery.data
+    ? Math.max(1, Math.ceil(repositoriesQuery.data.total_count / list.perPage))
+    : undefined
+  useEffect(() => {
+    if (repositoriesQuery.isPlaceholderData || lastPage === undefined) return
+    if (list.page > lastPage)
+      url.patch({ page: lastPage === 1 ? undefined : lastPage })
+  }, [lastPage, list.page, repositoriesQuery.isPlaceholderData]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // When a sync finishes, the repository list it produced is new data.
   const wasSyncing = useRef(false)
   useEffect(() => {
@@ -159,6 +178,25 @@ export default function GitConnectionDetail() {
     }
     wasSyncing.current = !!connection?.syncing
   }, [connection, connection_id, queryClient])
+
+  // Give up waiting on a requested sync after two minutes, whether or not the
+  // server still reports it running: a hung sync must not hold the page in
+  // "Syncing…" until the backend's own deadline.
+  useEffect(() => {
+    if (!pendingSync) return
+    const remaining = SYNC_WAIT_LIMIT_MS - (Date.now() - pendingSync.startedAt)
+    const timer = setTimeout(
+      () => {
+        toast.error('No sync result after 2 minutes', {
+          description:
+            'The sync may still be running on the server. Refresh the page to check again.',
+        })
+        setPendingSync(null)
+      },
+      Math.max(0, remaining)
+    )
+    return () => clearTimeout(timer)
+  }, [pendingSync])
 
   useEffect(() => {
     if (!pendingSync || !connection || connection.syncing) return
@@ -179,11 +217,6 @@ export default function GitConnectionDetail() {
         queryKey: listRepositoriesByConnectionQueryKey({
           path: { connection_id },
         }).slice(0, 1),
-      })
-    } else if (Date.now() - pendingSync.startedAt > 120_000) {
-      toast.error('No sync result after 2 minutes', {
-        description:
-          'The sync may still be running on the server. Refresh the page to check again.',
       })
     } else {
       return
@@ -616,6 +649,8 @@ export default function GitConnectionDetail() {
     />
   )
 }
+
+const SYNC_WAIT_LIMIT_MS = 120_000
 
 /** The server's explanation from a Problem Details error, when it gave one. */
 function problemDetail(error: unknown): string | undefined {

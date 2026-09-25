@@ -24,7 +24,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::{permission_check, require_sensitive_action, Permission, RequireAuth};
+use temps_auth::{
+    permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
+};
 use temps_core::SensitiveAction;
 use tracing::info;
 
@@ -887,7 +889,7 @@ pub async fn get_connection(
     State(state): State<Arc<AppState>>,
     Path(connection_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::GitConnectionsRead);
+    permission_guard!(auth, GitConnectionsRead);
 
     let connection = state
         .git_provider_manager
