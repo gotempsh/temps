@@ -125,7 +125,11 @@ function logPage(
   })
 }
 
+/** The time window each list request asked the backend for, in order. */
+type QueriedWindow = { from: string | null; to: string | null }
+
 async function mock(page: Page, kind: Kind) {
+  const windows: QueriedWindow[] = []
   await page.route(/\/api\/projects(?:\?|$)/, (route) =>
     route.fulfill({
       json: {
@@ -141,6 +145,16 @@ async function mock(page: Page, kind: Kind) {
   await page.route(
     (url) => url.pathname === endpoints[kind],
     (route) => {
+      const request = route.request()
+      const query = new URL(request.url()).searchParams
+      const body = request.method() === 'POST' ? request.postDataJSON() : {}
+      windows.push({
+        from:
+          query.get('start_date') ??
+          query.get('start_time') ??
+          body?.start_time,
+        to: query.get('end_date') ?? query.get('end_time') ?? body?.end_time,
+      })
       if (
         kind === 'analytics' &&
         new URL(route.request().url()).searchParams.get('facet') === 'traffic'
@@ -156,6 +170,7 @@ async function mock(page: Page, kind: Kind) {
       return route.fulfill({ json: fixtures[kind] })
     }
   )
+  return windows
 }
 for (const kind of Object.keys(fixtures) as Kind[]) {
   for (const width of [1440, 390]) {
@@ -165,7 +180,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       const errors: string[] = []
       page.on('pageerror', (error) => errors.push(error.message))
       await page.setViewportSize({ width, height: 1000 })
-      await mock(page, kind)
+      const windows = await mock(page, kind)
       await page.goto(`/${kind}`)
       await expect(
         page.getByRole('heading', {
@@ -199,11 +214,18 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         ).toBeVisible()
       await page.getByRole('button', { name: '6h', exact: true }).click()
       await expect(page).toHaveURL(/range=6h/)
+      // Quick presets are rolling: the URL carries only the preset, and each
+      // load resolves a fresh 6h window that is what the backend is queried for.
       const bounds = new URL(page.url()).searchParams
-      expect(
-        Date.parse(bounds.get('to')!) - Date.parse(bounds.get('from')!)
-      ).toBe(6 * 3600000)
-      const frozen = new URL(page.url()).searchParams.get('from')
+      expect(bounds.has('from')).toBe(false)
+      expect(bounds.has('to')).toBe(false)
+      const span = (queried?: QueriedWindow) =>
+        queried && Date.parse(queried.to!) - Date.parse(queried.from!)
+      await expect
+        .poll(() => span(windows[windows.length - 1]))
+        .toBe(6 * 3600000)
+      const requestsBeforeReload = windows.length
+      const windowBeforeReload = windows[requestsBeforeReload - 1]
       await page.reload()
       if (kind === 'logs')
         await expect(
@@ -217,7 +239,23 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
             })
             .getByRole('combobox', { name: 'Project scope' })
         ).toContainText('Storefront')
-      expect(new URL(page.url()).searchParams.get('from')).toBe(frozen)
+      const reloaded = new URL(page.url()).searchParams
+      expect(reloaded.get('range')).toBe('6h')
+      expect(reloaded.has('from')).toBe(false)
+      // A rolling preset must resolve a new window on reload, not replay the
+      // bounds it queried before.
+      await expect
+        .poll(() => {
+          if (windows.length <= requestsBeforeReload) return undefined
+          const latest = windows[windows.length - 1]
+          return {
+            span: span(latest),
+            advanced:
+              Date.parse(latest.from!) > Date.parse(windowBeforeReload.from!) &&
+              Date.parse(latest.to!) > Date.parse(windowBeforeReload.to!),
+          }
+        })
+        .toEqual({ span: 6 * 3600000, advanced: true })
       expect(
         await page.evaluate(
           () => document.documentElement.scrollWidth <= window.innerWidth
