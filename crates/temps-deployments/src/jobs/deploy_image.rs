@@ -5,6 +5,7 @@
 //!
 //! Deploys built container images to target environments
 
+use super::image_source::{DeployImageSource, ExpectedImageIdentity};
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -486,6 +487,18 @@ pub struct DeployImageJob {
     log_stream_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional: directly provided image tag (for external/pre-built images, bypasses BuildImageJob lookup)
     external_image_tag: Option<String>,
+    /// Where the image lives, and so how a remote worker obtains it. Separate
+    /// from `external_image_tag`, which only says "don't look up a build job":
+    /// uploads, rollbacks and promotions hand over a tag directly yet may only
+    /// exist on the control plane. `None` (job configs written before this
+    /// field existed) is resolved by [`DeployImageSource::resolve`].
+    image_source: Option<DeployImageSource>,
+    /// The image this deployment is bound to, independent of its (mutable)
+    /// tag. Set by rollback/promotion from the origin deployment's record;
+    /// a normal deploy instead reads the image ID `PullExternalImageJob`
+    /// resolved earlier in the same workflow. Only consulted before exporting
+    /// the control plane's copy of a registry image to a worker.
+    expected_image_identity: Option<ExpectedImageIdentity>,
     /// Docker log rotation config to prevent unbounded log growth
     log_config: Option<ContainerLogConfig>,
     /// Encryption service for decrypting node tokens during remote deployments
@@ -495,10 +508,24 @@ pub struct DeployImageJob {
     /// Local image builder — used to `save_image()` before transferring to remote nodes
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
     /// Registry credentials to forward to a worker's `POST /agent/images/pull`
-    /// when the deployed image is registry-sourced (`external_image_tag` is
-    /// set). `None` when the registry needs no auth, or when the image is a
-    /// control-plane-local build and this path is unused.
+    /// when the deployed image is registry-sourced
+    /// ([`DeployImageSource::Registry`]). `None` when the registry needs no
+    /// auth, or when the image is control-plane-local and this path is unused.
     registry_credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+}
+
+/// What the control plane's own Docker can tell a deploy job about an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlPlaneImage {
+    /// The image is in the control plane's Docker and can be exported.
+    Present,
+    /// The control plane's Docker answered, but not with this image (pruned,
+    /// never loaded, or the daemon could not be queried). Carries the reason.
+    Absent(String),
+    /// This process has no Docker daemon (control-plane serve profile).
+    DockerUnavailable(String),
+    /// No image builder is wired at all.
+    NoImageBuilder,
 }
 
 #[derive(Debug, Clone)]
@@ -509,6 +536,265 @@ struct FailedContainerCandidate {
     host_port: u16,
     image_name: String,
     node_id: Option<i32>,
+}
+
+/// Upper bound on any metadata file read from a `docker save` archive
+/// (`manifest.json`, `index.json`). Real ones are a few KiB; this only stops
+/// a malformed archive from being buffered whole.
+const MAX_SAVED_ARCHIVE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Check that, in a `docker save` archive, the exported tag `image_tag`
+/// names the image `expected_id` — the ID the control plane's Docker reported
+/// for that tag just before export (`image_identity`).
+///
+/// The worker's import binds `image_tag` to whatever the archive says the tag
+/// names, so that is the only thing checked: an ID merely *present* in the
+/// archive (another tag's entry, a nested index) proves nothing about the tag.
+///
+/// An archive names a tag in up to two places, each recording a different
+/// kind of digest:
+///
+/// - `manifest.json` entries whose `RepoTags` contain the tag → their
+///   `Config` digest (`<hex>.json` or `blobs/sha256/<hex>`). This is the image
+///   ID on Docker's classic image store.
+/// - OCI `index.json` descriptors annotated with the tag
+///   (`io.containerd.image.name`, or `org.opencontainers.image.ref.name` as a
+///   full reference or bare tag) → their `digest`. This is the image ID on the
+///   containerd image store — the index digest for a multi-platform image.
+///
+/// Which kind `inspect` reported depends on the daemon's store, so the
+/// archive is accepted when, in one of those places, the tag is named and
+/// every entry naming it records exactly `expected_id`. It is rejected when
+/// the tag is not named at all, or names anything else (the tag was
+/// re-pointed between verification and export).
+async fn verify_saved_image_id(
+    tar_path: &std::path::Path,
+    image_tag: &str,
+    expected_id: &str,
+) -> Result<(), String> {
+    let tar_path = tar_path.to_path_buf();
+    let image_tag = image_tag.to_string();
+    let expected = digest_hex(expected_id).to_string();
+    tokio::task::spawn_blocking(move || {
+        let metadata = read_saved_archive_metadata(&tar_path)?;
+        saved_archive_tag_matches(&metadata, &image_tag, &expected)
+    })
+    .await
+    .map_err(|e| format!("archive inspection task failed: {e}"))?
+}
+
+/// The hex part of `sha256:<hex>` (or of a bare `<hex>`).
+fn digest_hex(value: &str) -> &str {
+    let value = value.trim();
+    value.rsplit(':').next().unwrap_or(value)
+}
+
+/// Canonical `registry/repository:tag` form of an image reference, so that
+/// Docker's familiar names compare equal to fully qualified ones:
+/// `nginx:1.27` ≡ `docker.io/library/nginx:1.27`, `app` ≡
+/// `docker.io/library/app:latest`. Digest references keep their digest.
+fn normalize_image_ref(reference: &str) -> String {
+    let reference = reference.trim();
+    let (name, suffix) = match reference.split_once('@') {
+        Some((name, digest)) => (name, format!("@{digest}")),
+        None => {
+            let last_segment_start = reference.rfind('/').map_or(0, |i| i + 1);
+            match reference[last_segment_start..].rfind(':') {
+                Some(i) => {
+                    let split = last_segment_start + i;
+                    (&reference[..split], format!(":{}", &reference[split + 1..]))
+                }
+                None => (reference, ":latest".to_string()),
+            }
+        }
+    };
+    let (registry, repository) = match name.split_once('/') {
+        Some((first, rest))
+            if first.contains('.') || first.contains(':') || first == "localhost" =>
+        {
+            (first.to_ascii_lowercase(), rest.to_string())
+        }
+        _ => ("docker.io".to_string(), name.to_string()),
+    };
+    let registry = if registry == "index.docker.io" {
+        "docker.io".to_string()
+    } else {
+        registry
+    };
+    let repository = if registry == "docker.io" && !repository.contains('/') {
+        format!("library/{repository}")
+    } else {
+        repository
+    };
+    format!("{registry}/{repository}{suffix}")
+}
+
+/// The tag part of a normalized reference (`latest` in `…/app:latest`).
+fn normalized_ref_tag(normalized: &str) -> Option<&str> {
+    let last_segment = normalized.rsplit('/').next()?;
+    last_segment.split_once(':').map(|(_, tag)| tag)
+}
+
+#[derive(Deserialize)]
+struct SavedManifestEntry {
+    #[serde(rename = "Config")]
+    config: String,
+    #[serde(rename = "RepoTags", default)]
+    repo_tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SavedOciIndex {
+    #[serde(default)]
+    manifests: Vec<SavedOciDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct SavedOciDescriptor {
+    digest: String,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
+}
+
+const CONTAINERD_IMAGE_NAME_ANNOTATION: &str = "io.containerd.image.name";
+const OCI_REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+
+impl SavedOciDescriptor {
+    /// Whether this descriptor's annotations name `normalized_tag`.
+    ///
+    /// `io.containerd.image.name` is the full reference. The OCI
+    /// `ref.name` may be a full reference or — as Docker writes it — just the
+    /// tag; a bare tag is only trusted when there is no containerd name to
+    /// contradict it.
+    fn names(&self, normalized_tag: &str) -> bool {
+        if let Some(name) = self.annotations.get(CONTAINERD_IMAGE_NAME_ANNOTATION) {
+            return normalize_image_ref(name) == normalized_tag;
+        }
+        match self.annotations.get(OCI_REF_NAME_ANNOTATION) {
+            Some(ref_name) if ref_name.contains('/') || ref_name.contains(':') => {
+                normalize_image_ref(ref_name) == normalized_tag
+            }
+            Some(bare_tag) => normalized_ref_tag(normalized_tag) == Some(bare_tag.trim()),
+            None => false,
+        }
+    }
+}
+
+/// Top-level metadata of a `docker save` archive.
+#[derive(Default)]
+struct SavedArchiveMetadata {
+    has_metadata: bool,
+    manifest_entries: Vec<SavedManifestEntry>,
+    index_descriptors: Vec<SavedOciDescriptor>,
+}
+
+fn saved_archive_tag_matches(
+    metadata: &SavedArchiveMetadata,
+    image_tag: &str,
+    expected: &str,
+) -> Result<(), String> {
+    if !metadata.has_metadata {
+        return Err("archive has neither manifest.json nor index.json".to_string());
+    }
+    let tag = normalize_image_ref(image_tag);
+
+    // `manifest.json`: config digests of the entries tagged `image_tag`.
+    let manifest_ids: Vec<String> = metadata
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .repo_tags
+                .iter()
+                .flatten()
+                .any(|repo_tag| normalize_image_ref(repo_tag) == tag)
+        })
+        .map(|entry| {
+            let file_name = entry.config.rsplit('/').next().unwrap_or(&entry.config);
+            digest_hex(file_name.trim_end_matches(".json")).to_string()
+        })
+        .collect();
+    // `index.json`: digests of the descriptors annotated with `image_tag`.
+    let index_ids: Vec<String> = metadata
+        .index_descriptors
+        .iter()
+        .filter(|descriptor| descriptor.names(&tag))
+        .map(|descriptor| digest_hex(&descriptor.digest).to_string())
+        .collect();
+
+    if manifest_ids.is_empty() && index_ids.is_empty() {
+        return Err(format!("archive does not name {image_tag}"));
+    }
+    let all_expected = |ids: &[String]| !ids.is_empty() && ids.iter().all(|id| id == expected);
+    if all_expected(&manifest_ids) || all_expected(&index_ids) {
+        return Ok(());
+    }
+
+    let mut named: Vec<String> = manifest_ids
+        .into_iter()
+        .chain(index_ids)
+        .map(|id| format!("sha256:{id}"))
+        .collect();
+    named.sort();
+    named.dedup();
+    Err(format!(
+        "in the archive {image_tag} names {} instead",
+        named.join(", ")
+    ))
+}
+
+/// Read a metadata entry, refusing anything implausibly large.
+fn read_saved_archive_entry<R: std::io::Read>(
+    entry: tar::Entry<'_, R>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let size = entry.header().size().unwrap_or(0);
+    if size > MAX_SAVED_ARCHIVE_METADATA_BYTES {
+        return Err(format!("{name} in archive is too large ({size} bytes)"));
+    }
+    let mut buf = Vec::with_capacity(size as usize);
+    entry
+        .take(MAX_SAVED_ARCHIVE_METADATA_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot read {name} from archive: {e}"))?;
+    Ok(buf)
+}
+
+/// One pass over the archive for `manifest.json` and `index.json`.
+fn read_saved_archive_metadata(tar_path: &std::path::Path) -> Result<SavedArchiveMetadata, String> {
+    let file = std::fs::File::open(tar_path)
+        .map_err(|e| format!("cannot open archive {}: {e}", tar_path.display()))?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("cannot read archive {}: {e}", tar_path.display()))?;
+    let mut metadata = SavedArchiveMetadata::default();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .ok()
+            .map(|path| path.to_string_lossy().trim_start_matches("./").to_string());
+        match path.as_deref() {
+            Some("manifest.json") => {
+                let bytes = read_saved_archive_entry(entry, "manifest.json")?;
+                let manifest: Vec<SavedManifestEntry> = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid manifest.json in archive: {e}"))?;
+                metadata.manifest_entries.extend(manifest);
+                metadata.has_metadata = true;
+            }
+            Some("index.json") => {
+                let bytes = read_saved_archive_entry(entry, "index.json")?;
+                let index: SavedOciIndex = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid index.json in archive: {e}"))?;
+                metadata.index_descriptors.extend(index.manifests);
+                metadata.has_metadata = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(metadata)
 }
 
 fn lock_deployment_state<'a, T>(
@@ -571,6 +857,8 @@ impl DeployImageJob {
             deployment_id: None,
             log_stream_task: Arc::new(Mutex::new(None)),
             external_image_tag: None,
+            image_source: None,
+            expected_image_identity: None,
             log_config: None,
             encryption_service: None,
             config_service: None,
@@ -637,6 +925,153 @@ impl DeployImageJob {
     pub fn with_external_image_tag(mut self, image_tag: String) -> Self {
         self.external_image_tag = Some(image_tag);
         self
+    }
+
+    /// Declare where the deployed image lives. See [`DeployImageSource`].
+    pub fn with_image_source(mut self, image_source: DeployImageSource) -> Self {
+        self.image_source = Some(image_source);
+        self
+    }
+
+    /// Bind this deployment to a specific image (see
+    /// [`ExpectedImageIdentity`]).
+    pub fn with_expected_image_identity(mut self, expected: ExpectedImageIdentity) -> Self {
+        self.expected_image_identity = Some(expected);
+        self
+    }
+
+    /// The identity the deployed image must have: the explicitly recorded one,
+    /// else the image ID the dependency job (`PullExternalImageJob`) resolved
+    /// in this workflow. `None` when neither exists — e.g. the pull was
+    /// deferred to the worker and nothing was resolved locally.
+    fn expected_image_identity(&self, context: &WorkflowContext) -> Option<ExpectedImageIdentity> {
+        if let Some(expected) = &self.expected_image_identity {
+            return Some(expected.clone());
+        }
+        context
+            .get_output::<String>(&self.build_job_id, "image_id")
+            .ok()
+            .flatten()
+            .and_then(|image_id| ExpectedImageIdentity::image_id(&image_id))
+    }
+
+    /// The control plane's copy of a registry image, if it is provably the
+    /// image this deployment is bound to: `Ok(image_id)`, or `Err(reason)`.
+    ///
+    /// A tag match alone is never accepted — the tag may have been re-pointed
+    /// on the control plane since this deployment resolved it, and exporting
+    /// it would run a different image on the worker instead of failing.
+    ///
+    /// Every ID compared here comes from the same daemon's `inspect`, so it is
+    /// the same kind of digest on both sides whatever the image store: the
+    /// config digest on the classic store, the manifest/index digest on the
+    /// containerd store (`PullExternalImageJob` records the same field). The
+    /// returned ID is what [`verify_saved_image_id`] then requires the
+    /// exported tag to name in the archive, which records both kinds.
+    async fn verified_control_plane_copy(
+        &self,
+        image_tag: &str,
+        context: &WorkflowContext,
+    ) -> Result<String, String> {
+        let Some(image_builder) = self.image_builder.as_ref() else {
+            return Err(
+                "this control plane has no image builder to export a copy from".to_string(),
+            );
+        };
+        let local = match image_builder.image_identity(image_tag).await {
+            Ok(local) => local,
+            Err(temps_deployer::BuilderError::DockerUnavailable(e)) => {
+                return Err(format!(
+                    "this control plane has no Docker daemon to export a copy from ({e})"
+                ));
+            }
+            Err(e) => return Err(format!("the control plane does not hold a copy ({e})")),
+        };
+        let Some(expected) = self.expected_image_identity(context) else {
+            return Err(format!(
+                "no recorded image identity to verify the control plane's copy ({}) against, \
+                 and a tag alone is not trusted",
+                local.id
+            ));
+        };
+        if !expected.matches(&local) {
+            return Err(format!(
+                "the control plane holds a different image under this tag ({}; this \
+                 deployment expects {})",
+                local.id, expected
+            ));
+        }
+        Ok(local.id)
+    }
+
+    /// The source this job acts on for `image_tag`: the declared one, with a
+    /// reserved `temps.internal/` ref always treated as control-plane-local.
+    fn resolved_image_source(&self, image_tag: &str) -> DeployImageSource {
+        DeployImageSource::resolve(
+            image_tag,
+            self.image_source,
+            self.external_image_tag.is_some(),
+        )
+    }
+
+    /// Whether this process runs workloads on its own Docker (full serve
+    /// profile). `false` in the control-plane profile.
+    fn local_workloads_enabled(&self) -> bool {
+        self.node_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.local_workloads_enabled())
+            .unwrap_or(true)
+    }
+
+    /// What the control plane's own Docker can tell us about `image_tag`.
+    async fn control_plane_image(&self, image_tag: &str) -> ControlPlaneImage {
+        let Some(image_builder) = self.image_builder.as_ref() else {
+            return ControlPlaneImage::NoImageBuilder;
+        };
+        match image_builder.inspect_image(image_tag).await {
+            Ok(_) => ControlPlaneImage::Present,
+            Err(temps_deployer::BuilderError::DockerUnavailable(e)) => {
+                ControlPlaneImage::DockerUnavailable(e.to_string())
+            }
+            Err(e) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    "Image not available in the control plane's Docker: {}",
+                    e
+                );
+                ControlPlaneImage::Absent(e.to_string())
+            }
+        }
+    }
+
+    /// Why a control-plane-local image cannot be exported to a worker, or
+    /// `None` when it can. Each reason names its own remedy: a control plane
+    /// with Docker disabled needs a registry (or the full profile), while one
+    /// whose Docker simply lost the image (pruned) needs it re-uploaded.
+    async fn control_plane_export_blocker(&self, image_tag: &str) -> Option<String> {
+        const USE_A_REGISTRY: &str = "Push the image to a registry and deploy it by reference \
+             (`temps deploy:image`), or run the control plane with the full profile.";
+        match self.control_plane_image(image_tag).await {
+            ControlPlaneImage::Present => None,
+            ControlPlaneImage::NoImageBuilder => Some(format!(
+                "this control plane has no image builder (Docker is disabled here), so \
+                 nothing can export it. {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::DockerUnavailable(e) => Some(format!(
+                "this control plane has no Docker daemon to export it from ({e}). \
+                 {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::Absent(e) if !self.local_workloads_enabled() => Some(format!(
+                "this control plane runs no local workloads (control-plane profile), so it \
+                 has no Docker daemon to export it from ({e}). {USE_A_REGISTRY}"
+            )),
+            ControlPlaneImage::Absent(e) => Some(format!(
+                "the control plane's Docker no longer holds it — it may have been pruned \
+                 ({e}). Re-upload the image (`temps deploy:local-image`) or redeploy to \
+                 rebuild it, or push it to a registry and deploy it by reference \
+                 (`temps deploy:image`)."
+            )),
+        }
     }
 
     pub fn with_config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
@@ -876,15 +1311,18 @@ impl DeployImageJob {
     /// Ensure the image exists on a remote node, transferring it if needed.
     ///
     /// 1. Checks if the image already exists on the remote node (via agent API).
-    /// 2. If the image is registry-sourced (`external_image_tag` is set), asks
-    ///    the worker to pull it directly from the registry via
-    ///    `POST /agent/images/pull` — no Docker daemon is needed on the
-    ///    control plane for this path (control-plane serve profile).
-    /// 3. Otherwise (a control-plane-local build — only reachable in the full
-    ///    profile, since control-plane-profile git builds are refused before
-    ///    this job ever runs) saves the image as a tar on the control plane
-    ///    (`docker save`) and streams it to the remote agent
-    ///    (`POST /agent/images/import`), cleaning up the local tar afterward.
+    /// 2. How it gets there depends on [`DeployImageSource`], never on whether
+    ///    the tag was handed over directly:
+    ///    - **Registry**: the worker pulls it itself (`POST /agent/images/pull`)
+    ///      — no Docker daemon is needed on the control plane (control-plane
+    ///      serve profile). If that pull fails and the control plane's Docker
+    ///      holds the image (e.g. `PullExternalImageJob` pulled it there), it
+    ///      is transferred from the control plane instead.
+    ///    - **Control-plane-local** (uploads, `temps.internal/` refs, images
+    ///      built on the control plane): no registry can serve it, so it is
+    ///      saved as a tar on the control plane (`docker save`) and streamed to
+    ///      the agent (`POST /agent/images/import`). A control plane that
+    ///      cannot export it fails here with the remedy, before any pull.
     async fn ensure_image_on_remote(
         &self,
         image_tag: &str,
@@ -933,47 +1371,118 @@ impl DeployImageJob {
             }
         }
 
-        // Registry-sourced image: the worker pulls it itself. This is the
-        // only path available in the control-plane profile (no CP Docker
-        // daemon), and is strictly cheaper than save+stream in the full
-        // profile too — no local disk tar, no double transfer through the
-        // control plane's network link.
-        if self.external_image_tag.is_some() {
-            self.log(
-                context,
-                format!(
-                    "Requesting node '{}' pull '{}' directly from its registry...",
-                    node_name, image_tag
-                ),
-            )
-            .await?;
+        match self.resolved_image_source(image_tag) {
+            DeployImageSource::Registry => {
+                // The worker pulls it itself. This is the only path available
+                // in the control-plane profile (no CP Docker daemon), and is
+                // strictly cheaper than save+stream in the full profile too —
+                // no local disk tar, no double transfer through the control
+                // plane's network link.
+                self.log(
+                    context,
+                    format!(
+                        "Pulling registry image '{}' on node '{}'...",
+                        image_tag, node_name
+                    ),
+                )
+                .await?;
 
-            return match remote
-                .pull_image_from_registry(image_tag, self.registry_credentials.clone())
-                .await
-            {
-                Ok(_image_id) => {
-                    self.log(
+                let pull_error = match remote
+                    .pull_image_from_registry(image_tag, self.registry_credentials.clone())
+                    .await
+                {
+                    Ok(_image_id) => {
+                        self.log(
+                            context,
+                            format!(
+                                "Image '{}' pulled on node '{}' successfully",
+                                image_tag, node_name
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(e) => e,
+                };
+
+                let verified_image_id =
+                    match self.verified_control_plane_copy(image_tag, context).await {
+                        Ok(image_id) => image_id,
+                        Err(reason) => {
+                            let msg = format!(
+                                "Failed to pull image '{}' from registry on node '{}': {}. \
+                                 Not falling back to the control plane's copy: {}",
+                                image_tag, node_name, pull_error, reason
+                            );
+                            self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                                .await?;
+                            return Err(WorkflowError::JobExecutionFailed(msg));
+                        }
+                    };
+
+                self.log_at(
+                    context,
+                    LogLevel::Warning,
+                    format!(
+                        "WARNING: Registry pull of '{}' failed on node '{}' ({}); \
+                         falling back to transfer from control plane (verified {})",
+                        image_tag, node_name, pull_error, verified_image_id
+                    ),
+                )
+                .await?;
+                return self
+                    .transfer_image_via_import(
+                        image_tag,
+                        Some(&verified_image_id),
+                        remote,
+                        node_name,
                         context,
-                        format!(
-                            "Image '{}' pulled on node '{}' successfully",
-                            image_tag, node_name
-                        ),
                     )
-                    .await?;
-                    Ok(())
-                }
-                Err(e) => {
+                    .await;
+            }
+            DeployImageSource::ControlPlaneLocal => {
+                if let Some(reason) = self.control_plane_export_blocker(image_tag).await {
                     let msg = format!(
-                        "Failed to pull image '{}' from registry on node '{}': {}",
-                        image_tag, node_name, e
+                        "Failed to deliver image '{}' to node '{}': it exists only in the \
+                         control plane's local image store (an uploaded image or one built \
+                         on the control plane), which no registry can serve, and {}",
+                        image_tag, node_name, reason
                     );
-                    self.log(context, format!("ERROR: {}", msg)).await?;
-                    Err(WorkflowError::JobExecutionFailed(msg))
+                    self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                        .await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
                 }
-            };
+
+                self.log(
+                    context,
+                    format!(
+                        "Transferring control-plane-local image '{}' to node '{}' via import...",
+                        image_tag, node_name
+                    ),
+                )
+                .await?;
+            }
         }
 
+        self.transfer_image_via_import(image_tag, None, remote, node_name, context)
+            .await
+    }
+
+    /// Save `image_tag` from the control plane's Docker (`docker save`) and
+    /// stream it to the remote agent (`POST /agent/images/import`), cleaning up
+    /// the local tar afterward.
+    ///
+    /// With `expected_image_id`, the exported archive itself must contain that
+    /// image: the tag is re-resolved by `docker save`, so a re-point between
+    /// verification and export would otherwise ship a different image.
+    async fn transfer_image_via_import(
+        &self,
+        image_tag: &str,
+        expected_image_id: Option<&str>,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         let image_builder = match self.image_builder.as_ref() {
             Some(b) => b,
             None => {
@@ -1007,6 +1516,24 @@ impl DeployImageJob {
             );
             self.log(context, format!("ERROR: {}", msg)).await?;
             return Err(WorkflowError::JobExecutionFailed(msg));
+        }
+
+        if let Some(expected_image_id) = expected_image_id {
+            if let Err(reason) =
+                verify_saved_image_id(&tar_path, image_tag, expected_image_id).await
+            {
+                if let Err(e) = tokio::fs::remove_file(&tar_path).await {
+                    tracing::warn!("Failed to clean up image tar {:?}: {}", tar_path, e);
+                }
+                let msg = format!(
+                    "Failed to transfer image '{}' to node '{}': the exported archive is not \
+                     the verified image {} ({})",
+                    image_tag, node_name, expected_image_id, reason
+                );
+                self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                    .await?;
+                return Err(WorkflowError::JobExecutionFailed(msg));
+            }
         }
 
         // Transfer to remote node
@@ -1048,7 +1575,17 @@ impl DeployImageJob {
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
         let level = Self::detect_log_level(&message);
+        self.log_at(context, level, message).await
+    }
 
+    /// [`Self::log`] with an explicit level, for messages whose wording the
+    /// keyword-based [`Self::detect_log_level`] would misclassify.
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
@@ -3021,6 +3558,8 @@ pub struct DeployImageJobBuilder {
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     external_image_tag: Option<String>,
+    image_source: Option<DeployImageSource>,
+    expected_image_identity: Option<ExpectedImageIdentity>,
     log_config: Option<ContainerLogConfig>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
@@ -3113,6 +3652,8 @@ impl DeployImageJobBuilder {
             log_id: None,
             log_service: None,
             external_image_tag: None,
+            image_source: None,
+            expected_image_identity: None,
             log_config: None,
             encryption_service: None,
             config_service: None,
@@ -3243,6 +3784,30 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Declare where the deployed image lives, which decides how a remote
+    /// worker obtains it. See [`DeployImageSource`].
+    pub fn image_source(mut self, image_source: DeployImageSource) -> Self {
+        self.image_source = Some(image_source);
+        self
+    }
+
+    /// Bind the deployment to a specific image. See
+    /// [`DeployImageJob::with_expected_image_identity`].
+    pub fn expected_image_identity(mut self, expected: ExpectedImageIdentity) -> Self {
+        self.expected_image_identity = Some(expected);
+        self
+    }
+
+    /// Apply the image source the planner recorded in a `DeployImageJob` job
+    /// config. A config written before the field existed leaves it unset, and
+    /// the job derives it (see [`DeployImageSource::resolve`]).
+    pub fn image_source_from_job_config(self, config: &serde_json::Value) -> Self {
+        match DeployImageSource::from_job_config(config) {
+            Some(image_source) => self.image_source(image_source),
+            None => self,
+        }
+    }
+
     /// Set Docker log rotation config to prevent unbounded log growth
     pub fn container_log_config(mut self, log_config: ContainerLogConfig) -> Self {
         self.log_config = Some(log_config);
@@ -3319,7 +3884,7 @@ impl DeployImageJobBuilder {
     }
 
     /// Set registry credentials for a worker's direct registry pull, when the
-    /// deployed image is registry-sourced (`external_image_tag`) and needs
+    /// deployed image is registry-sourced ([`DeployImageSource::Registry`]) and needs
     /// authentication. See [`DeployImageJob::with_registry_credentials`].
     pub fn registry_credentials(
         mut self,
@@ -3373,6 +3938,12 @@ impl DeployImageJobBuilder {
         }
         if let Some(external_image_tag) = self.external_image_tag {
             job = job.with_external_image_tag(external_image_tag);
+        }
+        if let Some(image_source) = self.image_source {
+            job = job.with_image_source(image_source);
+        }
+        if let Some(expected) = self.expected_image_identity {
+            job = job.with_expected_image_identity(expected);
         }
         if let Some(log_config) = self.log_config {
             job = job.with_log_config(log_config);
@@ -5345,6 +5916,10 @@ mod tests {
     /// stubbing it out.
     struct RecordingImageBuilder {
         save_image_called: Arc<AtomicBool>,
+        /// Whether the control plane's Docker holds the image. When `true`,
+        /// `inspect_image` reports it as `linux/amd64`; tests pair that with a
+        /// `linux/amd64` remote so the platform check needs no agent call.
+        has_image: bool,
     }
 
     #[async_trait]
@@ -5373,15 +5948,14 @@ mod tests {
 
         async fn save_image(
             &self,
-            _image_name: &str,
+            image_name: &str,
             output_path: &std::path::Path,
         ) -> Result<(), temps_deployer::BuilderError> {
             self.save_image_called.store(true, Ordering::SeqCst);
-            tokio::fs::write(output_path, b"fake-tar-contents")
-                .await
-                .map_err(|e| {
-                    temps_deployer::BuilderError::IoError(std::io::Error::new(e.kind(), e))
-                })?;
+            // A real (tiny) `docker save` archive in which the saved tag names
+            // the image this builder reports (`sha256:local`), OCI layout.
+            write_saved_image_archive(output_path, image_name, "blobs/sha256/local")
+                .map_err(temps_deployer::BuilderError::IoError)?;
             Ok(())
         }
 
@@ -5409,6 +5983,18 @@ mod tests {
             &self,
             image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            if self.has_image {
+                return Ok(temps_deployer::ImageInfo {
+                    id: "sha256:local".to_string(),
+                    architecture: "amd64".to_string(),
+                    os: "linux".to_string(),
+                    platform: "linux/amd64".to_string(),
+                    size_bytes: 0,
+                    tags: vec![image_name.to_string()],
+                    created: None,
+                    working_dir: None,
+                });
+            }
             // Reported as not found so `verify_image_platform_for_node` takes
             // its graceful skip path — platform matching isn't what this test
             // is proving.
@@ -5420,6 +6006,71 @@ mod tests {
         fn get_native_platform(&self) -> String {
             "linux/amd64".to_string()
         }
+    }
+
+    /// Write a tar archive with the given `(path, contents)` entries.
+    fn write_archive(path: &std::path::Path, entries: &[(&str, Vec<u8>)]) -> std::io::Result<()> {
+        let mut builder = tar::Builder::new(std::fs::File::create(path)?);
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, contents.as_slice())?;
+        }
+        builder.finish()
+    }
+
+    /// `manifest.json` with one entry per `(Config, RepoTags)`.
+    fn manifest_json(entries: &[(&str, &[&str])]) -> Vec<u8> {
+        serde_json::Value::Array(
+            entries
+                .iter()
+                .map(|(config, repo_tags)| {
+                    serde_json::json!({
+                        "Config": config,
+                        "RepoTags": repo_tags,
+                        "Layers": [],
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+        .into_bytes()
+    }
+
+    /// OCI `index.json` with one descriptor per `(digest, annotations)`.
+    fn oci_index_json(descriptors: &[(&str, &[(&str, &str)])]) -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": descriptors
+                .iter()
+                .map(|(digest, annotations)| serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "digest": digest,
+                    "size": 1,
+                    "annotations": annotations
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), serde_json::Value::from(*v)))
+                        .collect::<serde_json::Map<_, _>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Write a minimal `docker save` archive whose `manifest.json` tags one
+    /// image (`config`) with `tag`.
+    fn write_saved_image_archive(
+        path: &std::path::Path,
+        tag: &str,
+        config: &str,
+    ) -> std::io::Result<()> {
+        write_archive(
+            path,
+            &[("manifest.json", manifest_json(&[(config, &[tag])]))],
+        )
     }
 
     fn job_with_target(container_deployer: Arc<dyn ContainerDeployer>) -> DeployImageJob {
@@ -5558,7 +6209,10 @@ mod tests {
                 "token".to_string(),
                 "worker-1".to_string(),
             )
-            .unwrap(),
+            .unwrap()
+            // The builder reports the image as present (linux/amd64); a known
+            // node platform keeps the architecture check off the mock agent.
+            .with_platform(Some("linux/amd64".to_string())),
         );
 
         let container_deployer: Arc<dyn ContainerDeployer> =
@@ -5567,6 +6221,7 @@ mod tests {
         let save_image_called = Arc::new(AtomicBool::new(false));
         job.image_builder = Some(Arc::new(RecordingImageBuilder {
             save_image_called: save_image_called.clone(),
+            has_image: true,
         }));
         // No external_image_tag: this is the BuildImageJob-driven path.
 
@@ -5579,6 +6234,859 @@ mod tests {
         assert!(
             save_image_called.load(Ordering::SeqCst),
             "expected the local image builder's save_image to be called for a local build"
+        );
+    }
+
+    const UPLOADED_IMAGE: &str = "temps.internal/project-1/environment-2/upload-0f3c9a:immutable";
+    const REGISTRY_IMAGE: &str = "ghcr.io/example-org/app:v1";
+
+    /// Agent endpoints hit, in order: `exists`, `pull`, `import`, or the raw
+    /// request line for anything else.
+    type AgentRequestLog = Arc<Mutex<Vec<String>>>;
+
+    fn agent_request_kind(request_text: &str) -> String {
+        let path = request_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        if path.starts_with("/agent/images/") && path.ends_with("/exists") {
+            "exists".to_string()
+        } else if path.starts_with("/agent/images/pull") {
+            "pull".to_string()
+        } else if path.starts_with("/agent/images/import") {
+            "import".to_string()
+        } else {
+            request_text.lines().next().unwrap_or_default().to_string()
+        }
+    }
+
+    /// Mock agent that records every request it receives. The image is never
+    /// already on the node; `/pull` answers with `pull_response`; `/import`
+    /// succeeds. Unexpected requests are answered with an error and recorded,
+    /// so the test's sequence assertion reports them instead of a hang.
+    async fn spawn_recording_agent(
+        pull_response: (&'static str, &'static str),
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
+        let requests: AgentRequestLog = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        // More slots than any expected sequence needs, so an unexpected extra
+        // request is still recorded rather than refused.
+        let agent_url = spawn_sequenced_agent(6, move |request_text| {
+            let kind = agent_request_kind(request_text);
+            recorded
+                .lock()
+                .expect("agent request log")
+                .push(kind.clone());
+            match kind.as_str() {
+                "exists" => ("200 OK", r#"{"success":true,"data":false}"#.to_string()),
+                "pull" => (pull_response.0, pull_response.1.to_string()),
+                "import" => (
+                    "200 OK",
+                    r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
+                ),
+                _ => (
+                    "404 Not Found",
+                    r#"{"success":false,"data":null,"error":"unexpected request"}"#.to_string(),
+                ),
+            }
+        })
+        .await;
+
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                agent_url,
+                "token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            // Known platform, so the pre-transfer architecture check never
+            // needs to ask the mock agent's health endpoint.
+            .with_platform(Some("linux/amd64".to_string())),
+        );
+        (remote, requests)
+    }
+
+    const PULL_OK: (&str, &str) = (
+        "200 OK",
+        r#"{"success":true,"data":{"image_id":"sha256:pulled","digest":null}}"#,
+    );
+    const PULL_FAILS: (&str, &str) = (
+        "500 Internal Server Error",
+        r#"{"success":false,"data":null,"error":"manifest unknown"}"#,
+    );
+
+    fn assert_agent_requests(requests: &AgentRequestLog, expected: &[&str], why: &str) {
+        let seen = requests.lock().expect("agent request log").clone();
+        assert_eq!(seen, expected, "{why}");
+    }
+
+    fn uploaded_image_job(
+        image_source: Option<DeployImageSource>,
+        builder: Option<RecordingImageBuilder>,
+    ) -> DeployImageJob {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job =
+            job_with_target(container_deployer).with_external_image_tag(UPLOADED_IMAGE.to_string());
+        if let Some(image_source) = image_source {
+            job = job.with_image_source(image_source);
+        }
+        if let Some(builder) = builder {
+            job.image_builder = Some(Arc::new(builder));
+        }
+        job
+    }
+
+    /// Regression: an uploaded image (`temps deploy:local-image`) is deployed
+    /// with a directly-handed tag, exactly like a registry image, but lives only
+    /// in the control plane's Docker. A remote replica must receive it via
+    /// save+stream; asking the worker to pull `temps.internal/...` failed with
+    /// "lookup temps.internal: no such host".
+    #[tokio::test]
+    async fn ensure_image_on_remote_imports_uploaded_image_instead_of_pulling() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-upload".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import"],
+            "an uploaded image must be imported, never pulled from a registry",
+        );
+        result.expect("an uploaded image must be transferred to the worker via import");
+        assert!(
+            save_image_called.load(Ordering::SeqCst),
+            "expected the uploaded image to be exported from the control plane"
+        );
+    }
+
+    /// Job configs planned before `image_source` existed carry only
+    /// `use_external_image: true`. A `temps.internal/` ref must still be
+    /// treated as control-plane-local, so deployments already queued when the
+    /// fix ships don't hit the same failure.
+    #[tokio::test]
+    async fn ensure_image_on_remote_imports_reserved_ref_from_legacy_config() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        // No image source declared; even an explicit `Registry` would be
+        // overridden for a reserved ref (see `DeployImageSource::resolve`).
+        let job = uploaded_image_job(
+            None,
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-legacy".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import"],
+            "a reserved temps.internal ref from a legacy config must be imported, never pulled",
+        );
+        result.expect("a reserved temps.internal ref must be transferred via import");
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A registry image is pulled by the worker itself; the control plane is
+    /// not involved.
+    #[tokio::test]
+    async fn ensure_image_on_remote_pulls_registry_image_on_node() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: true,
+        }));
+        let context = crate::test_utils::create_test_context("wf-pull".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "a registry image must be pulled by the node",
+        );
+        result.expect("registry pull should succeed");
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A registry-image job whose control plane holds a copy of the tag
+    /// (`RecordingImageBuilder` reports `sha256:local`), with the image ID the
+    /// dependency job resolved in this workflow recorded as `resolved_image_id`.
+    fn registry_fallback_job(
+        save_image_called: &Arc<AtomicBool>,
+        resolved_image_id: Option<&str>,
+    ) -> (DeployImageJob, WorkflowContext) {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: true,
+        }));
+        let mut context =
+            crate::test_utils::create_test_context("wf-fallback".to_string(), 1, 1, 1);
+        if let Some(image_id) = resolved_image_id {
+            // What `PullExternalImageJob` records; `job_with_target` depends on
+            // the job id "build".
+            context
+                .set_output("build", "image_id", image_id)
+                .expect("record resolved image id");
+        }
+        (job, context)
+    }
+
+    /// A registry image whose pull fails on the worker (registry unreachable
+    /// from that node, missing credentials there, ...) is still deliverable
+    /// when the control plane's copy is provably the image this deployment
+    /// resolved — here, the ID `PullExternalImageJob` recorded.
+    #[tokio::test]
+    async fn ensure_image_on_remote_falls_back_to_verified_control_plane_copy() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull", "import"],
+            "a failed registry pull must fall back to importing the verified control-plane copy",
+        );
+        result.expect("a failed registry pull must fall back to the verified control-plane copy");
+        assert!(
+            save_image_called.load(Ordering::SeqCst),
+            "expected the fallback to export the control plane's copy"
+        );
+    }
+
+    /// The tag was re-pointed on the control plane after this deployment
+    /// resolved it: exporting it would run a different image on the worker,
+    /// so the pull failure stands.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_fallback_when_control_plane_copy_differs() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:other"));
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "a re-pointed tag on the control plane must never be imported",
+        );
+        let message = result
+            .expect_err("a mismatched control-plane copy must not be used")
+            .to_string();
+        assert!(
+            message.contains("Failed to pull image 'ghcr.io/example-org/app:v1'")
+                && message.contains("manifest unknown")
+                && message.contains("holds a different image under this tag"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// No identity was recorded (the pull was deferred to the worker, or an
+    /// older workflow): a tag match alone is not trusted.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_fallback_without_recorded_identity() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, None);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "without a recorded identity the control-plane copy must not be imported",
+        );
+        let message = result
+            .expect_err("an unverifiable control-plane copy must not be used")
+            .to_string();
+        assert!(
+            message.contains("manifest unknown") && message.contains("no recorded image identity"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// An explicitly bound identity (rollback/promotion: the origin's
+    /// registered digest) takes precedence over workflow outputs; a local copy
+    /// that doesn't carry that digest is refused.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_fallback_when_bound_digest_is_absent() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+        let job = job.with_expected_image_identity(ExpectedImageIdentity::RepoDigest(
+            "sha256:0d1e2f".to_string(),
+        ));
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(&requests, &["exists", "pull"], "digest mismatch: no import");
+        let message = result.expect_err("digest mismatch").to_string();
+        assert!(
+            message.contains("registry digest sha256:0d1e2f"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    fn temp_archive(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("temps-saved-{label}-{}.tar", uuid::Uuid::new_v4()))
+    }
+
+    const TAG: &str = "ghcr.io/example-org/app:v1";
+    const OTHER_TAG: &str = "ghcr.io/example-org/app:v2";
+
+    async fn verify_archive(
+        entries: &[(&str, Vec<u8>)],
+        tag: &str,
+        expected: &str,
+    ) -> Result<(), String> {
+        let archive = temp_archive("verify");
+        write_archive(&archive, entries).unwrap();
+        let result = verify_saved_image_id(&archive, tag, expected).await;
+        let _ = std::fs::remove_file(archive);
+        result
+    }
+
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_classic_single_entry_in_either_layout() {
+        for config in ["blobs/sha256/abc123", "abc123.json"] {
+            assert_eq!(
+                verify_archive(
+                    &[("manifest.json", manifest_json(&[(config, &[TAG])]))],
+                    TAG,
+                    "sha256:abc123"
+                )
+                .await,
+                Ok(()),
+                "{config}"
+            );
+        }
+    }
+
+    /// Several entries; only the one tagged with the exported tag matters.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_tagged_entry_among_others() {
+        let manifest = manifest_json(&[
+            ("aaa111.json", &[OTHER_TAG]),
+            ("abc123.json", &[TAG]),
+            ("bbb222.json", &[]),
+        ]);
+        assert_eq!(
+            verify_archive(&[("manifest.json", manifest)], TAG, "sha256:abc123").await,
+            Ok(())
+        );
+    }
+
+    /// The expected image is in the archive, but under another tag: the
+    /// exported tag names something else, which is what the worker would run.
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_expected_image_under_another_tag() {
+        let manifest = manifest_json(&[("abc123.json", &[OTHER_TAG]), ("def456.json", &[TAG])]);
+        let err = verify_archive(&[("manifest.json", manifest)], TAG, "sha256:abc123")
+            .await
+            .expect_err("the exported tag names a different image");
+        assert!(err.contains("names sha256:def456"), "{err}");
+    }
+
+    /// containerd store: the tag-annotated index descriptor carries the image
+    /// (index) digest; the per-platform manifest.json configs differ from it.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_containerd_index_named_by_tag() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[(
+                    "sha256:idx999",
+                    &[
+                        (CONTAINERD_IMAGE_NAME_ANNOTATION, TAG),
+                        (OCI_REF_NAME_ANNOTATION, "v1"),
+                    ],
+                )]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[
+                    ("blobs/sha256/cfgamd", &[TAG]),
+                    ("blobs/sha256/cfgarm", &[TAG]),
+                ]),
+            ),
+        ];
+        assert_eq!(verify_archive(&entries, TAG, "sha256:idx999").await, Ok(()));
+    }
+
+    /// Docker's OCI layout on the classic store: index.json names the tag with
+    /// a manifest digest (a different kind), manifest.json with the config
+    /// digest that `inspect` reported.
+    #[tokio::test]
+    async fn verify_saved_image_id_accepts_classic_config_in_oci_layout() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[("sha256:man555", &[(OCI_REF_NAME_ANNOTATION, "v1")])]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("blobs/sha256/abc123", &[TAG])]),
+            ),
+        ];
+        assert_eq!(verify_archive(&entries, TAG, "sha256:abc123").await, Ok(()));
+    }
+
+    /// The reported race: the tag was re-pointed to a new index that still
+    /// references the verified image in a nested index. Only what the tag
+    /// names counts, so this is rejected.
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_expected_image_only_in_nested_index() {
+        let entries = [
+            (
+                "blobs/sha256/new777",
+                oci_index_json(&[("sha256:idx999", &[])]),
+            ),
+            (
+                "index.json",
+                oci_index_json(&[("sha256:new777", &[(CONTAINERD_IMAGE_NAME_ANNOTATION, TAG)])]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("blobs/sha256/cfgnew", &[TAG])]),
+            ),
+        ];
+        let err = verify_archive(&entries, TAG, "sha256:idx999")
+            .await
+            .expect_err("the tag names a different index");
+        assert!(err.contains("sha256:new777"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn verify_saved_image_id_rejects_archive_not_naming_the_tag() {
+        let entries = [
+            (
+                "index.json",
+                oci_index_json(&[(
+                    "sha256:abc123",
+                    &[(CONTAINERD_IMAGE_NAME_ANNOTATION, OTHER_TAG)],
+                )]),
+            ),
+            (
+                "manifest.json",
+                manifest_json(&[("abc123.json", &[OTHER_TAG])]),
+            ),
+        ];
+        let err = verify_archive(&entries, TAG, "sha256:abc123")
+            .await
+            .expect_err("the archive never names the exported tag");
+        assert!(
+            err.contains("does not name ghcr.io/example-org/app:v1"),
+            "{err}"
+        );
+    }
+
+    /// Docker writes familiar names (`nginx:1.27`); the export may be asked
+    /// for the fully qualified form, and vice versa.
+    #[tokio::test]
+    async fn verify_saved_image_id_normalizes_docker_hub_references() {
+        let manifest = manifest_json(&[("abc123.json", &["nginx:1.27"])]);
+        assert_eq!(
+            verify_archive(
+                &[("manifest.json", manifest.clone())],
+                "docker.io/library/nginx:1.27",
+                "sha256:abc123"
+            )
+            .await,
+            Ok(())
+        );
+        let index = oci_index_json(&[(
+            "sha256:idx999",
+            &[(
+                CONTAINERD_IMAGE_NAME_ANNOTATION,
+                "docker.io/library/nginx:1.27",
+            )],
+        )]);
+        assert_eq!(
+            verify_archive(&[("index.json", index)], "nginx:1.27", "sha256:idx999").await,
+            Ok(())
+        );
+        // A different repository with the same tag is not the same reference.
+        assert!(verify_archive(
+            &[("manifest.json", manifest)],
+            "ghcr.io/example-org/nginx:1.27",
+            "sha256:abc123"
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn normalize_image_ref_canonicalizes_references() {
+        assert_eq!(
+            normalize_image_ref("nginx"),
+            "docker.io/library/nginx:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("nginx:1.27"),
+            "docker.io/library/nginx:1.27"
+        );
+        assert_eq!(
+            normalize_image_ref("index.docker.io/library/nginx:1.27"),
+            "docker.io/library/nginx:1.27"
+        );
+        assert_eq!(normalize_image_ref("org/app:v1"), "docker.io/org/app:v1");
+        assert_eq!(normalize_image_ref(TAG), TAG);
+        assert_eq!(
+            normalize_image_ref("localhost:5000/app"),
+            "localhost:5000/app:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("temps.internal/project-1/environment-2/upload-0f3c9a:immutable"),
+            "temps.internal/project-1/environment-2/upload-0f3c9a:immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_saved_image_id_errors_on_unreadable_archives() {
+        let garbage = temp_archive("garbage");
+        std::fs::write(&garbage, b"not a tar").unwrap();
+        assert!(verify_saved_image_id(&garbage, TAG, "sha256:abc123")
+            .await
+            .is_err());
+        let _ = std::fs::remove_file(garbage);
+
+        let err = verify_archive(
+            &[("blobs/sha256/abc123", b"{}".to_vec())],
+            TAG,
+            "sha256:abc123",
+        )
+        .await
+        .expect_err("an archive without metadata proves nothing");
+        assert!(
+            err.contains("neither manifest.json nor index.json"),
+            "{err}"
+        );
+    }
+
+    /// Without a local copy there is nothing to fall back to: the pull error
+    /// is reported as before, and no export is attempted.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reports_pull_failure_without_local_copy() {
+        let (remote, requests) = spawn_recording_agent(PULL_FAILS).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        job.image_builder = Some(Arc::new(RecordingImageBuilder {
+            save_image_called: save_image_called.clone(),
+            has_image: false,
+        }));
+        let context = crate::test_utils::create_test_context("wf-pull-fail".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "with no local copy the deploy must stop after the failed pull",
+        );
+        let message = result
+            .expect_err("a failed pull with no local copy must fail the deploy")
+            .to_string();
+        assert!(
+            message.contains("Failed to pull image 'ghcr.io/example-org/app:v1'")
+                && message.contains("manifest unknown"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A control-plane-local image on a control plane with no image builder
+    /// (Docker disabled) fails with the registry remedy — and never tries a
+    /// pull that is guaranteed to fail with a confusing DNS error.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_local_image_without_image_builder() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let job = uploaded_image_job(Some(DeployImageSource::ControlPlaneLocal), None);
+        let context = crate::test_utils::create_test_context("wf-no-builder".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("a control-plane-local image cannot be delivered without a builder")
+            .to_string();
+        assert!(
+            message.contains("Failed to deliver image")
+                && message.contains("exists only in the control plane's local image store")
+                && message.contains("no image builder (Docker is disabled here)")
+                && message.contains("temps deploy:image"),
+            "error should explain the cause and the remedy: {message}"
+        );
+    }
+
+    /// Control-plane serve profile (`local_workloads_enabled = false`): the
+    /// image builder is wired but its Docker does not hold the image, so the
+    /// deploy is refused explicitly instead of attempting a registry pull.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_local_image_on_control_plane_profile() {
+        use crate::services::{NodeScheduler, NodeService};
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let scheduler = Arc::new(
+            NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_workloads_enabled(false),
+        );
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: false,
+            }),
+        )
+        .with_node_scheduler(scheduler);
+        let context = crate::test_utils::create_test_context("wf-cp-profile".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("the control-plane profile cannot export a local image")
+            .to_string();
+        assert!(
+            message.contains("control-plane profile")
+                && message.contains("no Docker daemon to export it from"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// Full profile, Docker available, but the image is gone from the control
+    /// plane (pruned): the error says so and points at re-uploading, instead
+    /// of blaming a missing Docker daemon.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reports_pruned_local_image() {
+        let (remote, requests) = spawn_recording_agent(PULL_OK).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: false,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-pruned".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .await;
+
+        assert_agent_requests(
+            &requests,
+            &["exists"],
+            "the refusal must happen before any pull or import",
+        );
+        let message = result
+            .expect_err("a pruned local image cannot be delivered")
+            .to_string();
+        assert!(
+            message.contains("may have been pruned")
+                && message.contains("temps deploy:local-image")
+                && !message.contains("no Docker daemon"),
+            "unexpected error: {message}"
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// The refusal and fallback messages are logged at their real level; the
+    /// keyword-based classifier alone would file "ERROR: …" under info.
+    #[test]
+    fn delivery_messages_are_not_misclassified_by_keyword_detection() {
+        assert_eq!(
+            DeployImageJob::detect_log_level(
+                "ERROR: Failed to deliver image 'x' to node 'y': it exists only in the \
+                 control plane's local image store"
+            ),
+            LogLevel::Error
+        );
+    }
+
+    fn external_image_job_from_config(config: &serde_json::Value) -> DeployImageJob {
+        let image = config["image_name"]
+            .as_str()
+            .expect("image_name")
+            .to_string();
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .build_job_id("verify_local_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .external_image_tag(image)
+        .image_source_from_job_config(config)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .expect("deploy job builds")
+    }
+
+    /// The execution service hands the planned job config to the builder via
+    /// `image_source_from_job_config`; the recorded source must reach the job.
+    #[test]
+    fn builder_applies_image_source_from_job_config() {
+        // A non-reserved tag, so only the recorded source can make it local.
+        let local = serde_json::json!({
+            "image_name": "example-app-1666:latest",
+            "use_external_image": true,
+            "image_source": "control_plane_local",
+        });
+        let job = external_image_job_from_config(&local);
+        assert_eq!(job.image_source, Some(DeployImageSource::ControlPlaneLocal));
+        assert_eq!(
+            job.resolved_image_source("example-app-1666:latest"),
+            DeployImageSource::ControlPlaneLocal
+        );
+
+        let registry = serde_json::json!({
+            "image_name": REGISTRY_IMAGE,
+            "use_external_image": true,
+            "image_source": "registry",
+        });
+        let job = external_image_job_from_config(&registry);
+        assert_eq!(job.image_source, Some(DeployImageSource::Registry));
+        assert_eq!(
+            job.resolved_image_source(REGISTRY_IMAGE),
+            DeployImageSource::Registry
+        );
+    }
+
+    /// Configs planned before the field existed leave the source unset; the
+    /// job then derives it from the tag.
+    #[test]
+    fn builder_leaves_image_source_unset_for_legacy_job_config() {
+        let legacy = serde_json::json!({
+            "image_name": UPLOADED_IMAGE,
+            "use_external_image": true,
+        });
+        let job = external_image_job_from_config(&legacy);
+        assert_eq!(job.image_source, None);
+        assert_eq!(
+            job.resolved_image_source(UPLOADED_IMAGE),
+            DeployImageSource::ControlPlaneLocal
+        );
+
+        let legacy_registry = serde_json::json!({
+            "image_name": REGISTRY_IMAGE,
+            "use_external_image": true,
+        });
+        let job = external_image_job_from_config(&legacy_registry);
+        assert_eq!(
+            job.resolved_image_source(REGISTRY_IMAGE),
+            DeployImageSource::Registry
+        );
+    }
+
+    /// Rollback/promotion bind the job through the builder; the bound
+    /// identity wins over any workflow output.
+    #[test]
+    fn expected_image_identity_prefers_bound_identity_over_workflow_output() {
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .build_job_id("pull_external_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .external_image_tag(REGISTRY_IMAGE.to_string())
+        .expected_image_identity(ExpectedImageIdentity::RepoDigest("sha256:ddd".to_string()))
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .expect("deploy job builds");
+
+        let mut context = crate::test_utils::create_test_context("wf-bound".to_string(), 1, 1, 1);
+        context
+            .set_output("pull_external_image", "image_id", "sha256:aaa")
+            .unwrap();
+        assert_eq!(
+            job.expected_image_identity(&context),
+            Some(ExpectedImageIdentity::RepoDigest("sha256:ddd".to_string()))
+        );
+
+        // Unbound: the dependency's resolved image ID; an empty one (pull
+        // deferred to the worker) is no identity at all.
+        let unbound = job_with_target(Arc::new(TrackingMockContainerDeployer::new()));
+        let mut context = crate::test_utils::create_test_context("wf-out".to_string(), 1, 1, 1);
+        assert_eq!(unbound.expected_image_identity(&context), None);
+        context.set_output("build", "image_id", "").unwrap();
+        assert_eq!(unbound.expected_image_identity(&context), None);
+        context
+            .set_output("build", "image_id", "sha256:aaa")
+            .unwrap();
+        assert_eq!(
+            unbound.expected_image_identity(&context),
+            Some(ExpectedImageIdentity::ImageId("sha256:aaa".to_string()))
         );
     }
 }

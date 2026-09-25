@@ -42,6 +42,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::jobs::image_source::{is_reserved_local_image_ref, RESERVED_LOCAL_IMAGE_PREFIX};
 use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBundleInfo};
 
 #[derive(OpenApi)]
@@ -565,17 +566,11 @@ pub struct DeployFromImageRequest {
     pub command: Option<Vec<String>>,
 }
 
-const RESERVED_LOCAL_IMAGE_PREFIX: &str = "temps.internal/";
-
 fn platform_local_image_tag(project_id: i32, environment_id: i32, source: &str) -> String {
     format!(
         "{RESERVED_LOCAL_IMAGE_PREFIX}project-{project_id}/environment-{environment_id}/{source}-{}:immutable",
         uuid::Uuid::new_v4().simple()
     )
-}
-
-fn is_reserved_local_image_ref(image_ref: &str) -> bool {
-    image_ref.starts_with(RESERVED_LOCAL_IMAGE_PREFIX)
 }
 
 fn authorize_local_image_claim(

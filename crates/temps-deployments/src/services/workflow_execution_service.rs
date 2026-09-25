@@ -1792,6 +1792,12 @@ impl WorkflowExecutionService {
                     builder = builder.external_image_tag(image_tag.clone());
                 }
 
+                // Where the image lives (registry vs. only on this control
+                // plane) — decides whether a remote worker pulls it or receives
+                // it via import. Absent on job configs planned before the field
+                // existed; the job then derives it (see `DeployImageSource::resolve`).
+                builder = builder.image_source_from_job_config(config);
+
                 // Apply container log rotation settings from config, and — for a
                 // registry-sourced image — the same private-registry credentials
                 // `PullExternalImageJob` uses, so a worker node can pull the image
