@@ -208,8 +208,14 @@ export function LogExplorer({
     return { projects, nodes, services }
   }, [lines])
 
-  const projectFacet = facetValues(facets, 'project_id')
-  const serviceFacet = facetValues(facets, 'external_service_id')
+  // Standalone database services store project_id = 0 because they have no
+  // owning project. It is a storage sentinel, not a selectable project.
+  const projectFacet = facetValues(facets, 'project_id').filter(
+    (item) => item.value !== '0'
+  )
+  const serviceFacet = facetValues(facets, 'external_service_id').filter(
+    (item) => item.value !== '0'
+  )
   const total = (values: FacetValue[]) =>
     values.reduce((sum, item) => sum + item.count, 0)
   const map = (
