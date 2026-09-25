@@ -197,3 +197,75 @@ describe("POST /v1/events/batch", () => {
     expect(json.details[0].index).toBe(1);
   });
 });
+
+describe("country backfill", () => {
+  type Call = [string, unknown[]];
+  const calls = (pool: Pool) =>
+    (pool.query as ReturnType<typeof mock>).mock.calls as unknown as Call[];
+  const updates = (pool: Pool) =>
+    calls(pool).filter(([sql]) => sql.trimStart().startsWith("UPDATE"));
+
+  it("fills an instance's NULL-country rows when a new event resolves a country", async () => {
+    const pool = makePool();
+    const { postEvent } = createEventsRoutes(pool, () => "DE");
+
+    const res = await postEvent(makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" }));
+    expect(res.status).toBe(201);
+
+    const ups = updates(pool);
+    expect(ups.length).toBe(2);
+    for (const [sql, values] of ups) {
+      // Only NULLs are filled — a known country is never overwritten.
+      expect(sql).toContain("country IS NULL");
+      expect(values).toEqual(["inst_abc", "DE"]);
+    }
+    expect(ups.map(([sql]) => sql).join("\n")).toContain("telemetry_instance_days");
+    expect(ups.map(([sql]) => sql).join("\n")).toContain("event_type <> 'cli_setup_step'");
+  });
+
+  it("does nothing when the request's country is unknown", async () => {
+    const pool = makePool();
+    const { postEvent } = createEventsRoutes(pool, () => null);
+
+    await postEvent(makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" }));
+    expect(updates(pool).length).toBe(0);
+  });
+
+  it("never backfills from a CLI setup attempt", async () => {
+    const pool = makePool();
+    const { postEvent } = createEventsRoutes(pool, () => "DE");
+
+    await postEvent(makeReq({
+      anonymous_id: "12345678-1234-4234-8234-123456789abc",
+      event_type: "cli_setup_step",
+      properties: { step: "install", status: "completed", method: "ssh", elapsed_bucket: "under_minute", cli_version: "0.1.36" },
+    }));
+    expect(updates(pool).length).toBe(0);
+  });
+
+  it("backfills each instance in a batch once, after the inserts", async () => {
+    const pool = makePool();
+    const { postBatch } = createEventsRoutes(pool, () => "US");
+
+    const req = new Request("http://localhost/v1/events/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        events: [
+          { anonymous_id: "inst_1", event_type: "deploy_attempted" },
+          { anonymous_id: "inst_1", event_type: "deploy_succeeded" },
+          { anonymous_id: "inst_2", event_type: "instance_started" },
+        ],
+      }),
+    });
+    expect((await postBatch(req)).status).toBe(201);
+
+    const all = calls(pool);
+    const firstUpdate = all.findIndex(([sql]) => sql.trimStart().startsWith("UPDATE"));
+    const lastInsert = all.map(([sql]) => sql.trimStart().startsWith("INSERT")).lastIndexOf(true);
+    expect(firstUpdate).toBeGreaterThan(lastInsert);
+
+    const ids = updates(pool).map(([, values]) => values[0]);
+    expect(ids.sort()).toEqual(["inst_1", "inst_1", "inst_2", "inst_2"]);
+  });
+});

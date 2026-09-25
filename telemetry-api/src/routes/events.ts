@@ -220,7 +220,44 @@ async function insertEvent(
   );
 }
 
-export function createEventsRoutes(pool: Pool) {
+// Fill in the country on an instance's earlier rows that were stored without
+// one (private IP, missing geo DB at the time, ...). Only NULLs are touched — a
+// country that is already known is never overwritten. Setup attempts stay
+// country-less by design. The partial indexes from migration 004 keep this a
+// near-free no-op once an instance has no NULL rows left.
+export async function backfillCountry(
+  pool: Pool,
+  anonymousId: string,
+  country: string | null
+): Promise<void> {
+  if (!country) return;
+  await pool.query(
+    `UPDATE telemetry_instance_days SET country = $2
+     WHERE anonymous_id = $1 AND country IS NULL`,
+    [anonymousId, country]
+  );
+  await pool.query(
+    `UPDATE telemetry_events SET country = $2
+     WHERE anonymous_id = $1 AND country IS NULL AND event_type <> 'cli_setup_step'`,
+    [anonymousId, country]
+  );
+}
+
+// Distinct instances in a request that should inherit the request's country.
+function backfillTargets(events: IngestBody[]): string[] {
+  return [
+    ...new Set(
+      events
+        .filter((e) => e.event_type !== "cli_setup_step")
+        .map((e) => e.anonymous_id)
+    ),
+  ];
+}
+
+export function createEventsRoutes(
+  pool: Pool,
+  resolveCountry: (req: Request) => string | null = countryForRequest
+) {
   return {
     // POST /v1/events — single event
     async postEvent(req: Request): Promise<Response> {
@@ -237,10 +274,13 @@ export function createEventsRoutes(pool: Pool) {
       }
 
       // Derive country from the request IP (never stored) for this request.
-      const country = countryForRequest(req);
+      const country = resolveCountry(req);
 
       try {
         await insertEvent(pool, parsed, country);
+        for (const id of backfillTargets([parsed])) {
+          await backfillCountry(pool, id, country);
+        }
       } catch (err) {
         console.error("[events] db insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });
@@ -286,11 +326,15 @@ export function createEventsRoutes(pool: Pool) {
 
       // One country for the whole batch — all events in a request share the
       // same client IP. Derived transiently; the IP is never stored.
-      const country = countryForRequest(req);
+      const country = resolveCountry(req);
 
       try {
         // Insert all events concurrently (pool handles connection reuse)
         await Promise.all(parsed.map((e) => insertEvent(pool, e, country)));
+        // Once per instance, after the inserts, so it can't race them.
+        for (const id of backfillTargets(parsed)) {
+          await backfillCountry(pool, id, country);
+        }
       } catch (err) {
         console.error("[events] batch insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });
