@@ -33,6 +33,13 @@ import sys
 from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+# The only `no-cache` values that keep setup-bun from saving on non-main refs.
+# Checking the value, not just the key, catches `no-cache: false` or an
+# inverted expression, which would save a PR-scoped copy again.
+SETUP_BUN_NO_CACHE = re.compile(
+    r"^\s*no-cache:\s*(?:true|\$\{\{\s*github\.ref\s*!=\s*'refs/heads/main'\s*\}\})\s*$",
+    re.MULTILINE,
+)
 RELEASE_WORKFLOW = WORKFLOWS_DIR / "release.yml"
 
 
@@ -94,7 +101,7 @@ def find_unguarded_self_saving_steps(text: str) -> list[int]:
         if re.search(r"^\s*(?:-\s+)?uses:\s*actions/cache@", line):
             violations.append(i + 1)
         if re.search(r"^\s*(?:-\s+)?uses:\s*oven-sh/setup-bun@", line):
-            if not re.search(r"^\s*no-cache:", step_block(lines, i), re.MULTILINE):
+            if not SETUP_BUN_NO_CACHE.search(step_block(lines, i)):
                 violations.append(i + 1)
     return violations
 

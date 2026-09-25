@@ -51,6 +51,9 @@ jobs:
         # twice already (dependency-scan.yml, network-kernel-tests.yml).
         run: python3 .github/scripts/check-cache-save-guards.py
 
+      - name: Test musl build cache pruning
+        run: python3 .github/scripts/test-prune-cargo-build-cache.py
+
       - name: Verify nextest target seed contracts
         run: python3 .github/scripts/test-nextest-cache-seed.py
 
