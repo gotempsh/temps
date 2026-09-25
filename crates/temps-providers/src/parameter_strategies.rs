@@ -920,7 +920,9 @@ impl ParameterStrategy for MinioParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
-        reject_known_cross_engine_image(params, "rustfs", "MinIO")?;
+        // RustFS images are accepted: `S3Service` runs them with RustFS's
+        // env/command (see `externalsvc::s3::is_rustfs_image`), and RustFS is
+        // this engine's default now that MinIO no longer publishes images.
         // MinIO doesn't require parameters for creation
         Ok(())
     }
@@ -933,11 +935,13 @@ impl ParameterStrategy for MinioParameterStrategy {
             }
         }
 
-        // Default docker_image if not provided (pinned to specific version for reproducibility)
+        // Default docker_image if not provided (pinned to specific version for
+        // reproducibility). MinIO no longer publishes server images, so new
+        // services run RustFS, which serves the same S3 API.
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
+                JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
             );
         }
 
@@ -1018,7 +1022,7 @@ impl ParameterStrategy for MinioParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+                    "default": DEFAULT_RUSTFS_IMAGE
                 }
             },
             "readonly": ["access_key", "secret_key"]
@@ -1903,6 +1907,23 @@ mod tests {
         );
     }
 
+    /// MinIO no longer publishes server images, so a MinIO-engine service
+    /// created without an explicit image must default to something pullable.
+    #[test]
+    fn minio_engine_defaults_new_services_to_rustfs() {
+        let strategy = MinioParameterStrategy;
+        let mut params = HashMap::new();
+        strategy.auto_generate_missing(&mut params).unwrap();
+        assert_eq!(
+            params.get("docker_image").and_then(JsonValue::as_str),
+            Some(DEFAULT_RUSTFS_IMAGE)
+        );
+        assert_eq!(
+            strategy.get_schema().unwrap()["properties"]["docker_image"]["default"].as_str(),
+            Some(DEFAULT_RUSTFS_IMAGE)
+        );
+    }
+
     #[test]
     fn storage_engines_reject_known_cross_engine_images() {
         let rustfs_image = HashMap::from([(
@@ -1914,9 +1935,11 @@ mod tests {
             JsonValue::String("minio/minio:latest".to_string()),
         )]);
 
+        // The MinIO engine runs RustFS images (its default since MinIO
+        // stopped publishing images); the RustFS engines still refuse MinIO.
         assert!(MinioParameterStrategy
             .validate_for_creation(&rustfs_image)
-            .is_err());
+            .is_ok());
         assert!(RustfsParameterStrategy
             .validate_for_creation(&minio_image)
             .is_err());

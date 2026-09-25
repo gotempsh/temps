@@ -19,7 +19,8 @@ REPORT_DIR=${TEMPS_BENCH_REPORT_DIR:-"/tmp/temps-backup-bench-$(date -u +%Y%m%dT
 NETWORK=temps-backup-bench_default
 PG_CONTAINER=temps-backup-bench-postgres-1
 RUSTFS_CONTAINER=temps-backup-bench-rustfs-1
-MC_IMAGE=quay.io/minio/mc:latest
+# RustFS's mc-compatible CLI; MinIO no longer publishes `mc` images.
+RC_IMAGE=rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
 PG_IMAGE=gotempsh/postgres-walg:18-bookworm
 S3_PREFIX=s3://backups/postgres/walg
 ACTIVE_BACKUP=0
@@ -46,9 +47,9 @@ pg_exec() {
   docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d bench "$@"
 }
 
-mc() {
-  docker run --rm --network "$NETWORK" --entrypoint /bin/sh "$MC_IMAGE" -ceu \
-    "mc alias set bench http://rustfs:9000 tempsbench tempsbench-local-only-secret >/dev/null; $*"
+rc() {
+  docker run --rm --network "$NETWORK" --entrypoint /bin/sh "$RC_IMAGE" -ceu \
+    "rc alias set bench http://rustfs:9000 tempsbench tempsbench-local-only-secret >/dev/null; $*"
 }
 
 walg_env=(
@@ -104,9 +105,12 @@ measure_database() {
 }
 
 repository_bytes() {
-  mc "mc du --json --recursive bench/backups/postgres/walg 2>/dev/null | tail -n 1" \
-    | sed -n 's/.*"size":\([0-9][0-9]*\).*/\1/p' \
-    | tail -n 1
+  # `rc du` prints one pretty-printed JSON document; the first
+  # `total_bytes` is the prefix total. RustFS does not advertise the
+  # server-side usage snapshot, so --fallback permits the client-side scan.
+  rc "rc du --json --fallback bench/backups/postgres/walg 2>/dev/null" \
+    | sed -n 's/.*"total_bytes": *\([0-9][0-9]*\).*/\1/p' \
+    | head -n 1
 }
 
 backup_checkpoint() {
@@ -213,7 +217,7 @@ restore_checkpoint() {
 log "report directory: $REPORT_DIR"
 "${COMPOSE[@]}" up -d
 wait_for_postgres "$PG_CONTAINER"
-mc "mc mb --ignore-existing bench/backups >/dev/null"
+rc "rc mb --ignore-existing bench/backups >/dev/null"
 pg_exec -c "CREATE TABLE IF NOT EXISTS bench_events (id bigint PRIMARY KEY, payload text NOT NULL, created_at timestamptz NOT NULL) WITH (fillfactor=100)"
 
 if [[ "$SKIP_FIRST" != "1" ]]; then

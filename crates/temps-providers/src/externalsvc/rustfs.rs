@@ -290,24 +290,29 @@ fn default_secret_key() -> String {
         .collect()
 }
 
-/// Build the `mc mirror` command used by RustFS restores.
+/// Build the `rc mirror` command used by RustFS restores.
 ///
 /// In-place restores must exactly reproduce every bucket present in the
 /// backup: objects created later inside those buckets are removed and any
 /// mirror error fails the restore. Destination-only buckets are intentionally
 /// retained to avoid deleting an entire bucket outside the selected backup's
 /// scope. A newly provisioned target is empty, so it does not need `--remove`.
-fn restore_mirror_command<'a>(
-    source: &'a str,
-    destination: &'a str,
+///
+/// When the backup source is a temporary credential (`source_has_token`) the
+/// mirror is staged so only the source-side `rc` call sends the session token
+/// (see `rc_client::mirror_command`).
+fn restore_mirror_command(
+    source: &str,
+    destination: &str,
     remove_extraneous: bool,
-) -> Vec<&'a str> {
-    let mut command = vec!["mc", "mirror", "--overwrite"];
-    if remove_extraneous {
-        command.push("--remove");
-    }
-    command.extend([source, destination]);
-    command
+    source_has_token: bool,
+) -> Vec<String> {
+    super::rc_client::mirror_command(
+        source,
+        destination,
+        remove_extraneous,
+        super::rc_client::TokenSide::when(source_has_token, super::rc_client::TokenSide::Source),
+    )
 }
 
 fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
@@ -456,9 +461,6 @@ fn adopted_ports_from_inspect(
 }
 
 impl RustfsService {
-    /// MinIO Client (mc) utility image - used for backup/restore operations via mc mirror
-    const MC_IMAGE: &'static str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
-
     pub fn new(
         name: String,
         docker: Arc<Docker>,
@@ -509,11 +511,11 @@ impl RustfsService {
         adopted_ports_from_inspect(&info, docker_image)
     }
 
-    /// Pull the MinIO Client (mc) image used for backup/restore operations
-    async fn pull_mc_image(&self, docker: &Docker) -> Result<()> {
-        info!("Pulling MinIO Client image {}", Self::MC_IMAGE);
+    /// Pull the RustFS client (`rc`) image used for backup/restore operations
+    async fn pull_rc_image(&self, docker: &Docker) -> Result<()> {
+        info!("Pulling RustFS client image {}", super::rc_client::RC_IMAGE);
 
-        crate::utils::pull_image_with_retry(docker, Self::MC_IMAGE, None)
+        crate::utils::pull_image_with_retry(docker, super::rc_client::RC_IMAGE, None)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
@@ -1562,7 +1564,7 @@ impl ExternalService for RustfsService {
         Ok(tag)
     }
 
-    /// Backup RustFS data to another S3 location using mc mirror
+    /// Backup RustFS data to another S3 location using `rc mirror`
     async fn backup_to_s3(
         &self,
         _s3_client: &aws_sdk_s3::Client,
@@ -1579,12 +1581,12 @@ impl ExternalService for RustfsService {
         use sea_orm::*;
 
         info!(
-            "Starting RustFS backup using MinIO Client for backup {}",
+            "Starting RustFS backup using the RustFS client (rc) for backup {}",
             backup.id
         );
 
         let backup_prefix = subpath_root;
-        let container_name = format!("mc-backup-{}", backup.id);
+        let container_name = format!("rc-backup-{}", backup.id);
 
         // Create a backup record
         let backup_record = temps_entities::external_service_backups::Entity::insert(
@@ -1608,16 +1610,12 @@ impl ExternalService for RustfsService {
         .exec_with_returning(pool)
         .await?;
 
-        // Pull the MinIO Client image
-        self.pull_mc_image(&self.docker).await?;
+        // Pull the RustFS client image
+        self.pull_rc_image(&self.docker).await?;
 
         let rustfs_config = self.get_rustfs_config(service_config)?;
 
         // Decrypt destination S3 credentials
-        let dest_endpoint = s3_source
-            .endpoint
-            .clone()
-            .unwrap_or(format!("{}:{}", s3_source.bucket_name, "9000"));
         let decrypted_access_key = self
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
@@ -1634,40 +1632,42 @@ impl ExternalService for RustfsService {
         )
         .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
 
-        // Environment variables for mc - source is the RustFS service, dest is backup S3
+        let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
+        let dest_endpoint_str = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or(&default_dest_endpoint);
+        let has_token = decrypted_session_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+
+        // Both aliases are defined through `RC_HOST_*` (no `rc alias set`, so
+        // no keys in argv). A temporary destination credential's session
+        // token travels separately as `TEMPS_REMOTE_SESSION_TOKEN` and is only
+        // sent, via `-H`, by the destination-side step of each mirror.
         let mut env_vars = vec![
-            format!(
-                "MC_HOST_source=http://{}:{}@{}:{}",
-                rustfs_config.access_key,
-                rustfs_config.secret_key,
-                rustfs_config.host,
-                rustfs_config.port
+            super::rc_client::rc_host_env(
+                "original",
+                &format!("http://{}:{}", rustfs_config.host, rustfs_config.port),
+                &rustfs_config.access_key,
+                &rustfs_config.secret_key,
             ),
-            format!(
-                "MC_HOST_dest=http://{}@{}",
-                super::mc_host_credential(
-                    &decrypted_access_key,
-                    &decrypted_secret_key,
-                    decrypted_session_token.as_deref(),
-                ),
-                dest_endpoint
+            super::rc_client::rc_host_env(
+                "backup-dest",
+                dest_endpoint_str,
+                &decrypted_access_key,
+                &decrypted_secret_key,
             ),
         ];
-        // The `mc alias set backup-dest ...` call below cannot carry a session
-        // token; this override can, and mc prefers it. Absent entirely for a
-        // long-lived credential.
-        env_vars.extend(super::mc_host_alias_override(
-            "backup-dest",
-            &dest_endpoint,
-            &decrypted_access_key,
-            &decrypted_secret_key,
+        env_vars.extend(super::rc_client::remote_session_token_env(
             decrypted_session_token.as_deref(),
         ));
 
-        // Create mc container with shell entrypoint and host networking
-        let mc_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive) with host networking; the commands below run via exec.
+        let rc_config = bollard::models::ContainerCreateBody {
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
             entrypoint: Some(vec!["sh".to_string()]),
             tty: Some(true),
             attach_stdin: Some(true),
@@ -1688,7 +1688,7 @@ impl ExternalService for RustfsService {
                         .name(&container_name)
                         .build(),
                 ),
-                mc_config,
+                rc_config,
             )
             .await?;
 
@@ -1699,44 +1699,18 @@ impl ExternalService for RustfsService {
             )
             .await?;
 
-        let source_endpoint = format!("http://{}:{}", rustfs_config.host, rustfs_config.port);
-        let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
-        let dest_endpoint_str = s3_source
-            .endpoint
-            .as_deref()
-            .unwrap_or(&default_dest_endpoint);
-        let source_name = "original/".to_string();
-        let dest_name = format!("backup-dest/{}/{}", s3_source.bucket_name, subpath_root);
-
-        // Execute commands: set aliases then mirror
-        let commands: Vec<Vec<&str>> = vec![
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "original",
-                &source_endpoint,
-                &rustfs_config.access_key,
-                &rustfs_config.secret_key,
-            ],
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-dest",
-                dest_endpoint_str,
-                &decrypted_access_key,
-                &decrypted_secret_key,
-            ],
-            vec!["mc", "mirror", "--overwrite", &source_name, &dest_name],
-        ];
+        let dest_name = format!(
+            "backup-dest/{}/{}",
+            s3_source.bucket_name,
+            subpath_root.trim_matches('/')
+        );
 
         let mut success = true;
         let mut error_logs = Vec::new();
-        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr on
-        // failure, and that stderr lands in `external_service_backups
-        // .error_message`. The destination credential may be a temporary one,
-        // so its session token has to be on this list alongside the keys.
+        // Client stderr lands in `external_service_backups.error_message`, and
+        // `mc` used to echo the credential-bearing host URL into it. The
+        // destination credential may be a temporary one, so its session token
+        // has to be on this list alongside the keys.
         let sensitive_values = SensitiveValues::new()
             .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None)
             .credential(
@@ -1745,25 +1719,26 @@ impl ExternalService for RustfsService {
                 decrypted_session_token.as_deref(),
             );
 
-        for cmd in commands {
-            // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
-            info!(
-                "Executing command: {:?}",
-                cmd.iter().take(3).collect::<Vec<_>>()
-            );
-
-            let (ok, _stdout, stderr) = self
-                .exec_in_container(&self.docker, &container.id, cmd)
-                .await?;
-
-            if !ok {
-                error_logs.push(sensitive_values.redact(&stderr));
+        // `rc mirror` cannot take the alias root as its source the way
+        // `mc mirror original/ ...` did, so mirror bucket by bucket into
+        // `<dest_name>/<bucket>/` — the same layout the restore paths list.
+        if success {
+            if let Err(e) = super::rc_client::mirror_all_buckets(
+                &self.docker,
+                &container.id,
+                "original",
+                &dest_name,
+                has_token,
+                &sensitive_values,
+            )
+            .await
+            {
+                error_logs.push(e.to_string());
                 success = false;
-                break;
             }
         }
 
-        // Clean up the mc container
+        // Clean up the rc container
         self.docker
             .remove_container(
                 &container.id,
@@ -1824,7 +1799,7 @@ impl ExternalService for RustfsService {
         }
     }
 
-    /// Restore RustFS data from an S3 backup using mc mirror
+    /// Restore RustFS data from an S3 backup using `rc mirror`
     async fn restore_from_s3(
         &self,
         _s3_client: &aws_sdk_s3::Client,
@@ -1842,50 +1817,51 @@ impl ExternalService for RustfsService {
         self.start().await?;
 
         let docker = &self.docker;
-        let container_name = format!("mc-restore-{}", uuid::Uuid::new_v4());
+        let container_name = format!("rc-restore-{}", uuid::Uuid::new_v4());
         let rustfs_config = self.get_rustfs_config(service_config)?;
 
-        // Pull the MinIO Client image
-        self.pull_mc_image(docker).await?;
+        // Pull the RustFS client image
+        self.pull_rc_image(docker).await?;
 
         // s3_source credentials are expected to be plain-text (already decrypted by caller)
         let source_access_key = &s3_source.access_key_id;
         let source_secret_key = &s3_source.secret_key;
         // Plaintext on the same contract; `None` for a long-lived credential.
         let source_session_token = s3_source.session_token.as_deref();
-        let source_endpoint = s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com");
+        let source_endpoint = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://s3.amazonaws.com");
+        let has_token = source_session_token.is_some_and(|token| !token.is_empty());
 
-        // Environment variables for mc - source is backup S3, dest is the RustFS service
+        // Environment for rc: `backup-source` is the backup S3, `dest` the
+        // RustFS service. No `rc alias set` (keys would sit in argv, and its
+        // probe cannot send a session token). A temporary source credential's
+        // token travels as `TEMPS_REMOTE_SESSION_TOKEN` and is only sent, via
+        // `-H`, by the source-side `rc` calls.
         let mut env_vars = vec![
-            format!(
-                "MC_HOST_source=http://{}@{}",
-                super::mc_host_credential(
-                    source_access_key,
-                    source_secret_key,
-                    source_session_token,
-                ),
-                source_endpoint
+            super::rc_client::rc_host_env(
+                "backup-source",
+                source_endpoint,
+                source_access_key,
+                source_secret_key,
             ),
-            format!(
-                "MC_HOST_dest=http://{}:{}@localhost:{}",
-                rustfs_config.access_key, rustfs_config.secret_key, rustfs_config.port
+            super::rc_client::rc_host_env(
+                "dest",
+                &format!("http://localhost:{}", rustfs_config.port),
+                &rustfs_config.access_key,
+                &rustfs_config.secret_key,
             ),
         ];
-        // The `mc alias set backup-source ...` call below cannot carry a
-        // session token; this override can, and mc prefers it. Absent entirely
-        // for a long-lived credential.
-        env_vars.extend(super::mc_host_alias_override(
-            "backup-source",
-            source_endpoint,
-            source_access_key,
-            source_secret_key,
+        env_vars.extend(super::rc_client::remote_session_token_env(
             source_session_token,
         ));
 
-        // Create mc container with shell entrypoint and host networking
-        let mc_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive) with host networking; the commands below run via exec.
+        let rc_config = bollard::models::ContainerCreateBody {
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
             entrypoint: Some(vec!["sh".to_string()]),
             tty: Some(true),
             attach_stdin: Some(true),
@@ -1905,7 +1881,7 @@ impl ExternalService for RustfsService {
                         .name(&container_name)
                         .build(),
                 ),
-                mc_config,
+                rc_config,
             )
             .await?;
 
@@ -1916,62 +1892,21 @@ impl ExternalService for RustfsService {
             )
             .await?;
 
-        let dest_endpoint = format!("http://localhost:{}", rustfs_config.port);
-
-        // Set up aliases
-        let setup_commands: Vec<Vec<&str>> = vec![
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-source",
-                source_endpoint,
-                source_access_key,
-                source_secret_key,
-            ],
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "dest",
-                &dest_endpoint,
-                &rustfs_config.access_key,
-                &rustfs_config.secret_key,
-            ],
-        ];
         // The backup source may be a temporary credential, so its session token
-        // is as sensitive as its secret key and mc will echo it back inside the
-        // `MC_HOST_*` URL it failed to use.
+        // is as sensitive as its secret key; redact it from any client output.
         let sensitive_values = SensitiveValues::new()
             .credential(source_access_key, source_secret_key, source_session_token)
             .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None);
 
-        for cmd in setup_commands {
-            let (ok, _stdout, stderr) = self.exec_in_container(docker, &container.id, cmd).await?;
-            if !ok {
-                // Clean up on alias setup failure
-                docker
-                    .remove_container(
-                        &container.id,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await?;
-                return Err(anyhow::anyhow!(
-                    "Failed to set up mc aliases for RustFS restore: {}",
-                    sensitive_values.redact(&stderr)
-                ));
-            }
-        }
-
-        // List buckets in the backup location
+        // List buckets in the backup location. The trailing `/` lists the
+        // folder's contents rather than every key sharing the prefix.
         let source_backup_location = format!(
-            "backup-source/{}/{}",
-            s3_source.bucket_name, backup_location
+            "backup-source/{}/{}/",
+            s3_source.bucket_name,
+            backup_location.trim_matches('/')
         );
-        let list_command = vec!["mc", "ls", "--json", &source_backup_location];
+        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
+        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
 
         let (list_ok, list_stdout, list_stderr) = self
             .exec_in_container(docker, &container.id, list_command)
@@ -1993,48 +1928,66 @@ impl ExternalService for RustfsService {
             ));
         }
 
-        // Parse bucket listing from JSON output
-        let mut buckets = Vec::new();
-        let json_objects = parse_multiline_json_output(&list_stdout)?;
-        for listing in json_objects {
-            if let (Some("folder"), Some(key)) = (
-                listing.get("type").and_then(|t| t.as_str()),
-                listing.get("key").and_then(|k| k.as_str()),
-            ) {
-                buckets.push(key.to_string());
+        // Parse the bucket folders out of the listing document.
+        let buckets = match super::rc_client::parse_ls_dir_names(&list_stdout) {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "RustFS in-place restore could not read the listing of '{}': {}",
+                    source_backup_location,
+                    sensitive_values.redact(&e.to_string())
+                ));
             }
-        }
+        };
 
         info!("Found buckets to restore: {:?}", buckets);
 
         // For each bucket, create it and mirror its contents
-        for bucket in buckets {
-            let bucket_name = bucket.trim_end_matches('/');
+        for bucket_name in &buckets {
             let dest_location = format!("dest/{}", bucket_name);
 
-            // Create bucket (ignore "already exists" errors)
-            let create_bucket_cmd = vec!["mc", "mb", &dest_location];
-            let (ok, stdout_mb, _) = self
+            // Create the bucket; `--ignore-existing` exits 0 when it is there,
+            // so a failure here is real (auth, network).
+            let create_bucket_cmd = vec!["rc", "mb", "--ignore-existing", &dest_location];
+            let (ok, _stdout_mb, stderr_mb) = self
                 .exec_in_container(docker, &container.id, create_bucket_cmd)
                 .await?;
 
-            if !ok && !stdout_mb.contains("object name cannot be empty") {
-                // Non-fatal: bucket may already exist, log and continue
-                info!(
-                    "Bucket creation returned non-zero for {}, continuing: {}",
-                    bucket_name, stdout_mb
-                );
+            if !ok {
+                let safe_stderr = sensitive_values.redact(&stderr_mb);
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "RustFS in-place restore could not create bucket '{}': {}",
+                    bucket_name,
+                    safe_stderr.trim()
+                ));
             }
 
             // An in-place restore must reproduce the selected backup exactly.
             // Do not use --skip-errors: a partial mirror cannot be reported as
             // a completed restore.
-            let source_bucket_loc = format!(
-                "backup-source/{}/{}/{}",
-                s3_source.bucket_name, backup_location, bucket_name
-            );
-            let dest_bucket_loc = format!("dest/{}", bucket_name);
-            let mirror_cmd = restore_mirror_command(&source_bucket_loc, &dest_bucket_loc, true);
+            let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+            let dest_bucket_loc = format!("dest/{}/", bucket_name);
+            let mirror_cmd =
+                restore_mirror_command(&source_bucket_loc, &dest_bucket_loc, true, has_token);
+            let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
 
             info!(
                 "Executing mirror command for bucket {}: {:?}",
@@ -2065,7 +2018,7 @@ impl ExternalService for RustfsService {
             }
         }
 
-        // Clean up the mc container
+        // Clean up the rc container
         docker
             .remove_container(
                 &container.id,
@@ -2099,7 +2052,7 @@ impl ExternalService for RustfsService {
     ///
     /// Strategy: clone the source service's config (image, region), generate new
     /// credentials and unused host ports, spin up a new container+volumes, then
-    /// run `mc mirror` from the backup location into every bucket discovered
+    /// run `rc mirror` from the backup location into every bucket discovered
     /// under the backup prefix. The new service gets its OWN access keys.
     async fn restore_to_new_service(
         &self,
@@ -2176,7 +2129,7 @@ impl ExternalService for RustfsService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create new RustFS container: {}", e))?;
 
-        let mut mc_container_id: Option<String> = None;
+        let mut rc_container_id: Option<String> = None;
         let restore_result: Result<()> = async {
             // Orchestrator already decrypted into the plaintext s3_source copy.
             // Re-decrypting would fail because these are no longer ciphertext.
@@ -2188,8 +2141,11 @@ impl ExternalService for RustfsService {
                 .s3_source
                 .endpoint
                 .as_deref()
-                .unwrap_or("s3.amazonaws.com");
-            // A session token is exactly as sensitive as the secret key, so mc
+                .unwrap_or("https://s3.amazonaws.com");
+            let has_token = source_session_token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty());
+            // A session token is exactly as sensitive as the secret key, so rc
             // output has to have it redacted too.
             let sensitive_values = SensitiveValues::new()
                 .credential(
@@ -2199,38 +2155,33 @@ impl ExternalService for RustfsService {
                 )
                 .credential(&new_config.access_key, &new_config.secret_key, None);
 
-            self.pull_mc_image(&self.docker).await?;
+            self.pull_rc_image(&self.docker).await?;
 
-            let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
+            let rc_container_name = format!("rc-restore-new-{}", uuid::Uuid::new_v4());
+            // Aliases via `RC_HOST_*` only (no `rc alias set`); a temporary
+            // source credential's token goes in `TEMPS_REMOTE_SESSION_TOKEN`
+            // and is only sent, via `-H`, by the source-side `rc` calls.
             let mut env_vars = vec![
-                format!(
-                    "MC_HOST_source=http://{}@{}",
-                    super::mc_host_credential(
-                        &source_access_key,
-                        &source_secret_key,
-                        source_session_token.as_deref(),
-                    ),
-                    source_endpoint
+                super::rc_client::rc_host_env(
+                    "backup-source",
+                    source_endpoint,
+                    &source_access_key,
+                    &source_secret_key,
                 ),
-                format!(
-                    "MC_HOST_dest=http://{}:{}@localhost:{}",
-                    new_config.access_key, new_config.secret_key, new_config.port
+                super::rc_client::rc_host_env(
+                    "dest",
+                    &format!("http://localhost:{}", new_config.port),
+                    &new_config.access_key,
+                    &new_config.secret_key,
                 ),
             ];
-            // The `mc alias set backup-source ...` call below cannot carry a
-            // session token; this override can, and mc prefers it. Absent
-            // entirely for a long-lived credential.
-            env_vars.extend(super::mc_host_alias_override(
-                "backup-source",
-                source_endpoint,
-                &source_access_key,
-                &source_secret_key,
+            env_vars.extend(super::rc_client::remote_session_token_env(
                 source_session_token.as_deref(),
             ));
 
-            let mc_config = bollard::models::ContainerCreateBody {
-                image: Some(Self::MC_IMAGE.to_string()),
-                env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            let rc_config = bollard::models::ContainerCreateBody {
+                image: Some(super::rc_client::RC_IMAGE.to_string()),
+                env: Some(env_vars),
                 entrypoint: Some(vec!["sh".to_string()]),
                 tty: Some(true),
                 attach_stdin: Some(true),
@@ -2248,13 +2199,13 @@ impl ExternalService for RustfsService {
                 .create_container(
                     Some(
                         bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                            .name(&mc_container_name)
+                            .name(&rc_container_name)
                             .build(),
                     ),
-                    mc_config,
+                    rc_config,
                 )
                 .await?;
-            mc_container_id = Some(container.id.clone());
+            rc_container_id = Some(container.id.clone());
 
             self.docker
                 .start_container(
@@ -2263,46 +2214,15 @@ impl ExternalService for RustfsService {
                 )
                 .await?;
 
-            let dest_endpoint = format!("http://localhost:{}", new_config.port);
-            let setup_commands: Vec<Vec<&str>> = vec![
-                vec![
-                    "mc",
-                    "alias",
-                    "set",
-                    "backup-source",
-                    source_endpoint,
-                    &source_access_key,
-                    &source_secret_key,
-                ],
-                vec![
-                    "mc",
-                    "alias",
-                    "set",
-                    "dest",
-                    &dest_endpoint,
-                    &new_config.access_key,
-                    &new_config.secret_key,
-                ],
-            ];
-
-            for cmd in setup_commands {
-                let (ok, _stdout, stderr) = self
-                    .exec_in_container(&self.docker, &container.id, cmd)
-                    .await?;
-                if !ok {
-                    Err(anyhow::anyhow!(
-                        "Failed to set up mc aliases for new RustFS restore: {}",
-                        sensitive_values.redact(&stderr)
-                    ))?;
-                }
-            }
-
             // List buckets at the backup prefix.
             let source_backup_location = format!(
-                "backup-source/{}/{}",
-                ctx.s3_source.bucket_name, ctx.backup_location
+                "backup-source/{}/{}/",
+                ctx.s3_source.bucket_name,
+                ctx.backup_location.trim_matches('/')
             );
-            let list_command = vec!["mc", "ls", "--json", &source_backup_location];
+            let list_command =
+                super::rc_client::ls_json_command(&source_backup_location, has_token);
+            let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
             let (list_ok, list_stdout, list_stderr) = self
                 .exec_in_container(&self.docker, &container.id, list_command)
                 .await?;
@@ -2315,16 +2235,14 @@ impl ExternalService for RustfsService {
                 ))?;
             }
 
-            let mut buckets: Vec<String> = Vec::new();
-            let json_objects = parse_multiline_json_output(&list_stdout)?;
-            for listing in json_objects {
-                if let (Some("folder"), Some(key)) = (
-                    listing.get("type").and_then(|t| t.as_str()),
-                    listing.get("key").and_then(|k| k.as_str()),
-                ) {
-                    buckets.push(key.to_string());
-                }
-            }
+            let buckets = super::rc_client::parse_ls_dir_names(&list_stdout).map_err(|e| {
+                anyhow::anyhow!(
+                    "RustFS restore to new service '{}' could not read the listing of '{}': {}",
+                    new_service_name,
+                    source_backup_location,
+                    sensitive_values.redact(&e.to_string())
+                )
+            })?;
 
             info!(
                 "Restoring {} bucket(s) into new RustFS service '{}'",
@@ -2332,26 +2250,30 @@ impl ExternalService for RustfsService {
                 new_service_name
             );
 
-            for bucket in buckets {
-                let bucket_name = bucket.trim_end_matches('/');
-                let dest_location = format!("dest/{}", bucket_name);
+            for bucket_name in &buckets {
+                let dest_location = format!("dest/{}/", bucket_name);
 
-                let mb_cmd = vec!["mc", "mb", &dest_location];
-                let (ok, stdout_mb, _) = self
+                // `--ignore-existing` exits 0 when the bucket is already there,
+                // so any failure here is real (auth, network) and would only
+                // resurface as a less clear "bucket not found" from the mirror.
+                let mb_target = format!("dest/{}", bucket_name);
+                let mb_cmd = vec!["rc", "mb", "--ignore-existing", &mb_target];
+                let (ok, _stdout_mb, stderr_mb) = self
                     .exec_in_container(&self.docker, &container.id, mb_cmd)
                     .await?;
-                if !ok && !stdout_mb.contains("already") {
-                    info!(
-                        "mc mb returned non-zero for bucket {}, continuing: {}",
-                        bucket_name, stdout_mb
-                    );
+                if !ok {
+                    Err(anyhow::anyhow!(
+                        "RustFS restore to new service '{}' could not create bucket '{}': {}",
+                        new_service_name,
+                        bucket_name,
+                        sensitive_values.redact(&stderr_mb).trim()
+                    ))?;
                 }
 
-                let source_bucket_loc = format!(
-                    "backup-source/{}/{}/{}",
-                    ctx.s3_source.bucket_name, ctx.backup_location, bucket_name
-                );
-                let mirror_cmd = restore_mirror_command(&source_bucket_loc, &dest_location, false);
+                let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+                let mirror_cmd =
+                    restore_mirror_command(&source_bucket_loc, &dest_location, false, has_token);
+                let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
 
                 info!("Mirroring bucket {} -> new RustFS service", bucket_name);
                 let (ok, _stdout, stderr) = self
@@ -2376,7 +2298,7 @@ impl ExternalService for RustfsService {
         // Always remove the credential-bearing helper. On failure, also remove
         // the not-yet-owned target container and volumes: the orchestrator only
         // creates its service row after this method succeeds.
-        let helper_cleanup_error = if let Some(container_id) = mc_container_id {
+        let helper_cleanup_error = if let Some(container_id) = rc_container_id {
             match self
                 .docker
                 .remove_container(
@@ -2391,7 +2313,7 @@ impl ExternalService for RustfsService {
                 Ok(()) => None,
                 Err(error) if docker_error_is_not_found(&error) => None,
                 Err(error) => Some(anyhow::anyhow!(
-                    "failed to remove credential-bearing mc helper container '{}': {}",
+                    "failed to remove credential-bearing rc helper container '{}': {}",
                     container_id,
                     error
                 )),
@@ -2477,28 +2399,6 @@ impl ExternalService for RustfsService {
     }
 }
 
-/// Parse multiline JSON output from `mc ls --json` (one JSON object per line)
-fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
-    let mut json_objects = Vec::new();
-    let mut current_object = String::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        current_object.push_str(trimmed);
-
-        if let Ok(json_value) = serde_json::from_str(&current_object) {
-            json_objects.push(json_value);
-            current_object.clear();
-        }
-    }
-
-    Ok(json_objects)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2547,9 +2447,9 @@ mod tests {
     #[test]
     fn in_place_restore_mirror_is_exact_and_does_not_hide_errors() {
         assert_eq!(
-            restore_mirror_command("backup/bucket", "live/bucket", true),
+            restore_mirror_command("backup/bucket", "live/bucket", true, false),
             vec![
-                "mc",
+                "rc",
                 "mirror",
                 "--overwrite",
                 "--remove",
@@ -2562,8 +2462,20 @@ mod tests {
     #[test]
     fn new_service_restore_does_not_remove_concurrent_writes() {
         assert_eq!(
-            restore_mirror_command("backup/bucket", "new/bucket", false),
-            vec!["mc", "mirror", "--overwrite", "backup/bucket", "new/bucket"]
+            restore_mirror_command("backup/bucket", "new/bucket", false, false),
+            vec!["rc", "mirror", "--overwrite", "backup/bucket", "new/bucket"]
+        );
+    }
+
+    /// A temporary backup credential stages the restore so only the
+    /// backup-side step sends the token; `--remove` stays on the live side.
+    #[test]
+    fn restore_from_a_temporary_credential_is_staged() {
+        let command = restore_mirror_command("backup/bucket/", "live/bucket/", true, true);
+        assert_eq!(command[0..2], ["sh", "-c"]);
+        assert_eq!(
+            command[3..],
+            ["sh", "backup/bucket/", "live/bucket/", "remove", "source"]
         );
     }
 
@@ -2766,5 +2678,228 @@ mod tests {
     fn test_secret_key_format() {
         let key = default_secret_key();
         assert_eq!(key.len(), 40);
+    }
+
+    /// End-to-end backup and in-place restore of a RustFS service through the
+    /// `rc` helper container: backup mirrors every bucket (rc cannot mirror an
+    /// alias root), restore lists rc's full-key JSON output, recreates each
+    /// bucket and mirrors it back with `--remove`.
+    ///
+    /// Bucket names `app` and `app-logs` share a prefix on purpose: a listing
+    /// or mirror without the trailing `/` would mix their objects.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rustfs_backup_and_restore_in_place() {
+        use super::super::test_utils::{
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
+        };
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+
+        let backup_s3 = match S3TestContainer::start(docker.clone(), "rustfs-backup-dest").await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("certificate") || msg.contains("TrustStore") {
+                    println!("Skipping RustFS backup test: TLS certificate issue: {msg}");
+                    return;
+                }
+                panic!("Failed to start backup S3 container: {e}");
+            }
+        };
+
+        let run_id = chrono::Utc::now().timestamp_millis();
+        let service_name = format!("test-rustfs-bkp-{run_id}");
+        let service = RustfsService::new(
+            service_name.clone(),
+            docker.clone(),
+            encryption_service.clone(),
+        );
+        let inferred = service
+            .init(ServiceConfig {
+                name: service_name.clone(),
+                service_type: ServiceType::Rustfs,
+                version: None,
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "region": "us-east-1",
+                    "docker_image": DEFAULT_RUSTFS_IMAGE,
+                }),
+            })
+            .await
+            .expect("RustFS service should start");
+        let service_config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Rustfs,
+            version: None,
+            parameters: serde_json::to_value(&inferred).unwrap(),
+        };
+
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .endpoint_url(format!("http://localhost:{}", inferred["port"]))
+                .region(Region::new("us-east-1"))
+                .behavior_version_latest()
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    inferred["access_key"].clone(),
+                    inferred["secret_key"].clone(),
+                    None,
+                    None,
+                    "rustfs-test",
+                ))
+                .force_path_style(true)
+                .build(),
+        );
+        let objects = [
+            ("app", "a.txt", "app object"),
+            ("app", "nested/b.txt", "app nested object"),
+            ("app-logs", "log.txt", "log object"),
+            ("uploads", "u.bin", "upload object"),
+        ];
+        for bucket in ["app", "app-logs", "uploads"] {
+            client.create_bucket().bucket(bucket).send().await.unwrap();
+        }
+        for (bucket, key, body) in objects {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    body.as_bytes().to_vec(),
+                ))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let mock_db = create_mock_db().await.expect("mock db");
+        let backup_s3_source = temps_entities::s3_sources::Model {
+            access_key_id: encryption_service
+                .encrypt_string(&backup_s3.access_key)
+                .unwrap(),
+            secret_key: encryption_service
+                .encrypt_string(&backup_s3.secret_key)
+                .unwrap(),
+            ..backup_s3.s3_source.clone()
+        };
+        let subpath_root = format!("external_services/rustfs/{service_name}");
+        let backup = create_mock_backup(&subpath_root);
+        let external_service =
+            create_mock_external_service(service_name.clone(), "rustfs", "latest");
+
+        let outcome = service
+            .backup_to_s3(
+                &backup_s3.s3_client,
+                &backup_s3.s3_credentials(),
+                backup.clone(),
+                &backup_s3_source,
+                &subpath_root,
+                &subpath_root,
+                &mock_db,
+                &external_service,
+                service_config.clone(),
+            )
+            .await
+            .expect("RustFS backup should complete");
+        assert!(outcome.size_bytes.unwrap_or_default() > 0);
+
+        // One folder per source bucket under the backup prefix.
+        let listed = backup_s3
+            .s3_client
+            .list_objects_v2()
+            .bucket(&backup_s3.bucket_name)
+            .prefix(format!("{subpath_root}/"))
+            .send()
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = listed
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                format!("{subpath_root}/app-logs/log.txt"),
+                format!("{subpath_root}/app/a.txt"),
+                format!("{subpath_root}/app/nested/b.txt"),
+                format!("{subpath_root}/uploads/u.bin"),
+            ]
+        );
+
+        // Diverge from the backup: lose an object, gain a stray one.
+        client
+            .delete_object()
+            .bucket("app")
+            .key("a.txt")
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket("app")
+            .key("written-after-backup.txt")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"stray"))
+            .send()
+            .await
+            .unwrap();
+
+        // `restore_from_s3` takes plaintext credentials.
+        let plaintext_source = temps_entities::s3_sources::Model {
+            access_key_id: backup_s3.access_key.clone(),
+            secret_key: backup_s3.secret_key.clone(),
+            ..backup_s3.s3_source.clone()
+        };
+        let restore = service
+            .restore_from_s3(
+                &backup_s3.s3_client,
+                &backup_s3.s3_credentials(),
+                &outcome.location,
+                &plaintext_source,
+                service_config.clone(),
+            )
+            .await;
+
+        let mut restored = Vec::new();
+        for bucket in ["app", "app-logs", "uploads"] {
+            let listed = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap();
+            for object in listed.contents() {
+                restored.push(format!("{bucket}/{}", object.key().unwrap_or_default()));
+            }
+        }
+        restored.sort();
+
+        let _ = service.remove().await;
+        let _ = backup_s3.cleanup().await;
+
+        restore.expect("RustFS in-place restore should complete");
+        assert_eq!(
+            restored,
+            vec![
+                "app-logs/log.txt".to_string(),
+                "app/a.txt".to_string(),
+                "app/nested/b.txt".to_string(),
+                "uploads/u.bin".to_string(),
+            ],
+            "in-place restore must bring back the lost object and remove the stray one"
+        );
     }
 }

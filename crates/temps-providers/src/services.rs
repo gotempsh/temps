@@ -2071,9 +2071,13 @@ impl ExternalServiceManager {
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
+                // RustFS reads RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY. It ignores
+                // RUSTFS_ROOT_USER/RUSTFS_ROOT_PASSWORD, which left remote
+                // containers on RustFS's built-in credentials instead of the
+                // ones stored for the service.
                 let env = HashMap::from([
-                    ("RUSTFS_ROOT_USER".to_string(), access_key),
-                    ("RUSTFS_ROOT_PASSWORD".to_string(), secret_key),
+                    ("RUSTFS_ACCESS_KEY".to_string(), access_key),
+                    ("RUSTFS_SECRET_KEY".to_string(), secret_key),
                 ]);
                 let cmd = vec![
                     "rustfs".to_string(),
@@ -2103,21 +2107,33 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
+                // MinIO no longer publishes server images, so a new service
+                // without an explicit image runs RustFS (same S3 API). An
+                // explicit MinIO image keeps MinIO's env and command.
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "quay.io/minio/minio:latest".to_string());
+                    .unwrap_or_else(|| DEFAULT_RUSTFS_IMAGE.to_string());
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
-                let env = HashMap::from([
-                    ("MINIO_ROOT_USER".to_string(), access_key),
-                    ("MINIO_ROOT_PASSWORD".to_string(), secret_key),
-                ]);
+                let env = crate::externalsvc::s3::s3_server_credentials_env(
+                    &image,
+                    &access_key,
+                    &secret_key,
+                )
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect::<HashMap<_, _>>();
+                let binary = if crate::externalsvc::s3::is_rustfs_image(&image) {
+                    "rustfs"
+                } else {
+                    "minio"
+                };
                 let cmd = vec![
-                    "minio".to_string(),
+                    binary.to_string(),
                     "server".to_string(),
                     "/data".to_string(),
                 ];

@@ -124,20 +124,27 @@ services:
       - "1025:1025"
       - "8025:8025"
 
+  # The service keeps the historical `minio` name (and the `minioadmin`
+  # credentials) so the scenarios' `--minio-endpoint`/`--minio-bucket`
+  # flags, their S3-source payloads, and the `temps-e2e-minio-1` container
+  # name the workflow attaches to temps-app-network all stay stable. It now
+  # runs RustFS: MinIO withdrew its public images (quay.io/minio/* and
+  # Docker Hub minio/* no longer pull).
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: rustfs/rustfs:1.0.0-rc.5
     # `backup-restore-scenario` needs a real S3-compatible target so the
     # backup engine's actual upload (and the restore's actual download) get
     # exercised, not just the API's bookkeeping rows -- same reasoning as
-    # Pebble/Mailpit above. This is the same image + credentials already
-    # proven in crates/temps-backup's own testcontainers-based Rust
-    # integration tests (`test_backup_to_minio_integration`).
-    command: ["server", "/data", "--console-address", ":9001"]
+    # Pebble/Mailpit above. This is the same image already proven in
+    # crates/temps-backup's own Rust integration tests
+    # (`test_backup_to_rustfs_integration`). The image's default command
+    # serves /data; RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY set the root
+    # credential.
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
     ports:
-      # Published as 9092/9093, not MinIO's own defaults of 9000/9001,
+      # Published as 9092/9093, not the S3 defaults of 9000/9001,
       # because 9000-9004 are already in persistent use by unrelated
       # containers on dev machines running other work -- same reasoning as
       # pebble-challtestsrv's 8055->8056 remap above. The S3 source's

@@ -62,8 +62,16 @@ pub struct S3InputConfig {
     #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
-    /// Docker image to use for MinIO (e.g., quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z)
-    #[serde(default = "default_image")]
+    /// Docker image for the S3 server. New services default to RustFS
+    /// (`rustfs/rustfs:1.0.0-rc.5`); an existing service keeps the MinIO image
+    /// it was created with. The container's env/command follow the image
+    /// (see [`is_rustfs_image`]).
+    ///
+    /// The serde fallback for a persisted config with no `docker_image` stays
+    /// the legacy MinIO reference on purpose: such a row belongs to a service
+    /// whose volume holds MinIO's on-disk format, and silently starting
+    /// RustFS on it would not serve that data.
+    #[serde(default = "legacy_minio_image")]
     #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
 
@@ -98,16 +106,27 @@ pub struct S3Config {
 /// Rewrites a bare (unqualified, i.e. Docker-Hub-resolved) `minio/minio` or
 /// `minio/mc` reference to its `quay.io` equivalent, preserving the tag.
 ///
-/// Docker Hub stopped serving these repositories entirely in 2026 ("pull
-/// access denied ... repository does not exist"), so any service whose
-/// `docker_image` was persisted before this fix — created back when
-/// `default_image()`/`MC_IMAGE` still pointed at Docker Hub — would otherwise
-/// keep retrying that dead reference on every `init()`/container recreation
-/// forever, since `create_container_once` always re-pulls before checking
-/// whether the container already exists. Only the exact former built-in
-/// defaults are rewritten; an already-qualified reference (`quay.io/...`,
-/// a private mirror, `ghcr.io/...`) is left untouched since it reflects an
-/// explicit operator choice, not our old default.
+/// History: Docker Hub stopped serving these repositories first, so this
+/// pointed old persisted defaults at quay.io. quay.io has since stopped
+/// serving them too, so the rewrite no longer makes anything pullable.
+///
+/// It is kept because removing it would break running services. Since it
+/// shipped, every MinIO container for a bare-reference service has been
+/// (re)created as `quay.io/minio/minio:<tag>`. `create_container_once`
+/// recreates the container whenever its image differs from
+/// `config.docker_image`, so dropping the rewrite would make the next
+/// `init()` tear those containers down to recreate them as
+/// `minio/minio:<tag>` — an image name the host may not hold and nothing can
+/// pull any more. Keeping the rewrite keeps those containers untouched. A
+/// host that only holds the bare spelling (the service never re-initialised
+/// after this rewrite shipped) is handled by
+/// [`S3Service::ensure_server_image`], which tags the local bare image with
+/// the quay.io name instead of pulling.
+///
+/// Only the exact former built-in defaults are rewritten; an
+/// already-qualified reference (`quay.io/...`, a private mirror,
+/// `ghcr.io/...`) is left untouched since it reflects an explicit operator
+/// choice, not our old default.
 fn normalize_minio_registry(image: String) -> String {
     for repo in ["minio/minio", "minio/mc"] {
         if let Some(rest) = image.strip_prefix(repo) {
@@ -208,12 +227,121 @@ fn example_region() -> &'static str {
     "us-east-1"
 }
 
+/// Image for new S3 services of this engine. MinIO no longer publishes
+/// server images (quay.io and Docker Hub both stopped serving them), so new
+/// services run RustFS, which speaks the same S3 API.
 fn default_image() -> String {
-    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
+    super::rustfs::DEFAULT_RUSTFS_IMAGE.to_string()
 }
 
 fn example_image() -> &'static str {
-    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+    super::rustfs::DEFAULT_RUSTFS_IMAGE
+}
+
+/// The last MinIO release this engine defaulted to. Only used to fill in a
+/// persisted config that predates the `docker_image` parameter (see
+/// `S3InputConfig::docker_image`), never for new services.
+const LEGACY_MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z";
+
+fn legacy_minio_image() -> String {
+    LEGACY_MINIO_IMAGE.to_string()
+}
+
+/// Repository part of an image reference: no `@digest`, no `:tag` (a `:`
+/// before the last `/` is a registry port, not a tag).
+fn image_repository(image: &str) -> &str {
+    let without_digest = image.split_once('@').map_or(image, |(repo, _)| repo);
+    match without_digest.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => repo,
+        _ => without_digest,
+    }
+}
+
+/// True when `image` runs RustFS rather than MinIO, judged by its repository
+/// name (`rustfs/rustfs`, `registry.local:5000/mirror/rustfs`, ...). Decides
+/// the credentials env, command and healthcheck of the server container.
+pub(crate) fn is_rustfs_image(image: &str) -> bool {
+    image_repository(image)
+        .to_ascii_lowercase()
+        .contains("rustfs")
+}
+
+/// Environment that sets the root credentials of an S3 server container
+/// running `image`: `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` for RustFS,
+/// `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` for MinIO.
+pub(crate) fn s3_server_credentials_env(
+    image: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> [(&'static str, String); 2] {
+    if is_rustfs_image(image) {
+        [
+            ("RUSTFS_ACCESS_KEY", access_key.to_string()),
+            ("RUSTFS_SECRET_KEY", secret_key.to_string()),
+        ]
+    } else {
+        [
+            ("MINIO_ROOT_USER", access_key.to_string()),
+            ("MINIO_ROOT_PASSWORD", secret_key.to_string()),
+        ]
+    }
+}
+
+/// Env, command and healthcheck for the S3 server container.
+struct S3ServerContainerSpec {
+    env: Vec<String>,
+    /// `None` runs the image's default command.
+    cmd: Option<Vec<String>>,
+    healthcheck: String,
+}
+
+fn s3_server_container_spec(config: &S3Config) -> S3ServerContainerSpec {
+    let mut env: Vec<String> =
+        s3_server_credentials_env(&config.docker_image, &config.access_key, &config.secret_key)
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+    if is_rustfs_image(&config.docker_image) {
+        // RustFS serves `/data` by default (`RUSTFS_VOLUMES=/data` in the
+        // image), and answers `/health` on the S3 port.
+        S3ServerContainerSpec {
+            env,
+            cmd: None,
+            healthcheck: "curl -sf http://localhost:9000/health > /dev/null || exit 1".to_string(),
+        }
+    } else {
+        // Allow unauthenticated Prometheus scraping from the local metrics
+        // collector.  These containers are private (no public exposure), so
+        // removing the JWT requirement is safe and avoids needing to
+        // generate & rotate bearer tokens on every scrape.
+        env.push("MINIO_PROMETHEUS_AUTH_TYPE=public".to_string());
+        S3ServerContainerSpec {
+            env,
+            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+            healthcheck: "mc ready local".to_string(),
+        }
+    }
+}
+
+/// The Docker Hub spelling of a `quay.io/minio/...` reference, i.e. the name
+/// the image was pulled under before [`normalize_minio_registry`] existed.
+fn legacy_docker_hub_minio_spelling(image: &str) -> Option<String> {
+    image
+        .strip_prefix("quay.io/minio/")
+        .map(|rest| format!("minio/{rest}"))
+}
+
+/// Error for a MinIO server image that is neither pullable nor on the host.
+fn minio_image_unavailable_error(image: &str, pull_error: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Cannot start S3 service: its MinIO image '{image}' could not be pulled ({pull_error}) \
+         and is not present on this host. MinIO no longer publishes server images \
+         (quay.io/minio/minio and Docker Hub minio/minio stopped serving them). To bring the \
+         service back, either set its docker_image to a registry you control that hosts this \
+         MinIO release, or move the data to RustFS: restore one of this service's backups to a \
+         new service with docker_image set to '{}'.",
+        super::rustfs::DEFAULT_RUSTFS_IMAGE
+    )
 }
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
@@ -229,18 +357,14 @@ pub struct S3Service {
 }
 
 impl S3Service {
-    /// MinIO Client (mc) utility image - used for temporary operations like migration and copy.
-    /// Pinned to an immutable release tag — never use `:latest` here to prevent
-    /// supply-chain / MITM attacks on floating tags.
-    const MC_IMAGE: &'static str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
-
-    /// Shell script executed inside a disposable mc container by `restore_in_place`.
+    /// Shell script executed inside a disposable `rc` container
+    /// ([`super::rc_client::RC_IMAGE`]) by `restore_in_place`.
     ///
     /// SECURITY: This is a compile-time constant. It MUST NOT be changed to a
     /// runtime `format!()` string that interpolates user-supplied values. All
     /// dynamic values arrive via Docker environment variables:
     ///   - `RESTORE_PREFIX` — user-influenced backup path (via `backup_location`)
-    ///   - `MC_HOST_bkp`, `MC_HOST_live` — S3 credentials
+    ///   - `RC_HOST_bkp`, `RC_HOST_live` — S3 credentials
     ///
     /// The shell expands `${RESTORE_PREFIX}` safely — environment variable values
     /// are never re-parsed as shell commands, so a value containing `'` or other
@@ -248,15 +372,42 @@ impl S3Service {
     ///
     /// Word-splitting fix: bucket names are iterated with `while IFS= read -r`
     /// from a temp file, avoiding glob expansion on whitespace in names.
+    ///
+    /// `rc ls` prints one line per entry (`[date]  0B backups/x/bucket-a/`)
+    /// whose last field is the FULL key relative to the backup bucket, not
+    /// just the folder name mc printed, so the `sed` keeps only the last path
+    /// segment. A failed listing aborts the restore instead of being read as
+    /// "nothing to restore", and so does a failed `rc mb` (with
+    /// `--ignore-existing` it exits 0 for a bucket that is already there).
+    ///
+    /// Temporary backup credentials: when `TEMPS_REMOTE_SESSION_TOKEN` is set,
+    /// every call against the backup (`bkp`) side goes through `bkp_rc`, which
+    /// adds `-H x-amz-security-token`, and each bucket is staged through a
+    /// scratch directory so the live-side `rc` call never carries the token
+    /// (the live server would reject it). Without a token the mirror stays a
+    /// direct `bkp` → `live` copy.
     const RESTORE_IN_PLACE_SCRIPT: &'static str = r#"set -e
 DEST='live'
 if [ -z "${RESTORE_PREFIX}" ]; then
   echo '[restore] RESTORE_PREFIX is empty — aborting'
   exit 1
 fi
+if [ -n "${TEMPS_REMOTE_SESSION_TOKEN:-}" ]; then
+  bkp_rc() { rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" "$@"; }
+else
+  bkp_rc() { rc "$@"; }
+fi
+STAGE_ROOT=$(mktemp -d)
+trap 'rm -rf "${STAGE_ROOT}"' EXIT
 echo "[restore] listing ${RESTORE_PREFIX}"
+LISTING=$(mktemp)
 BUCKET_LIST=$(mktemp)
-mc ls "${RESTORE_PREFIX}" | awk '{print $NF}' | grep '/$' | sed 's|/$||' > "${BUCKET_LIST}" || true
+if ! bkp_rc ls --no-color "${RESTORE_PREFIX}" > "${LISTING}"; then
+  echo "[restore] could not list ${RESTORE_PREFIX} — aborting"
+  exit 1
+fi
+awk '{print $NF}' "${LISTING}" | grep '/$' | sed 's|/$||; s|.*/||' > "${BUCKET_LIST}" || true
+rm -f "${LISTING}"
 if [ ! -s "${BUCKET_LIST}" ]; then
   rm -f "${BUCKET_LIST}"
   echo '[restore] no bucket directories found — nothing to restore'
@@ -265,9 +416,18 @@ fi
 while IFS= read -r bucket; do
   [ -z "${bucket}" ] && continue
   echo "[restore] ensuring ${DEST}/${bucket} exists"
-  mc mb "${DEST}/${bucket}" 2>&1 || true
+  rc mb --ignore-existing "${DEST}/${bucket}"
   echo "[restore] mirroring ${RESTORE_PREFIX}${bucket}/ -> ${DEST}/${bucket}/ (--overwrite --remove)"
-  mc mirror --overwrite --remove "${RESTORE_PREFIX}${bucket}/" "${DEST}/${bucket}/"
+  if [ -n "${TEMPS_REMOTE_SESSION_TOKEN:-}" ]; then
+    STAGE="${STAGE_ROOT}/bucket"
+    rm -rf "${STAGE}"
+    mkdir -p "${STAGE}"
+    bkp_rc mirror --overwrite "${RESTORE_PREFIX}${bucket}/" "${STAGE}/"
+    rc mirror --overwrite --remove "${STAGE}/" "${DEST}/${bucket}/"
+    rm -rf "${STAGE}"
+  else
+    rc mirror --overwrite --remove "${RESTORE_PREFIX}${bucket}/" "${DEST}/${bucket}/"
+  fi
   echo "[restore] done: ${bucket}"
 done < "${BUCKET_LIST}"
 rm -f "${BUCKET_LIST}"
@@ -381,11 +541,8 @@ echo '[restore] complete'"#;
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         // Pull the image first
-        info!("Pulling MinIO image {}", config.docker_image);
-
-        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        info!("Pulling S3 server image {}", config.docker_image);
+        Self::ensure_server_image(docker, &config.docker_image).await?;
 
         let container_name = self.get_container_name();
         // Add volume name construction
@@ -456,15 +613,9 @@ echo '[restore] complete'"#;
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        let env_vars = [
-            format!("MINIO_ROOT_USER={}", config.access_key),
-            format!("MINIO_ROOT_PASSWORD={}", config.secret_key),
-            // Allow unauthenticated Prometheus scraping from the local metrics
-            // collector.  These containers are private (no public exposure), so
-            // removing the JWT requirement is safe and avoids needing to
-            // generate & rotate bearer tokens on every scrape.
-            "MINIO_PROMETHEUS_AUTH_TYPE=public".to_string(),
-        ];
+        // RustFS and MinIO take different credential variables and commands;
+        // the image decides which (see `s3_server_container_spec`).
+        let server_spec = s3_server_container_spec(config);
         ensure_network_exists(docker)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
@@ -497,14 +648,14 @@ echo '[restore] complete'"#;
             image: Some(config.docker_image.to_string()),
             networking_config,
             exposed_ports: Some(Vec::from(["9000/tcp".to_string()])),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            env: Some(server_spec.env),
             labels: Some(
                 container_labels
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             ),
-            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+            cmd: server_spec.cmd,
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -513,7 +664,7 @@ echo '[restore] complete'"#;
                 ..host_config
             }),
             healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec!["CMD-SHELL".to_string(), "mc ready local".to_string()]),
+                test: Some(vec!["CMD-SHELL".to_string(), server_spec.healthcheck]),
                 interval: Some(1000000000), // 1 second
                 timeout: Some(3000000000),  // 3 seconds
                 retries: Some(3),
@@ -551,10 +702,71 @@ echo '[restore] complete'"#;
         Ok(())
     }
 
-    async fn pull_mc_image(&self, docker: &Docker) -> Result<()> {
-        info!("Pulling MinIO Client image {}", Self::MC_IMAGE);
+    /// Make the server image available before creating its container.
+    ///
+    /// `pull_image_with_retry` already falls back to a copy of the exact
+    /// reference on this host. For MinIO images two more cases are handled,
+    /// since MinIO no longer publishes them anywhere:
+    /// - the host holds the image under its pre-quay.io Docker Hub spelling
+    ///   (`minio/minio:<tag>`, see [`normalize_minio_registry`]): tag it with
+    ///   the configured name and use it, no registry needed;
+    /// - it is not on the host at all: fail with an error that says why and
+    ///   what to do, instead of a bare registry error.
+    async fn ensure_server_image(docker: &Docker, image: &str) -> Result<()> {
+        let pull_error = match crate::utils::pull_image_with_retry(docker, image, None).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if is_rustfs_image(image) {
+            return Err(anyhow::anyhow!(pull_error));
+        }
 
-        crate::utils::pull_image_with_retry(docker, Self::MC_IMAGE, None)
+        // A digest reference can't be satisfied by retagging (`docker tag`
+        // refuses digests), and falling back to `:latest` would silently
+        // relabel an arbitrary release, so digest pins go straight to the
+        // actionable error.
+        let legacy = legacy_docker_hub_minio_spelling(image).filter(|_| !image.contains('@'));
+        if let Some(legacy) = legacy {
+            if docker.inspect_image(&legacy).await.is_ok() {
+                let repository = image_repository(image);
+                let tag = image
+                    .strip_prefix(repository)
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .unwrap_or("latest");
+                docker
+                    .tag_image(
+                        &legacy,
+                        Some(
+                            bollard::query_parameters::TagImageOptionsBuilder::new()
+                                .repo(repository)
+                                .tag(tag)
+                                .build(),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "MinIO image '{}' is only on this host as '{}', and tagging it failed: {}",
+                            image,
+                            legacy,
+                            e
+                        )
+                    })?;
+                warn!(
+                    "Could not pull MinIO image '{}' ({}); using the local copy '{}' instead",
+                    image, pull_error, legacy
+                );
+                return Ok(());
+            }
+        }
+
+        Err(minio_image_unavailable_error(image, &pull_error))
+    }
+
+    async fn pull_rc_image(&self, docker: &Docker) -> Result<()> {
+        info!("Pulling RustFS client image {}", super::rc_client::RC_IMAGE);
+
+        crate::utils::pull_image_with_retry(docker, super::rc_client::RC_IMAGE, None)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
@@ -591,7 +803,7 @@ echo '[restore] complete'"#;
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
                     return Err(anyhow::anyhow!(
-                        "MinIO container exited unexpectedly with code {}",
+                        "S3 server container exited unexpectedly with code {}",
                         exit_code
                     ));
                 }
@@ -601,7 +813,9 @@ echo '[restore] complete'"#;
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!("MinIO container health check timed out"))
+        Err(anyhow::anyhow!(
+            "S3 server container health check timed out"
+        ))
     }
 
     async fn initialize_client(&self, config: ServiceConfig) -> Result<Client> {
@@ -1289,7 +1503,7 @@ impl ExternalService for S3Service {
     /// Backup S3 data to another S3 location
     async fn backup_to_s3(
         &self,
-        // we are not using the s3 client for this backup, we are using the mc container to backup the data
+        // we are not using the s3 client for this backup, we are using the rc container to backup the data
         _s3_client: &aws_sdk_s3::Client,
         s3_credentials: &super::S3Credentials,
         backup: temps_entities::backups::Model,
@@ -1304,13 +1518,13 @@ impl ExternalService for S3Service {
         use sea_orm::*;
 
         info!(
-            "Starting S3 backup using MinIO Client for backup {}",
+            "Starting S3 backup using the RustFS client (rc) for backup {}",
             backup.id
         );
 
         // Use a standard backup path without versioning
         let backup_prefix = subpath_root;
-        let container_name = format!("mc-backup-{}", backup.id);
+        let container_name = format!("rc-backup-{}", backup.id);
 
         // Create a backup record directly using ActiveModel setters (no need to build and then copy)
         let backup_record = temps_entities::external_service_backups::Entity::insert(
@@ -1334,17 +1548,13 @@ impl ExternalService for S3Service {
         .exec_with_returning(pool)
         .await?;
 
-        // Pull the MinIO Client image
-        self.pull_mc_image(&self.docker).await?;
+        // Pull the RustFS client image
+        self.pull_rc_image(&self.docker).await?;
 
         let service_config = service_config.clone();
         let s3_source_config = self.get_s3_config(service_config)?;
 
-        // Create environment variables for mc
-        let dest_endpoint = s3_source
-            .endpoint
-            .clone()
-            .unwrap_or(format!("{}:{}", s3_source.bucket_name, "9000"));
+        // Decrypt the backup destination's credentials
         let decrypted_access_key = self
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
@@ -1361,39 +1571,44 @@ impl ExternalService for S3Service {
         )
         .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
 
+        let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
+        let dest_endpoint = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or(&default_dest_endpoint);
+        let has_token = decrypted_session_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+
+        // Both aliases are defined through `RC_HOST_*` (no `rc alias set`, so
+        // no keys in argv; credentials percent-encoded because generated
+        // secrets can contain `/`). A temporary destination credential's
+        // session token travels separately as `TEMPS_REMOTE_SESSION_TOKEN`
+        // and is only sent, via `-H`, by the destination-side step of each
+        // mirror.
         let mut env_vars = vec![
-            format!(
-                "MC_HOST_source=http://{}:{}@{}:{}",
-                s3_source_config.access_key,
-                s3_source_config.secret_key,
-                s3_source_config.host,
-                s3_source_config.port
+            super::rc_client::rc_host_env(
+                "original",
+                &format!("http://{}:{}", s3_source_config.host, s3_source_config.port),
+                &s3_source_config.access_key,
+                &s3_source_config.secret_key,
             ),
-            format!(
-                "MC_HOST_dest=http://{}@{}",
-                super::mc_host_credential(
-                    &decrypted_access_key,
-                    &decrypted_secret_key,
-                    decrypted_session_token.as_deref(),
-                ),
-                dest_endpoint
+            super::rc_client::rc_host_env(
+                "backup-dest",
+                dest_endpoint,
+                &decrypted_access_key,
+                &decrypted_secret_key,
             ),
         ];
-        // The `mc alias set backup-dest ...` call below cannot carry a session
-        // token; this override can, and mc prefers it. Absent entirely for a
-        // long-lived credential.
-        env_vars.extend(super::mc_host_alias_override(
-            "backup-dest",
-            &dest_endpoint,
-            &decrypted_access_key,
-            &decrypted_secret_key,
+        env_vars.extend(super::rc_client::remote_session_token_env(
             decrypted_session_token.as_deref(),
         ));
 
-        // Create mc container with a shell entrypoint
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive); the commands below run via exec.
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
             entrypoint: Some(vec!["sh".to_string()]),
             tty: Some(true),
             attach_stdin: Some(true),
@@ -1427,47 +1642,18 @@ impl ExternalService for S3Service {
             )
             .await?;
 
-        let source_endpoint = format!("http://{}:{}", s3_source_config.host, s3_source_config.port);
-        let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
-        let dest_endpoint = s3_source
-            .endpoint
-            .as_deref()
-            .unwrap_or(&default_dest_endpoint);
-        let source_name = "original/".to_string();
-        let dest_name = format!("backup-dest/{}/{}", s3_source.bucket_name, subpath_root);
-
-        // Execute commands in sequence
-        let commands = vec![
-            // Add source alias
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "original",
-                &source_endpoint,
-                &s3_source_config.access_key,
-                &s3_source_config.secret_key,
-            ],
-            // Add destination alias
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-dest",
-                &dest_endpoint,
-                &decrypted_access_key,
-                &decrypted_secret_key,
-            ],
-            // Perform the mirror operation (without --remove to preserve files)
-            vec!["mc", "mirror", "--overwrite", &source_name, &dest_name],
-        ];
+        let dest_name = format!(
+            "backup-dest/{}/{}",
+            s3_source.bucket_name,
+            subpath_root.trim_matches('/')
+        );
 
         let mut success = true;
         let mut error_logs = Vec::new();
-        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr when it
-        // cannot use it, and this stderr is both logged and persisted into
-        // `external_service_backups.error_message`. The destination credential
-        // may be a temporary one, so its session token belongs on the list
+        // Client stderr is both logged and persisted into
+        // `external_service_backups.error_message`, and `mc` used to echo the
+        // credential-bearing host URL into it. The destination credential may
+        // be a temporary one, so its session token belongs on the list
         // alongside the keys.
         let sensitive_values = SensitiveValues::new()
             .credential(
@@ -1481,51 +1667,24 @@ impl ExternalService for S3Service {
                 decrypted_session_token.as_deref(),
             );
 
-        for cmd in commands {
-            // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
-            info!(
-                "Executing command: {:?}",
-                cmd.iter().take(3).collect::<Vec<_>>()
-            );
-
-            let exec = self
-                .docker
-                .create_exec(
-                    &container.id,
-                    bollard::exec::CreateExecOptions {
-                        cmd: Some(cmd.clone()),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-                self.docker.start_exec(&exec.id, None).await?
+        // `rc mirror` cannot take the alias root as its source the way
+        // `mc mirror original/ ...` did (without --remove, to preserve files),
+        // so mirror bucket by bucket into `<dest_name>/<bucket>/` — the same
+        // layout every restore path lists.
+        if success {
+            if let Err(e) = super::rc_client::mirror_all_buckets(
+                &self.docker,
+                &container.id,
+                "original",
+                &dest_name,
+                has_token,
+                &sensitive_values,
+            )
+            .await
             {
-                while let Ok(Some(output)) = output.try_next().await {
-                    match output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            info!("stdout: {}", String::from_utf8_lossy(&message));
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let safe_stderr =
-                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref());
-                            error!("stderr: {}", safe_stderr);
-                            error_logs.push(safe_stderr);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Check execution result
-            if let Some(inspect_result) = self.docker.inspect_exec(&exec.id).await?.exit_code {
-                if inspect_result != 0 {
-                    success = false;
-                    break;
-                }
+                error!("S3 backup mirror failed: {}", e);
+                error_logs.push(e.to_string());
+                success = false;
             }
         }
 
@@ -1593,7 +1752,7 @@ impl ExternalService for S3Service {
 
     async fn restore_from_s3(
         &self,
-        // we are not using the s3 client for this restore, we are using the mc container to restore the backup
+        // we are not using the s3 client for this restore, we are using the rc container to restore the backup
         _s3_client: &aws_sdk_s3::Client,
         _s3_credentials: &super::S3Credentials,
         backup_location: &str,
@@ -1609,43 +1768,52 @@ impl ExternalService for S3Service {
         self.start().await?;
 
         let docker = &self.docker;
-        let container_name = format!("mc-restore-{}", uuid::Uuid::new_v4());
+        let container_name = format!("rc-restore-{}", uuid::Uuid::new_v4());
         let s3_config = self.get_s3_config(service_config)?;
 
-        // Pull the MinIO Client image
-        self.pull_mc_image(docker).await?;
+        // Pull the RustFS client image
+        self.pull_rc_image(docker).await?;
 
-        // Create environment variables for mc
+        // Note: s3_source credentials are expected to be plain-text (already decrypted by caller)
+        // When called from CLI, they come from env vars (not encrypted)
+        // When called from main app, caller should decrypt before passing
+        let source_access_key = &s3_source.access_key_id;
+        let source_secret_key = &s3_source.secret_key;
+        // Plaintext on the same contract; `None` for a long-lived credential.
+        let source_session_token = s3_source.session_token.as_deref();
+        let has_token = source_session_token.is_some_and(|token| !token.is_empty());
+        let source_endpoint = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://s3.amazonaws.com");
+
+        // Aliases via `RC_HOST_*` only (no `rc alias set`: keys would sit in
+        // argv, and its probe cannot send a session token). A temporary source
+        // credential's token goes in `TEMPS_REMOTE_SESSION_TOKEN` and is only
+        // sent, via `-H`, by the source-side `rc` calls.
         let mut env_vars = vec![
-            format!(
-                "MC_HOST_source=http://{}@{}",
-                super::mc_host_credential(
-                    &s3_source.access_key_id,
-                    &s3_source.secret_key,
-                    s3_source.session_token.as_deref(),
-                ),
-                s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com")
+            super::rc_client::rc_host_env(
+                "backup-source",
+                source_endpoint,
+                source_access_key,
+                source_secret_key,
             ),
-            format!(
-                "MC_HOST_dest=http://{}:{}@localhost:{}",
-                s3_config.access_key, s3_config.secret_key, s3_config.port
+            super::rc_client::rc_host_env(
+                "dest",
+                &format!("http://localhost:{}", s3_config.port),
+                &s3_config.access_key,
+                &s3_config.secret_key,
             ),
         ];
-        // The `mc alias set backup-source ...` call below cannot carry a
-        // session token; this override can, and mc prefers it. Absent entirely
-        // for a long-lived credential.
-        env_vars.extend(super::mc_host_alias_override(
-            "backup-source",
-            s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com"),
-            &s3_source.access_key_id,
-            &s3_source.secret_key,
-            s3_source.session_token.as_deref(),
+        env_vars.extend(super::rc_client::remote_session_token_env(
+            source_session_token,
         ));
 
-        // Create mc container with a shell entrypoint
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive); the commands below run via exec.
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
             entrypoint: Some(vec!["sh".to_string()]),
             tty: Some(true),
             attach_stdin: Some(true),
@@ -1678,137 +1846,63 @@ impl ExternalService for S3Service {
             )
             .await?;
 
-        let source_endpoint = s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com");
-        let dest_endpoint = format!("http://localhost:{}", s3_config.port);
-
-        // Note: s3_source credentials are expected to be plain-text (already decrypted by caller)
-        // When called from CLI, they come from env vars (not encrypted)
-        // When called from main app, caller should decrypt before passing
-        let source_access_key = &s3_source.access_key_id;
-        let source_secret_key = &s3_source.secret_key;
-        // Plaintext on the same contract; `None` for a long-lived credential.
-        let source_session_token = s3_source.session_token.as_deref();
-
-        // mc prints the `MC_HOST_*` URL it could not use straight into stderr,
-        // and that stderr is logged and folded into the returned error. Both
+        // Client stderr is logged and folded into the returned error, and `mc`
+        // used to print the host URL it could not use into it. Both
         // credentials — including a temporary source credential's session
         // token — have to be scrubbed out of it first.
         let sensitive_values = SensitiveValues::new()
             .credential(source_access_key, source_secret_key, source_session_token)
             .credential(&s3_config.access_key, &s3_config.secret_key, None);
 
-        // Base commands for setting up aliases
-        let setup_commands = vec![
-            // Add source alias
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-source",
-                source_endpoint,
-                source_access_key,
-                source_secret_key,
-            ],
-            // Add destination alias
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "dest",
-                &dest_endpoint,
-                &s3_config.access_key,
-                &s3_config.secret_key,
-            ],
-        ];
-
-        // Execute setup commands
-        for cmd in setup_commands {
-            let exec = docker
-                .create_exec(
-                    &container.id,
-                    bollard::exec::CreateExecOptions {
-                        cmd: Some(cmd.clone()),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-                docker.start_exec(&exec.id, None).await?
-            {
-                while let Ok(Some(output)) = output.try_next().await {
-                    match output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            info!("stdout: {}", String::from_utf8_lossy(&message));
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            error!(
-                                "stderr: {}",
-                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref())
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
+        // The trailing `/` lists the folder's contents rather than every key
+        // that merely shares the prefix.
         let source_backup_location = format!(
-            "backup-source/{}/{}",
-            s3_source.bucket_name, backup_location
+            "backup-source/{}/{}/",
+            s3_source.bucket_name,
+            backup_location.trim_matches('/')
         );
         // First, list the buckets in the backup location
-        let list_command = vec!["mc", "ls", "--json", &source_backup_location];
-
-        let mut buckets = Vec::new();
-
-        // Execute list command to get buckets
-        let exec = docker
-            .create_exec(
-                &container.id,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(list_command),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-            docker.start_exec(&exec.id, None).await?
-        {
-            let mut output_str = String::new();
-            while let Ok(Some(output)) = output.try_next().await {
-                if let bollard::container::LogOutput::StdOut { message } = output {
-                    output_str.push_str(&String::from_utf8_lossy(&message));
-                }
+        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
+        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
+        let listing = super::rc_client::exec_capture(docker, &container.id, &list_command).await?;
+        let buckets = if listing.exit_code == 0 {
+            super::rc_client::parse_ls_dir_names(&listing.stdout)
+                .map_err(|e| anyhow::anyhow!("{}", sensitive_values.redact(&e.to_string())))
+        } else {
+            Err(anyhow::anyhow!(
+                "rc ls exited with code {}: {}",
+                listing.exit_code,
+                sensitive_values.redact(listing.stderr.trim())
+            ))
+        };
+        let buckets = match buckets {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "S3 restore could not list backup location '{}': {}",
+                    source_backup_location,
+                    e
+                ));
             }
-            info!("mc ls output: {}", output_str);
-            // Parse all JSON objects from the output
-            let json_objects = parse_multiline_json_output(&output_str)?;
-
-            // Process each JSON object
-            for listing in json_objects {
-                if let (Some("folder"), Some(key)) = (
-                    listing.get("type").and_then(|t| t.as_str()),
-                    listing.get("key").and_then(|k| k.as_str()),
-                ) {
-                    buckets.push(key.to_string());
-                }
-            }
-        }
+        };
 
         info!("Found buckets to restore: {:?}", buckets);
 
         // For each bucket, create it and mirror its contents
-        for bucket in buckets {
-            let bucket_name = bucket.trim_end_matches('/');
+        for bucket_name in &buckets {
             let dest_location = format!("dest/{}", bucket_name);
-            // Create bucket command
-            let create_bucket_cmd = vec!["mc", "mb", &dest_location];
+            // Create bucket command; `--ignore-existing` exits 0 when the
+            // bucket is already there.
+            let create_bucket_cmd = vec!["rc", "mb", "--ignore-existing", &dest_location];
 
             // Execute create bucket command
             let exec = docker
@@ -1845,9 +1939,9 @@ impl ExternalService for S3Service {
                 }
             }
 
-            // Check exit code and handle specific error case
+            // Any non-zero exit is a real failure (auth, network).
             if let Some(inspect_result) = docker.inspect_exec(&exec.id).await?.exit_code {
-                if inspect_result == 1 && !stdout.contains("object name cannot be empty") {
+                if inspect_result != 0 {
                     return Err(anyhow::anyhow!(
                         "Failed to create bucket {}: Exit code {} - {}",
                         bucket_name,
@@ -1857,24 +1951,23 @@ impl ExternalService for S3Service {
                 }
             }
 
-            let source_bucket_loc = format!(
-                "backup-source/{}/{}/{}",
-                s3_source.bucket_name, backup_location, bucket_name
-            );
-            let dest_bucket_loc = format!("dest/{}", bucket_name);
+            let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+            let dest_bucket_loc = format!("dest/{}/", bucket_name);
             // Mirror command for this bucket.
             // --overwrite: replace existing objects.
             // No --remove here: the CLI restore path does not guarantee the
             // live bucket only contains pre-backup objects (the caller may
             // have additional context). The API path (restore_in_place) uses
             // --remove for a stricter point-in-time guarantee.
-            let mirror_cmd = vec![
-                "mc",
-                "mirror",
-                "--overwrite",
+            // A temporary backup credential stages the mirror so only the
+            // source-side `rc` call sends its session token.
+            let mirror_cmd = super::rc_client::mirror_command(
                 &source_bucket_loc,
                 &dest_bucket_loc,
-            ];
+                false,
+                super::rc_client::TokenSide::when(has_token, super::rc_client::TokenSide::Source),
+            );
+            let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
 
             info!(
                 "Executing mirror command for bucket {}: {:?}",
@@ -1934,7 +2027,7 @@ impl ExternalService for S3Service {
                 // credential can straddle two Docker log frames and only the
                 // joined string is guaranteed to contain it intact.
                 return Err(anyhow::anyhow!(
-                    "mc mirror failed for bucket '{}' with exit code {}. stdout: {}. stderr: {}",
+                    "rc mirror failed for bucket '{}' with exit code {}. stdout: {}. stderr: {}",
                     bucket_name,
                     mirror_exit,
                     sensitive_values.redact(mirror_stdout.trim()),
@@ -1973,7 +2066,7 @@ impl ExternalService for S3Service {
         })
     }
 
-    /// Restore the live S3/MinIO service from a backup using a one-shot mc container.
+    /// Restore the live S3/MinIO service from a backup using a one-shot `rc` container.
     ///
     /// ## Semantics: `--overwrite --remove` (true point-in-time restore)
     ///
@@ -1990,23 +2083,23 @@ impl ExternalService for S3Service {
     ///
     /// ## What `--remove` does and does NOT remove
     ///
-    /// `mc mirror --remove` removes objects within each mirrored bucket. It does
+    /// `rc mirror --remove` removes objects within each mirrored bucket. It does
     /// NOT remove extra buckets in the live service that were not present at
     /// backup time — those are left in place. A future enhancement could enumerate
     /// and drop them, but that increases blast radius substantially and is deferred.
     ///
     /// ## Container pattern
     ///
-    /// A disposable `minio/mc` container runs in host-network mode so it can
+    /// A disposable `rustfs/rc` container runs in host-network mode so it can
     /// reach both the backup S3 source (typically an internet endpoint or a local
-    /// MinIO used for e2e) and the live MinIO service (typically `localhost:<port>`).
-    /// Credentials are passed exclusively via `MC_HOST_*` environment variables —
+    /// S3 server used for e2e) and the live S3 service (typically `localhost:<port>`).
+    /// Credentials are passed exclusively via `RC_HOST_*` environment variables —
     /// the same pattern the `S3MirrorEngine` backup engine uses.
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
         info!(
             service = %ctx.source_service.name,
             backup_location = ctx.backup_location,
-            "S3 restore_in_place: starting one-shot mc mirror (--overwrite --remove)"
+            "S3 restore_in_place: starting one-shot rc mirror (--overwrite --remove)"
         );
 
         // Ensure the live MinIO container is running before writing to it.
@@ -2015,11 +2108,11 @@ impl ExternalService for S3Service {
         let s3_config = self.get_s3_config(ctx.source_config)?;
         let docker = &self.docker;
 
-        self.pull_mc_image(docker).await?;
+        self.pull_rc_image(docker).await?;
 
-        // ── MC_HOST env vars ─────────────────────────────────────────────────
+        // ── RC_HOST env vars ─────────────────────────────────────────────────
         // The backup-source endpoint already carries a scheme (http:// / https://).
-        // Strip it before embedding in the MC_HOST string to avoid the malformed
+        // Strip it before embedding in the RC_HOST string to avoid the malformed
         // `http://...@http://...` double-scheme that would otherwise result.
         //
         // Credentials are ALREADY DECRYPTED by the orchestrator (RestoreContext
@@ -2037,7 +2130,7 @@ impl ExternalService for S3Service {
         //   bkp/<bkp_bucket>/<prefix>/bucket1/...
         //   bkp/<bkp_bucket>/<prefix>/bucket2/...
         //
-        // The script discovers those bucket folders via `mc ls`, creates each in
+        // The script discovers those bucket folders via `rc ls`, creates each in
         // the live service, and mirrors their contents with --overwrite --remove.
         //
         // SECURITY (injection prevention): `ctx.backup_location` is user-supplied
@@ -2061,39 +2154,49 @@ impl ExternalService for S3Service {
             ctx.backup_location.trim_matches('/')
         );
 
-        // SECURITY (docker inspect exposure): MC_HOST_* env vars embed plaintext
+        // SECURITY (docker inspect exposure): RC_HOST_* env vars embed plaintext
         // credentials in the container's environment for the container's lifetime.
         // This is the same pattern the S3MirrorEngine backup engine uses (accepted
         // design). The container is removed immediately after the script exits (see
         // the remove_container call below), bounding the exposure to the restore
         // execution window. Anyone with Docker socket access has equivalent trust
         // to these credentials for that window.
-        let env_vars = vec![
+        //
+        // A temporary backup credential's session token is NOT part of
+        // `RC_HOST_bkp` (rc would read it as part of the secret); it travels
+        // as `TEMPS_REMOTE_SESSION_TOKEN` and the script sends it with `-H`
+        // on the backup-side calls only.
+        let mut env_vars = vec![
             format!(
-                "MC_HOST_bkp={}://{}@{}",
+                "RC_HOST_bkp={}://{}@{}",
                 bkp_scheme,
                 super::mc_host_credential(
                     &ctx.s3_source.access_key_id,
                     &ctx.s3_source.secret_key,
-                    ctx.s3_source.session_token.as_deref(),
+                    None,
                 ),
                 bkp_hostpath,
             ),
             // Live service is always reached via localhost in host-network mode.
+            // Percent-encoded: rc cannot parse a raw `/` in the secret.
             format!(
-                "MC_HOST_live=http://{}:{}@localhost:{}",
-                s3_config.access_key, s3_config.secret_key, s3_config.port
+                "RC_HOST_live=http://{}@localhost:{}",
+                super::mc_host_credential(&s3_config.access_key, &s3_config.secret_key, None),
+                s3_config.port
             ),
             // RESTORE_PREFIX carries the user-influenced backup_location value.
             // It is passed as an env var — never interpolated into shell syntax —
             // so shell metacharacters in the value cannot cause injection.
             format!("RESTORE_PREFIX={}/", backup_prefix),
         ];
+        env_vars.extend(super::rc_client::remote_session_token_env(
+            ctx.s3_source.session_token.as_deref(),
+        ));
 
         // The container's combined stdout/stderr is folded into the error this
         // method returns, which is persisted to `restore_runs.error` and shown
-        // in the API. mc prints the `MC_HOST_*` URL it failed on, so every
-        // credential in those variables — session token included — has to be
+        // in the API. `mc` printed the host URL it failed on, so every
+        // credential in those variables — session token included — is
         // scrubbed out of that blob first.
         let sensitive_values = SensitiveValues::new()
             .credential(
@@ -2109,13 +2212,14 @@ impl ExternalService for S3Service {
         // ── Spin up and wait ─────────────────────────────────────────────────
         let container_name = format!("temps-s3restore-{}", uuid::Uuid::new_v4());
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
             env: Some(env_vars),
-            // One-shot: `sh -c <script>` exits when the script does.
+            // One-shot: `sh -c <script>` exits when the script does. The
+            // image's own entrypoint is `rc`, so it has to be overridden.
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: Some(vec![script]),
             host_config: Some(bollard::models::HostConfig {
-                // Host network so mc can reach both localhost (live MinIO)
+                // Host network so rc can reach both localhost (live S3 server)
                 // and the remote backup S3 endpoint without extra routing.
                 network_mode: Some("host".to_string()),
                 ..Default::default()
@@ -2135,7 +2239,7 @@ impl ExternalService for S3Service {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to create mc restore container '{}': {}",
+                    "failed to create rc restore container '{}': {}",
                     container_name,
                     e
                 )
@@ -2149,7 +2253,7 @@ impl ExternalService for S3Service {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to start mc restore container '{}': {}",
+                    "failed to start rc restore container '{}': {}",
                     container_name,
                     e
                 )
@@ -2189,7 +2293,7 @@ impl ExternalService for S3Service {
 
         if exit_code != 0 {
             return Err(anyhow::anyhow!(
-                "S3 restore failed: mc mirror exited with code {} for service '{}'. Logs:\n{}",
+                "S3 restore failed: rc restore script exited with code {} for service '{}'. Logs:\n{}",
                 exit_code,
                 ctx.source_service.name,
                 sensitive_values.redact(logs.trim()),
@@ -2207,7 +2311,7 @@ impl ExternalService for S3Service {
     ///
     /// Strategy: clone the source service's config (image, region), generate new
     /// credentials and an unused host port, spin up a new container+volume, then
-    /// run `mc mirror` from the backup location into every bucket discovered
+    /// run `rc mirror` from the backup location into every bucket discovered
     /// under the backup prefix. The new service gets its OWN access keys — it's
     /// not a clone of the source's credentials.
     ///
@@ -2266,7 +2370,7 @@ impl ExternalService for S3Service {
 
         // Provision the new container (image pull, volume, port binding, health check).
         // `create_container` writes any port-conflict retry back into
-        // `new_config`, so the `mc mirror` connection below (and the final
+        // `new_config`, so the `rc mirror` connection below (and the final
         // parameters returned to the orchestrator) target the port the
         // container actually bound to.
         new_service
@@ -2284,55 +2388,55 @@ impl ExternalService for S3Service {
         // Plaintext by the same RestoreContext contract. `None` for every
         // long-lived operator-configured credential.
         let source_session_token = ctx.s3_source.session_token.clone();
+        let has_token = source_session_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
         let source_endpoint = ctx
             .s3_source
             .endpoint
             .as_deref()
-            .unwrap_or("s3.amazonaws.com");
+            .unwrap_or("https://s3.amazonaws.com");
 
-        // Reuse the same mc-based mirror flow that restore_from_s3 uses, but
-        // dest is the NEW container. We shell out to a disposable mc container
+        // Reuse the same rc-based mirror flow that restore_from_s3 uses, but
+        // dest is the NEW container. We shell out to a disposable rc container
         // (host networking) rather than calling restore_from_s3 directly because
         // restore_from_s3 calls self.start() — which is a no-op on a fresh
         // instance that hasn't been init()'d.
-        self.pull_mc_image(&self.docker).await?;
+        self.pull_rc_image(&self.docker).await?;
 
-        let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
-        // SECURITY (docker inspect exposure): MC_HOST_* env vars embed plaintext
+        let rc_container_name = format!("rc-restore-new-{}", uuid::Uuid::new_v4());
+        // SECURITY (docker inspect exposure): RC_HOST_* env vars embed plaintext
         // credentials in the container environment for the container's lifetime.
         // The container is removed immediately after all mirror operations complete
         // (see the remove_container call at the end of this function), bounding
         // the exposure window to the restore execution time. Anyone with Docker
         // socket access has equivalent trust to these credentials for that window.
+        //
+        // Aliases via `RC_HOST_*` only (no `rc alias set`: keys would sit in
+        // argv, and its probe cannot send a session token). A temporary source
+        // credential's token goes in `TEMPS_REMOTE_SESSION_TOKEN` and is only
+        // sent, via `-H`, by the source-side `rc` calls.
         let mut env_vars = vec![
-            format!(
-                "MC_HOST_source=http://{}@{}",
-                super::mc_host_credential(
-                    &source_access_key,
-                    &source_secret_key,
-                    source_session_token.as_deref(),
-                ),
-                source_endpoint
+            super::rc_client::rc_host_env(
+                "backup-source",
+                source_endpoint,
+                &source_access_key,
+                &source_secret_key,
             ),
-            format!(
-                "MC_HOST_dest=http://{}:{}@localhost:{}",
-                new_config.access_key, new_config.secret_key, new_config.port
+            super::rc_client::rc_host_env(
+                "dest",
+                &format!("http://localhost:{}", new_config.port),
+                &new_config.access_key,
+                &new_config.secret_key,
             ),
         ];
-        // The `mc alias set backup-source ...` call below has no positional
-        // slot for a session token; this override does, and mc prefers it.
-        // Absent entirely for a long-lived credential.
-        env_vars.extend(super::mc_host_alias_override(
-            "backup-source",
-            source_endpoint,
-            &source_access_key,
-            &source_secret_key,
+        env_vars.extend(super::rc_client::remote_session_token_env(
             source_session_token.as_deref(),
         ));
 
-        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr when it
-        // cannot use it, and that stderr is logged and folded into the error
-        // persisted to `restore_runs.error`. A temporary source credential's
+        // Client stderr is logged and folded into the error persisted to
+        // `restore_runs.error`, and `mc` used to echo the credential-bearing
+        // host URL into it. A temporary source credential's
         // session token is as sensitive as its secret key, so it goes on the
         // list too.
         let sensitive_values = SensitiveValues::new()
@@ -2344,8 +2448,8 @@ impl ExternalService for S3Service {
             .credential(&new_config.access_key, &new_config.secret_key, None);
 
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
             entrypoint: Some(vec!["sh".to_string()]),
             tty: Some(true),
             attach_stdin: Some(true),
@@ -2363,7 +2467,7 @@ impl ExternalService for S3Service {
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&mc_container_name)
+                        .name(&rc_container_name)
                         .build(),
                 ),
                 container_config,
@@ -2377,70 +2481,29 @@ impl ExternalService for S3Service {
             )
             .await?;
 
-        let dest_endpoint = format!("http://localhost:{}", new_config.port);
-
-        // Configure aliases.
-        let setup_commands: Vec<Vec<&str>> = vec![
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-source",
-                source_endpoint,
-                &source_access_key,
-                &source_secret_key,
-            ],
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "dest",
-                &dest_endpoint,
-                &new_config.access_key,
-                &new_config.secret_key,
-            ],
-        ];
-
-        for cmd in setup_commands {
-            let exec = self
-                .docker
-                .create_exec(
-                    &container.id,
-                    bollard::exec::CreateExecOptions {
-                        cmd: Some(cmd.clone()),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-                self.docker.start_exec(&exec.id, None).await?
-            {
-                while let Ok(Some(chunk)) = output.try_next().await {
-                    match chunk {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            info!("mc stdout: {}", String::from_utf8_lossy(&message));
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            error!(
-                                "mc stderr: {}",
-                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref())
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            let exit_code = self
-                .docker
-                .inspect_exec(&exec.id)
-                .await?
-                .exit_code
-                .unwrap_or(-1);
-            if exit_code != 0 {
+        // List buckets at the backup prefix and mirror each into the new service.
+        let source_backup_location = format!(
+            "backup-source/{}/{}/",
+            ctx.s3_source.bucket_name,
+            ctx.backup_location.trim_matches('/')
+        );
+        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
+        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
+        let listing =
+            super::rc_client::exec_capture(&self.docker, &container.id, &list_command).await?;
+        let buckets = if listing.exit_code == 0 {
+            super::rc_client::parse_ls_dir_names(&listing.stdout)
+                .map_err(|e| anyhow::anyhow!("{}", sensitive_values.redact(&e.to_string())))
+        } else {
+            Err(anyhow::anyhow!(
+                "rc ls exited with code {}: {}",
+                listing.exit_code,
+                sensitive_values.redact(listing.stderr.trim())
+            ))
+        };
+        let buckets = match buckets {
+            Ok(buckets) => buckets,
+            Err(e) => {
                 let _ = self
                     .docker
                     .remove_container(
@@ -2451,64 +2514,14 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
-                // SECURITY: `mc alias set` argv positions 5+ are plaintext
-                // access_key / secret_key. Never log the real `cmd` — use a
-                // redacted copy so credentials don't appear in error messages
-                // or the `restore_runs.error` DB column.
-                let redacted_cmd: Vec<&str> = cmd
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| if i >= 5 { "***" } else { *s })
-                    .collect();
                 return Err(anyhow::anyhow!(
-                    "mc alias setup failed with exit code {} for command {:?}",
-                    exit_code,
-                    redacted_cmd
+                    "S3 restore to new service '{}' could not list backup location '{}': {}",
+                    new_service_name,
+                    source_backup_location,
+                    e
                 ));
             }
-        }
-
-        // List buckets at the backup prefix and mirror each into the new service.
-        let source_backup_location = format!(
-            "backup-source/{}/{}",
-            ctx.s3_source.bucket_name, ctx.backup_location
-        );
-        let list_command = vec!["mc", "ls", "--json", &source_backup_location];
-
-        let exec = self
-            .docker
-            .create_exec(
-                &container.id,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(list_command),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        let mut list_output = String::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-            self.docker.start_exec(&exec.id, None).await?
-        {
-            while let Ok(Some(chunk)) = output.try_next().await {
-                if let bollard::container::LogOutput::StdOut { message } = chunk {
-                    list_output.push_str(&String::from_utf8_lossy(&message));
-                }
-            }
-        }
-
-        let mut buckets: Vec<String> = Vec::new();
-        let json_objects = parse_multiline_json_output(&list_output)?;
-        for listing in json_objects {
-            if let (Some("folder"), Some(key)) = (
-                listing.get("type").and_then(|t| t.as_str()),
-                listing.get("key").and_then(|k| k.as_str()),
-            ) {
-                buckets.push(key.to_string());
-            }
-        }
+        };
 
         info!(
             "Restoring {} bucket(s) into new service '{}'",
@@ -2516,12 +2529,12 @@ impl ExternalService for S3Service {
             new_service_name
         );
 
-        for bucket in buckets {
-            let bucket_name = bucket.trim_end_matches('/');
+        for bucket_name in &buckets {
             let dest_location = format!("dest/{}", bucket_name);
 
-            // Create destination bucket (ignore "already exists" / empty-name noise).
-            let mb_cmd = vec!["mc", "mb", &dest_location];
+            // Create destination bucket; `--ignore-existing` exits 0 when the
+            // bucket is already there.
+            let mb_cmd = vec!["rc", "mb", "--ignore-existing", &dest_location];
             let mb_exec = self
                 .docker
                 .create_exec(
@@ -2534,22 +2547,35 @@ impl ExternalService for S3Service {
                     },
                 )
                 .await?;
-            let mut mb_stdout = String::new();
+            let mut mb_stderr = String::new();
             if let bollard::exec::StartExecResults::Attached { mut output, .. } =
                 self.docker.start_exec(&mb_exec.id, None).await?
             {
                 while let Ok(Some(chunk)) = output.try_next().await {
-                    if let bollard::container::LogOutput::StdOut { message } = chunk {
-                        mb_stdout.push_str(&String::from_utf8_lossy(&message));
+                    if let bollard::container::LogOutput::StdErr { message } = chunk {
+                        mb_stderr.push_str(&String::from_utf8_lossy(&message));
                     }
                 }
             }
             if let Some(code) = self.docker.inspect_exec(&mb_exec.id).await?.exit_code {
-                if code != 0 && !mb_stdout.contains("already") {
-                    info!(
-                        "mc mb returned {} for bucket {}, continuing: {}",
-                        code, bucket_name, mb_stdout
-                    );
+                if code != 0 {
+                    let _ = self
+                        .docker
+                        .remove_container(
+                            &container.id,
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "rc mb failed with exit code {} for bucket '{}' in new service '{}': {}",
+                        code,
+                        bucket_name,
+                        new_service_name,
+                        sensitive_values.redact(mb_stderr.trim())
+                    ));
                 }
             }
 
@@ -2559,17 +2585,15 @@ impl ExternalService for S3Service {
             // No --remove: the destination bucket was just created so there is
             // nothing extra to remove; --remove would be a no-op at best and
             // could race with startup writes at worst.
-            let source_bucket_loc = format!(
-                "backup-source/{}/{}/{}",
-                ctx.s3_source.bucket_name, ctx.backup_location, bucket_name
-            );
-            let mirror_cmd = vec![
-                "mc",
-                "mirror",
-                "--overwrite",
+            let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+            let dest_bucket_loc = format!("{}/", dest_location);
+            let mirror_cmd = super::rc_client::mirror_command(
                 &source_bucket_loc,
-                &dest_location,
-            ];
+                &dest_bucket_loc,
+                false,
+                super::rc_client::TokenSide::when(has_token, super::rc_client::TokenSide::Source),
+            );
+            let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
 
             info!(
                 "Mirroring bucket {} -> new service '{}'",
@@ -2630,7 +2654,7 @@ impl ExternalService for S3Service {
                 // chunks: a credential can straddle two Docker log frames and
                 // only the joined string is guaranteed to contain it intact.
                 return Err(anyhow::anyhow!(
-                    "mc mirror failed for bucket '{}' into new service '{}' with exit code {}. \
+                    "rc mirror failed for bucket '{}' into new service '{}' with exit code {}. \
                      stdout: {}. stderr: {}",
                     bucket_name,
                     new_service_name,
@@ -2641,7 +2665,7 @@ impl ExternalService for S3Service {
             }
         }
 
-        // Tear down the helper mc container.
+        // Tear down the helper rc container.
         let _ = self
             .docker
             .remove_container(
@@ -2680,12 +2704,11 @@ impl ExternalService for S3Service {
     }
 
     fn get_default_docker_image(&self) -> (String, String) {
-        // Return (image_name, version)
-        // Default MinIO image and release version
-        (
-            "quay.io/minio/minio".to_string(),
-            "RELEASE.2025-09-07T16-13-09Z".to_string(),
-        )
+        // Return (image_name, version). New services run RustFS: MinIO no
+        // longer publishes server images.
+        let image = super::rustfs::DEFAULT_RUSTFS_IMAGE;
+        let (name, version) = image.rsplit_once(':').unwrap_or((image, "latest"));
+        (name.to_string(), version.to_string())
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
@@ -2720,7 +2743,7 @@ impl ExternalService for S3Service {
     }
 
     fn get_default_version(&self) -> String {
-        "RELEASE.2025-09-07T16-13-09Z".to_string()
+        self.get_default_docker_image().1
     }
 
     async fn get_current_version(&self) -> Result<String> {
@@ -2915,7 +2938,7 @@ impl ExternalService for S3Service {
 }
 
 /// Strip the URL scheme from an S3 endpoint so it can be embedded in an
-/// `MC_HOST_<alias>=<scheme>://<key>:<secret>@<host>` env var without
+/// `RC_HOST_<alias>=<scheme>://<key>:<secret>@<host>` env var without
 /// producing a malformed double-scheme like `http://key:secret@http://host`.
 ///
 /// Returns `(scheme, host_and_path)`.  When the endpoint carries no scheme
@@ -2932,28 +2955,6 @@ fn mc_strip_scheme(endpoint: &str) -> (&'static str, &str) {
         // Bare host:port — assume plain HTTP (internal/MinIO default).
         ("http", endpoint)
     }
-}
-
-fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
-    let mut json_objects = Vec::new();
-    let mut current_object = String::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        current_object.push_str(trimmed);
-
-        // Try to parse the accumulated string as a JSON object
-        if let Ok(json_value) = serde_json::from_str(&current_object) {
-            json_objects.push(json_value);
-            current_object.clear();
-        }
-    }
-
-    Ok(json_objects)
 }
 
 #[cfg(test)]
@@ -3014,14 +3015,253 @@ mod tests {
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let service = S3Service::new("test-image".to_string(), docker, encryption_service);
         let (image_name, version) = service.get_default_docker_image();
+        // MinIO no longer publishes server images; new services run RustFS.
         assert_eq!(
-            image_name, "quay.io/minio/minio",
-            "Default image should be quay.io/minio/minio"
+            format!("{image_name}:{version}"),
+            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE
+        );
+        assert_eq!(service.get_default_version(), version);
+    }
+
+    /// A persisted config without `docker_image` belongs to a service created
+    /// before the parameter existed, i.e. a MinIO one. It must keep resolving
+    /// to MinIO: starting RustFS on a MinIO data volume would not serve it.
+    #[test]
+    fn test_persisted_config_without_image_stays_on_minio() {
+        let input: S3InputConfig = serde_json::from_value(serde_json::json!({
+            "port": "9000",
+            "access_key": "k",
+            "secret_key": "s",
+        }))
+        .unwrap();
+        assert_eq!(input.docker_image, LEGACY_MINIO_IMAGE);
+        assert!(!is_rustfs_image(&input.docker_image));
+    }
+
+    #[test]
+    fn test_schema_default_image_is_rustfs() {
+        assert_eq!(
+            default_image(),
+            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE
+        );
+        assert!(is_rustfs_image(&default_image()));
+    }
+
+    #[test]
+    fn test_is_rustfs_image_reads_the_repository_not_the_tag() {
+        for image in [
+            "rustfs/rustfs:1.0.0-rc.5",
+            "rustfs/rustfs",
+            "registry.internal:5000/mirror/rustfs:1.0.0-rc.5",
+            "ghcr.io/rustfs/rustfs@sha256:0123",
+            "RustFS/RustFS:latest",
+        ] {
+            assert!(is_rustfs_image(image), "{image}");
+        }
+        for image in [
+            "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+            "minio/minio:latest",
+            "registry.internal:5000/minio/minio:latest",
+            // A tag that mentions rustfs does not make the image RustFS.
+            "registry.internal:5000/minio/minio:rustfs-migration",
+        ] {
+            assert!(!is_rustfs_image(image), "{image}");
+        }
+    }
+
+    fn config_for_image(image: &str) -> S3Config {
+        S3Config {
+            port: "9000".to_string(),
+            access_key: "AKIAEXAMPLE".to_string(),
+            secret_key: "secret/with+chars".to_string(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: image.to_string(),
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn test_rustfs_image_gets_rustfs_env_and_default_command() {
+        let spec = s3_server_container_spec(&config_for_image(
+            crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
+        ));
+        assert_eq!(
+            spec.env,
+            vec![
+                "RUSTFS_ACCESS_KEY=AKIAEXAMPLE".to_string(),
+                "RUSTFS_SECRET_KEY=secret/with+chars".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.cmd, None,
+            "RustFS serves /data with its default command"
+        );
+        assert!(spec.healthcheck.contains("http://localhost:9000/health"));
+        assert!(
+            !spec.healthcheck.contains("mc "),
+            "RustFS images ship no mc"
+        );
+    }
+
+    #[test]
+    fn test_minio_image_keeps_minio_env_and_command() {
+        let spec = s3_server_container_spec(&config_for_image(LEGACY_MINIO_IMAGE));
+        assert_eq!(
+            spec.env,
+            vec![
+                "MINIO_ROOT_USER=AKIAEXAMPLE".to_string(),
+                "MINIO_ROOT_PASSWORD=secret/with+chars".to_string(),
+                "MINIO_PROMETHEUS_AUTH_TYPE=public".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.cmd,
+            Some(vec!["server".to_string(), "/data".to_string()])
+        );
+        assert_eq!(spec.healthcheck, "mc ready local");
+    }
+
+    #[test]
+    fn test_legacy_docker_hub_minio_spelling() {
+        assert_eq!(
+            legacy_docker_hub_minio_spelling("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
+                .as_deref(),
+            Some("minio/minio:RELEASE.2025-09-07T16-13-09Z")
+        );
+        assert_eq!(
+            legacy_docker_hub_minio_spelling("registry.internal:5000/minio/minio:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_missing_minio_image_error_is_actionable() {
+        let message = minio_image_unavailable_error(
+            LEGACY_MINIO_IMAGE,
+            "failed to pull image: 401 Unauthorized",
+        )
+        .to_string();
+        assert!(message.contains(LEGACY_MINIO_IMAGE), "{message}");
+        assert!(message.contains("401 Unauthorized"), "{message}");
+        assert!(message.contains("no longer publishes"), "{message}");
+        assert!(message.contains("docker_image"), "{message}");
+        assert!(
+            message.contains(crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE),
+            "{message}"
+        );
+    }
+
+    /// A MinIO image that cannot be pulled (MinIO withdrew them) is still
+    /// usable when the host holds it under the old Docker Hub spelling, and
+    /// fails with an actionable error when the host does not hold it at all.
+    #[tokio::test]
+    async fn test_ensure_server_image_handles_withdrawn_minio_images() {
+        use bollard::query_parameters::{RemoveImageOptions, TagImageOptionsBuilder};
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+        if crate::utils::pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .is_err()
+        {
+            println!("busybox:latest unavailable, skipping");
+            return;
+        }
+
+        // Only the bare Docker Hub spelling exists locally (tagged from
+        // busybox); the configured quay.io name has to be served from it.
+        let tag = format!("temps-test-{}", rand::random::<u32>());
+        docker
+            .tag_image(
+                "busybox:latest",
+                Some(
+                    TagImageOptionsBuilder::new()
+                        .repo("minio/minio")
+                        .tag(&tag)
+                        .build(),
+                ),
+            )
+            .await
+            .expect("tagging busybox locally should succeed");
+        let configured = format!("quay.io/minio/minio:{tag}");
+        let adopted = S3Service::ensure_server_image(&docker, &configured).await;
+        let tagged_locally = docker.inspect_image(&configured).await.is_ok();
+        for name in [format!("minio/minio:{tag}"), configured.clone()] {
+            let _ = docker
+                .remove_image(&name, None::<RemoveImageOptions>, None)
+                .await;
+        }
+        assert!(
+            adopted.is_ok(),
+            "local bare image must be used: {adopted:?}"
         );
         assert!(
-            version.starts_with("RELEASE."),
-            "Default version should be a MinIO release tag"
+            tagged_locally,
+            "the configured name must now resolve locally"
         );
+
+        let missing = format!(
+            "quay.io/minio/minio:temps-missing-{}",
+            rand::random::<u32>()
+        );
+        let err = S3Service::ensure_server_image(&docker, &missing)
+            .await
+            .expect_err("an unpullable MinIO image absent from the host must fail")
+            .to_string();
+        assert!(err.contains(&missing), "{err}");
+        assert!(err.contains("no longer publishes"), "{err}");
+    }
+
+    /// The in-place restore script runs in the `rc` image: every client call
+    /// must be `rc`, and folder names must be cut out of rc's full keys.
+    #[test]
+    fn test_restore_in_place_script_uses_rc() {
+        let script = S3Service::RESTORE_IN_PLACE_SCRIPT;
+        assert!(!script.contains("mc "), "script still calls mc: {script}");
+        assert!(script.contains(r#"rc ls --no-color "${RESTORE_PREFIX}""#));
+        assert!(script.contains(r#"rc mb --ignore-existing "${DEST}/${bucket}""#));
+        assert!(script.contains(
+            r#"rc mirror --overwrite --remove "${RESTORE_PREFIX}${bucket}/" "${DEST}/${bucket}/""#
+        ));
+        assert!(script.contains("s|.*/||"), "must strip the listed prefix");
+    }
+
+    /// With a temporary backup credential the script sends the token with
+    /// `-H` on backup-side calls only, reads it from the container env, and
+    /// stages the mirror so the live-side call never carries it.
+    #[test]
+    fn test_restore_in_place_script_sends_the_token_only_to_the_backup_side() {
+        let script = S3Service::RESTORE_IN_PLACE_SCRIPT;
+        assert!(script.contains(
+            r#"bkp_rc() { rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" "$@"; }"#
+        ));
+        assert!(script.contains(r#"bkp_rc ls --no-color "${RESTORE_PREFIX}""#));
+        assert!(script
+            .contains(r#"bkp_rc mirror --overwrite "${RESTORE_PREFIX}${bucket}/" "${STAGE}/""#));
+        assert!(
+            script.contains(r#"rc mirror --overwrite --remove "${STAGE}/" "${DEST}/${bucket}/""#)
+        );
+        // The live side (DEST) is never reached through bkp_rc.
+        for line in script.lines().filter(|l| l.contains("bkp_rc ")) {
+            assert!(
+                !line.contains("${DEST}"),
+                "live side must not get -H: {line}"
+            );
+        }
+        for line in script.lines().filter(|l| l.contains("-H ")) {
+            assert!(line.contains("bkp_rc()"), "-H only inside bkp_rc: {line}");
+        }
+        assert!(script.contains(r#"trap 'rm -rf "${STAGE_ROOT}"' EXIT"#));
     }
 
     #[test]
@@ -3050,10 +3290,9 @@ mod tests {
     #[test]
     fn test_legacy_docker_hub_minio_image_is_normalized_to_quay_io() {
         // Services created before the Docker Hub -> quay.io migration have
-        // this bare reference persisted in the database. It must be rewritten
-        // on load, since `create_container_once` always re-pulls the image
-        // (even when the container already exists) and Docker Hub now
-        // denies these repositories outright.
+        // this bare reference persisted in the database. It keeps being
+        // rewritten on load so the containers created under the quay.io name
+        // since then are not recreated (see `normalize_minio_registry`).
         for (persisted, expected) in [
             (
                 "minio/minio:RELEASE.2025-09-07T16-13-09Z",
@@ -3336,14 +3575,14 @@ mod tests {
         }
     }
 
-    // `flavor = "multi_thread"` is required because `MinioTestContainer`'s
+    // `flavor = "multi_thread"` is required because `S3TestContainer`'s
     // `Drop` impl calls `tokio::task::block_in_place`, which panics on the
     // default current-thread runtime.
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_s3_backup_and_restore_to_s3() {
         use super::super::test_utils::{
-            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
         };
 
         // Check if Docker is available
@@ -3370,11 +3609,11 @@ mod tests {
             }
         };
 
-        // Use separate MinIO instances so the backup destination is not mirrored
+        // Use separate S3 instances so the backup destination is not mirrored
         // back into the source service while copying all source buckets.
         let run_id = chrono::Utc::now().timestamp_millis();
         let source_bucket_0 = format!("temps-s3-roundtrip-{run_id}-000");
-        let source_minio = match MinioTestContainer::start(docker.clone(), &source_bucket_0).await {
+        let source_minio = match S3TestContainer::start(docker.clone(), &source_bucket_0).await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();
@@ -3395,7 +3634,7 @@ mod tests {
         };
 
         let backup_minio =
-            match MinioTestContainer::start(docker.clone(), "s3-backup-destination").await {
+            match S3TestContainer::start(docker.clone(), "s3-backup-destination").await {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = source_minio.cleanup().await;
@@ -3412,7 +3651,9 @@ mod tests {
             "access_key": source_minio.access_key.clone(),
             "secret_key": source_minio.secret_key.clone(),
             "region": "us-east-1",
-            "docker_image": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+            // The restored service is created from this image, so this also
+            // covers `S3Service` running a RustFS container.
+            "docker_image": crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
         });
 
         let s3_config = ServiceConfig {
@@ -3687,14 +3928,14 @@ mod tests {
     }
 
     #[test]
-    fn strip_scheme_mc_host_var_format_no_double_scheme() {
+    fn strip_scheme_rc_host_var_format_no_double_scheme() {
         // Regression: before mc_strip_scheme, an http:// endpoint produced
-        // MC_HOST=http://key:secret@http://host — invalid and rejected by mc.
+        // <client>_HOST=http://key:secret@http://host — an invalid URL.
         let endpoint = "http://minio.example.com:9000";
         let (scheme, host) = mc_strip_scheme(endpoint);
-        let var = format!("MC_HOST_bkp={}://key:secret@{}", scheme, host);
+        let var = format!("RC_HOST_bkp={}://key:secret@{}", scheme, host);
         assert!(!var.contains("http://http://"), "double-scheme detected");
-        assert_eq!(var, "MC_HOST_bkp=http://key:secret@minio.example.com:9000");
+        assert_eq!(var, "RC_HOST_bkp=http://key:secret@minio.example.com:9000");
     }
 
     /// Verify the CRITICAL shell-injection fix in `restore_in_place`.
@@ -3723,7 +3964,7 @@ mod tests {
         );
         let env_var = format!("RESTORE_PREFIX={}/", backup_prefix);
 
-        // 1. The env var MUST carry the raw, unescaped value so that mc can reach
+        // 1. The env var MUST carry the raw, unescaped value so that rc can reach
         //    the correct path.  This is safe: Docker env var values are byte
         //    sequences passed directly to the process, never re-parsed as shell.
         assert!(
@@ -3767,70 +4008,6 @@ mod tests {
         assert!(
             !script.contains("for bucket in $"),
             "script must not use bare 'for bucket in $VAR' (word-splitting risk)"
-        );
-    }
-
-    /// Verify that the `mc alias set` error path in `restore_to_new_service`
-    /// never exposes plaintext credentials in the error message.
-    ///
-    /// `mc alias set <name> <endpoint> <access_key> <secret_key>` puts credentials
-    /// at argv positions 5 and 6.  Before the fix, a failed alias setup included
-    /// the full `cmd` (with real keys) in the anyhow error that propagates into
-    /// `restore_runs.error` in the DB and `error!`-level logs.
-    #[test]
-    fn test_alias_setup_error_redacts_credentials() {
-        let access_key = "AKIAIOSFODNN7EXAMPLE";
-        let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-        let endpoint = "http://s3.amazonaws.com";
-
-        // Simulate the argv the production code builds.
-        let cmd: Vec<&str> = vec![
-            "mc",
-            "alias",
-            "set",
-            "backup-source",
-            endpoint,
-            access_key, // position 5 — must be redacted
-            secret_key, // position 6 — must be redacted
-        ];
-
-        // Apply the same redaction logic used in restore_to_new_service.
-        let redacted_cmd: Vec<&str> = cmd
-            .iter()
-            .enumerate()
-            .map(|(i, s)| if i >= 5 { "***" } else { *s })
-            .collect();
-
-        let error_msg = format!(
-            "mc alias setup failed with exit code {} for command {:?}",
-            1, redacted_cmd
-        );
-
-        // The error message must NOT contain either credential.
-        assert!(
-            !error_msg.contains(access_key),
-            "error message must not contain plaintext access_key; got: {:?}",
-            error_msg
-        );
-        assert!(
-            !error_msg.contains(secret_key),
-            "error message must not contain plaintext secret_key; got: {:?}",
-            error_msg
-        );
-        // The sentinel must appear instead.
-        assert!(
-            error_msg.contains("***"),
-            "error message must contain redaction sentinel '***'; got: {:?}",
-            error_msg
-        );
-        // Non-sensitive positional args must still appear for debuggability.
-        assert!(
-            error_msg.contains("backup-source"),
-            "error message must retain the alias name for context"
-        );
-        assert!(
-            error_msg.contains(endpoint),
-            "error message must retain the endpoint for context"
         );
     }
 }

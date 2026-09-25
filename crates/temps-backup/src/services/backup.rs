@@ -11465,7 +11465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backup_to_minio_integration() {
+    async fn test_backup_to_rustfs_integration() {
         let docker = match bollard::Docker::connect_with_local_defaults() {
             Ok(docker) => docker,
             Err(error) => {
@@ -11479,27 +11479,24 @@ mod tests {
         }
 
         use temps_database::test_utils::TestDatabase;
-        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+        use testcontainers::runners::AsyncRunner;
 
-        // Start MinIO container
-        let minio_container =
-            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
-                .with_env_var("MINIO_ROOT_USER", "minioadmin")
-                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("Failed to start MinIO container");
-
-        let minio_port = minio_container
-            .get_host_port_ipv4(9000)
+        // Start RustFS (S3-compatible) container
+        let s3_container = crate::test_rustfs::rustfs_container_request()
+            .start()
             .await
-            .expect("Failed to get MinIO port");
+            .expect("Failed to start RustFS container");
 
-        let minio_endpoint = format!("http://localhost:{}", minio_port);
+        let s3_port = s3_container
+            .get_host_port_ipv4(crate::test_rustfs::RUSTFS_S3_PORT)
+            .await
+            .expect("Failed to get RustFS port");
 
-        // Give MinIO time to start
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let s3_endpoint = format!("http://localhost:{}", s3_port);
+
+        crate::test_rustfs::wait_for_rustfs_ready(s3_port)
+            .await
+            .expect("RustFS did not become healthy");
 
         // Start PostgreSQL database with migrations
         let test_db = TestDatabase::with_migrations()
@@ -11511,13 +11508,13 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "minioadmin",
-                "minioadmin",
+                crate::test_rustfs::RUSTFS_ACCESS_KEY,
+                crate::test_rustfs::RUSTFS_SECRET_KEY,
                 None,
                 None,
                 "test",
             ))
-            .endpoint_url(&minio_endpoint)
+            .endpoint_url(&s3_endpoint)
             .force_path_style(true)
             .http_client(crate::engines::v2_common::bundled_roots_http_client())
             .build();
@@ -11583,13 +11580,13 @@ mod tests {
 
         // Create S3 source
         let s3_source_request = CreateS3SourceRequest {
-            name: "test-minio".to_string(),
+            name: "test-rustfs".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
             region: "us-east-1".to_string(),
-            endpoint: Some(minio_endpoint.clone()),
+            endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
@@ -11875,7 +11872,7 @@ mod tests {
 
         println!("\n✓ Integration test passed:");
         println!("  - Database container started (timescale/timescaledb-ha)");
-        println!("  - MinIO container started");
+        println!("  - RustFS container started");
         println!("  - Backup created with ID: {}", backup_result.id);
         println!(
             "  - Backup size: {} bytes (compressed)",
@@ -11910,22 +11907,20 @@ mod tests {
         }
 
         use temps_database::test_utils::TestDatabase;
-        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+        use testcontainers::runners::AsyncRunner;
 
-        let minio_container =
-            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
-                .with_env_var("MINIO_ROOT_USER", "minioadmin")
-                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("Failed to start MinIO container");
-        let minio_port = minio_container
-            .get_host_port_ipv4(9000)
+        let s3_container = crate::test_rustfs::rustfs_container_request()
+            .start()
             .await
-            .expect("Failed to get MinIO port");
-        let minio_endpoint = format!("http://localhost:{}", minio_port);
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            .expect("Failed to start RustFS container");
+        let s3_port = s3_container
+            .get_host_port_ipv4(crate::test_rustfs::RUSTFS_S3_PORT)
+            .await
+            .expect("Failed to get RustFS port");
+        let s3_endpoint = format!("http://localhost:{}", s3_port);
+        crate::test_rustfs::wait_for_rustfs_ready(s3_port)
+            .await
+            .expect("RustFS did not become healthy");
 
         let test_db = TestDatabase::with_migrations()
             .await
@@ -11935,13 +11930,13 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "minioadmin",
-                "minioadmin",
+                crate::test_rustfs::RUSTFS_ACCESS_KEY,
+                crate::test_rustfs::RUSTFS_SECRET_KEY,
                 None,
                 None,
                 "test",
             ))
-            .endpoint_url(&minio_endpoint)
+            .endpoint_url(&s3_endpoint)
             .force_path_style(true)
             .http_client(crate::engines::v2_common::bundled_roots_http_client())
             .build();
@@ -11981,13 +11976,13 @@ mod tests {
 
         let s3_source = backup_service
             .create_s3_source(CreateS3SourceRequest {
-                name: "test-minio-toggle".to_string(),
+                name: "test-rustfs-toggle".to_string(),
                 bucket_name: bucket_name.to_string(),
                 bucket_path: "/backups".to_string(),
-                access_key_id: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
+                access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
+                secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
                 region: "us-east-1".to_string(),
-                endpoint: Some(minio_endpoint.clone()),
+                endpoint: Some(s3_endpoint.clone()),
                 force_path_style: Some(true),
                 is_default: None,
                 backing_service_id: None,
@@ -12128,27 +12123,24 @@ mod tests {
         }
 
         use temps_database::test_utils::TestDatabase;
-        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+        use testcontainers::runners::AsyncRunner;
 
-        // Start MinIO container
-        let minio_container =
-            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
-                .with_env_var("MINIO_ROOT_USER", "minioadmin")
-                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("Failed to start MinIO container");
-
-        let minio_port = minio_container
-            .get_host_port_ipv4(9000)
+        // Start RustFS (S3-compatible) container
+        let s3_container = crate::test_rustfs::rustfs_container_request()
+            .start()
             .await
-            .expect("Failed to get MinIO port");
+            .expect("Failed to start RustFS container");
 
-        let minio_endpoint = format!("http://localhost:{}", minio_port);
+        let s3_port = s3_container
+            .get_host_port_ipv4(crate::test_rustfs::RUSTFS_S3_PORT)
+            .await
+            .expect("Failed to get RustFS port");
 
-        // Give MinIO time to start
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let s3_endpoint = format!("http://localhost:{}", s3_port);
+
+        crate::test_rustfs::wait_for_rustfs_ready(s3_port)
+            .await
+            .expect("RustFS did not become healthy");
 
         // Start source PostgreSQL database with migrations (isolated instance)
         let source_db = TestDatabase::new_isolated()
@@ -12165,13 +12157,13 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "minioadmin",
-                "minioadmin",
+                crate::test_rustfs::RUSTFS_ACCESS_KEY,
+                crate::test_rustfs::RUSTFS_SECRET_KEY,
                 None,
                 None,
                 "test",
             ))
-            .endpoint_url(&minio_endpoint)
+            .endpoint_url(&s3_endpoint)
             .force_path_style(true)
             .http_client(crate::engines::v2_common::bundled_roots_http_client())
             .build();
@@ -12282,10 +12274,10 @@ mod tests {
             name: "test-restore-source".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
             region: "us-east-1".to_string(),
-            endpoint: Some(minio_endpoint.clone()),
+            endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
@@ -12350,10 +12342,10 @@ mod tests {
             name: "test-restore-source".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
             region: "us-east-1".to_string(),
-            endpoint: Some(minio_endpoint.clone()),
+            endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
@@ -12521,7 +12513,7 @@ mod tests {
 
         println!("\n✓ Integration test passed:");
         println!("  - Source database created with test data (user + project)");
-        println!("  - Backup created and uploaded to MinIO");
+        println!("  - Backup created and uploaded to RustFS");
         println!("  - Target database created");
         println!("  - Backup restored to target database from URL");
         println!("  - Data verified: project and user successfully restored with matching data");
