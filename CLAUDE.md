@@ -18,7 +18,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Use `.context()` from anyhow -- ALWAYS use `.map_err()` with typed errors
 - Use `.unwrap()` or `.expect()` in production code -- ALWAYS use `?` or explicit error handling
 - Use `anyhow::Result` in service layer -- ALWAYS use typed error enums with `thiserror`
-- Expose sensitive data (API keys, tokens) in responses -- ALWAYS mask them
+- Expose stored sensitive data (API keys, tokens, passwords) in responses -- ALWAYS mask them. The one exception is a credential minted by the request itself (a new API key, an admin-reset temporary password): it is returned exactly once, in plaintext, with `Cache-Control: no-store`, and is never persisted in retrievable form
 - Create N+1 queries -- ALWAYS use JOINs for related data
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
@@ -979,7 +979,8 @@ impl From<Settings> for SettingsResponse {
 }
 ```
 
-- API keys, tokens, passwords: always mask with `***` in responses
+- API keys, tokens, passwords: always mask with `***` in responses when they are read back from storage
+- One-time issuance is the only exception: when the request itself mints the credential (API key creation returns `api_key`; `POST /users/{user_id}/password` returns `temporary_password`), return it once in plaintext with `Cache-Control: no-store`, store only a hash, and never log or audit the value
 - Encryption at rest via `EncryptionService` (AES-256-GCM)
 - Session tokens via `CookieCrypto`
 - S3 credentials encrypted before database storage

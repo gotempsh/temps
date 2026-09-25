@@ -78,6 +78,18 @@ export function parseRolesInput(rolesOption: string | undefined): RolesInputResu
   return { roles: selectedRoles }
 }
 
+/**
+ * Parse a user ID strictly. `parseInt` accepts a numeric prefix, so `12x` or
+ * `12.9` would silently become user 12 -- and these commands delete users,
+ * change roles and reset passwords, so a typo must never select someone else.
+ */
+export function parseUserId(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (!/^[1-9]\d*$/.test(trimmed)) return null
+  const id = Number(trimmed)
+  return Number.isSafeInteger(id) && id <= 2147483647 ? id : null
+}
+
 export function registerUsersCommands(program: Command): void {
   const users = program
     .command('users')
@@ -299,9 +311,9 @@ async function removeUser(options: RemoveOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
     return
   }
 
@@ -337,9 +349,9 @@ async function restoreUserAction(options: RestoreOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
     return
   }
 
@@ -360,9 +372,9 @@ async function resetPasswordAction(options: ResetPasswordOptions): Promise<void>
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
     return
   }
 
@@ -407,9 +419,9 @@ async function manageRoles(options: RoleOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
     return
   }
 

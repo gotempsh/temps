@@ -392,7 +392,7 @@ async fn complete_oidc_login(
     if user.must_change_password {
         let reset_token = state
             .auth_service
-            .create_required_password_change_token(user.id)
+            .create_required_password_change_token(&user)
             .await
             .map_err(|error| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),

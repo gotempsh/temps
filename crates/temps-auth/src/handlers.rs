@@ -1023,9 +1023,24 @@ pub async fn login(
             if user.must_change_password {
                 let reset_token = state
                     .auth_service
-                    .create_required_password_change_token(user.id)
+                    .create_required_password_change_token(&user)
                     .await
                     .map_err(|error| {
+                        // An admin reset replaced the password this request
+                        // verified: the credential it presented is no longer
+                        // valid, so answer exactly as for a wrong password.
+                        if matches!(
+                            error,
+                            crate::auth_service::UserAuthError::CredentialsChanged { .. }
+                        ) {
+                            warn!(
+                                user_id = user.id,
+                                "Password changed after verification; refusing password-change session"
+                            );
+                            return problem_new(StatusCode::UNAUTHORIZED)
+                                .with_title("Invalid Credentials")
+                                .with_detail("Invalid email or password.");
+                        }
                         error!(
                             user_id = user.id,
                             error = %error,
@@ -1286,6 +1301,22 @@ pub async fn login(
                                 password_change_required: false,
                             }),
                         ))
+                    }
+                    Err(crate::auth_service::AuthError::PasswordChangeRequired { .. }) => {
+                        // An admin reset flagged the account after this
+                        // request verified the (now replaced) password.
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "password_reset_during_login",
+                        )
+                        .await;
+                        Err(problem_new(StatusCode::UNAUTHORIZED)
+                            .with_title("Invalid Credentials")
+                            .with_detail("Invalid email or password."))
                     }
                     Err(e) => {
                         // The credentials were already verified, so the actor

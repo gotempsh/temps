@@ -47,17 +47,29 @@ export function ResetPasswordDialog({
   const queryClient = useQueryClient()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
-  const [temporaryPassword, setTemporaryPassword] = useState<string | null>(
-    null
-  )
+  // Keyed by the user it was generated for, so a result can never be shown
+  // under another user's name.
+  const [result, setResult] = useState<{
+    userId: number
+    temporaryPassword: string
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const resetPassword = useMutation({
     ...resetUserPasswordMutation(),
-    onSuccess: (data) => {
+    onSuccess: (data, variables) => {
       setError(null)
-      setTemporaryPassword(data.temporary_password)
-      queryClient.invalidateQueries({ queryKey: ['listUsers'] })
+      setResult({
+        userId: variables.path.user_id,
+        temporaryPassword: data.temporary_password,
+      })
+      // Generated query keys are `[{ _id: 'listUsers', ...options }]`; match on
+      // `_id` so every listUsers query (list page, detail page) refreshes.
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          (query.queryKey[0] as { _id?: string } | undefined)?._id ===
+          'listUsers',
+      })
     },
     onError: (err, variables) => {
       if (
@@ -74,14 +86,21 @@ export function ResetPasswordDialog({
   })
 
   const close = () => {
+    // A reset in flight must finish in this dialog: closing now would detach
+    // its one-time password from the user it belongs to.
+    if (resetPassword.isPending) return
     // Drop the credential from memory as soon as the dialog goes away.
-    setTemporaryPassword(null)
+    setResult(null)
     setError(null)
     resetPassword.reset()
     onClose()
   }
 
   const displayName = user?.name || user?.email || 'this user'
+  const temporaryPassword =
+    result && user && result.userId === user.id
+      ? result.temporaryPassword
+      : null
 
   return (
     <>
@@ -89,8 +108,14 @@ export function ResetPasswordDialog({
       <Dialog open={user !== null} onOpenChange={(open) => !open && close()}>
         <DialogContent
           className="sm:max-w-lg"
-          // Losing the password to a stray click would force another reset.
-          onInteractOutside={(e) => temporaryPassword && e.preventDefault()}
+          // Losing the password to a stray click would force another reset,
+          // and a pending reset must not be dismissed at all.
+          onInteractOutside={(e) => {
+            if (temporaryPassword || resetPassword.isPending) e.preventDefault()
+          }}
+          onEscapeKeyDown={(e) => {
+            if (resetPassword.isPending) e.preventDefault()
+          }}
         >
           {temporaryPassword ? (
             <>

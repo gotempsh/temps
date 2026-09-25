@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { parseRolesInput } from './index.js'
+import { parseRolesInput, parseUserId } from './index.js'
 
 describe('parseRolesInput', () => {
   test('defaults to user when no roles were given', () => {
@@ -33,5 +33,26 @@ describe('parseRolesInput', () => {
 
   test('a single valid role round-trips without adding a default', () => {
     expect(parseRolesInput('admin')).toEqual({ roles: ['admin'] })
+  })
+})
+
+describe('parseUserId', () => {
+  test('accepts a positive whole number, ignoring surrounding whitespace', () => {
+    expect(parseUserId('12')).toBe(12)
+    expect(parseUserId(' 7 ')).toBe(7)
+  })
+
+  test('rejects numeric prefixes that parseInt would silently truncate', () => {
+    // parseInt('12x') === 12 and parseInt('12.9') === 12: a typo must not
+    // select user 12 for a destructive command.
+    for (const raw of ['12x', '12.9', '1e3', '0x10', '12 13']) {
+      expect(parseUserId(raw)).toBeNull()
+    }
+  })
+
+  test('rejects zero, negatives, empty input and values beyond i32', () => {
+    for (const raw of ['0', '-3', '', '   ', '007', '2147483648']) {
+      expect(parseUserId(raw)).toBeNull()
+    }
   })
 })
