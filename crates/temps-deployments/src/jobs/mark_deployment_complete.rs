@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,6 +26,9 @@ use temps_entities::{
 };
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
+
+/// Deployment states the previous-deployment teardown sweep picks up.
+const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
 
 /// Process-level locks keyed by environment_id to serialize mark_complete
 /// operations for the same environment. This replaces PostgreSQL advisory
@@ -2069,13 +2072,19 @@ WHERE project.id = $2
             match self.get_remote_deployer(node_id).await {
                 Ok(remote) => remote,
                 Err(e) => {
-                    self.log(format!(
-                        "Failed to create remote deployer for container {} on node {}: {} — falling back to local",
-                        container_id, node_id, e
-                    ))
-                    .await
-                    .ok();
-                    self.container_deployer.clone()
+                    // Never fall back to the local daemon: it does not own this
+                    // container, and a matching ID there would be the wrong
+                    // container. Leave the row live so the next sweep retries
+                    // once the worker is reachable.
+                    warn!(
+                        container_id = %container_id,
+                        node_id,
+                        error = %e,
+                        "Cannot reach worker node to tear down container; will retry on next sweep"
+                    );
+                    return Err(format!(
+                        "Failed to connect to worker node {node_id} to remove container {container_id}: {e}"
+                    ));
                 }
             }
         } else {
@@ -2101,12 +2110,23 @@ WHERE project.id = $2
             }
         }
 
-        // Remove container from Docker
+        // Remove container from Docker. A container that is already gone
+        // (pruned, removed by hand, lost with its node's disk) is torn down:
+        // retrying could never succeed and would keep the deployment in the
+        // sweep forever.
         match deployer.remove_container(&container_id).await {
             Ok(_) => {
                 self.log(format!("Removed container {}", container_id))
                     .await
                     .ok();
+            }
+            Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
+                self.log(format!(
+                    "Container {} was already removed from Docker",
+                    container_id
+                ))
+                .await
+                .ok();
             }
             Err(e) => {
                 self.log(format!(
@@ -2244,8 +2264,6 @@ WHERE project.id = $2
         environment_id: i32,
         current_created_at: chrono::DateTime<chrono::Utc>,
     ) {
-        use sea_orm::Set;
-
         self.log("Checking for previous deployments to teardown...".to_string())
             .await
             .ok();
@@ -2278,12 +2296,7 @@ WHERE project.id = $2
                             .add(deployments::Column::Id.lt(self.deployment_id)),
                     ),
             )
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "built",
-                "completed",
-            ]))
+            .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
             .order_by_desc(deployments::Column::CreatedAt)
             .limit(MAX_TEARDOWN_DEPLOYMENTS_PER_PASS)
             .all(self.db.as_ref())
@@ -2342,6 +2355,25 @@ WHERE project.id = $2
             };
 
             if containers.is_empty() {
+                // Every recorded container was already retired (for example
+                // by the workflow's own post-deploy sweep), so there is
+                // nothing left to remove: finish the deployment off.
+                match self.has_retired_containers(deployment_id).await {
+                    Ok(true) => {
+                        self.mark_deployment_stopped(deployment).await;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        self.log(format!(
+                            "Failed to check retired containers for deployment {}: {}",
+                            deployment_id, e
+                        ))
+                        .await
+                        .ok();
+                        continue;
+                    }
+                }
                 // A slug is not proof of Docker-container ownership. Name
                 // collisions could otherwise stop or remove an unrelated
                 // container, so only recorded deployment containers are safe.
@@ -2406,33 +2438,7 @@ WHERE project.id = $2
                 continue;
             }
 
-            // Flip the fully torn-down deployment to a terminal "stopped" state
-            // so it is no longer matched by the scan above. This is what bounds
-            // the teardown query as deployment history grows — without it,
-            // every completed deployment would be re-scanned on every
-            // subsequent deploy forever. We do NOT touch "failed" deployments
-            // (excluded by the filter) and the rollback target finder
-            // (`find_last_successful_deployment`) only ever needs the
-            // most-recent completed deployment, which is the new current one —
-            // never a deployment we are stopping here.
-            let mut active_deployment: deployments::ActiveModel = deployment.into();
-            active_deployment.state = Set("stopped".to_string());
-            active_deployment.updated_at = Set(chrono::Utc::now());
-            if let Err(e) = active_deployment.update(self.db.as_ref()).await {
-                self.log(format!(
-                    "Failed to mark deployment {} as stopped: {}",
-                    deployment_id, e
-                ))
-                .await
-                .ok();
-            }
-
-            self.log(format!(
-                "Torn down deployment {} - containers stopped and removed",
-                deployment_id
-            ))
-            .await
-            .ok();
+            self.mark_deployment_stopped(deployment).await;
         }
 
         let summary = if incomplete_teardowns == 0 {
@@ -2443,6 +2449,67 @@ WHERE project.id = $2
             )
         };
         self.log(summary).await.ok();
+    }
+
+    /// Whether the deployment ever registered containers that have since been
+    /// retired — proof of ownership once no live rows remain.
+    async fn has_retired_containers(&self, deployment_id: i32) -> Result<bool, sea_orm::DbErr> {
+        let retired = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
+            .count(self.db.as_ref())
+            .await?;
+        Ok(retired > 0)
+    }
+
+    /// Flip a fully torn-down deployment to a terminal "stopped" state so it
+    /// is no longer matched by the teardown scan. This is what bounds the
+    /// scan as deployment history grows — without it, every completed
+    /// deployment would be re-scanned on every subsequent deploy forever. We
+    /// never touch "failed" deployments (excluded by the scan), and the
+    /// rollback target finder (`find_last_successful_deployment`) only needs
+    /// the most-recent completed deployment, which is the new current one —
+    /// never a deployment stopped here.
+    async fn mark_deployment_stopped(&self, deployment: deployments::Model) {
+        let deployment_id = deployment.id;
+        // Guarded on the swept states so a concurrent transition (e.g. to
+        // "failed") is never overwritten with "stopped".
+        let result = deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("stopped"))
+            .col_expr(
+                deployments::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
+            .exec(self.db.as_ref())
+            .await;
+        match result {
+            Ok(outcome) if outcome.rows_affected == 0 => {
+                self.log(format!(
+                    "Deployment {} changed state during teardown; leaving it as is",
+                    deployment_id
+                ))
+                .await
+                .ok();
+            }
+            Ok(_) => {
+                self.log(format!(
+                    "Torn down deployment {} - containers stopped and removed",
+                    deployment_id
+                ))
+                .await
+                .ok();
+            }
+            Err(e) => {
+                self.log(format!(
+                    "Failed to mark deployment {} as stopped: {}",
+                    deployment_id, e
+                ))
+                .await
+                .ok();
+            }
+        }
     }
 
     async fn successful_job_result(
@@ -2773,6 +2840,8 @@ mod teardown_tests {
         removed: Arc<StdMutex<Vec<String>>>,
         /// When set, `remove_container` fails like a busy/unreachable daemon.
         fail_remove: std::sync::atomic::AtomicBool,
+        /// When set, `remove_container` reports the container as already gone.
+        container_missing: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDeployer {
@@ -2781,6 +2850,7 @@ mod teardown_tests {
                 stopped: Arc::new(StdMutex::new(Vec::new())),
                 removed: Arc::new(StdMutex::new(Vec::new())),
                 fail_remove: std::sync::atomic::AtomicBool::new(false),
+                container_missing: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2814,6 +2884,12 @@ mod teardown_tests {
                 return Err(DeployerError::Other(format!(
                     "removal of container {id} is already in progress"
                 )));
+            }
+            if self
+                .container_missing
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(DeployerError::ContainerNotFound(id.to_string()));
             }
             self.removed.lock().unwrap().push(id.to_string());
             Ok(())
@@ -3739,6 +3815,109 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(prev_after.state, "stopped");
+    }
+
+    /// A container that is already gone from Docker (pruned, removed by hand)
+    /// can never be removed, so treating that as a failure would keep its
+    /// deployment in the sweep forever. It counts as torn down.
+    #[tokio::test]
+    async fn test_teardown_of_already_removed_container_completes() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let prev = insert_deployment(&db, project.id, env.id, "prev-deploy", "completed").await;
+        let prev_container = insert_container(&db, prev.id, "gone-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .container_missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let row = deployment_containers::Entity::find_by_id(prev_container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+        let prev_after = deployments::Entity::find_by_id(prev.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev_after.state, "stopped");
+    }
+
+    /// When another sweep (the workflow's post-deploy teardown) retires every
+    /// container row between passes, the deployment has nothing left to
+    /// remove. It must still be flipped to "stopped" rather than being skipped
+    /// as "ownership cannot be verified" and re-scanned forever.
+    #[tokio::test]
+    async fn test_deployment_with_only_retired_containers_is_stopped() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let prev = insert_deployment(&db, project.id, env.id, "prev-deploy", "completed").await;
+        let prev_container = insert_container(&db, prev.id, "prev-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+        assert_eq!(
+            deployments::Entity::find_by_id(prev.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "completed"
+        );
+
+        // Another sweep retires the row in the meantime.
+        let mut retired: deployment_containers::ActiveModel =
+            deployment_containers::Entity::find_by_id(prev_container.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        retired.deleted_at = Set(Some(chrono::Utc::now()));
+        retired.status = Set(Some("removed".to_string()));
+        retired.update(db.as_ref()).await.unwrap();
+
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let prev_after = deployments::Entity::find_by_id(prev.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev_after.state, "stopped");
+        assert!(
+            deployer.removed.lock().unwrap().is_empty(),
+            "nothing is left to remove once every row is retired"
+        );
     }
 
     /// "failed" deployments are never torn down — error history is preserved.
