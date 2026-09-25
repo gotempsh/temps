@@ -330,6 +330,7 @@ fn login_error_code_for(err: &OidcError) -> &'static str {
         OidcError::EmailNotVerified { .. } => "email_not_verified",
         OidcError::UserNotProvisioned { .. } => "user_not_provisioned",
         OidcError::ProviderDisabled { .. } => "provider_disabled",
+        OidcError::CredentialsChanged { .. } => "credentials_changed",
         OidcError::ProviderNotFound { .. } => "provider_not_found",
         OidcError::NoProviderConfigured => "no_provider_configured",
         OidcError::InvalidIssuer { .. } => "issuer_invalid",
@@ -394,12 +395,17 @@ async fn complete_oidc_login(
             .auth_service
             .create_required_password_change_token(&user)
             .await
-            .map_err(|error| OidcError::DiscoveryFailed {
-                issuer: provider.issuer_url.clone(),
-                reason: format!(
-                    "failed to create required password-change session for user {}: {error}",
-                    user.id
-                ),
+            .map_err(|error| match error {
+                crate::auth_service::UserAuthError::CredentialsChanged { user_id } => {
+                    OidcError::CredentialsChanged { user_id }
+                }
+                error => OidcError::DiscoveryFailed {
+                    issuer: provider.issuer_url.clone(),
+                    reason: format!(
+                        "failed to create required password-change session for user {}: {error}",
+                        user.id
+                    ),
+                },
             })?;
         let encrypted_token = state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
             OidcError::DiscoveryFailed {

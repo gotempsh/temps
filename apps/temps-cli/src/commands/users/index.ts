@@ -314,6 +314,8 @@ async function removeUser(options: RemoveOptions): Promise<void> {
   const id = parseUserId(options.id)
   if (id === null) {
     warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
@@ -352,6 +354,8 @@ async function restoreUserAction(options: RestoreOptions): Promise<void> {
   const id = parseUserId(options.id)
   if (id === null) {
     warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
@@ -375,6 +379,8 @@ async function resetPasswordAction(options: ResetPasswordOptions): Promise<void>
   const id = parseUserId(options.id)
   if (id === null) {
     warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
@@ -422,12 +428,15 @@ async function manageRoles(options: RoleOptions): Promise<void> {
   const id = parseUserId(options.id)
   if (id === null) {
     warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
   if (options.add) {
     if (!AVAILABLE_ROLES.includes(options.add)) {
       warning(`Invalid role: ${options.add}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
+      process.exitCode = 1
       return
     }
 
@@ -451,6 +460,7 @@ async function manageRoles(options: RoleOptions): Promise<void> {
   if (options.remove) {
     if (!AVAILABLE_ROLES.includes(options.remove)) {
       warning(`Invalid role: ${options.remove}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
+      process.exitCode = 1
       return
     }
 
