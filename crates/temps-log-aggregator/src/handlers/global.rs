@@ -231,6 +231,11 @@ pub struct GlobalLogCapabilities {
 /// all of them; the list is for the operator to recognise what they are.
 const DEFERRED_GENERATIONS_LISTED: usize = 20;
 
+/// What a non-administrator is told when the deferred directory is unreadable.
+const DEFERRED_LISTING_FAILED: &str =
+    "The server could not read its deferred WAL directory, so files set aside by recovery are \
+     not counted.";
+
 /// Whether new container log lines are being collected right now. Separate
 /// from `analytics` because the two fail independently: after a restart the
 /// index can be healthy while collection waits on WAL recovery, and without
@@ -262,9 +267,15 @@ pub struct LogCollectionCapability {
     /// Directory holding them, on the server's filesystem.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred_dir: Option<String>,
+    /// Set when that directory could not be read: the deferred counts and
+    /// list are then empty because they are unknown, not because nothing
+    /// was deferred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_error: Option<String>,
     /// `false` when the caller is not an instance administrator: `error`,
-    /// `deferred_dir` and each generation's `reason` are then omitted, since
-    /// they carry server filesystem paths and raw I/O errors. State and
+    /// `deferred_dir` and each generation's `reason` are then omitted, and
+    /// `deferred_error` is generic, since they carry server filesystem paths
+    /// and raw I/O errors. State and
     /// counts are always present, so a paused collector is never hidden.
     pub details_visible: bool,
 }
@@ -302,6 +313,9 @@ impl LogCollectionCapability {
         self.details_visible = false;
         self.error = None;
         self.deferred_dir = None;
+        if self.deferred_error.is_some() {
+            self.deferred_error = Some(DEFERRED_LISTING_FAILED.to_string());
+        }
         for generation in &mut self.deferred {
             generation.reason = None;
         }
@@ -337,6 +351,7 @@ impl From<CollectionStatus> for LogCollectionCapability {
             retry_at,
             deferred_count: status.deferred.len() as u64,
             deferred_bytes: status.deferred.iter().map(|g| g.bytes).sum(),
+            deferred_error: status.deferred_error,
             deferred_dir: status
                 .wal_dir
                 .map(|dir| dir.join(DEFERRED_DIR).display().to_string()),
@@ -418,12 +433,10 @@ pub async fn global_log_capabilities(
             .with_title("Could not read log index status")
             .with_detail(e.to_string())
     })?;
-    let collection = state.chunk_writer.collection_status().await.map_err(|e| {
-        tracing::error!(error = %e, "log collection status read failed");
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Could not read log collection status")
-            .with_detail(e.to_string())
-    })?;
+    let collection = state
+        .chunk_writer
+        .collection_status(DEFERRED_GENERATIONS_LISTED)
+        .await;
     Ok(Json(GlobalLogCapabilities {
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
@@ -1018,6 +1031,7 @@ mod collection_tests {
             },
             wal_dir: Some("/data/logs/wal".into()),
             deferred: Vec::new(),
+            deferred_error: None,
         });
         assert_eq!(capability.state, LogCollectionState::Retrying);
         assert!(!capability.collecting);
@@ -1040,6 +1054,7 @@ mod collection_tests {
             },
             wal_dir: Some("/data/logs/wal".into()),
             deferred: (0..DEFERRED_GENERATIONS_LISTED + 5).map(deferred).collect(),
+            deferred_error: None,
         });
         assert_eq!(capability.state, LogCollectionState::Running);
         assert!(
@@ -1067,6 +1082,7 @@ mod collection_tests {
             },
             wal_dir: Some("/srv/temps/logs/wal".into()),
             deferred: vec![deferred(0)],
+            deferred_error: None,
         })
         .without_server_details();
         assert!(!capability.details_visible);
@@ -1081,6 +1097,36 @@ mod collection_tests {
     }
 
     #[test]
+    fn an_unreadable_deferred_directory_is_reported_without_hiding_the_state() {
+        let status = CollectionStatus {
+            recovery: RecoveryState::Retrying {
+                error: "object storage unreachable".into(),
+                retry_at: Utc::now(),
+            },
+            wal_dir: Some("/srv/temps/logs/wal".into()),
+            deferred: Vec::new(),
+            deferred_error: Some(
+                "IO error: Permission denied reading /srv/temps/logs/wal/deferred".into(),
+            ),
+        };
+        let admin = LogCollectionCapability::from(status.clone());
+        assert_eq!(admin.state, LogCollectionState::Retrying);
+        assert!(admin
+            .deferred_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Permission denied")));
+
+        let reader = LogCollectionCapability::from(status).without_server_details();
+        assert_eq!(reader.state, LogCollectionState::Retrying);
+        assert_eq!(
+            reader.deferred_error.as_deref(),
+            Some(DEFERRED_LISTING_FAILED)
+        );
+        let json = serde_json::to_string(&reader).unwrap();
+        assert!(!json.contains("/srv/temps"), "{json}");
+    }
+
+    #[test]
     fn collection_without_a_wal_is_running_with_nothing_deferred() {
         let capability = LogCollectionCapability::from(CollectionStatus {
             recovery: RecoveryState::Complete {
@@ -1088,6 +1134,7 @@ mod collection_tests {
             },
             wal_dir: None,
             deferred: Vec::new(),
+            deferred_error: None,
         });
         assert!(capability.collecting);
         assert_eq!(capability.deferred_count, 0);

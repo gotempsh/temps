@@ -12961,9 +12961,16 @@ export type LogCollectionCapability = {
      */
     deferred_dir?: string | null;
     /**
+     * Set when that directory could not be read: the deferred counts and
+     * list are then empty because they are unknown, not because nothing
+     * was deferred.
+     */
+    deferred_error?: string | null;
+    /**
      * `false` when the caller is not an instance administrator: `error`,
-     * `deferred_dir` and each generation's `reason` are then omitted, since
-     * they carry server filesystem paths and raw I/O errors. State and
+     * `deferred_dir` and each generation's `reason` are then omitted, and
+     * `deferred_error` is generic, since they carry server filesystem paths
+     * and raw I/O errors. State and
      * counts are always present, so a paused collector is never hidden.
      */
     details_visible: boolean;
@@ -18625,19 +18632,6 @@ export type ResetPgStatStatementsResponse = {
      * Human-readable message confirming the destructive action.
      */
     message: string;
-};
-
-/**
- * Returned once when an administrator resets another user's password. The
- * temporary password is not stored in retrievable form, so this response is
- * the only place it ever appears. The user must replace it at next sign-in.
- */
-export type ResetUserPasswordResponse = {
-    /**
-     * Always true: the user must choose a new password at next sign-in.
-     */
-    must_change_password: boolean;
-    temporary_password: string;
 };
 
 export type ResizeSandboxBody = {
@@ -62726,54 +62720,6 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
-
-export type ResetUserPasswordData = {
-    body?: never;
-    path: {
-        /**
-         * User ID
-         */
-        user_id: number;
-    };
-    query?: never;
-    url: '/users/{user_id}/password';
-};
-
-export type ResetUserPasswordErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * users:manage required, or attempted to reset your own password (use POST /users/me/password)
-     */
-    403: unknown;
-    /**
-     * User not found
-     */
-    404: unknown;
-    /**
-     * User is deleted
-     */
-    409: unknown;
-    /**
-     * Recent identity verification (step-up) required
-     */
-    428: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ResetUserPasswordResponses = {
-    /**
-     * Password reset; the temporary password is returned once
-     */
-    200: ResetUserPasswordResponse;
-};
-
-export type ResetUserPasswordResponse2 = ResetUserPasswordResponses[keyof ResetUserPasswordResponses];
 
 export type RestoreUserData = {
     body?: never;

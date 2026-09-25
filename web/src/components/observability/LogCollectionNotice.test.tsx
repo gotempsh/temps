@@ -82,3 +82,25 @@ test('non-administrators are told details exist rather than shown an empty error
   expect(markup).toContain('An instance administrator can see the exact error')
   expect(markup).not.toContain('.reason')
 })
+
+test('a failed status request is shown instead of implying collection is fine', () => {
+  const markup = renderToStaticMarkup(
+    <LogCollectionNotice
+      collection={undefined}
+      statusError={new Error('Request failed with status 502')}
+      onRetry={() => {}}
+    />,
+  )
+  expect(markup).toContain('Log collection status is unavailable')
+  expect(markup).toContain('Request failed with status 502')
+  expect(markup).toContain('Try again')
+})
+
+test('an unreadable deferred directory is reported alongside the running state', () => {
+  const markup = render({
+    ...running,
+    deferred_error: 'IO error: Permission denied',
+  })
+  expect(markup).toContain('Could not check for log files set aside by recovery')
+  expect(markup).toContain('Permission denied')
+})

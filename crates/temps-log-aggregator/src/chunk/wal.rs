@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use crate::error::LogAggregatorError;
@@ -143,7 +143,7 @@ impl WalRecovery {
                     continue;
                 }
                 self.current = Some(RecoveryFile {
-                    reader: BufReader::new(File::open(&path).await?),
+                    reader: BufReader::new(Box::new(File::open(&path).await?)),
                     generation: WalGeneration {
                         path,
                         with_bloom,
@@ -164,21 +164,7 @@ impl WalRecovery {
                 .ok_or_else(|| LogAggregatorError::Validation {
                     message: "WAL recovery cursor lost its current file".to_string(),
                 })?;
-            let batch = match read_batch(current, self.batch_bytes).await {
-                Ok(batch) => batch,
-                Err(error @ LogAggregatorError::WalRecoveryReadFailed { .. }) => {
-                    // The file cannot be read at all past this point. Batches
-                    // already committed from it replay idempotently if it is
-                    // ever moved back, so deferring the whole file loses
-                    // nothing and unblocks every other stream.
-                    let path = current.generation.path.clone();
-                    self.current = None;
-                    let reason = format!("{error}. {}", retry_instructions(&self.root));
-                    defer_file(&path, &reason).await?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let batch = read_batch(current, self.batch_bytes).await;
 
             if batch.lines.is_empty() {
                 let mut generation = current.generation.clone();
@@ -234,7 +220,10 @@ impl WalRecovery {
     }
 }
 
-/// One bounded slice of a recovering file.
+/// One bounded slice of a recovering file. Reading never fails outright: a
+/// record that cannot be read ends the batch with the records decoded before
+/// it, and [`RecoveryFile::unreadable`] says why, so those records commit
+/// before the file is deferred.
 struct Batch {
     lines: Vec<LogLine>,
     /// Byte offset of the batch's first record.
@@ -244,19 +233,20 @@ struct Batch {
     reached_end: bool,
 }
 
-async fn read_batch(
-    current: &mut RecoveryFile,
-    batch_bytes: usize,
-) -> Result<Batch, LogAggregatorError> {
+async fn read_batch(current: &mut RecoveryFile, batch_bytes: usize) -> Batch {
     let mut lines = Vec::new();
     let mut payload_bytes = 0usize;
     let mut start = None;
     let reached_end = loop {
         let (len, crc, record_offset) = match current.pending_header.take() {
             Some(header) => header,
-            None => match read_record_header(current).await? {
-                Some(header) => header,
-                None => break true,
+            None => match read_record_header(current).await {
+                Ok(Some(header)) => header,
+                Ok(None) => break true,
+                Err(error) => {
+                    current.unreadable = Some(error.to_string());
+                    break true;
+                }
             },
         };
         if len > MAX_RECORD_BYTES {
@@ -278,7 +268,8 @@ async fn read_batch(
                 log_torn_tail(current, record_offset, "payload");
                 break true;
             }
-            return Err(wal_read_error(current, record_offset, error));
+            current.unreadable = Some(wal_read_error(current, record_offset, error).to_string());
+            break true;
         }
         current.offset += len as u64;
         if crc32fast::hash(&payload) != crc {
@@ -305,11 +296,11 @@ async fn read_batch(
             "wal: stopping recovery for this file; it will be deferred once its readable prefix commits"
         );
     }
-    Ok(Batch {
+    Batch {
         lines,
         start,
         reached_end,
-    })
+    }
 }
 
 /// A record cut short by end-of-file is the write a crash interrupted. The
@@ -411,9 +402,7 @@ const MAX_REASON_BYTES: u64 = 4 * 1024;
 /// never more than [`MAX_REASON_BYTES`]. Anything else is ignored with a
 /// warning rather than failing the listing: the note only explains, and the
 /// generation it belongs to must still be reported.
-async fn read_reason_note(
-    path: &Path,
-) -> Result<Option<(String, Option<std::time::SystemTime>)>, LogAggregatorError> {
+async fn read_reason_note(path: &Path) -> Result<Option<String>, LogAggregatorError> {
     let linked = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -445,7 +434,15 @@ async fn read_reason_note(
     if truncated {
         reason.push('…');
     }
-    Ok(Some((reason, linked.modified().ok())))
+    Ok(Some(reason))
+}
+
+/// `<generation>.reason`, beside the generation in [`DEFERRED_DIR`].
+fn reason_note_path(generation: &Path) -> PathBuf {
+    let mut name = generation.as_os_str().to_os_string();
+    name.push(".");
+    name.push(DEFERRED_REASON_EXTENSION);
+    PathBuf::from(name)
 }
 
 /// A generation parked in [`DEFERRED_DIR`].
@@ -468,7 +465,8 @@ pub struct WalRecovery {
 }
 
 struct RecoveryFile {
-    reader: BufReader<File>,
+    /// A file in production; tests substitute readers that fail mid-file.
+    reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
     generation: WalGeneration,
     offset: u64,
     pending_header: Option<(usize, u32, u64)>,
@@ -548,7 +546,16 @@ impl WalDir {
 
     /// Generations recovery moved to [`DEFERRED_DIR`], oldest deferral first.
     /// Read-only: listing never moves, deletes, or replays anything.
-    pub async fn deferred(&self) -> Result<Vec<DeferredGeneration>, LogAggregatorError> {
+    ///
+    /// Only the directory itself failing to open is an error. An entry that
+    /// cannot be inspected is skipped with a warning rather than hiding every
+    /// other one, and reason notes (the only files opened) are read for the
+    /// first `reasons_for` generations alone, so a status request costs one
+    /// `lstat` per entry plus a bounded number of small reads.
+    pub async fn deferred(
+        &self,
+        reasons_for: usize,
+    ) -> Result<Vec<DeferredGeneration>, LogAggregatorError> {
         let dir = self.root.join(DEFERRED_DIR);
         // Listed over an authenticated API, so nothing here may be steered
         // elsewhere by a planted symlink: not the directory, not a note.
@@ -563,33 +570,54 @@ impl WalDir {
         }
         let mut entries = fs::read_dir(&dir).await?;
         let mut deferred = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(path = %dir.display(), %error, "stopped listing deferred WAL generations early");
+                    break;
+                }
+            };
             let path = entry.path();
-            let metadata = entry.metadata().await?;
-            if !metadata.is_file()
-                || path.extension().and_then(|extension| extension.to_str())
-                    == Some(DEFERRED_REASON_EXTENSION)
+            if path.extension().and_then(|extension| extension.to_str())
+                == Some(DEFERRED_REASON_EXTENSION)
             {
                 continue;
             }
-            let note = dir.join(format!(
-                "{}.{DEFERRED_REASON_EXTENSION}",
-                entry.file_name().to_string_lossy()
-            ));
-            // The note is written at deferral time; the generation keeps the
-            // mtime of its last append through the rename.
-            let (reason, deferred_at) = match read_reason_note(&note).await? {
-                Some((reason, written_at)) => (Some(reason), written_at),
-                None => (None, metadata.modified().ok()),
+            let metadata = match entry.metadata().await {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "could not inspect a deferred WAL generation; leaving it out of the listing");
+                    continue;
+                }
+            };
+            // The note is written at deferral time, so its mtime is when the
+            // generation was deferred; the generation itself keeps the mtime
+            // of its last append through the rename.
+            let deferred_at = match fs::symlink_metadata(reason_note_path(&path)).await {
+                Ok(note) => note.modified().ok(),
+                Err(_) => metadata.modified().ok(),
             };
             deferred.push(DeferredGeneration {
                 path,
                 bytes: metadata.len(),
                 deferred_at: deferred_at.map(DateTime::<Utc>::from),
-                reason,
+                reason: None,
             });
         }
         deferred.sort_by(|a, b| a.deferred_at.cmp(&b.deferred_at).then(a.path.cmp(&b.path)));
+        for generation in deferred.iter_mut().take(reasons_for) {
+            let note = reason_note_path(&generation.path);
+            generation.reason = match read_reason_note(&note).await {
+                Ok(reason) => reason,
+                Err(error) => {
+                    warn!(path = %note.display(), %error, "could not read a deferred WAL reason note");
+                    None
+                }
+            };
+        }
         Ok(deferred)
     }
 
@@ -1439,7 +1467,11 @@ mod tests {
             .expect("cleanup");
         assert!(recovery.next().await.expect("recovery end").is_none());
         assert!(!generation_path.exists());
-        assert!(wal_dir.deferred().await.expect("deferred").is_empty());
+        assert!(wal_dir
+            .deferred(usize::MAX)
+            .await
+            .expect("deferred")
+            .is_empty());
         wal_dir
             .ensure_recovery_complete()
             .await
@@ -1481,7 +1513,7 @@ mod tests {
             .ensure_recovery_complete()
             .await
             .expect("a deferred generation no longer blocks recovery");
-        let deferred = wal_dir.deferred().await.expect("deferred");
+        let deferred = wal_dir.deferred(usize::MAX).await.expect("deferred");
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].path.file_name().unwrap(), file_name);
         let reason = deferred[0].reason.as_deref().expect("reason note");
@@ -1540,12 +1572,85 @@ mod tests {
             .ensure_recovery_complete()
             .await
             .expect("recovery completes");
-        let deferred = wal_dir.deferred().await.expect("deferred");
+        let deferred = wal_dir.deferred(usize::MAX).await.expect("deferred");
         assert_eq!(deferred.len(), 1);
         let reason = deferred[0].reason.as_deref().expect("reason note");
         assert!(reason.contains("fails its checksum"), "{reason}");
         assert!(
             reason.contains("the 1 records before it were replayed"),
+            "{reason}"
+        );
+    }
+
+    /// Yields `data`, then fails every read the way a bad disk sector does.
+    struct FailAfter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for FailAfter {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(Err(std::io::Error::other("injected read failure")));
+            }
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression: an I/O error after some records of a batch had decoded
+    /// used to defer the file and drop those records, so they were missing
+    /// from search and never retried.
+    #[tokio::test]
+    async fn read_error_mid_batch_commits_the_records_decoded_before_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_dir = WalDir::open(dir.path().to_path_buf()).await.expect("open");
+        let mut stream = wal_dir.stream("failing").await.expect("stream");
+        for msg in ["first", "second"] {
+            stream
+                .append(&sample_line("failing", msg))
+                .await
+                .expect("append");
+        }
+        stream.sync().await.expect("sync");
+        let path = stream.path().to_path_buf();
+        drop(stream);
+        let readable = fs::read(&path).await.expect("read wal");
+
+        let mut recovery = WalRecovery::new(dir.path().to_path_buf(), Vec::new(), 1024 * 1024);
+        recovery.current = Some(RecoveryFile {
+            reader: BufReader::new(Box::new(FailAfter {
+                data: readable,
+                pos: 0,
+            })),
+            generation: WalGeneration {
+                path: path.clone(),
+                with_bloom: true,
+                after_commit: AfterCommit::Retain,
+                recovery_identity: None,
+            },
+            offset: 0,
+            pending_header: None,
+            batchable: true,
+            records: 0,
+            unreadable: None,
+        });
+
+        assert_eq!(replay_all(&mut recovery).await, vec!["first", "second"]);
+        assert!(!path.exists(), "the file moves out of the WAL directory");
+        let deferred = wal_dir.deferred(usize::MAX).await.expect("deferred");
+        assert_eq!(deferred.len(), 1);
+        let reason = deferred[0].reason.as_deref().expect("reason note");
+        assert!(reason.contains("injected read failure"), "{reason}");
+        assert!(
+            reason.contains("the 2 records before it were replayed"),
             "{reason}"
         );
     }
@@ -1581,7 +1686,11 @@ mod tests {
         assert!(files_with_extension(dir.path(), "recovery-wal")
             .await
             .is_empty());
-        assert!(wal_dir.deferred().await.expect("deferred").is_empty());
+        assert!(wal_dir
+            .deferred(usize::MAX)
+            .await
+            .expect("deferred")
+            .is_empty());
         wal_dir
             .ensure_recovery_complete()
             .await
@@ -1605,7 +1714,7 @@ mod tests {
             .expect("recovery")
             .with_whole_generation_limit(1024);
         assert!(replay_all(&mut first).await.is_empty());
-        let deferred = wal_dir.deferred().await.expect("deferred");
+        let deferred = wal_dir.deferred(usize::MAX).await.expect("deferred");
         assert_eq!(deferred.len(), 1);
 
         // The operator's retry: move it back, restart with a build whose
@@ -1619,7 +1728,11 @@ mod tests {
             .await
             .expect("recovery");
         assert_eq!(replay_all(&mut second).await, vec!["x".repeat(2048)]);
-        assert!(wal_dir.deferred().await.expect("deferred").is_empty());
+        assert!(wal_dir
+            .deferred(usize::MAX)
+            .await
+            .expect("deferred")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1644,7 +1757,10 @@ mod tests {
         std::os::unix::fs::symlink(&secret, deferred.join("c.b.sealed-wal.reason"))
             .expect("planted symlink");
 
-        let listed = wal_dir.deferred().await.expect("listing still succeeds");
+        let listed = wal_dir
+            .deferred(usize::MAX)
+            .await
+            .expect("listing still succeeds");
         assert_eq!(listed.len(), 2, "both generations are still reported");
         let huge = listed
             .iter()
@@ -1678,7 +1794,11 @@ mod tests {
             .expect("file");
         std::os::unix::fs::symlink(&elsewhere, dir.path().join("wal").join(DEFERRED_DIR))
             .expect("planted symlink");
-        assert!(wal_dir.deferred().await.expect("listing").is_empty());
+        assert!(wal_dir
+            .deferred(usize::MAX)
+            .await
+            .expect("listing")
+            .is_empty());
     }
 
     #[tokio::test]

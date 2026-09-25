@@ -211,6 +211,18 @@ describe('describeCollection', () => {
     expect(summary.details).toEqual([])
   })
 
+  test('an unreadable deferred directory is a warning, not a clean bill of health', () => {
+    const summary = describeCollection({
+      ...base,
+      state: 'running',
+      deferred_error: 'IO error: Permission denied',
+    })
+    expect(summary.severity).toBe('warn')
+    expect(summary.details).toEqual([
+      'Could not check for WAL generations set aside by recovery: IO error: Permission denied',
+    ])
+  })
+
   test('a paused instance says why and when it retries', () => {
     const summary = describeCollection({
       ...base,

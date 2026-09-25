@@ -297,6 +297,8 @@ interface LogCollectionCapability {
   deferred_bytes: number
   deferred: DeferredWalGeneration[]
   deferred_dir?: string | null
+  /** Set when the deferred directory could not be read; counts are then unknown. */
+  deferred_error?: string | null
   /** False for non-admins: error, deferred_dir and reasons are withheld. */
   details_visible: boolean
 }
@@ -375,6 +377,12 @@ export function describeCollection(collection: LogCollectionCapability): Collect
         `  …and ${(collection.deferred_count - collection.deferred.length).toLocaleString()} more`,
       )
     }
+  }
+  if (collection.deferred_error) {
+    if (severity === 'ok') severity = 'warn'
+    details.push(
+      `Could not check for WAL generations set aside by recovery: ${collection.deferred_error}`,
+    )
   }
   return { severity, headline, details }
 }

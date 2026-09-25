@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Callout } from '@temps-sdk/ds'
+import { Button } from '@/components/ui/button'
 import type { LogCollectionCapability } from '@/api/client/types.gen'
 
 function formatBytes(bytes: number): string {
@@ -22,18 +23,49 @@ function when(iso: string | null | undefined): string | undefined {
 /**
  * Why new log lines might not be arriving. Without it a paused collector
  * looks exactly like a quiet fleet: the histogram simply stops. Renders
- * nothing while collection is running and nothing was set aside.
+ * nothing while collection is running and nothing was set aside, and says
+ * so when the status itself could not be fetched rather than implying
+ * everything is fine.
  */
 export function LogCollectionNotice({
   collection,
+  statusError,
+  onRetry,
 }: {
   collection: LogCollectionCapability | undefined
+  /** The capabilities request failed; `collection` is then unknown. */
+  statusError?: Error | null
+  onRetry?: () => void
 }) {
-  if (!collection) return null
+  if (!collection) {
+    if (!statusError) return null
+    return (
+      <Callout tone="warning" title="Log collection status is unavailable">
+        <p>
+          Temps could not report whether new log lines are being collected, so
+          a quiet histogram may not mean a quiet fleet.
+        </p>
+        <p className="mt-1 break-words font-mono text-xs">
+          {statusError.message}
+        </p>
+        {onRetry ? (
+          <Button
+            variant="link"
+            size="sm"
+            className="mt-1 h-auto p-0 text-xs underline"
+            onClick={onRetry}
+          >
+            Try again
+          </Button>
+        ) : null}
+      </Callout>
+    )
+  }
   return (
     <div className="space-y-3">
       <CollectionStateNotice collection={collection} />
       <DeferredGenerationsNotice collection={collection} />
+      <DeferredListingNotice collection={collection} />
     </div>
   )
 }
@@ -152,6 +184,30 @@ function DeferredGenerationsNotice({
           {hidden > 0 ? <li>…and {hidden.toLocaleString()} more</li> : null}
         </ul>
       </details>
+    </Callout>
+  )
+}
+
+/** The deferred directory could not be read, so the counts are unknown. */
+function DeferredListingNotice({
+  collection,
+}: {
+  collection: LogCollectionCapability
+}) {
+  if (!collection.deferred_error) return null
+  return (
+    <Callout
+      tone="warning"
+      title="Could not check for log files set aside by recovery"
+    >
+      <p>
+        Collection status is shown above, but files recovery could not replay
+        are not counted, so some older lines may be missing from search
+        without a warning here.
+      </p>
+      <p className="mt-1 break-words font-mono text-xs">
+        {collection.deferred_error}
+      </p>
     </Callout>
   )
 }

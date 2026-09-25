@@ -199,7 +199,11 @@ export default function GlobalLogs() {
         title="Logs"
         description={`${view.projectId ? 'Selected project' : 'All projects'} · application and database logs`}
       />
-      <LogCollectionNotice collection={capabilities.data?.collection} />
+      <LogCollectionNotice
+        collection={capabilities.data?.collection}
+        statusError={capabilities.error}
+        onRetry={() => void capabilities.refetch()}
+      />
       <LogExplorer
         lines={lines}
         environmentLabels={environmentLabels}

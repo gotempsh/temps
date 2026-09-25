@@ -112,6 +112,9 @@ pub struct CollectionStatus {
     /// Generations recovery set aside because it could not replay them in
     /// full; never replayed automatically.
     pub deferred: Vec<DeferredGeneration>,
+    /// Why `deferred` could not be listed. The recovery state is reported
+    /// regardless, so a paused collector is never hidden behind this.
+    pub deferred_error: Option<String>,
 }
 
 type ProjectPurgeGate = Arc<tokio::sync::RwLock<Option<DateTime<Utc>>>>;
@@ -703,7 +706,7 @@ impl ChunkWriterService {
         let Some(wal_dir) = &self.wal_dir else {
             return;
         };
-        match wal_dir.deferred().await {
+        match wal_dir.deferred(0).await {
             Ok(deferred) if deferred.is_empty() => {}
             Ok(deferred) => warn!(
                 count = deferred.len(),
@@ -716,19 +719,27 @@ impl ChunkWriterService {
         }
     }
 
-    /// Recovery state and deferred generations. Reads the deferred directory
-    /// on every call — it is small, and an operator moving files in or out
-    /// must be reflected without a restart.
-    pub async fn collection_status(&self) -> Result<CollectionStatus, LogAggregatorError> {
-        let deferred = match &self.wal_dir {
-            Some(wal_dir) => wal_dir.deferred().await?,
-            None => Vec::new(),
+    /// Recovery state and deferred generations, with reasons for the oldest
+    /// `reasons_for`. Lists the deferred directory on every call so an
+    /// operator moving files in or out is reflected without a restart. Never
+    /// fails: a listing error is reported beside the recovery state.
+    pub async fn collection_status(&self, reasons_for: usize) -> CollectionStatus {
+        let (deferred, deferred_error) = match &self.wal_dir {
+            Some(wal_dir) => match wal_dir.deferred(reasons_for).await {
+                Ok(deferred) => (deferred, None),
+                Err(error) => {
+                    warn!(%error, "could not list deferred log WAL generations");
+                    (Vec::new(), Some(error.to_string()))
+                }
+            },
+            None => (Vec::new(), None),
         };
-        Ok(CollectionStatus {
+        CollectionStatus {
             recovery: RecoveryState::clone(&self.recovery_state.load()),
             wal_dir: self.wal_dir.as_ref().map(|dir| dir.root().to_path_buf()),
             deferred,
-        })
+            deferred_error,
+        }
     }
 
     /// Background log workers wait here, independently of console startup.
@@ -1830,7 +1841,7 @@ mod tests {
         let rows = sink.all().await;
         assert_eq!(rows.len(), 1, "the readable prefix commits");
         assert_eq!(rows[0].line_count, 1);
-        let status = writer.collection_status().await.unwrap();
+        let status = writer.collection_status(usize::MAX).await;
         assert!(matches!(status.recovery, RecoveryState::Complete { .. }));
         assert_eq!(status.deferred.len(), 1);
         let reason = status.deferred[0].reason.as_deref().unwrap();
@@ -1865,7 +1876,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first.collection_status().await.unwrap().deferred.len(), 1);
+        assert_eq!(first.collection_status(usize::MAX).await.deferred.len(), 1);
         drop(first);
 
         let sink = Arc::new(VecSink::default());
@@ -1881,7 +1892,7 @@ mod tests {
             sink.all().await.is_empty(),
             "nothing replays a deferred file"
         );
-        let status = second.collection_status().await.unwrap();
+        let status = second.collection_status(usize::MAX).await;
         assert_eq!(status.deferred.len(), 1, "still reported after a restart");
         assert!(status.deferred[0].reason.is_some());
     }
@@ -1919,9 +1930,8 @@ mod tests {
             .expect("a crash-torn tail is ordinary, not damage");
         assert_eq!(sink.all().await.len(), 1);
         assert!(writer
-            .collection_status()
+            .collection_status(usize::MAX)
             .await
-            .unwrap()
             .deferred
             .is_empty());
         assert!(!has_recovery_wal(&wal_root).await);
@@ -2014,7 +2024,7 @@ mod tests {
             .map(|row| row.line_count as u64)
             .sum();
         assert_eq!(replayed, written, "every line, none deferred");
-        let status = writer.collection_status().await.unwrap();
+        let status = writer.collection_status(usize::MAX).await;
         assert!(matches!(status.recovery, RecoveryState::Complete { .. }));
         assert!(status.deferred.is_empty());
         assert_eq!(files_with_extension(&wal_root, "sealed-wal").await, 0);
