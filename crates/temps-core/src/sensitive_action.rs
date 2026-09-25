@@ -48,6 +48,11 @@ pub enum SensitiveAction {
     AssignRole {
         user_id: i32,
     },
+    /// Reset another user's password to a generated temporary one, revoking
+    /// all of their sessions.
+    ResetUserPassword {
+        user_id: i32,
+    },
     UpdateAccountEmail,
     RotateClusterCa,
     RestoreExternalService {
@@ -119,6 +124,7 @@ impl SensitiveAction {
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
+            Self::ResetUserPassword { .. } => "reset_user_password",
             Self::UpdateAccountEmail => "update_account_email",
             Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
@@ -245,6 +251,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::AssignRole { user_id: 1 }.as_str(),
             "assign_role"
+        );
+        assert_eq!(
+            SensitiveAction::ResetUserPassword { user_id: 1 }.as_str(),
+            "reset_user_password"
         );
         assert_eq!(
             SensitiveAction::UpdateAccountEmail.as_str(),

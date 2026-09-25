@@ -39922,6 +39922,24 @@
         ],
         "type": "object"
       },
+      "ResetUserPasswordResponse": {
+        "description": "Returned once when an administrator resets another user's password. The\ntemporary password is not stored in retrievable form, so this response is\nthe only place it ever appears. The user must replace it at next sign-in.",
+        "properties": {
+          "must_change_password": {
+            "description": "Always true: the user must choose a new password at next sign-in.",
+            "type": "boolean"
+          },
+          "temporary_password": {
+            "example": "Kp7#mW2qRz9!vN4xT8b$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "temporary_password",
+          "must_change_password"
+        ],
+        "type": "object"
+      },
       "ResizeSandboxBody": {
         "additionalProperties": false,
         "properties": {
@@ -116833,6 +116851,63 @@
           }
         ],
         "summary": "Update user information (admin only)",
+        "tags": [
+          "Users"
+        ]
+      }
+    },
+    "/users/{user_id}/password": {
+      "post": {
+        "description": "The recovery path for a user who lost their password when outbound email\nis not configured. Every browser session of the user is revoked and they\nmust choose a new password at next sign-in. API keys are deliberately left\nalone, matching `POST /users/me/password`: revoking them would silently\nbreak the user's automation. The temporary password is returned once and\ncannot be retrieved again.\n\nAny `users:manage` principal may reset any other user, including another\nadmin. That is the existing trust model for this permission (it can already\ndelete users and change their roles); only resetting yourself is refused.",
+        "operationId": "reset_user_password",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetUserPasswordResponse"
+                }
+              }
+            },
+            "description": "Password reset; the temporary password is returned once"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "users:manage required, or attempted to reset your own password (use POST /users/me/password)"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "409": {
+            "description": "User is deleted"
+          },
+          "428": {
+            "description": "Recent identity verification (step-up) required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reset another user's password to a generated temporary one (admin only).",
         "tags": [
           "Users"
         ]

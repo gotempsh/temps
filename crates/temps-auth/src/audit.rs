@@ -126,6 +126,16 @@ pub struct PasswordResetAudit {
     pub username: String,
 }
 
+// An administrator reset another user's password to a generated temporary one.
+// `context.user_id` is the acting admin; the temporary password itself is
+// never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminPasswordResetAudit {
+    pub context: AuditContext,
+    pub target_user_id: i32,
+    pub username: String,
+}
+
 // In-app password change for an authenticated user. `other_sessions_revoked`
 // reflects whether the operator opted to invalidate every other session on
 // submit; useful for auditors trying to reconstruct "did this user lose
@@ -560,6 +570,29 @@ impl AuditOperation for LogoutAudit {
 impl AuditOperation for PasswordResetAudit {
     fn operation_type(&self) -> String {
         "PASSWORD_RESET".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for AdminPasswordResetAudit {
+    fn operation_type(&self) -> String {
+        "ADMIN_PASSWORD_RESET".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

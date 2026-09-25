@@ -133,6 +133,17 @@ pub struct UpdateSelfRequest {
     pub name: Option<String>,
 }
 
+/// Returned once when an administrator resets another user's password. The
+/// temporary password is not stored in retrievable form, so this response is
+/// the only place it ever appears. The user must replace it at next sign-in.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ResetUserPasswordResponse {
+    #[schema(example = "Kp7#mW2qRz9!vN4xT8b$")]
+    pub temporary_password: String,
+    /// Always true: the user must choose a new password at next sign-in.
+    pub must_change_password: bool,
+}
+
 // In-app password change for the authenticated user. Distinct from the
 // out-of-band password-reset flow because it requires the current
 // password as a re-auth gate and runs while the user is logged in. When
