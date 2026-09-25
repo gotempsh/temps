@@ -74,6 +74,10 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
+import {
+  authMethodDisplayName,
+  providerDisplayName,
+} from '@/lib/git-connection'
 
 export default function GitProviderDetail() {
   const navigate = useNavigate()
@@ -307,45 +311,17 @@ export default function GitProviderDetail() {
   }
 
   const getProviderIcon = () => (
-    <ProviderLogo providerType={provider.provider_type} className="h-6 w-6" />
+    <ProviderLogo
+      providerType={provider.provider_type}
+      className="h-4 w-4 shrink-0"
+    />
   )
 
-  const getProviderDisplayName = () => {
-    switch (provider.provider_type) {
-      case 'github':
-        return 'GitHub'
-      case 'gitlab':
-        return 'GitLab'
-      case 'gitea':
-        return 'Gitea'
-      case 'bitbucket':
-        return 'Bitbucket'
-      case 'generic':
-        return 'Other Git Provider'
-      default:
-        return (
-          provider.provider_type.charAt(0).toUpperCase() +
-          provider.provider_type.slice(1)
-        )
-    }
-  }
+  const getProviderDisplayName = () =>
+    providerDisplayName(provider.provider_type)
 
-  const getAuthMethodDisplayName = () => {
-    switch (provider.auth_method) {
-      case 'app':
-      case 'github_app':
-        return 'GitHub App'
-      case 'oauth':
-        return 'OAuth'
-      case 'token':
-        return 'Personal Access Token'
-      default:
-        return (
-          provider.auth_method.charAt(0).toUpperCase() +
-          provider.auth_method.slice(1)
-        )
-    }
-  }
+  const getAuthMethodDisplayName = () =>
+    authMethodDisplayName(provider.auth_method)
 
   const verdict: { tone: StatusTone; label: string } = provider.is_active
     ? { tone: 'ok', label: 'Active' }

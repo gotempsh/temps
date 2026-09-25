@@ -713,7 +713,9 @@ impl BackupCommand {
         // or local-secret write so a mode mismatch cannot affect external
         // services or materialize secrets in the wrong storage model.
         let restored_db = rt
-            .block_on(sea_orm::Database::connect(&args.database_url))
+            .block_on(sea_orm::Database::connect(temps_database::connect_options(
+                &args.database_url,
+            )))
             .map_err(|error| {
                 anyhow::anyhow!(
                     "Failed to inspect the restored installation mode: {}",
@@ -873,12 +875,14 @@ impl BackupCommand {
             "{}",
             "Validating target TimescaleDB connection...".bright_white()
         );
-        let db = Database::connect(database_url).await.map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to connect to target control-plane database: {}",
-                error
-            )
-        })?;
+        let db = Database::connect(temps_database::connect_options(database_url))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to connect to target control-plane database: {}",
+                    error
+                )
+            })?;
         db.query_one(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT 1".to_string(),
@@ -1625,7 +1629,7 @@ impl BackupCommand {
         // Connect to the restored database
         println!("{}", "Connecting to restored database...".bright_white());
         let db = Arc::new(
-            Database::connect(database_url)
+            Database::connect(temps_database::connect_options(database_url))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to restored database: {}", e))?,
         );
@@ -2038,7 +2042,9 @@ impl BackupCommand {
 
         println!("{}", "Connecting to temps database...".bright_white());
         let db = rt
-            .block_on(Database::connect(&args.database_url))
+            .block_on(Database::connect(temps_database::connect_options(
+                &args.database_url,
+            )))
             .map_err(|e| anyhow::anyhow!("Failed to connect to temps database: {}", e))?;
 
         // Query the external service

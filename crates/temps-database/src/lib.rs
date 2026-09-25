@@ -9,7 +9,7 @@ mod connection;
 
 pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
-    cancel_migration_backend, connect_for_migrate, connect_without_migrations,
+    cancel_migration_backend, connect_for_migrate, connect_options, connect_without_migrations,
     establish_connection, get_pending_migration_names, reconcile_otel_trace_summaries,
     run_migrations, run_migrations_reported, run_migrations_streaming, run_post_migration_backfill,
     run_post_migration_backfill_streaming, run_post_migration_indexes,

@@ -8864,6 +8864,20 @@
               "null"
             ]
           },
+          "last_sync_error": {
+            "description": "Why the most recent repository sync failed or timed out; null once a\nsync succeeds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sync_error_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "last_synced_at": {
             "format": "date-time",
             "type": [
@@ -78493,6 +78507,52 @@
           }
         ],
         "summary": "Permanently delete a git provider connection",
+        "tags": [
+          "Git Providers"
+        ]
+      },
+      "get": {
+        "description": "Returns the connection's account, sync and health state. Credential values\nare never included; `has_authenticated_credentials` reports only whether\nthe connection can make authenticated provider requests.",
+        "operationId": "get_connection",
+        "parameters": [
+          {
+            "description": "Connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionResponse"
+                }
+              }
+            },
+            "description": "Connection details"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Connection not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a single git provider connection",
         "tags": [
           "Git Providers"
         ]

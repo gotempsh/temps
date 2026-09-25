@@ -2576,7 +2576,6 @@ fn normalize_edge_target(settings: &mut AppSettings) {
     }
 }
 
-/// Update application settings
 /// Fill only absent object fields; arrays, scalars and explicit nulls are
 /// replacement values supplied by the caller, never silently merged.
 fn fill_omitted_settings(submitted: &mut serde_json::Value, stored: serde_json::Value) {
@@ -2594,6 +2593,7 @@ fn fill_omitted_settings(submitted: &mut serde_json::Value, stored: serde_json::
     }
 }
 
+/// Update application settings
 #[utoipa::path(
     tag = "Settings",
     put,

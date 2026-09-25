@@ -36,6 +36,11 @@ pub struct Model {
     pub health_message: Option<String>,
     pub last_health_check_at: Option<DBDateTime>,
     pub consecutive_health_failures: i32,
+    /// Why the most recent repository sync failed or timed out; `None` once a
+    /// sync succeeds. Syncs run detached, so this is the only place a failure
+    /// reaches the API instead of just the server log.
+    pub last_sync_error: Option<String>,
+    pub last_sync_error_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

@@ -11018,6 +11018,7 @@ version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
  "futures",
+ "log",
  "once_cell",
  "sea-orm",
  "sea-orm-migration",
@@ -11028,6 +11029,7 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

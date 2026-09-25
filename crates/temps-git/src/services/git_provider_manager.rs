@@ -1735,7 +1735,9 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
-                GitProviderManagerError::ConnectionNotFound(connection_id.to_string())
+                GitProviderManagerError::ConnectionNotFound(format!(
+                    "no git connection with id {connection_id}"
+                ))
             })?;
 
         Ok(connection)
@@ -2055,11 +2057,11 @@ impl GitProviderManager {
             self.sync_repositories_internal(connection_id),
         )
         .await;
-        drop(guard);
 
-        match outcome {
+        let failure = match &outcome {
             Ok(Ok(())) => {
                 tracing::info!(connection_id, "Repository sync completed");
+                None
             }
             Ok(Err(e)) => {
                 tracing::error!(
@@ -2067,6 +2069,7 @@ impl GitProviderManager {
                     error = %e,
                     "Repository sync failed; syncing flag has been reset"
                 );
+                Some(e.to_string())
             }
             Err(_elapsed) => {
                 tracing::error!(
@@ -2074,8 +2077,47 @@ impl GitProviderManager {
                     deadline_secs = SYNC_HARD_DEADLINE.as_secs(),
                     "Repository sync exceeded hard deadline and was aborted"
                 );
+                Some(format!(
+                    "Repository sync exceeded the {}s deadline and was aborted",
+                    SYNC_HARD_DEADLINE.as_secs()
+                ))
             }
+        };
+
+        // Record the outcome BEFORE the guard releases `syncing`: a client
+        // that sees `syncing = false` must already be able to read how the
+        // sync ended, or a failure would briefly look like a success.
+        if let Err(e) = self.record_sync_outcome(connection_id, failure).await {
+            tracing::error!(
+                connection_id,
+                error = %e,
+                "Failed to record repository sync outcome"
+            );
         }
+        drop(guard);
+    }
+
+    /// Persist how a sync ended: the failure reason and when it happened, or
+    /// cleared on success so a stale error never outlives a working sync.
+    async fn record_sync_outcome(
+        &self,
+        connection_id: i32,
+        failure: Option<String>,
+    ) -> Result<(), GitProviderManagerError> {
+        let failed_at = failure.as_ref().map(|_| chrono::Utc::now());
+        git_provider_connections::Entity::update_many()
+            .col_expr(
+                git_provider_connections::Column::LastSyncError,
+                sea_orm::sea_query::Expr::value(failure),
+            )
+            .col_expr(
+                git_provider_connections::Column::LastSyncErrorAt,
+                sea_orm::sea_query::Expr::value(failed_at),
+            )
+            .filter(git_provider_connections::Column::Id.eq(connection_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
     }
 
     /// Wrap `&self` in an `Arc` copy of the manager. Used to hand the
@@ -6355,6 +6397,8 @@ mod tests {
             health_message: None,
             last_health_check_at: None,
             consecutive_health_failures: 0,
+            last_sync_error: None,
+            last_sync_error_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -7001,6 +7045,8 @@ services:
             health_message: None,
             last_health_check_at: None,
             consecutive_health_failures: 0,
+            last_sync_error: None,
+            last_sync_error_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -7496,5 +7542,98 @@ services:
         // Verify the other template's files were not included
         assert!(!file_names.contains(&"main.py"));
         assert!(!file_names.contains(&"README.md"));
+    }
+
+    /// A sync runs detached, so its failure used to reach only the server log:
+    /// the console saw `syncing` flip back to false and could not tell a failed
+    /// sync from one that succeeded and found nothing. The reason must be
+    /// persisted before `syncing` is released, and a later success clears it.
+    #[tokio::test]
+    async fn failed_sync_is_recorded_on_the_connection_and_cleared_on_success() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+
+        // An auth config that doesn't deserialize makes the sync fail before
+        // any provider request, exactly like a misconfigured provider does.
+        let provider = git_providers::ActiveModel {
+            name: Set("broken-provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("sync-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(true),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let manager = Arc::new(GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        ));
+
+        manager.clone().run_sync_guarded(connection.id).await;
+
+        let failed = manager.get_connection(connection.id).await.unwrap();
+        let reason = failed
+            .last_sync_error
+            .as_deref()
+            .expect("a failed sync must record why it failed");
+        assert!(!reason.is_empty());
+        assert!(failed.last_sync_error_at.is_some());
+
+        // The guard releases `syncing` from a spawned task; give it a moment.
+        let mut released = false;
+        for _ in 0..50 {
+            if !manager.get_connection(connection.id).await.unwrap().syncing {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
+            "a failed sync must still release the syncing flag"
+        );
+
+        manager
+            .record_sync_outcome(connection.id, None)
+            .await
+            .unwrap();
+        let recovered = manager.get_connection(connection.id).await.unwrap();
+        assert_eq!(recovered.last_sync_error, None);
+        assert_eq!(recovered.last_sync_error_at, None);
     }
 }

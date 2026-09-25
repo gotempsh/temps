@@ -4084,6 +4084,12 @@ export type ConnectionResponse = {
     is_active: boolean;
     is_expired: boolean;
     last_health_check_at?: string | null;
+    /**
+     * Why the most recent repository sync failed or timed out; null once a
+     * sync succeeds.
+     */
+    last_sync_error?: string | null;
+    last_sync_error_at?: string | null;
     last_synced_at?: string | null;
     provider_id: number;
     /**
@@ -38848,6 +38854,42 @@ export type DeleteConnectionResponses = {
 };
 
 export type DeleteConnectionResponse = DeleteConnectionResponses[keyof DeleteConnectionResponses];
+
+export type GetConnectionData = {
+    body?: never;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}';
+};
+
+export type GetConnectionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Connection not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetConnectionResponses = {
+    /**
+     * Connection details
+     */
+    200: ConnectionResponse;
+};
+
+export type GetConnectionResponse = GetConnectionResponses[keyof GetConnectionResponses];
 
 export type ActivateConnectionData = {
     body?: never;

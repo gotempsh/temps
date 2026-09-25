@@ -163,6 +163,7 @@ const AddGitProvider = lazy(() =>
   import('./pages/AddGitProvider').then((m) => ({ default: m.AddGitProvider }))
 )
 const GitProviderDetail = lazy(() => import('./pages/GitProviderDetail'))
+const GitConnectionDetail = lazy(() => import('./pages/GitConnectionDetail'))
 const DnsProviders = lazy(() =>
   import('./pages/DnsProviders').then((m) => ({ default: m.DnsProviders }))
 )
@@ -894,6 +895,10 @@ const FullAppRoutes = () => {
                     <Route
                       path="/git-providers/:id"
                       element={<GitProviderDetail />}
+                    />
+                    <Route
+                      path="/git-providers/:id/connections/:connectionId"
+                      element={<GitConnectionDetail />}
                     />
                     <Route path="/dns-providers" element={<DnsProviders />} />
                     <Route
