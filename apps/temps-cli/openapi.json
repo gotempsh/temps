@@ -113247,6 +113247,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Update application settings",
         "tags": [
           "Settings"
         ]
@@ -116857,7 +116858,7 @@
     },
     "/users/{user_id}/password": {
       "post": {
-        "description": "The recovery path for a user who lost their password when outbound email\nis not configured. The user is signed out everywhere and must choose a new\npassword at next sign-in. The temporary password is returned once and\ncannot be retrieved again.",
+        "description": "The recovery path for a user who lost their password when outbound email\nis not configured. Every browser session of the user is revoked and they\nmust choose a new password at next sign-in. API keys are deliberately left\nalone, matching `POST /users/me/password`: revoking them would silently\nbreak the user's automation. The temporary password is returned once and\ncannot be retrieved again.\n\nAny `users:manage` principal may reset any other user, including another\nadmin. That is the existing trust model for this permission (it can already\ndelete users and change their roles); only resetting yourself is refused.",
         "operationId": "reset_user_password",
         "parameters": [
           {
