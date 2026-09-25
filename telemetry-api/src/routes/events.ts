@@ -3,6 +3,12 @@
 
 import type { Pool } from "pg";
 import { countryForRequest } from "../geo.js";
+import {
+  backfillCountry,
+  backfillTargets,
+  insertEvent,
+  type IngestBody,
+} from "../db/events.js";
 
 // Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
@@ -75,14 +81,6 @@ export const KNOWN_EVENT_TYPES = new Set([
   // Counts keyed by compile-time identifiers only; never error messages.
   "error_summary",
 ]);
-
-interface IngestBody {
-  anonymous_id: string;
-  event_type: string;
-  properties?: Record<string, unknown>;
-  temps_version?: string;
-  occurred_at?: string;
-}
 
 interface BatchIngestBody {
   events: IngestBody[];
@@ -178,80 +176,19 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
   };
 }
 
-// `country` is the 2-letter ISO code derived from the request IP at ingest time
-// (see geo.ts). The IP itself is never passed here or stored — only the country.
-async function insertEvent(
+// A backfill failure must never turn an accepted event into an error: the event
+// is already stored, and a 500 would invite a client retry that duplicates it.
+// Log and move on; the next event from the instance retries the backfill.
+async function backfillBestEffort(
   pool: Pool,
-  event: IngestBody,
+  events: IngestBody[],
   country: string | null
 ): Promise<void> {
-  if (event.event_type === "cli_setup_step") country = null;
-  await pool.query(
-    `INSERT INTO telemetry_events
-       (anonymous_id, event_type, properties, temps_version, occurred_at, country)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [
-      event.anonymous_id,
-      event.event_type,
-      JSON.stringify(event.properties ?? {}),
-      event.temps_version ?? null,
-      event.occurred_at ?? new Date().toISOString(),
-      country,
-    ]
-  );
-
-  // An installer attempt is not an active Temps server.
-  if (event.event_type === "cli_setup_step") return;
-
-  // Upsert the instance-day record for cheap DAI (daily active instances)
-  // queries. Backfill country if it was previously null (an instance's country
-  // shouldn't change, but the first event of the day may pre-date the lookup).
-  await pool.query(
-    `INSERT INTO telemetry_instance_days (anonymous_id, day, temps_version, country)
-     VALUES ($1, $2::date, $3, $4)
-     ON CONFLICT (anonymous_id, day) DO UPDATE
-       SET country = COALESCE(telemetry_instance_days.country, EXCLUDED.country)`,
-    [
-      event.anonymous_id,
-      (event.occurred_at ?? new Date().toISOString()).slice(0, 10),
-      event.temps_version ?? null,
-      country,
-    ]
-  );
-}
-
-// Fill in the country on an instance's earlier rows that were stored without
-// one (private IP, missing geo DB at the time, ...). Only NULLs are touched — a
-// country that is already known is never overwritten. Setup attempts stay
-// country-less by design. The partial indexes from migration 004 keep this a
-// near-free no-op once an instance has no NULL rows left.
-export async function backfillCountry(
-  pool: Pool,
-  anonymousId: string,
-  country: string | null
-): Promise<void> {
-  if (!country) return;
-  await pool.query(
-    `UPDATE telemetry_instance_days SET country = $2
-     WHERE anonymous_id = $1 AND country IS NULL`,
-    [anonymousId, country]
-  );
-  await pool.query(
-    `UPDATE telemetry_events SET country = $2
-     WHERE anonymous_id = $1 AND country IS NULL AND event_type <> 'cli_setup_step'`,
-    [anonymousId, country]
-  );
-}
-
-// Distinct instances in a request that should inherit the request's country.
-function backfillTargets(events: IngestBody[]): string[] {
-  return [
-    ...new Set(
-      events
-        .filter((e) => e.event_type !== "cli_setup_step")
-        .map((e) => e.anonymous_id)
-    ),
-  ];
+  try {
+    await backfillCountry(pool, backfillTargets(events), country);
+  } catch (err) {
+    console.error("[events] country backfill failed (event kept):", err);
+  }
 }
 
 export function createEventsRoutes(
@@ -278,13 +215,11 @@ export function createEventsRoutes(
 
       try {
         await insertEvent(pool, parsed, country);
-        for (const id of backfillTargets([parsed])) {
-          await backfillCountry(pool, id, country);
-        }
       } catch (err) {
         console.error("[events] db insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
+      await backfillBestEffort(pool, [parsed], country);
 
       return Response.json({ ok: true }, { status: 201 });
     },
@@ -331,14 +266,12 @@ export function createEventsRoutes(
       try {
         // Insert all events concurrently (pool handles connection reuse)
         await Promise.all(parsed.map((e) => insertEvent(pool, e, country)));
-        // Once per instance, after the inserts, so it can't race them.
-        for (const id of backfillTargets(parsed)) {
-          await backfillCountry(pool, id, country);
-        }
       } catch (err) {
         console.error("[events] batch insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
+      // After the inserts, so it can't race them; one statement for the batch.
+      await backfillBestEffort(pool, parsed, country);
 
       return Response.json({ ok: true, accepted: parsed.length }, { status: 201 });
     },

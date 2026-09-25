@@ -8,29 +8,70 @@
 // and is NEVER stored or logged — only the resulting country code is persisted,
 // preserving the anonymous-by-design contract.
 //
-// The DB is loaded once at startup. If it's missing (e.g. not provisioned in a
-// dev environment), geolocation degrades gracefully to `null` country.
+// The DB is loaded once at startup. In production it is REQUIRED: without it
+// every event silently stores a NULL country, which once went unnoticed for
+// weeks. `initGeo({ required: true })` therefore throws, the process exits, and
+// the deployment fails its health check instead of shipping. Outside
+// production a missing DB degrades gracefully to `null` country. Deployments
+// that deliberately run without geolocation set GEOLITE2_COUNTRY_DB=disabled.
 
 import { open, type Reader, type CountryResponse } from "maxmind";
 
 // Path to the GeoLite2-Country.mmdb inside the image (provisioned at build).
-const DB_PATH = process.env.GEOLITE2_COUNTRY_DB ?? "/app/data/GeoLite2-Country.mmdb";
+// An empty value means "unset", not a path.
+const DB_PATH = process.env.GEOLITE2_COUNTRY_DB || "/app/data/GeoLite2-Country.mmdb";
+
+// Explicit opt-out value for GEOLITE2_COUNTRY_DB.
+export const GEO_DISABLED = "disabled";
+
+// A stable public IP that every GeoLite2 Country/City release resolves. A file
+// that opens but can't resolve it is truncated or the wrong database.
+const PROBE_IP = "8.8.8.8";
 
 let _reader: Reader<CountryResponse> | null = null;
-let _loadAttempted = false;
 
-export async function initGeo(): Promise<void> {
-  if (_loadAttempted) return;
-  _loadAttempted = true;
+// Open a GeoLite2 DB and prove it resolves countries. Throws otherwise.
+export async function openCountryDb(path: string): Promise<Reader<CountryResponse>> {
+  const reader = await open<CountryResponse>(path);
+  let probe: string | undefined;
   try {
-    _reader = await open<CountryResponse>(DB_PATH);
-    console.log(`[geo] loaded GeoLite2-Country from ${DB_PATH}`);
+    probe = reader.get(PROBE_IP)?.country?.iso_code;
+  } catch {
+    probe = undefined;
+  }
+  if (!probe) {
+    throw new Error(
+      `opened but resolved no country for probe IP ${PROBE_IP}; not a usable GeoLite2 Country/City database`
+    );
+  }
+  return reader;
+}
+
+export async function initGeo(opts: { required: boolean; path?: string }): Promise<void> {
+  const path = opts.path ?? DB_PATH;
+  _reader = null;
+
+  if (path === GEO_DISABLED) {
+    console.warn("[geo] GEOLITE2_COUNTRY_DB=disabled; country geolocation disabled");
+    return;
+  }
+
+  try {
+    _reader = await openCountryDb(path);
+    console.log(`[geo] loaded GeoLite2-Country from ${path}`);
   } catch (err) {
-    _reader = null;
+    const reason = err instanceof Error ? err.message : String(err);
+    if (opts.required) {
+      throw new Error(
+        `[geo] GeoLite2-Country DB not usable at ${path} (${reason}). Country ` +
+          `geolocation is required in production: place GeoLite2-Country.mmdb in ` +
+          `telemetry-api/data/ before building the image (or point ` +
+          `GEOLITE2_COUNTRY_DB at a valid DB), or set ` +
+          `GEOLITE2_COUNTRY_DB=${GEO_DISABLED} to run without it.`
+      );
+    }
     console.warn(
-      `[geo] GeoLite2-Country DB not available at ${DB_PATH} (${
-        err instanceof Error ? err.message : String(err)
-      }); country geolocation disabled`,
+      `[geo] GeoLite2-Country DB not usable at ${path} (${reason}); country geolocation disabled`
     );
   }
 }

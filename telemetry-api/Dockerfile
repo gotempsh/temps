@@ -18,17 +18,14 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
-# GeoLite2 DB for anonymous country lookup (gitignored; provisioned locally /
-# at build). geo.ts reads GEOLITE2_COUNTRY_DB (default /app/data/...).
-# The build FAILS if the DB is missing: at runtime geo.ts only logs a warning
-# and stores every event with a null country, which previously shipped to
-# production unnoticed for weeks when an image was built from a checkout
-# without data/. Place GeoLite2-Country.mmdb in data/ before building.
+# GeoLite2 DB for anonymous country lookup (gitignored; place
+# GeoLite2-Country.mmdb in data/ before building). geo.ts reads
+# GEOLITE2_COUNTRY_DB (default /app/data/GeoLite2-Country.mmdb). The server
+# REFUSES TO START in production if that DB is missing, corrupt, or can't
+# resolve countries, so a bad image fails its deploy health check instead of
+# silently storing NULL countries. Set GEOLITE2_COUNTRY_DB=disabled to run
+# without geolocation on purpose.
 COPY data ./data
-RUN test -s /app/data/GeoLite2-Country.mmdb || { \
-      echo "ERROR: data/GeoLite2-Country.mmdb is missing or empty; country geolocation would be disabled. Copy the GeoLite2 Country DB into telemetry-api/data/ and rebuild." >&2; \
-      exit 1; \
-    }
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
 

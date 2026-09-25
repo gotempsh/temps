@@ -17,8 +17,10 @@ async function main() {
   client.release();
   console.log("[server] database connection ok");
 
-  // Load the GeoLite2-Country DB once (degrades gracefully if absent).
-  await initGeo();
+  // Load the GeoLite2-Country DB once. Required in production: a missing or
+  // unusable DB fails startup (and so the deploy's health check) instead of
+  // silently storing NULL countries. Degrades to null countries elsewhere.
+  await initGeo({ required: process.env.NODE_ENV === "production" });
 
   const events = createEventsRoutes(pool);
   const stats = createStatsRoutes(pool);
