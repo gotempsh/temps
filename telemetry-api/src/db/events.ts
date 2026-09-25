@@ -70,27 +70,31 @@ export function backfillTargets(events: IngestBody[]): string[] {
 
 // Fill in the country on the given instances' earlier rows that were stored
 // without one (private IP, missing geo DB at the time, ...). Only NULLs are
-// touched — a country that is already known is never overwritten.
+// touched — a country that is already known is never overwritten. Setup
+// attempts stay country-less by design.
 //
-// One statement for every instance in the request: both tables are updated
-// atomically (a data-modifying CTE runs in the same statement snapshot), and a
-// 100-event batch costs one round trip, not one per instance. The partial
-// indexes from migration 004 keep it a near-free no-op once an instance has no
-// NULL rows left.
-export async function backfillCountry(
+// Called by the background CountryBackfiller (src/backfill.ts), never on the
+// ingest request path. One statement per flush for every queued instance,
+// each with its own country: both tables are updated atomically (a
+// data-modifying CTE runs in the same statement), and the partial indexes from
+// migration 004 keep it cheap once an instance has no NULL rows left.
+export async function backfillCountries(
   pool: Pool,
-  anonymousIds: string[],
-  country: string | null
+  entries: ReadonlyArray<readonly [anonymousId: string, country: string]>
 ): Promise<void> {
-  if (!country || anonymousIds.length === 0) return;
+  if (entries.length === 0) return;
   await pool.query(
-    `WITH filled_days AS (
-       UPDATE telemetry_instance_days SET country = $2
-       WHERE anonymous_id = ANY($1::text[]) AND country IS NULL
+    `WITH src AS (
+       SELECT * FROM unnest($1::text[], $2::text[]) AS s(anonymous_id, country)
+     ), filled_days AS (
+       UPDATE telemetry_instance_days d SET country = src.country
+       FROM src
+       WHERE d.anonymous_id = src.anonymous_id AND d.country IS NULL
      )
-     UPDATE telemetry_events SET country = $2
-     WHERE anonymous_id = ANY($1::text[]) AND country IS NULL
-       AND event_type <> 'cli_setup_step'`,
-    [anonymousIds, country]
+     UPDATE telemetry_events e SET country = src.country
+     FROM src
+     WHERE e.anonymous_id = src.anonymous_id AND e.country IS NULL
+       AND e.event_type <> 'cli_setup_step'`,
+    [entries.map(([id]) => id), entries.map(([, country]) => country)]
   );
 }

@@ -6,6 +6,7 @@ import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";
 import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
+import { CountryBackfiller } from "./backfill.js";
 import { errorFields, log } from "./log.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
@@ -23,7 +24,11 @@ async function main() {
   // silently storing NULL countries. Degrades to null countries elsewhere.
   await initGeo({ required: process.env.NODE_ENV === "production" });
 
-  const events = createEventsRoutes(pool);
+  // Country backfill runs in the background, off the ingest request path.
+  const backfill = new CountryBackfiller(pool);
+  backfill.start();
+
+  const events = createEventsRoutes(pool, { backfill });
   const stats = createStatsRoutes(pool);
   const failureReports = createFailureReportsRoutes(pool);
 
@@ -73,6 +78,18 @@ async function main() {
   });
 
   log("info", "server", "temps telemetry API listening", { port: server.port });
+
+  // On a platform stop, flush queued backfills before exiting.
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.once(signal, () => {
+      log("info", "server", "shutting down; flushing country backfill", {
+        signal,
+        pending: backfill.pendingCount,
+      });
+      server.stop();
+      void backfill.stop().finally(() => process.exit(0));
+    });
+  }
 }
 
 main().catch((err) => {

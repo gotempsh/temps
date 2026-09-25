@@ -3,12 +3,8 @@
 
 import type { Pool } from "pg";
 import { countryForRequest } from "../geo.js";
-import {
-  backfillCountry,
-  backfillTargets,
-  insertEvent,
-  type IngestBody,
-} from "../db/events.js";
+import { backfillTargets, insertEvent, type IngestBody } from "../db/events.js";
+import type { CountryBackfillQueue } from "../backfill.js";
 import { errorFields, log } from "../log.js";
 
 // Runtime event types are kept in lockstep with the Rust binary's
@@ -177,29 +173,16 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
   };
 }
 
-// A backfill failure must never turn an accepted event into an error: the event
-// is already stored, and a 500 would invite a client retry that duplicates it.
-// Log and move on; the next event from the instance retries the backfill.
-async function backfillBestEffort(
-  pool: Pool,
-  events: IngestBody[],
-  country: string | null
-): Promise<void> {
-  const targets = backfillTargets(events);
-  try {
-    await backfillCountry(pool, targets, country);
-  } catch (err) {
-    log("error", "events", "country backfill failed (event kept)", {
-      instances: targets.length,
-      ...errorFields(err),
-    });
-  }
+export interface EventsRoutesDeps {
+  // Background country backfill; enqueueing is synchronous and never touches
+  // the database on the request path (see backfill.ts).
+  backfill: CountryBackfillQueue;
+  resolveCountry?: (req: Request) => string | null;
 }
 
-export function createEventsRoutes(
-  pool: Pool,
-  resolveCountry: (req: Request) => string | null = countryForRequest
-) {
+export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
+  const resolveCountry = deps.resolveCountry ?? countryForRequest;
+
   return {
     // POST /v1/events — single event
     async postEvent(req: Request): Promise<Response> {
@@ -224,7 +207,7 @@ export function createEventsRoutes(
         log("error", "events", "db insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
-      await backfillBestEffort(pool, [parsed], country);
+      deps.backfill.enqueue(backfillTargets([parsed]), country);
 
       return Response.json({ ok: true }, { status: 201 });
     },
@@ -275,8 +258,8 @@ export function createEventsRoutes(
         log("error", "events", "batch insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
-      // After the inserts, so it can't race them; one statement for the batch.
-      await backfillBestEffort(pool, parsed, country);
+      // Queued only after the inserts succeeded, so the flush can't race them.
+      deps.backfill.enqueue(backfillTargets(parsed), country);
 
       return Response.json({ ok: true, accepted: parsed.length }, { status: 201 });
     },

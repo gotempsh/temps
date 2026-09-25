@@ -18,6 +18,13 @@ describe("KNOWN_EVENT_TYPES", () => {
   });
 });
 
+// Records what the routes enqueue for background backfill.
+function makeQueue() {
+  const queued: Array<[string[], string | null]> = [];
+  return { queued, enqueue: (ids: string[], country: string | null) => void queued.push([ids, country]) };
+}
+const noBackfill = { enqueue: () => {} };
+
 function makePool(queryFn: () => unknown = () => ({ rows: [] })) {
   return {
     query: mock(queryFn),
@@ -41,7 +48,7 @@ describe("POST /v1/events", () => {
 
   it("accepts setup events without counting a CLI attempt as an active server", async () => {
     const pool = makePool();
-    const res = await createEventsRoutes(pool).postEvent(makeReq(setupEvent));
+    const res = await createEventsRoutes(pool, { backfill: noBackfill }).postEvent(makeReq(setupEvent));
     expect(res.status).toBe(201);
     expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(1);
     const values = (pool.query as ReturnType<typeof mock>).mock.calls[0]?.[1];
@@ -51,7 +58,7 @@ describe("POST /v1/events", () => {
   it("rejects setup fields that could contain identifiers or raw errors", async () => {
     for (const extra of [{ host: "private.example" }, { email: "admin@example.com" }, { error: "secret" }, { constructor: "unexpected" }]) {
       const pool = makePool();
-      const res = await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, ...extra } }));
+      const res = await createEventsRoutes(pool, { backfill: noBackfill }).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, ...extra } }));
       expect(res.status).toBe(422);
       expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     }
@@ -59,13 +66,13 @@ describe("POST /v1/events", () => {
 
   it("rejects arbitrary setup statuses and non-random identifiers", async () => {
     const pool = makePool();
-    expect((await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, anonymous_id: "server.example" }))).status).toBe(422);
-    expect((await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, status: "private error" } }))).status).toBe(422);
+    expect((await createEventsRoutes(pool, { backfill: noBackfill }).postEvent(makeReq({ ...setupEvent, anonymous_id: "server.example" }))).status).toBe(422);
+    expect((await createEventsRoutes(pool, { backfill: noBackfill }).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, status: "private error" } }))).status).toBe(422);
   });
 
   it("accepts a valid event", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool);
+    const { postEvent } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const res = await postEvent(
       makeReq({
@@ -84,7 +91,7 @@ describe("POST /v1/events", () => {
 
   it("rejects invalid JSON", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool);
+    const { postEvent } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const req = new Request("http://localhost/v1/events", {
       method: "POST",
@@ -96,7 +103,7 @@ describe("POST /v1/events", () => {
 
   it("rejects unknown event_type", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool);
+    const { postEvent } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const res = await postEvent(
       makeReq({ anonymous_id: "inst_abc123", event_type: "random_garbage" })
@@ -108,7 +115,7 @@ describe("POST /v1/events", () => {
 
   it("rejects missing anonymous_id", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool);
+    const { postEvent } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const res = await postEvent(
       makeReq({ event_type: "deploy_attempted" })
@@ -118,7 +125,7 @@ describe("POST /v1/events", () => {
 
   it("strips PII keys from properties", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool);
+    const { postEvent } = createEventsRoutes(pool, { backfill: noBackfill });
 
     await postEvent(
       makeReq({
@@ -139,7 +146,7 @@ describe("POST /v1/events", () => {
 describe("POST /v1/events/batch", () => {
   it("accepts a valid batch", async () => {
     const pool = makePool();
-    const { postBatch } = createEventsRoutes(pool);
+    const { postBatch } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const req = new Request("http://localhost/v1/events/batch", {
       method: "POST",
@@ -160,7 +167,7 @@ describe("POST /v1/events/batch", () => {
 
   it("rejects batch over 100 events", async () => {
     const pool = makePool();
-    const { postBatch } = createEventsRoutes(pool);
+    const { postBatch } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const events = Array.from({ length: 101 }, () => ({
       anonymous_id: "inst_1",
@@ -178,7 +185,7 @@ describe("POST /v1/events/batch", () => {
 
   it("rejects batch with any invalid event", async () => {
     const pool = makePool();
-    const { postBatch } = createEventsRoutes(pool);
+    const { postBatch } = createEventsRoutes(pool, { backfill: noBackfill });
 
     const req = new Request("http://localhost/v1/events/batch", {
       method: "POST",
@@ -198,12 +205,14 @@ describe("POST /v1/events/batch", () => {
   });
 });
 
-describe("country backfill", () => {
+describe("country backfill (request path)", () => {
   type Call = [string, unknown[]];
   const calls = (pool: Pool) =>
     (pool.query as ReturnType<typeof mock>).mock.calls as unknown as Call[];
-  const backfills = (pool: Pool) =>
-    calls(pool).filter(([sql]) => sql.includes("UPDATE telemetry_events"));
+  // The request path may only store events (INSERT, incl. the instance-day
+  // upsert's ON CONFLICT DO UPDATE); the backfill UPDATE runs in the background.
+  const updates = (pool: Pool) =>
+    calls(pool).filter(([sql]) => !sql.trimStart().startsWith("INSERT"));
 
   function batchReq(events: unknown[]): Request {
     return new Request("http://localhost/v1/events/batch", {
@@ -213,89 +222,49 @@ describe("country backfill", () => {
     });
   }
 
-  it("fills NULL countries in both tables in one statement when a country resolves", async () => {
+  it("queues the instance with the resolved country and runs no UPDATE on the request path", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool, () => "DE");
-
-    const res = await postEvent(makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" }));
+    const queue = makeQueue();
+    const res = await createEventsRoutes(pool, { backfill: queue, resolveCountry: () => "DE" }).postEvent(
+      makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" })
+    );
     expect(res.status).toBe(201);
-
-    const ups = backfills(pool);
-    expect(ups.length).toBe(1);
-    const [sql, values] = ups[0]!;
-    // Both tables, one statement, so they can't diverge.
-    expect(sql).toContain("UPDATE telemetry_instance_days");
-    // Only NULLs are filled — a known country is never overwritten.
-    expect(sql.match(/country IS NULL/g)?.length).toBe(2);
-    expect(sql).toContain("event_type <> 'cli_setup_step'");
-    expect(values).toEqual([["inst_abc"], "DE"]);
+    expect(queue.queued).toEqual([[["inst_abc"], "DE"]]);
+    expect(updates(pool).length).toBe(0);
   });
 
-  it("does nothing when the request's country is unknown", async () => {
+  it("queues each distinct instance of a batch once, with no UPDATE", async () => {
     const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool, () => null);
-
-    await postEvent(makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" }));
-    expect(backfills(pool).length).toBe(0);
+    const queue = makeQueue();
+    const res = await createEventsRoutes(pool, { backfill: queue, resolveCountry: () => "US" }).postBatch(
+      batchReq([
+        { anonymous_id: "inst_1", event_type: "deploy_attempted" },
+        { anonymous_id: "inst_1", event_type: "deploy_succeeded" },
+        { anonymous_id: "inst_2", event_type: "instance_started" },
+      ])
+    );
+    expect(res.status).toBe(201);
+    expect(queue.queued).toEqual([[["inst_1", "inst_2"], "US"]]);
+    expect(updates(pool).length).toBe(0);
   });
 
-  it("never backfills from a CLI setup attempt", async () => {
-    const pool = makePool();
-    const { postEvent } = createEventsRoutes(pool, () => "DE");
-
-    await postEvent(makeReq({
+  it("never queues CLI setup attempts", async () => {
+    const queue = makeQueue();
+    await createEventsRoutes(makePool(), { backfill: queue, resolveCountry: () => "DE" }).postEvent(makeReq({
       anonymous_id: "12345678-1234-4234-8234-123456789abc",
       event_type: "cli_setup_step",
       properties: { step: "install", status: "completed", method: "ssh", elapsed_bucket: "under_minute", cli_version: "0.1.36" },
     }));
-    expect(backfills(pool).length).toBe(0);
+    expect(queue.queued).toEqual([[[], "DE"]]);
   });
 
-  it("backfills a whole batch with one statement, after the inserts", async () => {
-    const pool = makePool();
-    const { postBatch } = createEventsRoutes(pool, () => "US");
-
-    const res = await postBatch(batchReq([
-      { anonymous_id: "inst_1", event_type: "deploy_attempted" },
-      { anonymous_id: "inst_1", event_type: "deploy_succeeded" },
-      { anonymous_id: "inst_2", event_type: "instance_started" },
-    ]));
-    expect(res.status).toBe(201);
-
-    const all = calls(pool);
-    const ups = backfills(pool);
-    expect(ups.length).toBe(1);
-    expect(ups[0]![1]).toEqual([["inst_1", "inst_2"], "US"]);
-
-    const firstUpdate = all.findIndex(([sql]) => sql.includes("UPDATE telemetry_events"));
-    const lastInsert = all.map(([sql]) => sql.trimStart().startsWith("INSERT")).lastIndexOf(true);
-    expect(firstUpdate).toBeGreaterThan(lastInsert);
-  });
-
-  it("still accepts the event when the backfill fails", async () => {
-    const failing = (sql: string) => {
-      if (sql.includes("UPDATE telemetry_events")) throw new Error("backfill boom");
-      return { rows: [] };
-    };
-    const single = makePool(failing as () => unknown);
-    const res = await createEventsRoutes(single, () => "DE").postEvent(
-      makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" })
-    );
-    expect(res.status).toBe(201);
-
-    const batch = makePool(failing as () => unknown);
-    const batchRes = await createEventsRoutes(batch, () => "DE").postBatch(
-      batchReq([{ anonymous_id: "inst_abc", event_type: "instance_started" }])
-    );
-    expect(batchRes.status).toBe(201);
-    expect((await batchRes.json()).accepted).toBe(1);
-  });
-
-  it("still returns 500 when the event itself can't be stored", async () => {
+  it("does not queue anything when the event can't be stored", async () => {
+    const queue = makeQueue();
     const pool = makePool(() => { throw new Error("insert boom"); });
-    const res = await createEventsRoutes(pool, () => "DE").postEvent(
+    const res = await createEventsRoutes(pool, { backfill: queue, resolveCountry: () => "DE" }).postEvent(
       makeReq({ anonymous_id: "inst_abc", event_type: "instance_started" })
     );
     expect(res.status).toBe(500);
+    expect(queue.queued.length).toBe(0);
   });
 });
