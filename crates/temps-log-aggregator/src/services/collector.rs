@@ -11,13 +11,14 @@
 //! - On stream error: exponential backoff (1s → 30s cap), reconnects using the
 //!   timestamp of the last successfully received line to avoid gaps.
 //! - On container gone (404): gives up immediately instead of retrying forever.
-//! - On a transient failure deciding whether to collect a container (e.g. the
-//!   ownership lookup hits a database blip): retries in the background, since
-//!   discovery sees each container only once.
+//! - Deciding whether to collect a discovered container (inspect + ownership
+//!   lookup) runs off the Docker-events task, bounded per attempt, and a
+//!   transient failure (e.g. a database blip) is retried, since discovery sees
+//!   each container only once.
 //! - Max consecutive failures threshold: after 20 consecutive errors the streaming
 //!   task for that container exits to avoid wasting resources.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bollard::query_parameters::LogsOptionsBuilder;
@@ -25,7 +26,7 @@ use bollard::Docker;
 
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -43,6 +44,10 @@ const LABEL_DEPLOY_ID: &str = "sh.temps.deploy_id";
 /// Maximum consecutive stream errors before giving up on a container.
 /// At 30s max backoff this is roughly 10 minutes of retrying.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
+
+/// How long one attempt at deciding whether (and from where) to collect a
+/// container may take before it is abandoned and retried.
+const START_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Backoff bounds for retrying a container whose collection could not be
 /// decided yet (see [`CollectorService::start_streaming_with_retry`]).
@@ -76,43 +81,24 @@ pub struct CollectorService {
     tail_tx: broadcast::Sender<LogLine>,
     /// Active streaming tasks per container_id
     active_streams: Mutex<HashMap<String, StreamTask>>,
-    /// Containers whose start is being retried in the background. Removing
-    /// an id (on stop) cancels its retry.
-    pending_starts: Mutex<HashSet<String>>,
-    /// One lock per container, held across a whole start or stop so the two
-    /// never interleave: a stop that arrives while a (retried) start is
-    /// inspecting the container waits, then tears down whatever that start
-    /// installed, instead of finding nothing to cancel and leaving a stream
-    /// behind. Entries are dropped once nobody holds or waits on them.
-    lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Containers with a start in progress in the background, each with the
+    /// token of the start that owns it. A start installs its stream only
+    /// while its own token is still here (checked under this lock, which
+    /// `stop_streaming` takes to remove the entry), so a stop — or a newer
+    /// start for the same container — cancels it without ever waiting on it.
+    pending_starts: Mutex<HashMap<String, u64>>,
+    next_start_token: std::sync::atomic::AtomicU64,
 }
 
-/// Held for the duration of one start or stop of a container; see
-/// [`CollectorService::lifecycle_locks`].
-struct ContainerLifecycleGuard<'a> {
-    locks: &'a std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    container_id: String,
-    lock: Arc<Mutex<()>>,
-    guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl Drop for ContainerLifecycleGuard<'_> {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        // Clones are only made under this map lock, so a count of two (the
-        // map's and ours) means nobody else holds or waits on it.
-        let mut locks = self
-            .locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if Arc::strong_count(&self.lock) == 2
-            && locks
-                .get(&self.container_id)
-                .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock))
-        {
-            locks.remove(&self.container_id);
-        }
-    }
+/// How one start attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartOutcome {
+    Started,
+    AlreadyStreaming,
+    /// Not running, or nothing this instance collects.
+    NotCollected,
+    /// Stopped, or superseded by a newer start, before it could install.
+    Cancelled,
 }
 
 impl CollectorService {
@@ -130,8 +116,8 @@ impl CollectorService {
             db: None,
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
-            pending_starts: Mutex::new(HashSet::new()),
-            lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
+            pending_starts: Mutex::new(HashMap::new()),
+            next_start_token: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -158,51 +144,79 @@ impl CollectorService {
     /// Extracts context from Docker labels. If the container has no temps.sh labels,
     /// it is silently skipped.
     pub async fn start_streaming(&self, container_id: &str) -> Result<(), LogAggregatorError> {
-        let _lifecycle = self.lock_container(container_id).await;
-        self.start_streaming_locked(container_id).await
+        self.try_start(container_id, None).await.map(|_| ())
     }
 
-    /// Wait for exclusive start/stop rights over one container.
-    async fn lock_container(&self, container_id: &str) -> ContainerLifecycleGuard<'_> {
-        let lock = self
-            .lifecycle_locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(container_id.to_string())
-            .or_default()
-            .clone();
-        let guard = Arc::clone(&lock).lock_owned().await;
-        ContainerLifecycleGuard {
-            locks: &self.lifecycle_locks,
-            container_id: container_id.to_string(),
-            lock,
-            guard: Some(guard),
+    /// One start attempt. With `token`, the attempt belongs to a background
+    /// start and installs nothing once that start was cancelled.
+    async fn try_start(
+        &self,
+        container_id: &str,
+        token: Option<u64>,
+    ) -> Result<StartOutcome, LogAggregatorError> {
+        if let Some(token) = token {
+            if !self.start_is_current(container_id, token).await {
+                return Ok(StartOutcome::Cancelled);
+            }
         }
+        if self.is_streaming(container_id).await {
+            debug!(container_id = container_id, "Already streaming, skipping");
+            return Ok(StartOutcome::AlreadyStreaming);
+        }
+
+        let decision = tokio::time::timeout(START_ATTEMPT_TIMEOUT, self.decide_start(container_id))
+            .await
+            .map_err(|_| LogAggregatorError::OperationTimedOut {
+                operation: "decide whether to collect logs",
+                target: format!("container '{container_id}'"),
+            })??;
+        let Some((ctx, resume_after)) = decision else {
+            debug!(
+                container_id = container_id,
+                "Container is not running or carries no labels this instance collects, skipping"
+            );
+            return Ok(StartOutcome::NotCollected);
+        };
+
+        // Resolve the daemon at streaming start — returns a typed error on a
+        // control-plane process instead of spawning a task that immediately
+        // fails with a connection error.
+        let docker: Arc<Docker> = self
+            .docker
+            .require()
+            .map_err(LogAggregatorError::DockerUnavailable)?;
+        let chunk_writer = self.chunk_writer.clone();
+        let tail_tx = self.tail_tx.clone();
+        let container_id_owned = container_id.to_string();
+        let outcome = self
+            .install_stream(container_id, token, move || {
+                tokio::spawn(async move {
+                    Self::stream_container_logs(
+                        docker,
+                        chunk_writer,
+                        tail_tx,
+                        container_id_owned,
+                        ctx,
+                        resume_after,
+                    )
+                    .await;
+                })
+            })
+            .await;
+        if outcome == StartOutcome::Started {
+            info!(container_id = container_id, "Started log streaming");
+        }
+        Ok(outcome)
     }
 
-    /// [`Self::start_streaming`] for a caller already holding the
-    /// container's lifecycle lock.
-    async fn start_streaming_locked(&self, container_id: &str) -> Result<(), LogAggregatorError> {
-        // Check if already streaming
-        {
-            let streams = self.active_streams.lock().await;
-            if streams.contains_key(container_id) {
-                debug!(container_id = container_id, "Already streaming, skipping");
-                return Ok(());
-            }
-        }
-
-        // Inspect container for labels
-        let ctx = self.extract_context(container_id).await?;
-        let ctx = match ctx {
-            Some(c) => c,
-            None => {
-                debug!(
-                    container_id = container_id,
-                    "Container is not running or carries no labels this instance collects, skipping"
-                );
-                return Ok(());
-            }
+    /// The container's collection context and resume point, or `None` when
+    /// it is not collected here.
+    async fn decide_start(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<(ContainerContext, i64)>, LogAggregatorError> {
+        let Some(ctx) = self.extract_context(container_id).await? else {
+            return Ok(None);
         };
 
         // Query the DB for the latest chunk end timestamp for this container.
@@ -229,76 +243,77 @@ impl CollectorService {
                 "Resuming log stream from last known position"
             );
         }
-
-        // Resolve the daemon at streaming start — returns a typed error on a
-        // control-plane process instead of spawning a task that immediately
-        // fails with a connection error.
-        let docker: Arc<Docker> = self
-            .docker
-            .require()
-            .map_err(LogAggregatorError::DockerUnavailable)?;
-        let chunk_writer = self.chunk_writer.clone();
-        let tail_tx = self.tail_tx.clone();
-        let container_id_owned = container_id.to_string();
-
-        let handle = tokio::spawn(async move {
-            Self::stream_container_logs(
-                docker,
-                chunk_writer,
-                tail_tx,
-                container_id_owned.clone(),
-                ctx,
-                resume_after,
-            )
-            .await;
-        });
-
-        let mut streams = self.active_streams.lock().await;
-        streams.insert(container_id.to_string(), StreamTask { handle });
-
-        info!(container_id = container_id, "Started log streaming");
-        Ok(())
+        Ok(Some((ctx, resume_after)))
     }
 
-    /// Start streaming a container, retrying in the background while the
-    /// decision to collect it fails transiently.
-    ///
-    /// Discovery sees a container once — in the startup scan or on its
-    /// Docker `start` event — so a failed [`Self::start_streaming`] would be
-    /// final: a database blip during the ownership lookup would leave a
-    /// running container's logs uncollected until it or temps restarted.
-    /// A transient failure is instead retried (1s → 30s backoff) until the
-    /// container streams, turns out not to be collectable, disappears, or is
-    /// stopped. Returns `Ok` once a retry is scheduled; permanent failures
-    /// are returned as before.
-    pub async fn start_streaming_with_retry(
-        self: &Arc<Self>,
-        container_id: &str,
-    ) -> Result<(), LogAggregatorError> {
-        let lifecycle = self.lock_container(container_id).await;
-        let error = match self.start_streaming_locked(container_id).await {
-            Err(error) if Self::start_is_retryable(&error) => error,
-            other => return other,
-        };
-        let scheduled = self
-            .pending_starts
+    /// Whether a live stream is registered. A stream task that ended on its
+    /// own (container gone, too many errors) does not count, so it never
+    /// blocks the container's next start.
+    async fn is_streaming(&self, container_id: &str) -> bool {
+        self.active_streams
             .lock()
             .await
-            .insert(container_id.to_string());
-        drop(lifecycle);
-        if !scheduled {
-            // A retry for this container is already running.
-            return Ok(());
+            .get(container_id)
+            .is_some_and(|task| !task.handle.is_finished())
+    }
+
+    /// Register the stream `spawn` starts, unless the start owning `token`
+    /// was cancelled or a live stream already exists. Nothing is spawned
+    /// then.
+    ///
+    /// Holds `pending_starts` while inserting into `active_streams` — the
+    /// order `stop_streaming` takes them in — so a stop either removes the
+    /// token first (this start is cancelled) or runs after the insert and
+    /// tears the stream down.
+    async fn install_stream(
+        &self,
+        container_id: &str,
+        token: Option<u64>,
+        spawn: impl FnOnce() -> JoinHandle<()>,
+    ) -> StartOutcome {
+        let pending = self.pending_starts.lock().await;
+        if let Some(token) = token {
+            if pending.get(container_id) != Some(&token) {
+                return StartOutcome::Cancelled;
+            }
         }
-        warn!(
-            container_id = container_id,
-            error = %error,
-            "Could not start collecting logs for container; retrying in the background"
-        );
+        let mut streams = self.active_streams.lock().await;
+        if streams
+            .get(container_id)
+            .is_some_and(|task| !task.handle.is_finished())
+        {
+            return StartOutcome::AlreadyStreaming;
+        }
+        streams.insert(container_id.to_string(), StreamTask { handle: spawn() });
+        StartOutcome::Started
+    }
+
+    /// Start streaming a discovered container in the background, retrying
+    /// while the decision to collect it fails transiently.
+    ///
+    /// Discovery sees a container once — in the startup scan or on its
+    /// Docker `start` event — so a failed start would be final: a database
+    /// blip during the ownership lookup would leave a running container's
+    /// logs uncollected until it or temps restarted. The work runs off the
+    /// caller's task (the single Docker-events task must never wait on an
+    /// inspect or a lookup), each attempt is bounded, and a transient failure
+    /// is retried (1s → 30s backoff) until the container streams, turns out
+    /// not to be collectable, disappears, or is stopped.
+    pub async fn start_streaming_with_retry(self: &Arc<Self>, container_id: &str) {
+        let token = self
+            .next_start_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = self.pending_starts.lock().await;
+            if pending.contains_key(container_id) {
+                // A start for this container is already in progress.
+                return;
+            }
+            pending.insert(container_id.to_string(), token);
+        }
         let collector = Arc::clone(self);
         let container_id = container_id.to_string();
-        tokio::spawn(async move { collector.retry_start(container_id).await });
-        Ok(())
+        tokio::spawn(async move { collector.run_start(container_id, token).await });
     }
 
     /// Whether a [`Self::start_streaming`] failure may clear on its own.
@@ -309,26 +324,32 @@ impl CollectorService {
             && error.retry_class() == RetryClass::Transient
     }
 
-    async fn retry_start(self: Arc<Self>, container_id: String) {
+    async fn start_is_current(&self, container_id: &str, token: u64) -> bool {
+        self.pending_starts.lock().await.get(container_id) == Some(&token)
+    }
+
+    /// Drop this start's claim, unless a stop or a newer start replaced it.
+    async fn finish_start(&self, container_id: &str, token: u64) {
+        let mut pending = self.pending_starts.lock().await;
+        if pending.get(container_id) == Some(&token) {
+            pending.remove(container_id);
+        }
+    }
+
+    async fn run_start(self: Arc<Self>, container_id: String, token: u64) {
         let mut delay = START_RETRY_INITIAL;
         let mut attempt: u32 = 0;
         loop {
-            tokio::time::sleep(delay).await;
-            // Held across the pending check AND the start, so a stop either
-            // lands first (and this retry ends here) or waits and then tears
-            // down the stream this attempt installs.
-            let _lifecycle = self.lock_container(&container_id).await;
-            if !self.pending_starts.lock().await.contains(&container_id) {
-                debug!(
-                    container_id = %container_id,
-                    "Container stopped; abandoning log collection start retry"
-                );
-                return;
-            }
             attempt += 1;
-            match self.start_streaming_locked(&container_id).await {
+            match self.try_start(&container_id, Some(token)).await {
                 Err(error) if Self::start_is_retryable(&error) => {
-                    if attempt.is_multiple_of(START_RETRY_LOG_EVERY) {
+                    if attempt == 1 {
+                        warn!(
+                            container_id = %container_id,
+                            error = %error,
+                            "Could not start collecting logs for container; retrying in the background"
+                        );
+                    } else if attempt.is_multiple_of(START_RETRY_LOG_EVERY) {
                         warn!(
                             container_id = %container_id,
                             attempt,
@@ -336,15 +357,23 @@ impl CollectorService {
                             "Still cannot start collecting logs for container; retrying"
                         );
                     }
-                    delay = std::cmp::min(delay * 2, START_RETRY_MAX);
                 }
                 result => {
-                    self.pending_starts.lock().await.remove(&container_id);
+                    self.finish_start(&container_id, token).await;
                     match result {
-                        Ok(()) => info!(
+                        Ok(StartOutcome::Started) if attempt > 1 => info!(
                             container_id = %container_id,
                             attempt,
                             "Started collecting logs for container after retrying"
+                        ),
+                        Ok(StartOutcome::Cancelled) => debug!(
+                            container_id = %container_id,
+                            "Container stopped; abandoning log collection start"
+                        ),
+                        Ok(_) => {}
+                        Err(LogAggregatorError::ContainerNotFound { .. }) => debug!(
+                            container_id = %container_id,
+                            "Container disappeared before log collection could start"
                         ),
                         Err(error) => warn!(
                             container_id = %container_id,
@@ -356,12 +385,15 @@ impl CollectorService {
                     return;
                 }
             }
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, START_RETRY_MAX);
         }
     }
 
     /// Stop streaming logs for a container and flush remaining buffer.
     pub async fn stop_streaming(&self, container_id: &str) {
-        let _lifecycle = self.lock_container(container_id).await;
+        // Cancels a background start; see `install_stream` for why this is
+        // taken before `active_streams`.
         self.pending_starts.lock().await.remove(container_id);
         let task = {
             let mut streams = self.active_streams.lock().await;
@@ -1057,26 +1089,40 @@ mod tests {
         }
     }
 
-    // A container that stops while its start is being retried must not be
-    // picked up later: stopping cancels the retry.
+    // A container that stops while its start is in progress must not be
+    // picked up later: stopping cancels the start, which then ends without
+    // touching Docker (disabled here, so it would fail permanently).
     #[tokio::test(start_paused = true)]
-    async fn test_stopping_a_container_cancels_its_start_retry() {
+    async fn test_stopping_a_container_cancels_its_start() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let collector = Arc::new(collector_with_db(Arc::new(db)).await);
-        collector.pending_starts.lock().await.insert("cid".into());
+        collector
+            .pending_starts
+            .lock()
+            .await
+            .insert("cid".into(), 1);
 
         collector.stop_streaming("cid").await;
         assert!(collector.pending_starts.lock().await.is_empty());
 
-        // The retry wakes, finds itself cancelled and ends without touching
-        // Docker (which is disabled here and would fail permanently).
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Arc::clone(&collector).retry_start("cid".into()),
+            Arc::clone(&collector).run_start("cid".into(), 1),
         )
         .await
-        .expect("a cancelled retry must end");
+        .expect("a cancelled start must end");
         assert!(collector.active_containers().await.is_empty());
+    }
+
+    // An attempt stuck on a stalled inspect or lookup is abandoned as a
+    // retryable timeout rather than holding its container forever.
+    #[test]
+    fn test_a_timed_out_start_attempt_is_retried() {
+        let error = LogAggregatorError::OperationTimedOut {
+            operation: "decide whether to collect logs",
+            target: "container 'cid'".into(),
+        };
+        assert!(CollectorService::start_is_retryable(&error));
     }
 
     // End to end against a real daemon: a running deployment container whose
@@ -1102,12 +1148,13 @@ mod tests {
             .into_connection();
         let (collector, _tmp) = docker_collector(docker.clone(), db).await;
 
-        let scheduled = collector.start_streaming_with_retry(&id).await;
-        let started_at_first = collector.active_containers().await.contains(&id);
-        let mut streaming = false;
+        let began = std::time::Instant::now();
+        collector.start_streaming_with_retry(&id).await;
+        let mut streamed_after = None;
         for _ in 0..50 {
-            if collector.active_containers().await.contains(&id) {
-                streaming = true;
+            if collector.is_streaming(&id).await && collector.pending_starts.lock().await.is_empty()
+            {
+                streamed_after = Some(began.elapsed());
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1115,10 +1162,12 @@ mod tests {
         collector.stop_streaming(&id).await;
         remove_container(&docker, &id).await;
 
-        scheduled.expect("a transient failure schedules a retry instead of failing");
-        assert!(!started_at_first, "the first attempt must have failed");
-        assert!(streaming, "the retry must start collecting the container");
-        assert!(collector.pending_starts.lock().await.is_empty());
+        let streamed_after = streamed_after.expect("the retry must start collecting the container");
+        // Only a retry, after the first backoff, can have succeeded.
+        assert!(
+            streamed_after >= START_RETRY_INITIAL,
+            "streamed after {streamed_after:?}: the first attempt must have failed"
+        );
     }
 
     /// A reachable local Docker daemon with `alpine:3` present, or `None`
@@ -1205,45 +1254,101 @@ mod tests {
         (collector, tmp)
     }
 
-    // A stop that arrives while a start for the same container is in flight
-    // (e.g. a retry still inspecting it) must wait for that start and then
-    // tear down the stream it installed — not find nothing to cancel and
-    // leave a stream behind that makes the next start event skip collection.
+    fn pending_stream() -> JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
+    }
+
+    // A stop that lands while a background start is still deciding (after
+    // its last pending check) must win: the start then installs nothing, so
+    // no stream outlives the stop and the next start event is not skipped.
+    // The stop itself never waits on the in-flight start.
     #[tokio::test]
-    async fn test_stop_during_an_in_flight_start_tears_down_what_it_installed() {
+    async fn test_stop_before_install_cancels_the_in_flight_start() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let collector = Arc::new(collector_with_db(Arc::new(db)).await);
-        collector.pending_starts.lock().await.insert("cid".into());
+        let collector = collector_with_db(Arc::new(db)).await;
+        collector
+            .pending_starts
+            .lock()
+            .await
+            .insert("cid".into(), 1);
 
-        // The retry has passed its pending check and is mid-start.
-        let in_flight_start = collector.lock_container("cid").await;
-        let stopping = tokio::spawn({
-            let collector = Arc::clone(&collector);
-            async move { collector.stop_streaming("cid").await }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(
-            !stopping.is_finished(),
-            "stop must wait for the in-flight start"
-        );
-        assert!(collector.pending_starts.lock().await.contains("cid"));
+        collector.stop_streaming("cid").await;
+        let mut spawned = false;
+        let outcome = collector
+            .install_stream("cid", Some(1), || {
+                spawned = true;
+                pending_stream()
+            })
+            .await;
 
-        // The start completes by installing its stream.
-        collector.active_streams.lock().await.insert(
-            "cid".into(),
-            StreamTask {
-                handle: tokio::spawn(std::future::pending::<()>()),
-            },
-        );
-        drop(in_flight_start);
-        stopping.await.unwrap();
+        assert_eq!(outcome, StartOutcome::Cancelled);
+        assert!(!spawned, "a cancelled start must not spawn a stream");
+        assert!(collector.active_containers().await.is_empty());
+    }
+
+    // The other order: the start installs first, then the stop tears the
+    // stream down.
+    #[tokio::test]
+    async fn test_stop_after_install_tears_the_stream_down() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+        collector
+            .pending_starts
+            .lock()
+            .await
+            .insert("cid".into(), 1);
+
+        let outcome = collector
+            .install_stream("cid", Some(1), pending_stream)
+            .await;
+        assert_eq!(outcome, StartOutcome::Started);
+        collector.stop_streaming("cid").await;
 
         assert!(collector.active_containers().await.is_empty());
         assert!(collector.pending_starts.lock().await.is_empty());
-        assert!(
-            collector.lifecycle_locks.lock().unwrap().is_empty(),
-            "an idle container's lock must not be kept"
-        );
+    }
+
+    // A start superseded by a newer one for the same container (stopped and
+    // started again) installs nothing, and does not clear the newer claim.
+    #[tokio::test]
+    async fn test_a_superseded_start_leaves_the_newer_one_alone() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+        collector
+            .pending_starts
+            .lock()
+            .await
+            .insert("cid".into(), 2);
+
+        let outcome = collector
+            .install_stream("cid", Some(1), pending_stream)
+            .await;
+        collector.finish_start("cid", 1).await;
+
+        assert_eq!(outcome, StartOutcome::Cancelled);
+        assert_eq!(collector.pending_starts.lock().await.get("cid"), Some(&2));
+    }
+
+    // A stream task that ended on its own must not make the container look
+    // collected forever: the next start replaces it.
+    #[tokio::test]
+    async fn test_a_finished_stream_does_not_block_the_next_start() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        collector
+            .active_streams
+            .lock()
+            .await
+            .insert("cid".into(), StreamTask { handle: finished });
+
+        assert!(!collector.is_streaming("cid").await);
+        let outcome = collector.install_stream("cid", None, pending_stream).await;
+        assert_eq!(outcome, StartOutcome::Started);
+        assert!(collector.is_streaming("cid").await);
     }
 
     // Discovery can act on a stale view (the startup scan listed it, or a
