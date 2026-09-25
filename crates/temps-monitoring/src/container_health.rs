@@ -123,6 +123,17 @@ fn is_intentionally_stopped(status: Option<&str>) -> bool {
     status.is_some_and(|status| status == "stopped" || status.starts_with("retained:"))
 }
 
+/// Truncate a timestamp to the microsecond precision Postgres stores.
+/// Docker reports nanoseconds, so comparing a live Docker timestamp with its
+/// own stored copy would otherwise see the copy as older (or different) by
+/// the discarded sub-microsecond part.
+fn at_db_precision(
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::SubsecRound;
+    timestamp.map(|timestamp| timestamp.trunc_subsecs(6))
+}
+
 /// Whether the container's exit is still covered by its intentional-stop
 /// marker. A user-stopped (`"stopped"`) container that Docker reports as
 /// started after the stop ran again since — by hand or through a restart
@@ -137,10 +148,10 @@ fn exit_is_intentional(
     if !is_intentionally_stopped(container.status.as_deref()) {
         return false;
     }
-    let stopped_at = container.finished_at.or(container.started_at);
+    let stopped_at = at_db_precision(container.finished_at.or(container.started_at));
     let restarted_since_stop = container.status.as_deref() == Some("stopped")
         && matches!(
-            (stopped_at, info.started_at),
+            (stopped_at, at_db_precision(info.started_at)),
             (Some(stopped_at), Some(started_at)) if started_at > stopped_at
         );
     !restarted_since_stop
@@ -521,7 +532,7 @@ impl ContainerHealthMonitor {
         let host_port = published_tcp_host_port(container.container_port, &info.ports);
         let port_changed = host_port != container.host_port;
         if !port_changed
-            && container.started_at == info.started_at
+            && at_db_precision(container.started_at) == at_db_precision(info.started_at)
             && container.cpu_limit_cores == info.cpu_limit_cores
         {
             return Ok(());
@@ -2697,6 +2708,13 @@ mod tests {
         assert_eq!(reason, None, "an unreadable environment must still alarm");
     }
 
+    /// A timestamp `ago` in the past with a sub-microsecond component, the
+    /// way Docker reports container start and finish times.
+    fn docker_precision_timestamp(ago: chrono::Duration) -> chrono::DateTime<chrono::Utc> {
+        use chrono::SubsecRound;
+        (chrono::Utc::now() - ago).trunc_subsecs(0) + chrono::Duration::nanoseconds(123_456_789)
+    }
+
     #[tokio::test]
     async fn crash_after_unobserved_restart_of_user_stopped_container_alarms() {
         use sea_orm::ActiveModelTrait;
@@ -2706,7 +2724,9 @@ mod tests {
         let current = fixture.deployment("app-8", "completed").await;
         fixture.serve(&current).await;
         let container = fixture.container(&current, "stopped").await;
-        let stopped_run_started = chrono::Utc::now() - chrono::Duration::hours(1);
+        // Nanosecond precision, like Docker's `StartedAt`: Postgres keeps
+        // only microseconds, so the stored copy is truncated.
+        let stopped_run_started = docker_precision_timestamp(chrono::Duration::hours(1));
         deployment_containers::ActiveModel {
             id: Set(container.id),
             started_at: Set(Some(stopped_run_started)),
