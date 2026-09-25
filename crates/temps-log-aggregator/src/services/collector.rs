@@ -11,10 +11,13 @@
 //! - On stream error: exponential backoff (1s → 30s cap), reconnects using the
 //!   timestamp of the last successfully received line to avoid gaps.
 //! - On container gone (404): gives up immediately instead of retrying forever.
+//! - On a transient failure deciding whether to collect a container (e.g. the
+//!   ownership lookup hits a database blip): retries in the background, since
+//!   discovery sees each container only once.
 //! - Max consecutive failures threshold: after 20 consecutive errors the streaming
 //!   task for that container exits to avoid wasting resources.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bollard::query_parameters::LogsOptionsBuilder;
@@ -26,7 +29,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::error::LogAggregatorError;
+use crate::error::{LogAggregatorError, RetryClass};
 use crate::parser::{parse_docker_timestamp, parse_log_line};
 use crate::services::{ChunkWriterService, LogMetadataService};
 use crate::types::{ContainerContext, LogLine, LogStream};
@@ -40,6 +43,15 @@ const LABEL_DEPLOY_ID: &str = "sh.temps.deploy_id";
 /// Maximum consecutive stream errors before giving up on a container.
 /// At 30s max backoff this is roughly 10 minutes of retrying.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
+
+/// Backoff bounds for retrying a container whose collection could not be
+/// decided yet (see [`CollectorService::start_streaming_with_retry`]).
+const START_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+const START_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A still-failing start retry is logged on its first failure and then every
+/// this many attempts (~5 minutes at the backoff cap), not every 30 seconds.
+const START_RETRY_LOG_EVERY: u32 = 10;
 
 /// State of a streaming task for a single container
 struct StreamTask {
@@ -64,6 +76,9 @@ pub struct CollectorService {
     tail_tx: broadcast::Sender<LogLine>,
     /// Active streaming tasks per container_id
     active_streams: Mutex<HashMap<String, StreamTask>>,
+    /// Containers whose start is being retried in the background. Removing
+    /// an id (on stop) cancels its retry.
+    pending_starts: Mutex<HashSet<String>>,
 }
 
 impl CollectorService {
@@ -81,6 +96,7 @@ impl CollectorService {
             db: None,
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
+            pending_starts: Mutex::new(HashSet::new()),
         }
     }
 
@@ -184,8 +200,102 @@ impl CollectorService {
         Ok(())
     }
 
+    /// Start streaming a container, retrying in the background while the
+    /// decision to collect it fails transiently.
+    ///
+    /// Discovery sees a container once — in the startup scan or on its
+    /// Docker `start` event — so a failed [`Self::start_streaming`] would be
+    /// final: a database blip during the ownership lookup would leave a
+    /// running container's logs uncollected until it or temps restarted.
+    /// A transient failure is instead retried (1s → 30s backoff) until the
+    /// container streams, turns out not to be collectable, disappears, or is
+    /// stopped. Returns `Ok` once a retry is scheduled; permanent failures
+    /// are returned as before.
+    pub async fn start_streaming_with_retry(
+        self: &Arc<Self>,
+        container_id: &str,
+    ) -> Result<(), LogAggregatorError> {
+        let error = match self.start_streaming(container_id).await {
+            Err(error) if Self::start_is_retryable(&error) => error,
+            other => return other,
+        };
+        if !self
+            .pending_starts
+            .lock()
+            .await
+            .insert(container_id.to_string())
+        {
+            // A retry for this container is already running.
+            return Ok(());
+        }
+        warn!(
+            container_id = container_id,
+            error = %error,
+            "Could not start collecting logs for container; retrying in the background"
+        );
+        let collector = Arc::clone(self);
+        let container_id = container_id.to_string();
+        tokio::spawn(async move { collector.retry_start(container_id).await });
+        Ok(())
+    }
+
+    /// Whether a [`Self::start_streaming`] failure may clear on its own.
+    /// A missing Docker daemon never will on this process, however its
+    /// recovery classification reads.
+    fn start_is_retryable(error: &LogAggregatorError) -> bool {
+        !matches!(error, LogAggregatorError::DockerUnavailable(_))
+            && error.retry_class() == RetryClass::Transient
+    }
+
+    async fn retry_start(self: Arc<Self>, container_id: String) {
+        let mut delay = START_RETRY_INITIAL;
+        let mut attempt: u32 = 0;
+        loop {
+            tokio::time::sleep(delay).await;
+            if !self.pending_starts.lock().await.contains(&container_id) {
+                debug!(
+                    container_id = %container_id,
+                    "Container stopped; abandoning log collection start retry"
+                );
+                return;
+            }
+            attempt += 1;
+            match self.start_streaming(&container_id).await {
+                Err(error) if Self::start_is_retryable(&error) => {
+                    if attempt.is_multiple_of(START_RETRY_LOG_EVERY) {
+                        warn!(
+                            container_id = %container_id,
+                            attempt,
+                            error = %error,
+                            "Still cannot start collecting logs for container; retrying"
+                        );
+                    }
+                    delay = std::cmp::min(delay * 2, START_RETRY_MAX);
+                }
+                result => {
+                    self.pending_starts.lock().await.remove(&container_id);
+                    match result {
+                        Ok(()) => info!(
+                            container_id = %container_id,
+                            attempt,
+                            "Started collecting logs for container after retrying"
+                        ),
+                        Err(error) => warn!(
+                            container_id = %container_id,
+                            attempt,
+                            error = %error,
+                            "Gave up starting log collection for container"
+                        ),
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     /// Stop streaming logs for a container and flush remaining buffer.
     pub async fn stop_streaming(&self, container_id: &str) {
+        self.pending_starts.lock().await.remove(container_id);
         let task = {
             let mut streams = self.active_streams.lock().await;
             streams.remove(container_id)
@@ -347,10 +457,11 @@ impl CollectorService {
         let Some(db) = self.db.as_ref() else {
             return Ok(true);
         };
-        let lookup_failed = |e: sea_orm::DbErr| LogAggregatorError::DockerStreamFailed {
-            container_id: container_id.to_string(),
-            reason: format!("Failed to verify project {project_id} ownership: {e}"),
-        };
+        let lookup_failed =
+            |source: sea_orm::DbErr| LogAggregatorError::ContainerContextLookupFailed {
+                container_id: container_id.to_string(),
+                source,
+            };
 
         let found = match deploy_id {
             Some(deploy_id) => {
@@ -425,9 +536,9 @@ impl CollectorService {
                 .filter(temps_entities::external_services::Column::Name.eq(name.clone()))
                 .one(db.as_ref())
                 .await
-                .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                .map_err(|source| LogAggregatorError::ContainerContextLookupFailed {
                     container_id: container_id.to_string(),
-                    reason: format!("Failed to resolve external service '{name}': {e}"),
+                    source,
                 })?;
             return Ok(svc.map(|svc| ContainerContext {
                 project_id: 0,
@@ -450,9 +561,9 @@ impl CollectorService {
             .filter(temps_entities::external_services::Column::ContainerName.eq(cname))
             .one(db.as_ref())
             .await
-            .map_err(|e| LogAggregatorError::DockerStreamFailed {
+            .map_err(|source| LogAggregatorError::ContainerContextLookupFailed {
                 container_id: container_id.to_string(),
-                reason: format!("Failed to resolve imported service for container '{cname}': {e}"),
+                source,
             })?
         {
             return Ok(Some(ContainerContext {
@@ -471,9 +582,9 @@ impl CollectorService {
             .filter(temps_entities::service_members::Column::ContainerName.eq(cname))
             .one(db.as_ref())
             .await
-            .map_err(|e| LogAggregatorError::DockerStreamFailed {
+            .map_err(|source| LogAggregatorError::ContainerContextLookupFailed {
                 container_id: container_id.to_string(),
-                reason: format!("Failed to resolve cluster member for container '{cname}': {e}"),
+                source,
             })?
         {
             return Ok(Some(ContainerContext {
@@ -799,5 +910,204 @@ mod tests {
             .await
             .expect("lookup must not error");
         assert!(!owned);
+    }
+
+    // A database blip while checking ownership must not read as "not ours":
+    // it surfaces as a lookup failure that discovery retries, since the
+    // container is seen only once and would otherwise never be collected.
+    #[tokio::test]
+    async fn test_ownership_lookup_connection_failure_is_retried() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                "connection reset".into(),
+            ))])
+            .into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+
+        let error = collector
+            .owns_project_container("cid", 1, "1", Some(7))
+            .await
+            .expect_err("a failed lookup must not decide ownership");
+        assert!(
+            matches!(
+                error,
+                LogAggregatorError::ContainerContextLookupFailed { .. }
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(CollectorService::start_is_retryable(&error));
+    }
+
+    // The same holds for the external-service lookups on unlabelled containers.
+    #[tokio::test]
+    async fn test_external_service_lookup_connection_failure_is_retried() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::ConnectionAcquire(
+                sea_orm::ConnAcquireErr::Timeout,
+            )])
+            .into_connection();
+        let collector = collector_with_db(Arc::new(db)).await;
+
+        let error = collector
+            .extract_external_service_context("cid", Some("legacy-postgres"), &HashMap::new())
+            .await
+            .expect_err("a failed lookup must not skip the container");
+        assert!(CollectorService::start_is_retryable(&error));
+    }
+
+    // Failures that cannot clear on their own are not retried: the container
+    // is gone, this process has no Docker daemon, or the lookup itself is
+    // malformed.
+    #[test]
+    fn test_permanent_start_failures_are_not_retried() {
+        let permanent = [
+            LogAggregatorError::ContainerNotFound {
+                container_id: "cid".into(),
+            },
+            LogAggregatorError::DockerUnavailable(
+                temps_core::DockerHandle::disabled("test", "no daemon")
+                    .require()
+                    .expect_err("a disabled handle has no daemon"),
+            ),
+            LogAggregatorError::ContainerContextLookupFailed {
+                container_id: "cid".into(),
+                source: sea_orm::DbErr::Custom("bad query".into()),
+            },
+        ];
+        for error in &permanent {
+            assert!(
+                !CollectorService::start_is_retryable(error),
+                "must not retry: {error}"
+            );
+        }
+    }
+
+    // A container that stops while its start is being retried must not be
+    // picked up later: stopping cancels the retry.
+    #[tokio::test(start_paused = true)]
+    async fn test_stopping_a_container_cancels_its_start_retry() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let collector = Arc::new(collector_with_db(Arc::new(db)).await);
+        collector.pending_starts.lock().await.insert("cid".into());
+
+        collector.stop_streaming("cid").await;
+        assert!(collector.pending_starts.lock().await.is_empty());
+
+        // The retry wakes, finds itself cancelled and ends without touching
+        // Docker (which is disabled here and would fail permanently).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Arc::clone(&collector).retry_start("cid".into()),
+        )
+        .await
+        .expect("a cancelled retry must end");
+        assert!(collector.active_containers().await.is_empty());
+    }
+
+    // End to end against a real daemon: a running deployment container whose
+    // ownership lookup fails once (database blip) is still collected, because
+    // discovery retries it instead of dropping it for good.
+    #[tokio::test]
+    async fn test_container_is_collected_after_ownership_lookup_recovers() {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
+
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => Arc::new(docker),
+            _ => {
+                eprintln!("Skipping ownership retry test: Docker unavailable");
+                return;
+            }
+        };
+        let image = "alpine:3";
+        if docker.inspect_image(image).await.is_err() {
+            eprintln!("Skipping ownership retry test: {image} not present locally");
+            return;
+        }
+        let labels = HashMap::from([
+            (LABEL_PROJECT_ID.to_string(), "1".to_string()),
+            (LABEL_ENV.to_string(), "1".to_string()),
+            (LABEL_SERVICE.to_string(), "web".to_string()),
+            (LABEL_DEPLOY_ID.to_string(), "7".to_string()),
+        ]);
+        let created = docker
+            .create_container(
+                None::<CreateContainerOptions>,
+                ContainerCreateBody {
+                    image: Some(image.to_string()),
+                    cmd: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "while true; do echo tick; sleep 1; done".into(),
+                    ]),
+                    labels: Some(labels),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create test container");
+        let id = created.id;
+        docker
+            .start_container(
+                &id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start test container");
+
+        // Ownership lookup fails, then succeeds on retry; the resume-point
+        // lookup that follows finds no earlier chunk.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                "connection reset".into(),
+            ))])
+            .append_query_results(vec![vec![id_row(7)]])
+            .append_query_results(vec![
+                Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
+            ])
+            .into_connection();
+        let db = Arc::new(db);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
+        let chunk_writer =
+            ChunkWriterService::open(storage, Arc::new(NoopManifestSink), None, None)
+                .await
+                .unwrap();
+        let collector = Arc::new(
+            CollectorService::new(
+                Arc::new(temps_core::DockerHandle::available(docker.clone())),
+                chunk_writer,
+                Arc::new(LogMetadataService::new(db.clone())),
+                16,
+            )
+            .with_db(db),
+        );
+
+        let scheduled = collector.start_streaming_with_retry(&id).await;
+        let started_at_first = collector.active_containers().await.contains(&id);
+        let mut streaming = false;
+        for _ in 0..50 {
+            if collector.active_containers().await.contains(&id) {
+                streaming = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        collector.stop_streaming(&id).await;
+        let _ = docker
+            .remove_container(
+                &id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        scheduled.expect("a transient failure schedules a retry instead of failing");
+        assert!(!started_at_first, "the first attempt must have failed");
+        assert!(streaming, "the retry must start collecting the container");
+        assert!(collector.pending_starts.lock().await.is_empty());
     }
 }

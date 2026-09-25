@@ -848,7 +848,7 @@ fn spawn_local_container_discovery(
                 Ok(ids) => {
                     let count = ids.len();
                     for id in ids {
-                        if let Err(e) = startup_collector.start_streaming(&id).await {
+                        if let Err(e) = startup_collector.start_streaming_with_retry(&id).await {
                             tracing::warn!(
                                 container_id = %id,
                                 error = %e,
@@ -927,7 +927,9 @@ fn spawn_local_container_discovery(
                                     container_id = container_id,
                                     "Docker event: container started"
                                 );
-                                if let Err(e) = events_collector.start_streaming(container_id).await
+                                if let Err(e) = events_collector
+                                    .start_streaming_with_retry(container_id)
+                                    .await
                                 {
                                     tracing::debug!(
                                         container_id = container_id,

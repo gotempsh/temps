@@ -133,6 +133,11 @@ impl From<LogAggregatorError> for Problem {
                     .with_title("Docker Stream Error")
                     .with_detail(error.to_string())
             }
+            LogAggregatorError::ContainerContextLookupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Container Lookup Failed")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::StorageConfiguration { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Storage Configuration Error")

@@ -78,6 +78,17 @@ pub enum LogAggregatorError {
     #[error("Container '{container_id}' not found")]
     ContainerNotFound { container_id: String },
 
+    /// The database lookup that decides whether (and under which owner) a
+    /// container's logs are collected failed. Kept apart from
+    /// [`Self::DockerStreamFailed`] so its [`sea_orm::DbErr`] still decides
+    /// whether discovery retries the container.
+    #[error("Could not decide whether to collect logs for container '{container_id}': {source}")]
+    ContainerContextLookupFailed {
+        container_id: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     /// The local Docker daemon is not available in this serve profile.
     /// Container log streaming requires a Docker daemon on the same host.
     /// Remote logs are collected via the `RemoteLogCollectorService`.
@@ -191,35 +202,9 @@ impl LogAggregatorError {
                 | std::io::ErrorKind::Unsupported => RetryClass::Permanent,
                 _ => RetryClass::Transient,
             },
-            Self::Database(error) => match error {
-                sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => {
-                    RetryClass::Transient
-                }
-                sea_orm::DbErr::Exec(_) | sea_orm::DbErr::Query(_) => {
-                    if error.sql_err().is_some() {
-                        RetryClass::Permanent
-                    } else {
-                        // `sql_err` identifies the supported constraint
-                        // errors. Other runtime failures can include
-                        // serialization failures, deadlocks, and lost
-                        // connections, so stopping would strand recoverable
-                        // WAL.
-                        RetryClass::Transient
-                    }
-                }
-                sea_orm::DbErr::TryIntoErr { .. }
-                | sea_orm::DbErr::ConvertFromU64(_)
-                | sea_orm::DbErr::UnpackInsertId
-                | sea_orm::DbErr::UpdateGetPrimaryKey
-                | sea_orm::DbErr::RecordNotFound(_)
-                | sea_orm::DbErr::AttrNotSet(_)
-                | sea_orm::DbErr::Custom(_)
-                | sea_orm::DbErr::Type(_)
-                | sea_orm::DbErr::Json(_)
-                | sea_orm::DbErr::Migration(_)
-                | sea_orm::DbErr::RecordNotInserted
-                | sea_orm::DbErr::RecordNotUpdated => RetryClass::Permanent,
-            },
+            Self::Database(error) | Self::ContainerContextLookupFailed { source: error, .. } => {
+                db_retry_class(error)
+            }
             Self::CompressionFailed { .. }
             | Self::DecompressionFailed { .. }
             | Self::ChunkNotFound { .. }
@@ -235,6 +220,37 @@ impl LogAggregatorError {
             | Self::ChunkFormat { .. }
             | Self::ManifestConflictUnresolved { .. } => RetryClass::Permanent,
         }
+    }
+}
+
+/// Connection loss and non-constraint runtime failures can clear on their
+/// own; conversion, constraint and shape errors cannot.
+fn db_retry_class(error: &sea_orm::DbErr) -> RetryClass {
+    match error {
+        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => RetryClass::Transient,
+        sea_orm::DbErr::Exec(_) | sea_orm::DbErr::Query(_) => {
+            if error.sql_err().is_some() {
+                RetryClass::Permanent
+            } else {
+                // `sql_err` identifies the supported constraint errors. Other
+                // runtime failures can include serialization failures,
+                // deadlocks, and lost connections, so stopping would strand
+                // recoverable work.
+                RetryClass::Transient
+            }
+        }
+        sea_orm::DbErr::TryIntoErr { .. }
+        | sea_orm::DbErr::ConvertFromU64(_)
+        | sea_orm::DbErr::UnpackInsertId
+        | sea_orm::DbErr::UpdateGetPrimaryKey
+        | sea_orm::DbErr::RecordNotFound(_)
+        | sea_orm::DbErr::AttrNotSet(_)
+        | sea_orm::DbErr::Custom(_)
+        | sea_orm::DbErr::Type(_)
+        | sea_orm::DbErr::Json(_)
+        | sea_orm::DbErr::Migration(_)
+        | sea_orm::DbErr::RecordNotInserted
+        | sea_orm::DbErr::RecordNotUpdated => RetryClass::Permanent,
     }
 }
 
