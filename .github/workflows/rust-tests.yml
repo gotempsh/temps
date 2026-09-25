@@ -118,6 +118,18 @@ jobs:
     # tighter bound would turn a slow run into a failed one.
     timeout-minutes: 100
     steps:
+      # The runner starts with ~27GiB free. The restored cache archive, its
+      # extracted target dir, the build and the archive written on save all
+      # need room at once: with the 21GB entry, restores aborted partway and a
+      # save died with "No space left on device", which left its key reserved
+      # so later runs could not save either. Same cleanup as the test jobs.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
