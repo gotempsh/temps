@@ -125,12 +125,11 @@ fn is_intentionally_stopped(status: Option<&str>) -> bool {
 
 /// Whether the container's exit is still covered by its intentional-stop
 /// marker. A user-stopped (`"stopped"`) container that Docker reports as
-/// started after the start we last recorded ran again since the stop — by
-/// hand or through a restart policy — so a new exit is a real crash even if
-/// the restart and the crash both fell between two polls. (Rows carry no
-/// stop timestamp, so a restart followed by another user stop inside a
-/// single poll interval is also treated as a crash — one alarm, rather than
-/// silently missing real crashes.)
+/// started after the stop ran again since — by hand or through a restart
+/// policy — so a new exit is a real crash even if the restart and the crash
+/// both fell between two polls. The stop time is the row's `finished_at`,
+/// written by the stop itself; rows stopped before that was recorded fall
+/// back to the last start the monitor saw.
 fn exit_is_intentional(
     container: &deployment_containers::Model,
     info: &temps_deployer::ContainerInfo,
@@ -138,10 +137,11 @@ fn exit_is_intentional(
     if !is_intentionally_stopped(container.status.as_deref()) {
         return false;
     }
+    let stopped_at = container.finished_at.or(container.started_at);
     let restarted_since_stop = container.status.as_deref() == Some("stopped")
         && matches!(
-            (container.started_at, info.started_at),
-            (Some(recorded), Some(observed)) if observed > recorded
+            (stopped_at, info.started_at),
+            (Some(stopped_at), Some(started_at)) if started_at > stopped_at
         );
     !restarted_since_stop
 }
@@ -807,12 +807,19 @@ impl ContainerHealthMonitor {
         } else {
             Some(info.status.to_string())
         };
+        // While the marker stands, `finished_at` is the stop time the
+        // restart check compares against: never erase it with a missing value.
+        let finished_at = if intentional {
+            info.finished_at.or(container.finished_at)
+        } else {
+            info.finished_at
+        };
         let unchanged = container.status == new_status
             && container.exit_code == info.exit_code
             && container.exit_reason == info.exit_reason
             && container.oom_killed == info.oom_killed
             && container.error_message == info.error_message
-            && container.finished_at == info.finished_at;
+            && container.finished_at == finished_at;
         if unchanged {
             return;
         }
@@ -824,7 +831,7 @@ impl ContainerHealthMonitor {
             exit_reason: Set(info.exit_reason.clone()),
             oom_killed: Set(info.oom_killed),
             error_message: Set(info.error_message.clone()),
-            finished_at: Set(info.finished_at),
+            finished_at: Set(finished_at),
             ..Default::default()
         };
 
@@ -2732,5 +2739,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status.as_deref(), Some("exited"));
+    }
+
+    #[tokio::test]
+    async fn restart_then_user_stop_between_polls_does_not_alarm() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        let last_seen_start = chrono::Utc::now() - chrono::Duration::hours(1);
+        let stopped_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(last_seen_start)),
+            finished_at: Set(Some(stopped_at)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        // Restarted after the last poll, then stopped by the user before the
+        // next one: Docker's start time is newer than the recorded start but
+        // older than the stop.
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_at - chrono::Duration::minutes(1)),
+            )
+            .await;
+
+        assert!(fixture.alarms().await.is_empty());
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+    }
+
+    #[tokio::test]
+    async fn crash_after_restart_following_recorded_stop_alarms() {
+        use sea_orm::ActiveModelTrait;
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let container = fixture.container(&current, "stopped").await;
+        let stopped_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        deployment_containers::ActiveModel {
+            id: Set(container.id),
+            started_at: Set(Some(stopped_at - chrono::Duration::hours(1))),
+            finished_at: Set(Some(stopped_at)),
+            ..Default::default()
+        }
+        .update(fixture.db.as_ref())
+        .await
+        .unwrap();
+
+        fixture
+            .poll(
+                ContainerStatus::Exited,
+                Some(stopped_at + chrono::Duration::minutes(1)),
+            )
+            .await;
+
+        assert_eq!(fixture.alarms().await.len(), 1);
     }
 }

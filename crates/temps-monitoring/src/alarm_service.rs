@@ -22,7 +22,7 @@ use temps_core::notifications::{
 use temps_core::{Job, JobQueue};
 use temps_entities::alarms;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Alarm types that the system can fire
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -833,8 +833,8 @@ impl AlarmService {
         use std::collections::HashSet;
 
         let eligible = action.eligible_statuses();
-        // Every fallible read happens before the write: once the UPDATE
-        // commits, a later error would skip the resolution jobs and the
+        // Every read that may fail the request happens before the write: once
+        // the UPDATE commits, an error would skip the resolution jobs and the
         // caller's audit record, and a retry could not restore them because
         // the alarms are no longer eligible.
         let (target_ids, requested, matching_before) = match &selector {
@@ -946,11 +946,34 @@ impl AlarmService {
             })?;
         updated.sort_by_key(|alarm| alarm.id);
 
-        // Advisory only: derived from the count taken before the update, so
-        // alarms fired or transitioned concurrently can make it drift.
-        // Callers loop until it reaches zero, and every round re-selects
-        // from the live table.
-        let remaining = matching_before.saturating_sub(updated.len() as u64);
+        // Advisory: callers loop until it reaches zero, and every round
+        // re-selects from the live table. Counted after the update so an
+        // alarm that became eligible mid-request is still reported. The
+        // write has committed by now, so a failed count must not fail the
+        // request (that would skip the resolution jobs and the audit
+        // record); fall back to the estimate from the pre-update count.
+        let remaining = match &selector {
+            BulkAlarmSelector::Ids(_) => 0,
+            BulkAlarmSelector::Matching(filters) => match alarms::Entity::find()
+                .filter(project_id_filter(project_id))
+                .filter(alarm_filters_condition(filters))
+                .filter(alarms::Column::Status.is_in(eligible.iter().copied()))
+                .count(self.db.as_ref())
+                .await
+            {
+                Ok(remaining) => remaining,
+                Err(e) => {
+                    let estimate = matching_before.saturating_sub(updated.len() as u64);
+                    warn!(
+                        project_id = ?project_id,
+                        estimate,
+                        error = %e,
+                        "Failed to count alarms remaining after bulk update; reporting the pre-update estimate"
+                    );
+                    estimate
+                }
+            },
+        };
 
         info!(
             project_id = ?project_id,

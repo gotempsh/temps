@@ -4089,10 +4089,12 @@ impl DeploymentService {
             let retry = temps_core::retry::RetryConfig::new(3)
                 .with_base_delay(std::time::Duration::from_millis(100))
                 .with_max_delay(std::time::Duration::from_secs(2));
+            let stopped_at = chrono::Utc::now();
             let update_result = retry
                 .retry(|| async {
                     let active_container = deployment_containers::ActiveModel {
                         status: Set(Some("stopped".to_string())),
+                        finished_at: Set(Some(stopped_at)),
                         ..deployment_containers::ActiveModel::from(container.clone())
                     };
                     active_container.update(self.db.as_ref()).await
@@ -5261,9 +5263,11 @@ impl DeploymentService {
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
 
-        // Update container status in database
+        // Update container status in database. The stop time lets the health
+        // monitor tell this stop apart from a later restart and crash.
         let mut active_container: deployment_containers::ActiveModel = container.into();
         active_container.status = Set(Some("stopped".to_string()));
+        active_container.finished_at = Set(Some(chrono::Utc::now()));
         active_container.update(self.db.as_ref()).await?;
 
         // Same reasoning as `pause_deployment`: this status UPDATE fires no
@@ -8810,6 +8814,10 @@ mod tests {
             .expect("Container should exist");
 
         assert_eq!(updated_container.status, Some("stopped".to_string()));
+        assert!(
+            updated_container.finished_at.is_some(),
+            "the stop time is recorded for the health monitor"
+        );
 
         Ok(())
     }
