@@ -20,7 +20,7 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
-import { positiveInteger } from '@/lib/global-observability'
+import { facetProjectLabels, positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -142,9 +142,7 @@ export default function GlobalLogs() {
   // Facets count the whole time range, so they can name projects that have
   // no line on the loaded page. The facet response names them itself, under
   // the same log access — so reading logs never also requires permission to
-  // read projects. An id it could not name is a project this instance no
-  // longer has (deleted, or lines collected before it existed), shown as
-  // unknown rather than under a name-shaped placeholder.
+  // read projects.
   const facetProjectIds = [
     ...new Set(
       facetValues(facets.data, 'project_id').flatMap((item) => {
@@ -153,13 +151,12 @@ export default function GlobalLogs() {
       })
     ),
   ]
-  const facetProjectNames = facets.data?.project_names ?? {}
-  const projectLabels = Object.fromEntries(
-    facetProjectIds.map((id) => [
-      String(id),
-      facetProjectNames[String(id)] ?? `Unknown project #${id}`,
-    ])
-  )
+  const { labels: projectLabels, existing: facetProjectsThatExist } =
+    facetProjectLabels(
+      facetProjectIds,
+      // Optional in practice: a server predating the field omits it.
+      facets.data?.project_names as Record<string, string> | undefined
+    )
 
   // Environment IDs are all the store keeps; the interface presents slugs.
   // Resolved per-project rather than globally, since two projects can reuse
@@ -171,7 +168,7 @@ export default function GlobalLogs() {
       ...lines.flatMap((line) =>
         line.project_id != null ? [line.project_id] : []
       ),
-      ...facetProjectIds.filter((id) => String(id) in facetProjectNames),
+      ...facetProjectsThatExist,
     ]),
   ]
   const environmentQueries = useQueries({

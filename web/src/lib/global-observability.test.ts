@@ -8,6 +8,7 @@ import {
   positiveInteger,
   readObservationWindow,
   normalizeObservationWindow,
+  facetProjectLabels,
 } from './global-observability'
 
 const now = Date.parse('2026-09-09T12:00:00Z')
@@ -102,4 +103,20 @@ test('custom windows and legacy one-day links retain their meaning', () => {
     readObservationWindow(new URLSearchParams('range=custom&from=invalid'), now)
       .range
   ).toBe('1d')
+})
+
+describe('facetProjectLabels', () => {
+  test('names projects the server resolved and marks the rest unknown', () => {
+    expect(facetProjectLabels([1, 2], { '1': 'storefront' })).toEqual({
+      labels: { '1': 'storefront', '2': 'Unknown project #2' },
+      existing: [1],
+    })
+  })
+
+  test('a server that sends no names does not make every project unknown', () => {
+    expect(facetProjectLabels([1, 2], undefined)).toEqual({
+      labels: {},
+      existing: [1, 2],
+    })
+  })
 })
