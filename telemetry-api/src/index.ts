@@ -6,6 +6,7 @@ import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";
 import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
+import { errorFields, log } from "./log.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
 
@@ -15,7 +16,7 @@ async function main() {
   const client = await pool.connect();
   await client.query("SELECT 1");
   client.release();
-  console.log("[server] database connection ok");
+  log("info", "server", "database connection ok");
 
   // Load the GeoLite2-Country DB once. Required in production: a missing or
   // unusable DB fails startup (and so the deploy's health check) instead of
@@ -66,15 +67,15 @@ async function main() {
       return Response.json({ error: "not found" }, { status: 404 });
     },
     error(err) {
-      console.error("[server] unhandled error:", err);
+      log("error", "server", "unhandled error", errorFields(err));
       return Response.json({ error: "internal server error" }, { status: 500 });
     },
   });
 
-  console.log(`[server] temps telemetry API listening on http://localhost:${server.port}`);
+  log("info", "server", "temps telemetry API listening", { port: server.port });
 }
 
 main().catch((err) => {
-  console.error("[server] startup failed:", err);
+  log("error", "server", "startup failed", errorFields(err));
   process.exit(1);
 });

@@ -11,18 +11,16 @@
 // The DB is loaded once at startup. In production it is REQUIRED: without it
 // every event silently stores a NULL country, which once went unnoticed for
 // weeks. `initGeo({ required: true })` therefore throws, the process exits, and
-// the deployment fails its health check instead of shipping. Outside
-// production a missing DB degrades gracefully to `null` country. Deployments
-// that deliberately run without geolocation set GEOLITE2_COUNTRY_DB=disabled.
+// the deployment fails its health check instead of shipping. The Dockerfile
+// runs the same check at build time (src/verify-geo.ts). Outside production a
+// missing DB degrades gracefully to `null` country.
 
 import { open, type Reader, type CountryResponse } from "maxmind";
+import { errorFields, log } from "./log.js";
 
 // Path to the GeoLite2-Country.mmdb inside the image (provisioned at build).
 // An empty value means "unset", not a path.
 const DB_PATH = process.env.GEOLITE2_COUNTRY_DB || "/app/data/GeoLite2-Country.mmdb";
-
-// Explicit opt-out value for GEOLITE2_COUNTRY_DB.
-export const GEO_DISABLED = "disabled";
 
 // A stable public IP that every GeoLite2 Country/City release resolves. A file
 // that opens but can't resolve it is truncated or the wrong database.
@@ -51,28 +49,23 @@ export async function initGeo(opts: { required: boolean; path?: string }): Promi
   const path = opts.path ?? DB_PATH;
   _reader = null;
 
-  if (path === GEO_DISABLED) {
-    console.warn("[geo] GEOLITE2_COUNTRY_DB=disabled; country geolocation disabled");
-    return;
-  }
-
   try {
     _reader = await openCountryDb(path);
-    console.log(`[geo] loaded GeoLite2-Country from ${path}`);
+    log("info", "geo", "loaded GeoLite2-Country", { path });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     if (opts.required) {
       throw new Error(
-        `[geo] GeoLite2-Country DB not usable at ${path} (${reason}). Country ` +
-          `geolocation is required in production: place GeoLite2-Country.mmdb in ` +
-          `telemetry-api/data/ before building the image (or point ` +
-          `GEOLITE2_COUNTRY_DB at a valid DB), or set ` +
-          `GEOLITE2_COUNTRY_DB=${GEO_DISABLED} to run without it.`
+        `GeoLite2-Country DB not usable at ${path} (${reason}). Country ` +
+          `geolocation is required in production: place GeoLite2-Country.mmdb ` +
+          `in telemetry-api/data/ before building the image, or point ` +
+          `GEOLITE2_COUNTRY_DB at a valid DB.`
       );
     }
-    console.warn(
-      `[geo] GeoLite2-Country DB not usable at ${path} (${reason}); country geolocation disabled`
-    );
+    log("warn", "geo", "GeoLite2-Country DB not usable; country geolocation disabled", {
+      path,
+      ...errorFields(err),
+    });
   }
 }
 

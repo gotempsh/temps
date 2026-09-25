@@ -5,7 +5,7 @@ import { describe, it, expect, afterAll } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { countryForIp, GEO_DISABLED, initGeo } from "./geo.js";
+import { countryForIp, initGeo } from "./geo.js";
 
 // The real DB is gitignored (MaxMind license), so tests that need it only run
 // where it has been provisioned locally.
@@ -21,7 +21,7 @@ describe("initGeo", () => {
     const err = await initGeo({ required: true, path: missing }).catch((e) => e);
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toContain(missing);
-    expect(err.message).toContain(`GEOLITE2_COUNTRY_DB=${GEO_DISABLED}`);
+    expect(err.message).toContain("telemetry-api/data/");
     expect(countryForIp("8.8.8.8")).toBeNull();
   });
 
@@ -36,14 +36,28 @@ describe("initGeo", () => {
     expect(countryForIp("8.8.8.8")).toBeNull();
   });
 
-  it("lets a deployment opt out explicitly even when required", async () => {
-    await initGeo({ required: true, path: GEO_DISABLED });
-    expect(countryForIp("8.8.8.8")).toBeNull();
-  });
-
   it.skipIf(!HAS_REAL_DB)("loads a real DB and resolves public IPs only", async () => {
     await initGeo({ required: true, path: REAL_DB });
     expect(countryForIp("8.8.8.8")).toBe("US");
     expect(countryForIp("10.0.0.1")).toBeNull();
+  });
+});
+
+describe("verify-geo.ts (Dockerfile build step)", () => {
+  const script = join(import.meta.dir, "verify-geo.ts");
+  const run = (path: string) =>
+    Bun.spawnSync(["bun", script], { env: { ...process.env, GEOLITE2_COUNTRY_DB: path } });
+
+  it("fails the build with a structured error when the DB is missing", () => {
+    const res = run(join(tmp, "nope.mmdb"));
+    expect(res.exitCode).toBe(1);
+    const line = JSON.parse(res.stderr.toString().trim().split("\n").pop()!);
+    expect(line.level).toBe("error");
+    expect(line.component).toBe("geo");
+    expect(line.error).toContain("nope.mmdb");
+  });
+
+  it.skipIf(!HAS_REAL_DB)("passes with a real DB", () => {
+    expect(run(REAL_DB).exitCode).toBe(0);
   });
 });

@@ -9,6 +9,7 @@ import {
   insertEvent,
   type IngestBody,
 } from "../db/events.js";
+import { errorFields, log } from "../log.js";
 
 // Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
@@ -184,10 +185,14 @@ async function backfillBestEffort(
   events: IngestBody[],
   country: string | null
 ): Promise<void> {
+  const targets = backfillTargets(events);
   try {
-    await backfillCountry(pool, backfillTargets(events), country);
+    await backfillCountry(pool, targets, country);
   } catch (err) {
-    console.error("[events] country backfill failed (event kept):", err);
+    log("error", "events", "country backfill failed (event kept)", {
+      instances: targets.length,
+      ...errorFields(err),
+    });
   }
 }
 
@@ -216,7 +221,7 @@ export function createEventsRoutes(
       try {
         await insertEvent(pool, parsed, country);
       } catch (err) {
-        console.error("[events] db insert failed:", err);
+        log("error", "events", "db insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
       await backfillBestEffort(pool, [parsed], country);
@@ -267,7 +272,7 @@ export function createEventsRoutes(
         // Insert all events concurrently (pool handles connection reuse)
         await Promise.all(parsed.map((e) => insertEvent(pool, e, country)));
       } catch (err) {
-        console.error("[events] batch insert failed:", err);
+        log("error", "events", "batch insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
       // After the inserts, so it can't race them; one statement for the batch.
