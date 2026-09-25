@@ -224,7 +224,8 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       await expect
         .poll(() => span(windows[windows.length - 1]))
         .toBe(6 * 3600000)
-      const beforeReload = windows.length
+      const requestsBeforeReload = windows.length
+      const windowBeforeReload = windows[requestsBeforeReload - 1]
       await page.reload()
       if (kind === 'logs')
         await expect(
@@ -241,13 +242,20 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       const reloaded = new URL(page.url()).searchParams
       expect(reloaded.get('range')).toBe('6h')
       expect(reloaded.has('from')).toBe(false)
+      // A rolling preset must resolve a new window on reload, not replay the
+      // bounds it queried before.
       await expect
-        .poll(() =>
-          windows.length > beforeReload
-            ? span(windows[windows.length - 1])
-            : undefined
-        )
-        .toBe(6 * 3600000)
+        .poll(() => {
+          if (windows.length <= requestsBeforeReload) return undefined
+          const latest = windows[windows.length - 1]
+          return {
+            span: span(latest),
+            advanced:
+              Date.parse(latest.from!) > Date.parse(windowBeforeReload.from!) &&
+              Date.parse(latest.to!) > Date.parse(windowBeforeReload.to!),
+          }
+        })
+        .toEqual({ span: 6 * 3600000, advanced: true })
       expect(
         await page.evaluate(
           () => document.documentElement.scrollWidth <= window.innerWidth
