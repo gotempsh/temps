@@ -11,10 +11,26 @@ import {
   resolveAlarmMutation,
   silenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { AlarmResponse } from '@/api/client/types.gen'
+import { bulkUpdateProjectAlarms } from '@/api/client'
+import type {
+  AlarmResponse,
+  BulkAlarmActionRequest,
+  BulkAlarmRequest,
+} from '@/api/client/types.gen'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,12 +57,27 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { AlarmClock, BellOff, Check, CheckCircle2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+import {
+  actionAppliesTo,
+  type AlarmSelection,
+  bulkRequestFor,
+  canSelectAllMatching,
+  EMPTY_SELECTION,
+  isRowSelected,
+  isSelectable,
+  pageCheckState,
+  selectableIds,
+  selectionCount,
+  toggleRow,
+  togglePage,
+} from './alarmBulkSelection'
 
 const SILENCE_OPTIONS = [
   { label: '1 hour', hours: 1 },
@@ -57,6 +88,39 @@ const SILENCE_OPTIONS = [
 
 const PAGE_SIZE = 20
 const ALL = '__all__'
+
+/**
+ * Follow-up requests allowed for one "all matching" action. The server
+ * changes at most 1000 alarms per request and reports how many remain, so
+ * this clears up to 20k before asking the user to run it again instead of
+ * looping forever against a source that keeps firing.
+ */
+const MAX_BULK_ROUNDS = 20
+
+interface BulkTotals {
+  updated: number
+  skipped: number
+  remaining: number
+}
+
+function bulkSuccessMessage(
+  action: BulkAlarmActionRequest,
+  totals: BulkTotals
+): string {
+  const verb = action === 'acknowledge' ? 'Acknowledged' : 'Resolved'
+  if (totals.updated === 0) {
+    return action === 'acknowledge'
+      ? 'No firing alarms to acknowledge'
+      : 'No active alarms to resolve'
+  }
+  return `${verb} ${totals.updated} alarm${totals.updated === 1 ? '' : 's'}`
+}
+
+function selectionLabel(selection: AlarmSelection): string {
+  const count = selectionCount(selection)
+  if (count == null) return 'All active alarms matching the current filters'
+  return `${count} selected`
+}
 
 // ── Display helpers (no IFEs in JSX) ──────────────────────────────────────
 
@@ -150,6 +214,11 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [severity, setSeverity] = useState<string>(ALL)
   const [alarmType, setAlarmType] = useState<string>(ALL)
   const [page, setPage] = useState(1)
+  const [selection, setSelection] = useState<AlarmSelection>(EMPTY_SELECTION)
+  // Filter-wide actions can touch alarms on other pages, so they are
+  // confirmed first; explicit row selections run immediately.
+  const [confirmAction, setConfirmAction] =
+    useState<BulkAlarmActionRequest | null>(null)
 
   const { data: projectsData, isLoading: projectsLoading } = useQuery(
     getProjectsOptions({ query: { per_page: 100 } })
@@ -247,12 +316,74 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
   })
 
+  const bulk = useMutation({
+    mutationFn: async (body: BulkAlarmRequest): Promise<BulkTotals> => {
+      const totals: BulkTotals = { updated: 0, skipped: 0, remaining: 0 }
+      for (let round = 0; round < MAX_BULK_ROUNDS; round++) {
+        const { data: result } = await bulkUpdateProjectAlarms({
+          path: projectPath,
+          body,
+          throwOnError: true,
+        })
+        totals.updated += result.updated
+        totals.skipped += result.skipped
+        totals.remaining = result.remaining
+        if (result.remaining === 0 || result.updated === 0) break
+      }
+      return totals
+    },
+    onSuccess: (totals, body) => {
+      toast.success(bulkSuccessMessage(body.action, totals), {
+        description:
+          totals.remaining > 0
+            ? `${totals.remaining} more matching alarm(s) remain — run it again to continue.`
+            : undefined,
+      })
+      setSelection(EMPTY_SELECTION)
+      invalidate()
+    },
+    onError: (error: unknown, body) =>
+      toast.error(
+        getErrorMessage(error, `Failed to ${body.action} alarms`)
+      ),
+  })
+
+  const runBulk = (action: BulkAlarmActionRequest) => {
+    if (selection.kind === 'all-matching') {
+      setConfirmAction(action)
+      return
+    }
+    bulk.mutate(bulkRequestFor(action, selection, {}))
+  }
+
+  const confirmBulk = () => {
+    if (confirmAction == null) return
+    bulk.mutate(
+      bulkRequestFor(confirmAction, selection, {
+        status: status === ALL ? undefined : status,
+        severity: severity === ALL ? undefined : severity,
+        alarmType: alarmType === ALL ? undefined : alarmType,
+      })
+    )
+    setConfirmAction(null)
+  }
+
+  // A selection only makes sense for the list it was made on.
+  useEffect(() => {
+    setSelection(EMPTY_SELECTION)
+  }, [effectiveProjectId, status, severity, alarmType, page])
+
   const items = useMemo(() => data?.items ?? [], [data])
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
   const isMutating =
-    acknowledge.isPending || resolve.isPending || silence.isPending
+    acknowledge.isPending ||
+    resolve.isPending ||
+    silence.isPending ||
+    bulk.isPending
+  const hasSelection = selectionCount(selection) !== 0
+  const pageSelectable = selectableIds(items).length > 0
 
   // Once the deep-linked alarm's row is on the page, scroll it into view. The
   // row itself keeps a persistent highlight (below) while the param is present.
@@ -302,7 +433,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
             <p className="text-sm text-muted-foreground">
               Firing history across metrics, containers, uptime, and databases —
-              acknowledge or resolve from one place.
+              acknowledge or resolve from one place, one at a time or in bulk
+              by selecting rows.
             </p>
           </div>
         )}
@@ -409,10 +541,71 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
 
       {/* Table */}
       <Card>
+        {hasSelection && (
+          <div className="flex flex-col gap-2 border-b bg-muted/40 px-3 py-2 sm:flex-row sm:items-center">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+              <span className="font-medium">{selectionLabel(selection)}</span>
+              {canSelectAllMatching(selection, items, total) && (
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0"
+                  onClick={() => setSelection({ kind: 'all-matching' })}
+                >
+                  Select all alarms matching these filters
+                </Button>
+              )}
+            </div>
+            <div className="flex gap-1 sm:ml-auto">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={
+                  isMutating ||
+                  !actionAppliesTo('acknowledge', selection, items)
+                }
+                onClick={() => runBulk('acknowledge')}
+              >
+                <Check className="mr-1 h-3.5 w-3.5" />
+                Acknowledge
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={
+                  isMutating || !actionAppliesTo('resolve', selection, items)
+                }
+                onClick={() => runBulk('resolve')}
+              >
+                <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
+                Resolve
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={bulk.isPending}
+                onClick={() => setSelection(EMPTY_SELECTION)}
+              >
+                <X className="mr-1 h-3.5 w-3.5" />
+                Clear
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="overflow-x-auto">
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-[40px]">
+                  <Checkbox
+                    aria-label="Select all active alarms on this page"
+                    checked={pageCheckState(selection, items)}
+                    disabled={!pageSelectable || isMutating}
+                    onCheckedChange={() =>
+                      setSelection(togglePage(selection, items))
+                    }
+                  />
+                </TableHead>
                 <TableHead className="w-[110px]">Severity</TableHead>
                 <TableHead>Alarm</TableHead>
                 <TableHead className="hidden lg:table-cell">Scope</TableHead>
@@ -426,7 +619,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             <TableBody>
               {!hasProject && !projectsLoading ? (
                 <TableRow className="hover:bg-transparent">
-                  <TableCell colSpan={6} className="p-0">
+                  <TableCell colSpan={7} className="p-0">
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
@@ -438,6 +631,9 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               ) : alarmsLoading || (projectsLoading && !hasProject) ? (
                 Array.from({ length: 6 }).map((_, i) => (
                   <TableRow key={i}>
+                    <TableCell>
+                      <Skeleton className="h-4 w-4" />
+                    </TableCell>
                     <TableCell>
                       <Skeleton className="h-5 w-16" />
                     </TableCell>
@@ -460,7 +656,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 ))
               ) : items.length === 0 ? (
                 <TableRow className="hover:bg-transparent">
-                  <TableCell colSpan={6} className="p-0">
+                  <TableCell colSpan={7} className="p-0">
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
@@ -478,11 +674,24 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                   <TableRow
                     key={alarm.id}
                     data-alarm-id={alarm.id}
+                    data-state={
+                      isRowSelected(selection, alarm) ? 'selected' : undefined
+                    }
                     className={cn(
                       deepLinkAlarmId === alarm.id &&
                         'bg-primary/5 ring-1 ring-inset ring-primary/40'
                     )}
                   >
+                    <TableCell>
+                      <Checkbox
+                        aria-label={`Select alarm ${alarm.title}`}
+                        checked={isRowSelected(selection, alarm)}
+                        disabled={!isSelectable(alarm) || isMutating}
+                        onCheckedChange={() =>
+                          setSelection(toggleRow(selection, alarm.id))
+                        }
+                      />
+                    </TableCell>
                     <TableCell>{severityBadge(alarm.severity)}</TableCell>
                     <TableCell>
                       <div className="font-medium">{alarm.title}</div>
@@ -636,6 +845,36 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         </div>
       )}
+
+      <AlertDialog
+        open={confirmAction != null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmAction(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmAction === 'acknowledge'
+                ? 'Acknowledge all matching alarms?'
+                : 'Resolve all matching alarms?'}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmAction === 'acknowledge'
+                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmBulk}>
+              {confirmAction === 'acknowledge'
+                ? 'Acknowledge all'
+                : 'Resolve all'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

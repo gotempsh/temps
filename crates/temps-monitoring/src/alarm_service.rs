@@ -245,6 +245,12 @@ pub enum AlarmError {
 
     #[error("Queue error for alarm {alarm_id}: {reason}")]
     Queue { alarm_id: i32, reason: String },
+
+    #[error("Invalid bulk alarm request for project {project_id:?}: {reason}")]
+    InvalidBulkRequest {
+        project_id: Option<i32>,
+        reason: String,
+    },
 }
 
 impl From<sea_orm::DbErr> for AlarmError {
@@ -265,6 +271,75 @@ fn project_id_filter(project_id: Option<i32>) -> sea_orm::sea_query::SimpleExpr 
         Some(id) => alarms::Column::ProjectId.eq(id),
         None => alarms::Column::ProjectId.is_null(),
     }
+}
+
+/// Condition matching the optional list filters of [`AlarmFilters`]. Shared
+/// by listing and bulk updates so "everything matching these filters" means
+/// exactly what the list view shows.
+fn alarm_filters_condition(filters: &AlarmFilters) -> Condition {
+    let mut condition = Condition::all();
+    if let Some(environment_id) = filters.environment_id {
+        condition = condition.add(alarms::Column::EnvironmentId.eq(environment_id));
+    }
+    if let Some(deployment_id) = filters.deployment_id {
+        condition = condition.add(alarms::Column::DeploymentId.eq(deployment_id));
+    }
+    if let Some(alarm_type) = &filters.alarm_type {
+        condition = condition.add(alarms::Column::AlarmType.eq(alarm_type.as_str()));
+    }
+    if let Some(status) = &filters.status {
+        condition = condition.add(alarms::Column::Status.eq(status.as_str()));
+    }
+    if let Some(severity) = &filters.severity {
+        condition = condition.add(alarms::Column::Severity.eq(severity.as_str()));
+    }
+    condition
+}
+
+/// Maximum alarms changed by one bulk request. Selecting "all matching" on a
+/// long-running noisy alarm can match thousands of rows; each resolved alarm
+/// also emits an `AlarmResolved` job, so a request is bounded and reports
+/// how many matching alarms remain for the caller to continue.
+pub const MAX_BULK_ALARM_UPDATE: u64 = 1000;
+
+/// Lifecycle transition applied by [`AlarmService::bulk_update_alarms`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkAlarmAction {
+    /// Firing → acknowledged. Already acknowledged/resolved alarms are skipped.
+    Acknowledge,
+    /// Firing or acknowledged → resolved. Already resolved alarms are skipped.
+    Resolve,
+}
+
+impl BulkAlarmAction {
+    fn eligible_statuses(self) -> &'static [&'static str] {
+        match self {
+            Self::Acknowledge => &["firing"],
+            Self::Resolve => &["firing", "acknowledged"],
+        }
+    }
+}
+
+/// Which alarms a bulk request targets.
+#[derive(Debug)]
+pub enum BulkAlarmSelector {
+    /// Explicit alarm IDs (e.g. the rows selected in the console).
+    Ids(Vec<i32>),
+    /// Every alarm matching the list filters.
+    Matching(AlarmFilters),
+}
+
+/// Result of a bulk alarm update.
+#[derive(Debug, Default)]
+pub struct BulkAlarmOutcome {
+    /// Alarms that transitioned, oldest first.
+    pub updated_ids: Vec<i32>,
+    /// Requested alarms left unchanged because they were already in (or past)
+    /// the target state. Always 0 for [`BulkAlarmSelector::Matching`].
+    pub skipped: u64,
+    /// Matching, still-eligible alarms not processed because the request hit
+    /// [`MAX_BULK_ALARM_UPDATE`]. Always 0 for [`BulkAlarmSelector::Ids`].
+    pub remaining: u64,
 }
 
 pub struct AlarmService {
@@ -732,6 +807,190 @@ impl AlarmService {
         Ok(())
     }
 
+    /// Acknowledge or resolve many alarms in one request.
+    ///
+    /// `project_id: None` scopes to host/control-plane-wide (system) alarms.
+    /// Explicit IDs outside that scope are rejected rather than silently
+    /// ignored, so a caller cannot touch another project's alarms and always
+    /// learns when its selection was stale. Alarms already in (or past) the
+    /// target state are skipped, matching the single-alarm endpoints.
+    ///
+    /// The transition is one guarded `UPDATE … RETURNING` in a transaction,
+    /// so concurrent single-alarm actions cannot double-transition a row.
+    /// Resolving emits an `AlarmResolved` job per alarm for integrations, but
+    /// does not send a per-alarm recovery notification: an operator clearing
+    /// a backlog is not a recovery, and hundreds of "resolved" messages would
+    /// flood every notification channel.
+    pub async fn bulk_update_alarms(
+        &self,
+        project_id: Option<i32>,
+        selector: BulkAlarmSelector,
+        action: BulkAlarmAction,
+        user_id: i32,
+    ) -> Result<BulkAlarmOutcome, AlarmError> {
+        use sea_orm::{sea_query::Expr, QuerySelect, TransactionTrait};
+
+        let eligible = action.eligible_statuses();
+        let (target_ids, requested) = match &selector {
+            BulkAlarmSelector::Ids(ids) => {
+                let mut ids = ids.clone();
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() {
+                    return Err(AlarmError::InvalidBulkRequest {
+                        project_id,
+                        reason: "alarm_ids must contain at least one alarm".to_string(),
+                    });
+                }
+                if ids.len() as u64 > MAX_BULK_ALARM_UPDATE {
+                    return Err(AlarmError::InvalidBulkRequest {
+                        project_id,
+                        reason: format!(
+                            "{} alarm_ids requested; at most {MAX_BULK_ALARM_UPDATE} per request",
+                            ids.len()
+                        ),
+                    });
+                }
+                let in_scope: Vec<i32> = alarms::Entity::find()
+                    .select_only()
+                    .column(alarms::Column::Id)
+                    .filter(project_id_filter(project_id))
+                    .filter(alarms::Column::Id.is_in(ids.clone()))
+                    .into_tuple()
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(|e| AlarmError::Database {
+                        operation: format!("load {} alarm(s) for bulk update", ids.len()),
+                        reason: e.to_string(),
+                    })?;
+                if in_scope.len() != ids.len() {
+                    let missing = ids
+                        .iter()
+                        .find(|id| !in_scope.contains(id))
+                        .copied()
+                        .unwrap_or_default();
+                    return Err(AlarmError::NotFound {
+                        alarm_id: missing,
+                        project_id,
+                    });
+                }
+                let requested = ids.len() as u64;
+                (ids, requested)
+            }
+            BulkAlarmSelector::Matching(filters) => {
+                let ids: Vec<i32> = alarms::Entity::find()
+                    .select_only()
+                    .column(alarms::Column::Id)
+                    .filter(project_id_filter(project_id))
+                    .filter(alarm_filters_condition(filters))
+                    .filter(alarms::Column::Status.is_in(eligible.iter().copied()))
+                    .order_by(alarms::Column::FiredAt, Order::Asc)
+                    .order_by(alarms::Column::Id, Order::Asc)
+                    .limit(MAX_BULK_ALARM_UPDATE)
+                    .into_tuple()
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(|e| AlarmError::Database {
+                        operation: "select matching alarms for bulk update".to_string(),
+                        reason: e.to_string(),
+                    })?;
+                (ids, 0)
+            }
+        };
+
+        if target_ids.is_empty() {
+            return Ok(BulkAlarmOutcome::default());
+        }
+
+        let now = Utc::now();
+        let mut update = alarms::Entity::update_many()
+            .col_expr(alarms::Column::UpdatedAt, Expr::value(now))
+            .filter(project_id_filter(project_id))
+            .filter(alarms::Column::Id.is_in(target_ids.clone()))
+            .filter(alarms::Column::Status.is_in(eligible.iter().copied()));
+        update = match action {
+            BulkAlarmAction::Acknowledge => update
+                .col_expr(
+                    alarms::Column::Status,
+                    Expr::value(AlarmStatus::Acknowledged.as_str()),
+                )
+                .col_expr(alarms::Column::AcknowledgedAt, Expr::value(Some(now)))
+                .col_expr(alarms::Column::AcknowledgedBy, Expr::value(Some(user_id))),
+            BulkAlarmAction::Resolve => update
+                .col_expr(
+                    alarms::Column::Status,
+                    Expr::value(AlarmStatus::Resolved.as_str()),
+                )
+                .col_expr(alarms::Column::ResolvedAt, Expr::value(Some(now))),
+        };
+
+        let txn = self.db.begin().await.map_err(|e| AlarmError::Database {
+            operation: format!("begin bulk {action:?} of {} alarm(s)", target_ids.len()),
+            reason: e.to_string(),
+        })?;
+        let mut updated =
+            update
+                .exec_with_returning(&txn)
+                .await
+                .map_err(|e| AlarmError::Database {
+                    operation: format!("bulk {action:?} of {} alarm(s)", target_ids.len()),
+                    reason: e.to_string(),
+                })?;
+        txn.commit().await.map_err(|e| AlarmError::Database {
+            operation: format!("commit bulk {action:?} of {} alarm(s)", target_ids.len()),
+            reason: e.to_string(),
+        })?;
+        updated.sort_by_key(|alarm| alarm.id);
+
+        let remaining = match &selector {
+            BulkAlarmSelector::Ids(_) => 0,
+            BulkAlarmSelector::Matching(filters) => alarms::Entity::find()
+                .filter(project_id_filter(project_id))
+                .filter(alarm_filters_condition(filters))
+                .filter(alarms::Column::Status.is_in(eligible.iter().copied()))
+                .count(self.db.as_ref())
+                .await
+                .map_err(|e| AlarmError::Database {
+                    operation: "count alarms remaining after bulk update".to_string(),
+                    reason: e.to_string(),
+                })?,
+        };
+
+        info!(
+            project_id = ?project_id,
+            user_id,
+            action = ?action,
+            updated = updated.len(),
+            remaining,
+            "Bulk alarm update applied"
+        );
+
+        if action == BulkAlarmAction::Resolve {
+            for alarm in &updated {
+                let job = Job::AlarmResolved(AlarmResolvedJob {
+                    alarm_id: alarm.id,
+                    project_id: alarm.project_id,
+                    environment_id: alarm.environment_id,
+                    deployment_id: alarm.deployment_id,
+                    alarm_type: alarm.alarm_type.clone(),
+                    title: alarm.title.clone(),
+                });
+                if let Err(e) = self.job_queue.send(job).await {
+                    error!(
+                        "Failed to emit AlarmResolved job for bulk-resolved alarm {}: {}",
+                        alarm.id, e
+                    );
+                }
+            }
+        }
+
+        Ok(BulkAlarmOutcome {
+            skipped: requested.saturating_sub(updated.len() as u64),
+            updated_ids: updated.into_iter().map(|alarm| alarm.id).collect(),
+            remaining,
+        })
+    }
+
     /// Mute an alarm — and any future re-fire of the same
     /// (project, alarm_type, deployment, container, service) scope — until
     /// `Utc::now() + duration`. Unlike acknowledge/resolve this is not a
@@ -788,27 +1047,9 @@ impl AlarmService {
     ) -> Result<(Vec<alarms::Model>, u64), AlarmError> {
         let page_size = std::cmp::min(page_size, 100);
 
-        let mut query = alarms::Entity::find().filter(project_id_filter(project_id));
-
-        if let Some(environment_id) = filters.environment_id {
-            query = query.filter(alarms::Column::EnvironmentId.eq(environment_id));
-        }
-
-        if let Some(deployment_id) = filters.deployment_id {
-            query = query.filter(alarms::Column::DeploymentId.eq(deployment_id));
-        }
-
-        if let Some(alarm_type) = &filters.alarm_type {
-            query = query.filter(alarms::Column::AlarmType.eq(alarm_type.as_str()));
-        }
-
-        if let Some(status) = &filters.status {
-            query = query.filter(alarms::Column::Status.eq(status.as_str()));
-        }
-
-        if let Some(severity) = &filters.severity {
-            query = query.filter(alarms::Column::Severity.eq(severity.as_str()));
-        }
+        let query = alarms::Entity::find()
+            .filter(project_id_filter(project_id))
+            .filter(alarm_filters_condition(&filters));
 
         let paginator = query
             .order_by(alarms::Column::FiredAt, Order::Desc)
@@ -2236,5 +2477,330 @@ mod tests {
         let result = service.fire_alarm(request).await;
         assert!(result.is_ok());
         assert_eq!(notification_service.send_count(), 1);
+    }
+
+    // ── Bulk acknowledge/resolve against a real database ──────────────
+
+    struct BulkFixture {
+        _database: temps_database::test_utils::TestDatabase,
+        db: Arc<DatabaseConnection>,
+        service: AlarmService,
+        jobs: Arc<TrackingJobQueue>,
+        notifications: Arc<TrackingNotificationService>,
+        project_a: i32,
+        project_b: i32,
+        user_id: i32,
+    }
+
+    async fn bulk_fixture() -> Option<BulkFixture> {
+        use temps_entities::{preset::Preset, projects};
+
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping bulk alarm test: Docker runtime unavailable");
+                return None;
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        };
+        let db = database.connection_arc();
+        let mut project_ids = Vec::new();
+        for slug in ["bulk-a", "bulk-b"] {
+            let project = projects::ActiveModel {
+                name: Set(slug.to_string()),
+                slug: Set(slug.to_string()),
+                repo_owner: Set("owner".to_string()),
+                repo_name: Set(slug.to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::NextJs),
+                directory: Set("/".to_string()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                is_deleted: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            project_ids.push(project.id);
+        }
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Operator".to_string()),
+            email: Set("operator@example.com".to_string()),
+            email_verified: Set(true),
+            must_change_password: Set(false),
+            mfa_enabled: Set(false),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let jobs = Arc::new(TrackingJobQueue::new());
+        let notifications = Arc::new(TrackingNotificationService::new());
+        let service = AlarmService::new(db.clone(), notifications.clone(), jobs.clone());
+        Some(BulkFixture {
+            _database: database,
+            db,
+            service,
+            jobs,
+            notifications,
+            project_a: project_ids[0],
+            project_b: project_ids[1],
+            user_id: user.id,
+        })
+    }
+
+    impl BulkFixture {
+        async fn alarm(&self, project_id: Option<i32>, alarm_type: &str, status: &str) -> i32 {
+            alarms::ActiveModel {
+                project_id: Set(project_id),
+                alarm_type: Set(alarm_type.to_string()),
+                severity: Set("critical".to_string()),
+                status: Set(status.to_string()),
+                title: Set(format!("{alarm_type} alarm")),
+                fired_at: Set(Utc::now()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .unwrap()
+            .id
+        }
+
+        async fn status_of(&self, id: i32) -> String {
+            alarms::Entity::find_by_id(id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_acknowledge_by_ids_skips_non_firing_alarms() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let firing = f
+            .alarm(Some(f.project_a), "container_crash", "firing")
+            .await;
+        let acked = f
+            .alarm(Some(f.project_a), "container_crash", "acknowledged")
+            .await;
+        let resolved = f
+            .alarm(Some(f.project_a), "container_crash", "resolved")
+            .await;
+
+        let outcome = f
+            .service
+            .bulk_update_alarms(
+                Some(f.project_a),
+                BulkAlarmSelector::Ids(vec![firing, acked, resolved, firing]),
+                BulkAlarmAction::Acknowledge,
+                f.user_id,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.updated_ids, vec![firing]);
+        assert_eq!(outcome.skipped, 2, "duplicate IDs count once");
+        assert_eq!(outcome.remaining, 0);
+        let row = alarms::Entity::find_by_id(firing)
+            .one(f.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "acknowledged");
+        assert_eq!(row.acknowledged_by, Some(f.user_id));
+        assert!(row.acknowledged_at.is_some());
+        assert_eq!(f.status_of(resolved).await, "resolved");
+        assert_eq!(f.jobs.send_count(), 0, "acknowledging emits no jobs");
+    }
+
+    #[tokio::test]
+    async fn bulk_update_rejects_ids_from_another_project_without_changes() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let own = f
+            .alarm(Some(f.project_a), "container_crash", "firing")
+            .await;
+        let foreign = f
+            .alarm(Some(f.project_b), "container_crash", "firing")
+            .await;
+        let system = f.alarm(None, "disk_space_low", "firing").await;
+
+        for other in [foreign, system] {
+            let error = f
+                .service
+                .bulk_update_alarms(
+                    Some(f.project_a),
+                    BulkAlarmSelector::Ids(vec![own, other]),
+                    BulkAlarmAction::Resolve,
+                    f.user_id,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AlarmError::NotFound { alarm_id, .. } if alarm_id == other),
+                "{error}"
+            );
+        }
+        // The whole request is rejected: nothing changed, in either project.
+        for id in [own, foreign, system] {
+            assert_eq!(f.status_of(id).await, "firing");
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_resolve_matching_filter_stays_in_scope() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let crash_firing = f
+            .alarm(Some(f.project_a), "container_crash", "firing")
+            .await;
+        let crash_acked = f
+            .alarm(Some(f.project_a), "container_crash", "acknowledged")
+            .await;
+        let other_type = f.alarm(Some(f.project_a), "high_cpu", "firing").await;
+        let other_project = f
+            .alarm(Some(f.project_b), "container_crash", "firing")
+            .await;
+
+        let outcome = f
+            .service
+            .bulk_update_alarms(
+                Some(f.project_a),
+                BulkAlarmSelector::Matching(AlarmFilters {
+                    alarm_type: Some(AlarmType::ContainerCrash),
+                    ..Default::default()
+                }),
+                BulkAlarmAction::Resolve,
+                f.user_id,
+            )
+            .await
+            .unwrap();
+
+        let mut expected = vec![crash_firing, crash_acked];
+        expected.sort_unstable();
+        assert_eq!(outcome.updated_ids, expected);
+        assert_eq!(outcome.remaining, 0);
+        assert_eq!(f.status_of(crash_firing).await, "resolved");
+        assert_eq!(f.status_of(crash_acked).await, "resolved");
+        assert_eq!(f.status_of(other_type).await, "firing");
+        assert_eq!(f.status_of(other_project).await, "firing");
+        assert_eq!(f.jobs.send_count(), 2, "one AlarmResolved job per alarm");
+        assert_eq!(
+            f.notifications.send_count(),
+            0,
+            "an operator clearing a backlog must not flood notification channels"
+        );
+
+        // Running it again is a no-op.
+        let again = f
+            .service
+            .bulk_update_alarms(
+                Some(f.project_a),
+                BulkAlarmSelector::Matching(AlarmFilters {
+                    alarm_type: Some(AlarmType::ContainerCrash),
+                    ..Default::default()
+                }),
+                BulkAlarmAction::Resolve,
+                f.user_id,
+            )
+            .await
+            .unwrap();
+        assert!(again.updated_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_resolve_matching_reports_remaining_beyond_the_cap() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let extra = 3;
+        let total = MAX_BULK_ALARM_UPDATE as usize + extra;
+        let now = Utc::now();
+        let rows: Vec<alarms::ActiveModel> = (0..total)
+            .map(|index| alarms::ActiveModel {
+                project_id: Set(Some(f.project_a)),
+                alarm_type: Set("container_crash".to_string()),
+                severity: Set("critical".to_string()),
+                status: Set("firing".to_string()),
+                title: Set(format!("crash {index}")),
+                fired_at: Set(now - Duration::seconds(index as i64)),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .collect();
+        alarms::Entity::insert_many(rows)
+            .exec(f.db.as_ref())
+            .await
+            .unwrap();
+
+        let first = f
+            .service
+            .bulk_update_alarms(
+                Some(f.project_a),
+                BulkAlarmSelector::Matching(AlarmFilters::default()),
+                BulkAlarmAction::Resolve,
+                f.user_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.updated_ids.len() as u64, MAX_BULK_ALARM_UPDATE);
+        assert_eq!(first.remaining, extra as u64);
+
+        let second = f
+            .service
+            .bulk_update_alarms(
+                Some(f.project_a),
+                BulkAlarmSelector::Matching(AlarmFilters::default()),
+                BulkAlarmAction::Resolve,
+                f.user_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.updated_ids.len(), extra);
+        assert_eq!(second.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_update_rejects_empty_and_oversized_id_lists() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = AlarmService::new(
+            db,
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        for ids in [
+            Vec::new(),
+            (1..=MAX_BULK_ALARM_UPDATE as i32 + 1).collect::<Vec<_>>(),
+        ] {
+            let error = service
+                .bulk_update_alarms(
+                    Some(1),
+                    BulkAlarmSelector::Ids(ids),
+                    BulkAlarmAction::Resolve,
+                    7,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AlarmError::InvalidBulkRequest { .. }),
+                "{error}"
+            );
+        }
     }
 }
