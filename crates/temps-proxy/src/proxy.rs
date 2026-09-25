@@ -56,6 +56,7 @@ use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
 use pingora::Error;
+use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
     Result,
@@ -292,6 +293,28 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     let is_html = upstream_ct.contains("text/html");
     let has_ct = !upstream_ct.is_empty();
 
+    // The converter reads the body as UTF-8 HTML. We ask the upstream for an
+    // identity body (see `request_identity_encoding_for_markdown`), but an
+    // upstream is free to compress anyway; converting those bytes produces
+    // mojibake under a text/markdown header. Pass such responses through
+    // untouched instead — the client gets valid (compressed) HTML.
+    // Every Content-Encoding field and every coding in each: a response can
+    // carry `identity` in one field and `gzip` in another, or `gzip, br` in one.
+    // Checked in place, no allocation: this runs for every Markdown response.
+    // A header value that isn't visible ASCII can't be verified as identity,
+    // so it counts as encoded.
+    let is_encoded = upstream_response
+        .headers
+        .get_all("content-encoding")
+        .iter()
+        .any(|value| match value.to_str() {
+            Ok(codings) => codings
+                .split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+            Err(_) => true,
+        });
+
     // Reject bodies we already know are too large from Content-Length, before
     // we commit to a text/markdown Content-Type in response_filter. Pingora
     // sends response headers to the client before response_body_filter runs,
@@ -305,7 +328,8 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|len| len > MAX_MARKDOWN_BODY_BYTES);
 
-    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large {
+    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large || is_encoded
+    {
         // Cannot or should not convert — reset the flag so response_body_filter
         // will pass the body through normally.
         ctx.wants_markdown = false;
@@ -318,6 +342,17 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: non-2xx status={}, content-type={:?}",
                 status, upstream_ct
+            );
+        } else if is_encoded {
+            debug!(
+                "Markdown conversion cancelled: upstream sent Content-Encoding {:?} \
+                 (content-type={:?})",
+                upstream_response
+                    .headers
+                    .get_all("content-encoding")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                upstream_ct
             );
         } else if declared_too_large {
             debug!(
@@ -343,6 +378,47 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     }
 }
 
+/// Ask the upstream for an uncompressed body when the client wants Markdown.
+///
+/// `upstream_compression.adjust_level(0)` only stops Pingora from compressing
+/// the response itself; the client's own `Accept-Encoding` (browsers and most
+/// HTTP clients send `gzip, br`) is still forwarded, so a compressing upstream
+/// (Next.js, nginx) answers with a gzip body the HTML-to-Markdown converter
+/// cannot read.
+fn request_identity_encoding_for_markdown(upstream_request: &mut RequestHeader) {
+    if let Err(e) = upstream_request.insert_header("Accept-Encoding", "identity") {
+        warn!("Failed to set Accept-Encoding for markdown request: {}", e);
+    }
+}
+
+/// Compression level for responses Pingora compresses on the client's behalf.
+const RESPONSE_COMPRESSION_LEVEL: u32 = 6;
+
+/// Re-enable response compression for a Markdown request whose response is
+/// being passed through unconverted (JSON, an error, oversized or already
+/// encoded HTML).
+///
+/// For Markdown requests compression is turned off and the upstream is asked
+/// for `identity`, so without this a large pass-through response would reach
+/// a client that accepts gzip uncompressed. Pingora records the accepted
+/// encodings from the *upstream* request, which by then says `identity`, so
+/// the client's original header (saved before the rewrite) is fed back in.
+fn restore_client_compression(compression: &mut ResponseCompressionCtx, accept_encoding: &str) {
+    compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
+    let mut req = match RequestHeader::build("GET", b"/", None) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to build header for restoring compression: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = req.insert_header("Accept-Encoding", accept_encoding) {
+        warn!("Failed to restore Accept-Encoding for compression: {}", e);
+        return;
+    }
+    compression.request_filter(&req);
+}
+
 /// Rewrite outbound response headers for Markdown delivery.
 /// Must be called from `response_filter` (before the body is sent to the client).
 ///
@@ -358,8 +434,8 @@ fn apply_markdown_response_headers(upstream_response: &mut ResponseHeader, ctx: 
     // Remove Content-Length — the Markdown body will differ in size from the HTML.
     // Pingora will handle framing via chunked transfer encoding.
     upstream_response.remove_header("Content-Length");
-    // Remove Content-Encoding — we disabled upstream compression for markdown
-    // requests, but be defensive in case it was set anyway.
+    // The gate only lets identity-encoded bodies through, so this is at most
+    // `Content-Encoding: identity`; drop it since the body is rewritten.
     upstream_response.remove_header("Content-Encoding");
     // Set x-markdown-tokens to 0 as a placeholder.  The actual token count is
     // computed in response_body_filter once the full body is available, but
@@ -809,6 +885,11 @@ pub struct ProxyContext {
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
     pub markdown_buffer: Vec<u8>,
+    /// The client's `Accept-Encoding`, saved before a Markdown request rewrites
+    /// it to `identity`, so compression can be restored if the response is
+    /// passed through unconverted. `None` when compression was off anyway
+    /// (streaming requests) or the client sent none.
+    pub markdown_fallback_accept_encoding: Option<String>,
     /// Number of upstream connection attempts (for retry logic)
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
@@ -3911,6 +3992,7 @@ impl ProxyHttp for LoadBalancer {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -4021,7 +4103,9 @@ impl ProxyHttp for LoadBalancer {
             || req_path.contains("/logs")
             || req_path.contains("/webhook");
 
-        if accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path {
+        let compression_disabled =
+            accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path;
+        if compression_disabled {
             // Disable compression for SSE/WebSocket/streaming paths
             // compression requires buffering which breaks streaming responses
             session.upstream_compression.adjust_level(0);
@@ -4048,7 +4132,9 @@ impl ProxyHttp for LoadBalancer {
             }
         } else {
             // Enable compression for normal requests
-            session.upstream_compression.adjust_level(6);
+            session
+                .upstream_compression
+                .adjust_level(RESPONSE_COMPRESSION_LEVEL);
         }
 
         // Detect whether the client prefers a Markdown response.
@@ -4073,8 +4159,18 @@ impl ProxyHttp for LoadBalancer {
             // SSE or WebSocket we must not buffer.
             if !ctx.is_sse && !ctx.is_websocket {
                 ctx.wants_markdown = true;
-                // Disable upstream compression so we receive raw HTML bytes to convert.
+                if !compression_disabled {
+                    ctx.markdown_fallback_accept_encoding = session
+                        .req_header()
+                        .headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                }
+                // Don't compress the response ourselves, and ask the upstream
+                // not to either, so the body filter receives raw HTML.
                 session.upstream_compression.adjust_level(0);
+                request_identity_encoding_for_markdown(session.req_header_mut());
                 debug!("Client requested text/markdown — enabling HTML-to-Markdown conversion");
             } else {
                 debug!(
@@ -5951,6 +6047,11 @@ impl ProxyHttp for LoadBalancer {
         // content type.  We only convert successful (2xx) text/html responses; everything
         // else passes through unchanged so the client receives the original response as-is.
         apply_markdown_upstream_gate(upstream_response, ctx);
+        if !ctx.wants_markdown {
+            if let Some(accept_encoding) = ctx.markdown_fallback_accept_encoding.take() {
+                restore_client_compression(&mut session.upstream_compression, &accept_encoding);
+            }
+        }
 
         Ok(())
     }
@@ -6861,6 +6962,7 @@ mod markdown_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -7394,6 +7496,7 @@ mod markdown_pipeline_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -7502,6 +7605,124 @@ mod markdown_pipeline_tests {
         assert!(
             !ctx.wants_markdown,
             "missing Content-Type must cancel conversion"
+        );
+    }
+
+    #[test]
+    fn gate_cancels_compressed_upstream_body() {
+        for encoding in &["gzip", "br", "deflate", "zstd", "GZIP"] {
+            let mut ctx = make_ctx();
+            ctx.wants_markdown = true;
+            let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+            resp.insert_header("Content-Encoding", *encoding).unwrap();
+            apply_markdown_upstream_gate(&mut resp, &mut ctx);
+            assert!(
+                !ctx.wants_markdown,
+                "Content-Encoding {} must cancel conversion",
+                encoding
+            );
+            apply_markdown_response_headers(&mut resp, &ctx);
+            assert_eq!(
+                resp.headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some(*encoding),
+                "a passed-through compressed body keeps its Content-Encoding"
+            );
+            assert!(
+                resp.headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.starts_with("text/html")),
+                "a passed-through body keeps its text/html Content-Type"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_allows_identity_content_encoding() {
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(ctx.wants_markdown);
+    }
+
+    #[test]
+    fn gzip_html_is_passed_through_byte_for_byte() {
+        // Regression: temps.sh served gzip bytes decoded as UTF-8 (every 0x8b
+        // became U+FFFD) under Content-Type: text/markdown.
+        let gzip_magic_and_payload: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        let (ctx, _resp, body) = run_pipeline(ctx, resp, gzip_magic_and_payload);
+        assert!(!ctx.wants_markdown);
+        assert_eq!(body.as_deref(), Some(gzip_magic_and_payload));
+    }
+
+    #[test]
+    fn gate_cancels_when_any_encoding_field_is_not_identity() {
+        // `identity` first and `gzip` in a second field, and a combined list.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.append_header("Content-Encoding", "identity").unwrap();
+        resp.append_header("Content-Encoding", "gzip").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(
+            !ctx.wants_markdown,
+            "a second gzip field must cancel conversion"
+        );
+
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity, br")
+            .unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(!ctx.wants_markdown, "`identity, br` must cancel conversion");
+    }
+
+    #[test]
+    fn pass_through_response_is_compressed_for_the_client_again() {
+        // What Pingora does for a Markdown request: compression off, and the
+        // upstream request (already rewritten) says identity.
+        let mut compression = ResponseCompressionCtx::new(0, false, false);
+        let mut upstream_req = RequestHeader::build("GET", b"/api/data", None).unwrap();
+        request_identity_encoding_for_markdown(&mut upstream_req);
+        compression.request_filter(&upstream_req);
+
+        // The gate passed a JSON response through; restore the client's gzip.
+        restore_client_compression(&mut compression, "gzip, br");
+
+        let mut resp = make_response(200, Some("application/json"));
+        compression.response_header_filter(&mut resp, false);
+        let encoding = resp
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert!(
+            matches!(encoding.as_deref(), Some("gzip") | Some("br")),
+            "pass-through response must be compressed for a client that accepts it, got {:?}",
+            encoding
+        );
+    }
+
+    #[test]
+    fn markdown_request_asks_upstream_for_identity_encoding() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Accept-Encoding", "gzip, deflate, br")
+            .unwrap();
+        request_identity_encoding_for_markdown(&mut req);
+        assert_eq!(
+            req.headers
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
         );
     }
 
