@@ -294,6 +294,7 @@ pub mod m20260922_000001_stateless_control_plane_jobs;
 
 mod m20260920_000001_compose_security_policies;
 mod m20260921_000005_add_docker_socket_mounted_to_deployments;
+mod m20260924_000001_add_sync_error_to_git_provider_connections;
 
 pub struct Migrator;
 
@@ -650,6 +651,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260921_000005_add_docker_socket_mounted_to_deployments::Migration),
             Box::new(m20260922_000001_stateless_control_plane_jobs::Migration),
             Box::new(m20260918_000001_add_pull_only_root_directory_to_projects::Migration),
+            Box::new(m20260924_000001_add_sync_error_to_git_provider_connections::Migration),
         ]
     }
 }

@@ -121,21 +121,7 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { detectedPortForSelection } from '@/lib/dockerfile-port'
-
-// Derives a browsable repo URL from whatever the API gave us. clone_url is an
-// HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
-// "continue with git URL" flow it's the raw string the user typed, which may
-// be SSH shorthand (git@host:owner/repo) — normalize both to https://host/owner/repo.
-function getRepositoryUrl(repository: RepositoryResponse): string | null {
-  const raw = repository.clone_url || repository.ssh_url
-  if (!raw) return null
-  let url = raw.trim().replace(/\.git$/, '')
-  const sshMatch = url.match(/^git@([^:]+):(.+)$/)
-  if (sshMatch) {
-    url = `https://${sshMatch[1]}/${sshMatch[2]}`
-  }
-  return url.startsWith('http://') || url.startsWith('https://') ? url : null
-}
+import { getRepositoryUrl } from '@/lib/repository-url'
 
 // Best-effort provider detection from the repo URL's hostname, for the brand
 // logo next to the repo name. `RepositoryResponse` doesn't carry a provider
