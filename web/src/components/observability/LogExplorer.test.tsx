@@ -22,6 +22,8 @@ test('standalone database logs do not appear as Project 0 or application logs', 
       ],
       external_service_id: [{ value: '4', count: 100 }],
     },
+    project_names: {},
+    external_service_names: {},
   }
   try {
     const html = renderToStaticMarkup(

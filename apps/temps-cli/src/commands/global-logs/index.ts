@@ -232,7 +232,8 @@ interface GlobalLogFacetsResponse {
  * The display name for an id-valued facet value (`project_id`,
  * `external_service_id`), or `undefined` for fields whose values are already
  * readable. The server names every id it still has, so an id it could not
- * name belongs to something this instance no longer has.
+ * name belongs to something this instance no longer has — except project 0,
+ * which marks lines from a standalone database service.
  */
 export function facetValueName(
   result: Pick<GlobalLogFacetsResponse, 'project_names' | 'external_service_names'>,
@@ -246,6 +247,9 @@ export function facetValueName(
         ? result.external_service_names
         : undefined
   if (!names) return undefined
+  // Standalone database services are stored under project_id 0: no owning
+  // project, not a deleted one.
+  if (field === 'project_id' && value === '0') return 'none (database service)'
   return names[value] ?? 'unknown (no longer exists)'
 }
 

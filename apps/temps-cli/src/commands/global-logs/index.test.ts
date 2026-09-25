@@ -287,6 +287,10 @@ describe('facetValueName', () => {
     expect(facetValueName(result, 'project_id', '9')).toBe('unknown (no longer exists)')
   })
 
+  test('project 0 is a database service, not a deleted project', () => {
+    expect(facetValueName(result, 'project_id', '0')).toBe('none (database service)')
+  })
+
   test('leaves readable fields, and servers that send no names, alone', () => {
     expect(facetValueName(result, 'env', 'production')).toBeUndefined()
     expect(facetValueName({}, 'project_id', '3')).toBeUndefined()
