@@ -23883,6 +23883,16 @@
       "GlobalLogFacetsResponse": {
         "description": "Distinct values and counts per requested field, inside the current window.",
         "properties": {
+          "external_service_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Display names for the returned `external_service_id` values; see\n`project_names`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "facets": {
             "description": "Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values\nare ordered by count, descending.",
             "type": "object"
@@ -23890,11 +23900,23 @@
           "partial": {
             "description": "`true` when a field's value list was capped or timed out, so it is a\nprefix rather than the complete set. Reported rather than glossed: the\npoint of a facet is that a user can trust it to surface values they\nhave never seen on screen.",
             "type": "boolean"
+          },
+          "project_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Display names for the returned `project_id` values, keyed by value.\nResolved here, under the log access that produced the facets, so a\ncaller who may read these logs can tell the projects apart without\nalso needing permission to read projects — the same names search\nlines carry as `owner`. A returned value missing from this map names a\nproject this instance no longer has.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           }
         },
         "required": [
           "facets",
-          "partial"
+          "partial",
+          "project_names",
+          "external_service_names"
         ],
         "type": "object"
       },

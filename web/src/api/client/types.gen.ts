@@ -10988,6 +10988,13 @@ export type GlobalLogFacetsRequest = GlobalLogSearchRequest & {
  */
 export type GlobalLogFacetsResponse = {
     /**
+     * Display names for the returned `external_service_id` values; see
+     * `project_names`.
+     */
+    external_service_names: {
+        [key: string]: string;
+    };
+    /**
      * Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values
      * are ordered by count, descending.
      */
@@ -11001,6 +11008,17 @@ export type GlobalLogFacetsResponse = {
      * have never seen on screen.
      */
     partial: boolean;
+    /**
+     * Display names for the returned `project_id` values, keyed by value.
+     * Resolved here, under the log access that produced the facets, so a
+     * caller who may read these logs can tell the projects apart without
+     * also needing permission to read projects — the same names search
+     * lines carry as `owner`. A returned value missing from this map names a
+     * project this instance no longer has.
+     */
+    project_names: {
+        [key: string]: string;
+    };
 };
 
 /**

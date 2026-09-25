@@ -178,6 +178,8 @@ test('facet projects with no line on the loaded page are named from projectLabel
               ],
             },
             partial: false,
+            project_names: { '1': 'web-app', '2': 'api' },
+            external_service_names: {},
           }}
           projectLabels={{ '2': 'worker-app', '42': 'Unknown project #42' }}
           onFilter={() => {}}

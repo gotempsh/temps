@@ -13,7 +13,6 @@ import {
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { useQueries } from '@tanstack/react-query'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { getProject } from '@/api/client/sdk.gen'
 import type { LogLevel, LogSourceKind } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -141,10 +140,11 @@ export default function GlobalLogs() {
   const lines = search.error ? [] : search.lines
 
   // Facets count the whole time range, so they can name projects that have
-  // no line on the loaded page. Resolve those names directly instead of
-  // leaving them to the page's lines. A project this instance no longer has
-  // (deleted, or lines collected before it existed) answers 404 and is shown
-  // as unknown rather than under a name-shaped placeholder.
+  // no line on the loaded page. The facet response names them itself, under
+  // the same log access — so reading logs never also requires permission to
+  // read projects. An id it could not name is a project this instance no
+  // longer has (deleted, or lines collected before it existed), shown as
+  // unknown rather than under a name-shaped placeholder.
   const facetProjectIds = [
     ...new Set(
       facetValues(facets.data, 'project_id').flatMap((item) => {
@@ -153,33 +153,12 @@ export default function GlobalLogs() {
       })
     ),
   ]
-  const projectQueries = useQueries({
-    queries: facetProjectIds.map((id) => ({
-      // Own key: this query resolves a missing project to `null`, which must
-      // not leak into the shared project cache other pages read.
-      queryKey: ['log-facet-project', id],
-      // The Problem body carries no status, so a missing project is told
-      // apart from a failed request by the HTTP status itself.
-      queryFn: async ({ signal }: { signal: AbortSignal }) => {
-        const result = await getProject({ path: { id }, signal })
-        if (result.response?.status === 404) return null
-        if (!result.data)
-          throw new Error(
-            (result.error as { detail?: string } | undefined)?.detail ??
-              `Project ${id} could not be loaded.`
-          )
-        return result.data
-      },
-      staleTime: 60_000,
-    })),
-  })
+  const facetProjectNames = facets.data?.project_names ?? {}
   const projectLabels = Object.fromEntries(
-    projectQueries.flatMap((query, index) => {
-      const id = facetProjectIds[index]
-      if (query.data) return [[String(id), query.data.name]]
-      if (query.data === null) return [[String(id), `Unknown project #${id}`]]
-      return []
-    })
+    facetProjectIds.map((id) => [
+      String(id),
+      facetProjectNames[String(id)] ?? `Unknown project #${id}`,
+    ])
   )
 
   // Environment IDs are all the store keeps; the interface presents slugs.
@@ -192,7 +171,7 @@ export default function GlobalLogs() {
       ...lines.flatMap((line) =>
         line.project_id != null ? [line.project_id] : []
       ),
-      ...facetProjectIds.filter((_, index) => projectQueries[index]?.data),
+      ...facetProjectIds.filter((id) => String(id) in facetProjectNames),
     ]),
   ]
   const environmentQueries = useQueries({

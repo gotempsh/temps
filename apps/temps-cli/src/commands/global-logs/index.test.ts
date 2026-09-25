@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildFilters,
   describeCollection,
+  facetValueName,
   parseDuration,
   toAnalyticsQuery,
   validateAttrPredicate,
@@ -269,4 +270,25 @@ test('describeCollection tells non-administrators where the details are', () => 
   expect(summary.details).toEqual([
     'An instance administrator can see the exact error and file locations.',
   ])
+})
+
+describe('facetValueName', () => {
+  const result = {
+    project_names: { '3': 'storefront' },
+    external_service_names: { '5': 'orders-db' },
+  }
+
+  test('names project and service ids the server resolved', () => {
+    expect(facetValueName(result, 'project_id', '3')).toBe('storefront')
+    expect(facetValueName(result, 'external_service_id', '5')).toBe('orders-db')
+  })
+
+  test('says an unnamed id no longer exists instead of printing nothing', () => {
+    expect(facetValueName(result, 'project_id', '9')).toBe('unknown (no longer exists)')
+  })
+
+  test('leaves readable fields, and servers that send no names, alone', () => {
+    expect(facetValueName(result, 'env', 'production')).toBeUndefined()
+    expect(facetValueName({}, 'project_id', '3')).toBeUndefined()
+  })
 })

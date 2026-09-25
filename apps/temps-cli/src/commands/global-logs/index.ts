@@ -222,6 +222,31 @@ interface GlobalLogFacetsResponse {
   facets: Record<string, FacetValue[]>
   /** True when a value list was capped or the aggregation timed out. */
   partial: boolean
+  /** Names for the returned `project_id` values, keyed by value. */
+  project_names?: Record<string, string>
+  /** Names for the returned `external_service_id` values, keyed by value. */
+  external_service_names?: Record<string, string>
+}
+
+/**
+ * The display name for an id-valued facet value (`project_id`,
+ * `external_service_id`), or `undefined` for fields whose values are already
+ * readable. The server names every id it still has, so an id it could not
+ * name belongs to something this instance no longer has.
+ */
+export function facetValueName(
+  result: Pick<GlobalLogFacetsResponse, 'project_names' | 'external_service_names'>,
+  field: string,
+  value: string,
+): string | undefined {
+  const names =
+    field === 'project_id'
+      ? result.project_names
+      : field === 'external_service_id'
+        ? result.external_service_names
+        : undefined
+  if (!names) return undefined
+  return names[value] ?? 'unknown (no longer exists)'
 }
 
 interface AttributeKeysResponse {
@@ -845,10 +870,19 @@ async function facetsAction(options: FacetsOptions): Promise<void> {
   for (const [field, values] of entries) {
     newline()
     header(field)
+    const named = facetValueName(result, field, '') !== undefined
     printTable(
       values,
       [
         { header: 'Value', accessor: (v: FacetValue) => v.value },
+        ...(named
+          ? [
+              {
+                header: 'Name',
+                accessor: (v: FacetValue) => facetValueName(result, field, v.value) ?? '',
+              },
+            ]
+          : []),
         {
           header: 'Lines',
           accessor: (v: FacetValue) => v.count.toLocaleString(),
