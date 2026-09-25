@@ -300,24 +300,20 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     // untouched instead — the client gets valid (compressed) HTML.
     // Every Content-Encoding field and every coding in each: a response can
     // carry `identity` in one field and `gzip` in another, or `gzip, br` in one.
-    let encodings: Vec<String> = upstream_response
+    // Checked in place, no allocation: this runs for every Markdown response.
+    // A header value that isn't visible ASCII can't be verified as identity,
+    // so it counts as encoded.
+    let is_encoded = upstream_response
         .headers
         .get_all("content-encoding")
         .iter()
-        .map(|v| {
-            v.to_str()
-                .map(str::to_lowercase)
-                .unwrap_or_else(|_| "invalid".into())
-        })
-        .flat_map(|v| {
-            v.split(',')
-                .map(|c| c.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|c| !c.is_empty())
-        .collect();
-    let is_encoded = encodings.iter().any(|c| c != "identity");
-    let content_encoding = encodings.join(", ");
+        .any(|value| match value.to_str() {
+            Ok(codings) => codings
+                .split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+            Err(_) => true,
+        });
 
     // Reject bodies we already know are too large from Content-Length, before
     // we commit to a text/markdown Content-Type in response_filter. Pingora
@@ -351,7 +347,12 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: upstream sent Content-Encoding {:?} \
                  (content-type={:?})",
-                content_encoding, upstream_ct
+                upstream_response
+                    .headers
+                    .get_all("content-encoding")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                upstream_ct
             );
         } else if declared_too_large {
             debug!(
