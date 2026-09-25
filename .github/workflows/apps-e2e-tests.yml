@@ -87,6 +87,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Build and link scenario SDK dependencies
         run: |
@@ -261,6 +262,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Build and link scenario SDK dependencies
         run: |

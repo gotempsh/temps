@@ -98,6 +98,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # Restore always, save only from `main` — see the cache-scoping note in
       # rust-tests.yml. Saving from every ref stored a byte-identical 161MB

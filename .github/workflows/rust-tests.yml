@@ -194,7 +194,9 @@ jobs:
       # inside the toolchain container, with target/ and the cargo registry
       # mounted from the persistent cache so rebuilds are incremental. Uses
       # the `fast` profile (release semantics, parallel codegen, no LTO);
-      # production images keep the default `release` profile.
+      # production images keep the default `release` profile. The JSON
+      # messages list every unit of the build, fresh or not, which is what
+      # the prune step below keys on.
       - name: Build temps binary in toolchain container
         run: |
           mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
@@ -208,13 +210,57 @@ jobs:
               cd /build/web && bun install && \
                 RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
               cd /build
-              cargo build --profile fast --bin temps --package temps-cli
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-build-messages.json
               cp target/fast/temps ci-prebuilt/temps
               chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
-                ci-prebuilt crates/temps-cli/dist
+                ci-prebuilt crates/temps-cli/dist cargo-build-messages.json
             '
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
+
+      # Restoring from the newest older entry and saving under a new key
+      # carries every earlier generation of build output forward: each
+      # dependency bump left a full second copy of the workspace's rlibs and
+      # incremental sessions behind, and the entry reached 21GB. Drop what
+      # this build did not use before saving. Runs that don't save only
+      # report what would go, so the numbers stay visible on every PR.
+      - name: Prune stale build output from cargo cache
+        env:
+          PRUNE_MODE: ${{ github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true' && '--apply' || '' }}
+        run: |
+          python3 .github/scripts/prune-cargo-build-cache.py $PRUNE_MODE \
+            --messages cargo-build-messages.json \
+            --target-dir ci-build-cache/target \
+            --registry ci-build-cache/cargo-registry \
+            --lockfile Cargo.lock
+
+      # Pruning decides "stale" from cargo's hashes. If a cargo release ever
+      # changes how those map to file names, this rebuild puts back whatever
+      # was wrongly removed before the save, so the cache stays complete, and
+      # the warning says the prune script needs updating.
+      - name: Verify pruned cache is still fresh
+        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm \
+            --volume "$PWD":/build --workdir /build \
+            --volume "$PWD/ci-build-cache/target":/build/target \
+            --volume "$PWD/ci-build-cache/cargo-registry":/usr/local/cargo/registry \
+            temps-toolchain:ci \
+            sh -ec '
+              git config --global --add safe.directory /build
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-verify-messages.json
+              chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
+                cargo-verify-messages.json
+            '
+          rebuilt=$(jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name' \
+            cargo-verify-messages.json)
+          if [ -n "$rebuilt" ]; then
+            echo "::warning::Pruning removed build output that was still in use (rebuilt before saving): $(echo $rebuilt)"
+          else
+            echo "All units fresh after pruning."
+          fi
 
       - name: Save cargo target dir (musl, fast profile)
         if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
@@ -317,6 +363,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -337,8 +384,11 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      # Restore always, save only from `main`: the combined actions/cache
+      # step saves from whichever ref misses, into a scope only that ref reads.
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -353,6 +403,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Check workspace
         run: cargo check --workspace --all-targets
@@ -383,6 +440,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # Restore always, save only from `main` — see the cache-scoping note on
       # the toolchain export above.
@@ -427,6 +485,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # No `bun install`: the check reads the committed file and needs nothing
       # but Bun itself, so it reports in seconds on every pull request.
@@ -456,6 +515,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -465,8 +525,9 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -481,6 +542,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

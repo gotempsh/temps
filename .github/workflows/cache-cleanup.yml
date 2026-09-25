@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Cache Cleanup
+
+# Deletes Actions cache entries that a newer entry has replaced, so they stop
+# counting against the pool until LRU eviction gets to them. See
+# .github/scripts/prune-superseded-caches.py for what counts as replaced.
+#
+# Runs right after each `main` Rust Tests run, which is when a dependency bump
+# saves a new generation, plus once a day to catch anything else.
+on:
+  workflow_run:
+    workflows: [Rust Tests]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run: list what would be deleted without deleting it"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Delete superseded caches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Delete superseded caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: python3 .github/scripts/prune-superseded-caches.py $DRY_RUN
