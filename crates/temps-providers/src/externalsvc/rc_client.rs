@@ -46,10 +46,9 @@
 //! - Exit codes: 0 ok, 2 usage, 3 network or not found while listing, 4 auth,
 //!   5 not found. Unlike mc, a failed listing never exits 0.
 
-use anyhow::{anyhow, Result};
 use bollard::Docker;
 use futures::TryStreamExt;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::SensitiveValues;
 
@@ -209,6 +208,55 @@ pub fn ls_json_command(target: &str, token_side: bool) -> Vec<String> {
     }
 }
 
+/// Failures of the `rc` helper operations. Every captured client output in a
+/// variant has already been passed through [`SensitiveValues`] by the code
+/// that built it, so these messages are safe to log, persist and return.
+#[derive(Debug, thiserror::Error)]
+pub enum RcClientError {
+    #[error("rc could not list '{target}' (exit code {exit_code}): {stderr}")]
+    ListFailed {
+        target: String,
+        exit_code: i64,
+        stderr: String,
+    },
+
+    #[error("could not read the `rc ls --json` output for '{target}' ({reason}): {output}")]
+    UnparsableListing {
+        target: String,
+        reason: String,
+        output: String,
+    },
+
+    #[error("`rc ls` of '{target}' reported an error: {message}")]
+    ListingReportedError { target: String, message: String },
+
+    #[error(
+        "`rc ls` of '{target}' returned a truncated listing ({returned} entries); \
+         refusing to back up or restore a partial bucket set as if it were complete"
+    )]
+    TruncatedListing { target: String, returned: usize },
+
+    #[error(
+        "rc mirror of bucket '{bucket}' from '{source_path}' to '{destination}' failed \
+         (exit code {exit_code}): {output}"
+    )]
+    MirrorFailed {
+        bucket: String,
+        source_path: String,
+        destination: String,
+        exit_code: i64,
+        output: String,
+    },
+
+    #[error("Docker exec {operation} in rc helper container '{container_id}' failed: {error}")]
+    Docker {
+        container_id: String,
+        operation: &'static str,
+        #[source]
+        error: bollard::errors::Error,
+    },
+}
+
 /// Folder names from `rc ls --json <alias>/<path>` output, in listing order.
 ///
 /// Only directory entries (`"is_dir": true`) count. The name is the last path
@@ -219,36 +267,57 @@ pub fn ls_json_command(target: &str, token_side: bool) -> Vec<String> {
 /// - a backup prefix (`rc ls --json bkp/backups/2026/`), whose keys are full
 ///   bucket-relative keys (`"backups/2026/bucket-a/"`).
 ///
-/// Errors on anything that is not an `rc` listing document, instead of
-/// silently reporting "nothing to restore" for output it cannot read.
-pub fn parse_ls_dir_names(stdout: &str) -> Result<Vec<String>> {
-    let document: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
-        anyhow!(
-            "could not parse `rc ls --json` output as a JSON document ({}): {}",
-            e,
-            truncate_for_error(stdout)
-        )
-    })?;
+/// Errors on anything that is not a complete `rc` listing document, instead
+/// of silently reporting "nothing to restore" for output it cannot read. `rc
+/// ls` pages through the S3 listing itself (verified: 1,100 prefixes under
+/// one folder come back in one document with `"truncated": false`), so
+/// `"truncated": true` is never expected; if it appears, the listing is
+/// incomplete and this is a hard [`RcClientError::TruncatedListing`] — a
+/// backup or restore over a partial bucket set must not report success. A
+/// document without a `truncated` field is treated the same way, since its
+/// completeness cannot be proven.
+///
+/// `target` names the listed path in errors; `sensitive_values` scrubs any
+/// credential out of the output echoed into them.
+pub fn parse_ls_dir_names(
+    target: &str,
+    stdout: &str,
+    sensitive_values: &SensitiveValues<'_>,
+) -> Result<Vec<String>, RcClientError> {
+    let unparsable = |reason: String| RcClientError::UnparsableListing {
+        target: target.to_string(),
+        reason,
+        output: sensitive_values.redact(&truncate_for_error(stdout)),
+    };
+
+    let document: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| unparsable(format!("not a JSON document: {e}")))?;
 
     if let Some(error) = document.get("error") {
-        return Err(anyhow!("`rc ls` reported an error: {}", error));
+        return Err(RcClientError::ListingReportedError {
+            target: target.to_string(),
+            message: sensitive_values.redact(&error.to_string()),
+        });
     }
 
     let items = document
         .get("items")
         .and_then(|items| items.as_array())
-        .ok_or_else(|| {
-            anyhow!(
-                "`rc ls --json` output has no `items` array: {}",
-                truncate_for_error(stdout)
-            )
-        })?;
+        .ok_or_else(|| unparsable("no `items` array".to_string()))?;
 
-    if document.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
-        warn!(
-            "`rc ls --json` reported a truncated listing; only {} entries were returned",
-            items.len()
-        );
+    match document.get("truncated").and_then(|t| t.as_bool()) {
+        Some(false) => {}
+        Some(true) => {
+            return Err(RcClientError::TruncatedListing {
+                target: target.to_string(),
+                returned: items.len(),
+            })
+        }
+        None => {
+            return Err(unparsable(
+                "no boolean `truncated` field, so completeness cannot be verified".to_string(),
+            ))
+        }
     }
 
     Ok(items
@@ -292,7 +361,14 @@ pub(crate) async fn exec_capture(
     docker: &Docker,
     container_id: &str,
     cmd: &[&str],
-) -> Result<ExecOutput> {
+) -> Result<ExecOutput, RcClientError> {
+    let docker_error = |operation: &'static str| {
+        move |error: bollard::errors::Error| RcClientError::Docker {
+            container_id: container_id.to_string(),
+            operation,
+            error,
+        }
+    };
     let exec = docker
         .create_exec(
             container_id,
@@ -303,14 +379,17 @@ pub(crate) async fn exec_capture(
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        .map_err(docker_error("create"))?;
 
     let mut stdout = String::new();
     let mut stderr = String::new();
-    if let bollard::exec::StartExecResults::Attached { mut output, .. } =
-        docker.start_exec(&exec.id, None).await?
+    if let bollard::exec::StartExecResults::Attached { mut output, .. } = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(docker_error("start"))?
     {
-        while let Some(chunk) = output.try_next().await? {
+        while let Some(chunk) = output.try_next().await.map_err(docker_error("stream"))? {
             match chunk {
                 bollard::container::LogOutput::StdOut { message } => {
                     stdout.push_str(&String::from_utf8_lossy(&message));
@@ -323,12 +402,40 @@ pub(crate) async fn exec_capture(
         }
     }
 
-    let exit_code = docker.inspect_exec(&exec.id).await?.exit_code.unwrap_or(-1);
+    let exit_code = docker
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(docker_error("inspect"))?
+        .exit_code
+        .unwrap_or(-1);
     Ok(ExecOutput {
         exit_code,
         stdout,
         stderr,
     })
+}
+
+/// `rc ls --json <target>` inside a running helper container, parsed into
+/// folder names (see [`parse_ls_dir_names`]). `token_side` sends the remote
+/// session token (see [`ls_json_command`]).
+pub(crate) async fn list_dir_names(
+    docker: &Docker,
+    container_id: &str,
+    target: &str,
+    token_side: bool,
+    sensitive_values: &SensitiveValues<'_>,
+) -> Result<Vec<String>, RcClientError> {
+    let command = ls_json_command(target, token_side);
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    let listing = exec_capture(docker, container_id, &command).await?;
+    if listing.exit_code != 0 {
+        return Err(RcClientError::ListFailed {
+            target: target.to_string(),
+            exit_code: listing.exit_code,
+            stderr: sensitive_values.redact(listing.stderr.trim()),
+        });
+    }
+    parse_ls_dir_names(target, &listing.stdout, sensitive_values)
 }
 
 /// `rc mirror --overwrite <source_alias>/<bucket>/ <dest_prefix>/<bucket>/`
@@ -354,18 +461,10 @@ pub(crate) async fn mirror_all_buckets(
     dest_prefix: &str,
     dest_has_token: bool,
     sensitive_values: &SensitiveValues<'_>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<String>, RcClientError> {
     let source_root = format!("{}/", source_alias.trim_end_matches('/'));
-    let listing = exec_capture(docker, container_id, &["rc", "ls", "--json", &source_root]).await?;
-    if listing.exit_code != 0 {
-        return Err(anyhow!(
-            "rc could not list the buckets to back up (exit code {}): {}",
-            listing.exit_code,
-            sensitive_values.redact(listing.stderr.trim())
-        ));
-    }
-    let buckets = parse_ls_dir_names(&listing.stdout)
-        .map_err(|e| anyhow!("{}", sensitive_values.redact(&e.to_string())))?;
+    let buckets =
+        list_dir_names(docker, container_id, &source_root, false, sensitive_values).await?;
     info!("rc: mirroring {} bucket(s): {:?}", buckets.len(), buckets);
 
     let dest_prefix = dest_prefix.trim_end_matches('/');
@@ -381,13 +480,14 @@ pub(crate) async fn mirror_all_buckets(
         let command: Vec<&str> = command.iter().map(String::as_str).collect();
         let mirror = exec_capture(docker, container_id, &command).await?;
         if mirror.exit_code != 0 {
-            return Err(anyhow!(
-                "rc mirror failed for bucket '{}' (exit code {}): {}",
-                bucket,
-                mirror.exit_code,
-                sensitive_values
-                    .redact(format!("{}\n{}", mirror.stderr.trim(), mirror.stdout.trim()).trim())
-            ));
+            return Err(RcClientError::MirrorFailed {
+                bucket: bucket.clone(),
+                source_path: source,
+                destination: dest,
+                exit_code: mirror.exit_code,
+                output: sensitive_values
+                    .redact(format!("{}\n{}", mirror.stderr.trim(), mirror.stdout.trim()).trim()),
+            });
         }
     }
     Ok(buckets)
@@ -396,6 +496,48 @@ pub(crate) async fn mirror_all_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(stdout: &str) -> Result<Vec<String>, RcClientError> {
+        parse_ls_dir_names("bkp/bucket/pre/", stdout, &SensitiveValues::new())
+    }
+
+    #[test]
+    fn a_truncated_listing_is_a_hard_error_not_a_partial_result() {
+        let output = r#"{"items":[{"key":"pre/a/","is_dir":true}],"truncated":true}"#;
+        match parse(output) {
+            Err(RcClientError::TruncatedListing { target, returned }) => {
+                assert_eq!(target, "bkp/bucket/pre/");
+                assert_eq!(returned, 1);
+            }
+            other => panic!("expected TruncatedListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_listing_without_a_truncated_flag_cannot_prove_completeness() {
+        let output = r#"{"items":[{"key":"pre/a/","is_dir":true}]}"#;
+        assert!(matches!(
+            parse(output),
+            Err(RcClientError::UnparsableListing { .. })
+        ));
+    }
+
+    #[test]
+    fn listing_errors_are_redacted() {
+        let sensitive = SensitiveValues::new().credential("AKIASECRETKEYID", "sekrit", None);
+        let err = parse_ls_dir_names(
+            "bkp/",
+            r#"{"error":"denied for AKIASECRETKEYID"}"#,
+            &sensitive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("AKIASECRETKEYID"), "{err}");
+        let err = parse_ls_dir_names("bkp/", "garbage sekrit", &sensitive)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sekrit"), "{err}");
+    }
 
     /// Exact output of `rc ls --json s/` (an alias root) from rustfs/rc v0.1.36.
     const ROOT_LISTING: &str = r#"{
@@ -433,7 +575,7 @@ mod tests {
     #[test]
     fn parses_bucket_names_from_an_alias_root_listing() {
         assert_eq!(
-            parse_ls_dir_names(ROOT_LISTING).unwrap(),
+            parse(ROOT_LISTING).unwrap(),
             vec!["dst".to_string(), "src1".to_string()]
         );
     }
@@ -441,7 +583,7 @@ mod tests {
     #[test]
     fn strips_the_listed_prefix_from_folder_keys() {
         assert_eq!(
-            parse_ls_dir_names(PREFIX_LISTING).unwrap(),
+            parse(PREFIX_LISTING).unwrap(),
             vec!["src1".to_string(), "src2".to_string()]
         );
     }
@@ -450,7 +592,7 @@ mod tests {
     fn strips_a_multi_segment_prefix() {
         let output =
             r#"{"items":[{"key":"backups/2026/09/app-data/","is_dir":true}],"truncated":false}"#;
-        assert_eq!(parse_ls_dir_names(output).unwrap(), vec!["app-data"]);
+        assert_eq!(parse(output).unwrap(), vec!["app-data"]);
     }
 
     #[test]
@@ -459,32 +601,32 @@ mod tests {
             {"key":"pre/manifest.json","size":12,"is_dir":false},
             {"key":"pre/bucket-a/","is_dir":true}
         ],"truncated":false}"#;
-        assert_eq!(parse_ls_dir_names(output).unwrap(), vec!["bucket-a"]);
+        assert_eq!(parse(output).unwrap(), vec!["bucket-a"]);
     }
 
     #[test]
     fn an_empty_listing_is_no_buckets_not_an_error() {
         let output = "{\n  \"items\": [],\n  \"truncated\": false\n}\n";
-        assert!(parse_ls_dir_names(output).unwrap().is_empty());
+        assert!(parse(output).unwrap().is_empty());
     }
 
     #[test]
     fn rejects_mc_style_ndjson_instead_of_reporting_nothing_to_restore() {
         let mc_output = "{\"status\":\"success\",\"type\":\"folder\",\"key\":\"bkt1/\"}\n\
                          {\"status\":\"success\",\"type\":\"folder\",\"key\":\"bkt2/\"}\n";
-        assert!(parse_ls_dir_names(mc_output).is_err());
+        assert!(parse(mc_output).is_err());
     }
 
     #[test]
     fn surfaces_an_rc_error_document() {
         let output = r#"{"error":"Failed to list objects: Not found: Bucket not found: dst","details":{"type":"not_found"}}"#;
-        let err = parse_ls_dir_names(output).unwrap_err().to_string();
+        let err = parse(output).unwrap_err().to_string();
         assert!(err.contains("Bucket not found"), "{err}");
     }
 
     #[test]
     fn rejects_empty_output() {
-        assert!(parse_ls_dir_names("").is_err());
+        assert!(parse("").is_err());
     }
 
     #[test]

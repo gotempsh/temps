@@ -63,9 +63,9 @@ pub struct S3InputConfig {
     pub region: String,
 
     /// Docker image for the S3 server. New services default to RustFS
-    /// (`rustfs/rustfs:1.0.0-rc.5`); an existing service keeps the MinIO image
-    /// it was created with. The container's env/command follow the image
-    /// (see [`is_rustfs_image`]).
+    /// (`rustfs/rustfs:1.0.0`); an existing service keeps the MinIO image it
+    /// was created with. Which server the image runs is `server`, not the
+    /// image name.
     ///
     /// The serde fallback for a persisted config with no `docker_image` stays
     /// the legacy MinIO reference on purpose: such a row belongs to a service
@@ -74,6 +74,16 @@ pub struct S3InputConfig {
     #[serde(default = "legacy_minio_image")]
     #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
+
+    /// Which S3 server `docker_image` runs: `rustfs` or `minio`. It decides
+    /// the container's credential variables, command and healthcheck.
+    ///
+    /// New services default to `rustfs` and store it. A persisted config
+    /// without it predates the field; see [`S3Service::resolve_server_kind`]
+    /// for how its kind is worked out (image metadata, then MinIO).
+    #[serde(default, deserialize_with = "deserialize_optional_server_kind")]
+    #[schemars(example = example_server_kind(), default = "default_server_kind")]
+    pub server: Option<S3ServerKind>,
 
     /// Real Docker container name when this service was imported from an
     /// existing MinIO/S3-compatible container (set by `import_from_container`,
@@ -97,6 +107,10 @@ pub struct S3Config {
     pub host: String,
     pub region: String,
     pub docker_image: String,
+    /// See `S3InputConfig::server`. `None` until resolved for a config that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<S3ServerKind>,
     /// Real container name for imported services — see
     /// `S3InputConfig::container_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +165,7 @@ impl From<S3InputConfig> for S3Config {
             host: input.host,
             region: input.region,
             docker_image: normalize_minio_registry(input.docker_image),
+            server: input.server,
             container_name: input.container_name,
         }
     }
@@ -165,6 +180,23 @@ where
         Some(s) if !s.is_empty() => Some(s),
         _ => None,
     })
+}
+
+/// Parses `S3InputConfig::server`. A blank string (an untouched form field)
+/// counts as absent; anything other than `rustfs`/`minio` is rejected.
+fn deserialize_optional_server_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<S3ServerKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => S3ServerKind::parse(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 /// Treats a blank string the same as an absent value — see
@@ -257,33 +289,154 @@ fn image_repository(image: &str) -> &str {
     }
 }
 
-/// True when `image` runs RustFS rather than MinIO, judged by its repository
-/// name (`rustfs/rustfs`, `registry.local:5000/mirror/rustfs`, ...). Decides
-/// the credentials env, command and healthcheck of the server container.
-pub(crate) fn is_rustfs_image(image: &str) -> bool {
-    image_repository(image)
-        .to_ascii_lowercase()
-        .contains("rustfs")
+/// The S3 server program a service's container runs. RustFS and MinIO speak
+/// the same S3 API but take different credential variables, commands and
+/// healthchecks, so this, not the image name, decides those settings: a
+/// private mirror can publish either server under any repository name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum S3ServerKind {
+    Rustfs,
+    Minio,
 }
 
-/// Environment that sets the root credentials of an S3 server container
-/// running `image`: `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` for RustFS,
+impl S3ServerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            S3ServerKind::Rustfs => "rustfs",
+            S3ServerKind::Minio => "minio",
+        }
+    }
+
+    /// Parses a stored or user-supplied `server` value (case-insensitive).
+    pub fn parse(value: &str) -> Result<Self, S3ServerKindError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rustfs" => Ok(S3ServerKind::Rustfs),
+            "minio" => Ok(S3ServerKind::Minio),
+            _ => Err(S3ServerKindError::Unknown {
+                value: value.to_string(),
+            }),
+        }
+    }
+
+    /// Image a service of this kind runs when none is configured.
+    pub fn default_image(self) -> &'static str {
+        match self {
+            S3ServerKind::Rustfs => super::rustfs::DEFAULT_RUSTFS_IMAGE,
+            S3ServerKind::Minio => LEGACY_MINIO_IMAGE,
+        }
+    }
+}
+
+impl std::fmt::Display for S3ServerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Failures to work out which S3 server an image runs.
+#[derive(Debug, thiserror::Error)]
+pub enum S3ServerKindError {
+    #[error("Unknown S3 server kind '{value}': expected 'rustfs' or 'minio'")]
+    Unknown { value: String },
+    #[error(
+        "Could not inspect S3 server image '{image}' to tell whether it runs RustFS or MinIO \
+         (set the service's `server` parameter to 'rustfs' or 'minio' to skip this check): {error}"
+    )]
+    ImageInspect {
+        image: String,
+        #[source]
+        error: bollard::errors::Error,
+    },
+}
+
+fn default_server_kind() -> S3ServerKind {
+    S3ServerKind::Rustfs
+}
+
+fn example_server_kind() -> S3ServerKind {
+    S3ServerKind::Rustfs
+}
+
+/// Works out which S3 server an image runs from its own metadata: the
+/// entrypoint and command (`rustfs` vs `minio` binary), the environment it
+/// ships (`RUSTFS_*` vs `MINIO_*`) and its `name` label. Returns `None` when
+/// the metadata points at neither server or at both, so the caller decides
+/// what an unknown image means; the repository name is never consulted.
+pub(crate) fn detect_server_kind(
+    entrypoint: &[String],
+    cmd: &[String],
+    env: &[String],
+    labels: &HashMap<String, String>,
+) -> Option<S3ServerKind> {
+    let program_is = |name: &str| {
+        entrypoint.iter().chain(cmd.iter()).any(|arg| {
+            arg.split_whitespace()
+                .next()
+                .and_then(|program| program.rsplit('/').next())
+                .is_some_and(|program| program.eq_ignore_ascii_case(name))
+        })
+    };
+    let env_has = |prefix: &str| {
+        env.iter().any(|entry| {
+            entry
+                .split_once('=')
+                .map_or(entry.as_str(), |(key, _)| key)
+                .starts_with(prefix)
+        })
+    };
+    let named = |name: &str| {
+        labels
+            .get("name")
+            .is_some_and(|label| label.trim().eq_ignore_ascii_case(name))
+    };
+
+    let rustfs = program_is("rustfs") || env_has("RUSTFS_") || named("rustfs");
+    let minio = program_is("minio") || env_has("MINIO_") || named("minio");
+    match (rustfs, minio) {
+        (true, false) => Some(S3ServerKind::Rustfs),
+        (false, true) => Some(S3ServerKind::Minio),
+        _ => None,
+    }
+}
+
+/// [`detect_server_kind`] over a pulled image's config.
+fn detect_image_server_kind(config: Option<&bollard::models::ImageConfig>) -> Option<S3ServerKind> {
+    let config = config?;
+    detect_server_kind(
+        config.entrypoint.as_deref().unwrap_or_default(),
+        config.cmd.as_deref().unwrap_or_default(),
+        config.env.as_deref().unwrap_or_default(),
+        &config.labels.clone().unwrap_or_default(),
+    )
+}
+
+/// True when the image *name* looks like MinIO. Only used to word error
+/// messages about images that could not be pulled; it never decides how a
+/// container is configured.
+fn image_name_mentions_minio(image: &str) -> bool {
+    image_repository(image)
+        .to_ascii_lowercase()
+        .contains("minio")
+}
+
+/// Environment that sets the root credentials of an S3 server container:
+/// `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` for RustFS,
 /// `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` for MinIO.
 pub(crate) fn s3_server_credentials_env(
-    image: &str,
+    kind: S3ServerKind,
     access_key: &str,
     secret_key: &str,
 ) -> [(&'static str, String); 2] {
-    if is_rustfs_image(image) {
-        [
+    match kind {
+        S3ServerKind::Rustfs => [
             ("RUSTFS_ACCESS_KEY", access_key.to_string()),
             ("RUSTFS_SECRET_KEY", secret_key.to_string()),
-        ]
-    } else {
-        [
+        ],
+        S3ServerKind::Minio => [
             ("MINIO_ROOT_USER", access_key.to_string()),
             ("MINIO_ROOT_PASSWORD", secret_key.to_string()),
-        ]
+        ],
     }
 }
 
@@ -295,30 +448,31 @@ struct S3ServerContainerSpec {
     healthcheck: String,
 }
 
-fn s3_server_container_spec(config: &S3Config) -> S3ServerContainerSpec {
+fn s3_server_container_spec(config: &S3Config, kind: S3ServerKind) -> S3ServerContainerSpec {
     let mut env: Vec<String> =
-        s3_server_credentials_env(&config.docker_image, &config.access_key, &config.secret_key)
+        s3_server_credentials_env(kind, &config.access_key, &config.secret_key)
             .into_iter()
             .map(|(name, value)| format!("{name}={value}"))
             .collect();
-    if is_rustfs_image(&config.docker_image) {
+    match kind {
         // RustFS serves `/data` by default (`RUSTFS_VOLUMES=/data` in the
         // image), and answers `/health` on the S3 port.
-        S3ServerContainerSpec {
+        S3ServerKind::Rustfs => S3ServerContainerSpec {
             env,
             cmd: None,
             healthcheck: "curl -sf http://localhost:9000/health > /dev/null || exit 1".to_string(),
-        }
-    } else {
-        // Allow unauthenticated Prometheus scraping from the local metrics
-        // collector.  These containers are private (no public exposure), so
-        // removing the JWT requirement is safe and avoids needing to
-        // generate & rotate bearer tokens on every scrape.
-        env.push("MINIO_PROMETHEUS_AUTH_TYPE=public".to_string());
-        S3ServerContainerSpec {
-            env,
-            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
-            healthcheck: "mc ready local".to_string(),
+        },
+        S3ServerKind::Minio => {
+            // Allow unauthenticated Prometheus scraping from the local metrics
+            // collector.  These containers are private (no public exposure), so
+            // removing the JWT requirement is safe and avoids needing to
+            // generate & rotate bearer tokens on every scrape.
+            env.push("MINIO_PROMETHEUS_AUTH_TYPE=public".to_string());
+            S3ServerContainerSpec {
+                env,
+                cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+                healthcheck: "mc ready local".to_string(),
+            }
         }
     }
 }
@@ -373,12 +527,16 @@ impl S3Service {
     /// Word-splitting fix: bucket names are iterated with `while IFS= read -r`
     /// from a temp file, avoiding glob expansion on whitespace in names.
     ///
-    /// `rc ls` prints one line per entry (`[date]  0B backups/x/bucket-a/`)
-    /// whose last field is the FULL key relative to the backup bucket, not
-    /// just the folder name mc printed, so the `sed` keeps only the last path
-    /// segment. A failed listing aborts the restore instead of being read as
-    /// "nothing to restore", and so does a failed `rc mb` (with
-    /// `--ignore-existing` it exits 0 for a bucket that is already there).
+    /// The listing is `rc ls --json`: its pretty-printed document carries a
+    /// `"truncated"` flag, which the script requires to be `false` (a `true`
+    /// or a missing flag aborts — a partial bucket set must never restore as
+    /// if it were complete; there is no jq in the image, so this is a grep on
+    /// the flag's own line). Each folder entry's `"key"` is the FULL key
+    /// relative to the backup bucket (`backups/x/bucket-a/`), not just the
+    /// folder name mc printed, so the `sed` keeps only the last path segment.
+    /// A failed listing aborts the restore instead of being read as "nothing
+    /// to restore", and so does a failed `rc mb` (with `--ignore-existing` it
+    /// exits 0 for a bucket that is already there).
     ///
     /// Temporary backup credentials: when `TEMPS_REMOTE_SESSION_TOKEN` is set,
     /// every call against the backup (`bkp`) side goes through `bkp_rc`, which
@@ -402,11 +560,19 @@ trap 'rm -rf "${STAGE_ROOT}"' EXIT
 echo "[restore] listing ${RESTORE_PREFIX}"
 LISTING=$(mktemp)
 BUCKET_LIST=$(mktemp)
-if ! bkp_rc ls --no-color "${RESTORE_PREFIX}" > "${LISTING}"; then
+if ! bkp_rc ls --json "${RESTORE_PREFIX}" > "${LISTING}"; then
   echo "[restore] could not list ${RESTORE_PREFIX} — aborting"
   exit 1
 fi
-awk '{print $NF}' "${LISTING}" | grep '/$' | sed 's|/$||; s|.*/||' > "${BUCKET_LIST}" || true
+if grep -q '"truncated": *true' "${LISTING}"; then
+  echo "[restore] the listing of ${RESTORE_PREFIX} is truncated — refusing a partial restore"
+  exit 1
+fi
+if ! grep -q '"truncated": *false' "${LISTING}"; then
+  echo "[restore] could not verify that the listing of ${RESTORE_PREFIX} is complete — aborting"
+  exit 1
+fi
+sed -n 's/^[[:space:]]*"key": *"\(.*\)",*[[:space:]]*$/\1/p' "${LISTING}" | grep '/$' | sed 's|/$||; s|.*/||' > "${BUCKET_LIST}" || true
 rm -f "${LISTING}"
 if [ ! -s "${BUCKET_LIST}" ]; then
   rm -f "${BUCKET_LIST}"
@@ -489,7 +655,9 @@ echo '[restore] complete'"#;
     /// `config` is taken by mutable reference so a retry's port change is
     /// written back to the caller — otherwise the caller (and anything it
     /// persists to the database) keeps referencing the original port even
-    /// though the container actually ended up bound to a different one.
+    /// though the container actually ended up bound to a different one. The
+    /// resolved `server` kind is written back the same way, so `init()`
+    /// reports it and a new service stores it.
     async fn create_container(
         &self,
         docker: &Docker,
@@ -497,7 +665,11 @@ echo '[restore] complete'"#;
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 3;
+        info!("Pulling S3 server image {}", config.docker_image);
+        Self::ensure_server_image(docker, &config.docker_image, config.server).await?;
+        let kind = Self::resolve_server_kind(docker, config).await?;
         let mut attempt_config = config.clone();
+        attempt_config.server = Some(kind);
         for attempt in 1..=MAX_ATTEMPTS {
             match self
                 .create_container_once(docker, &attempt_config, resource_limits)
@@ -534,15 +706,21 @@ echo '[restore] complete'"#;
         unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
     }
 
+    /// Creates and starts the server container once. `create_container` has
+    /// already made the image available and resolved `config.server`.
     async fn create_container_once(
         &self,
         docker: &Docker,
         config: &S3Config,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
-        // Pull the image first
-        info!("Pulling S3 server image {}", config.docker_image);
-        Self::ensure_server_image(docker, &config.docker_image).await?;
+        let kind = config.server.ok_or_else(|| {
+            anyhow::anyhow!(
+                "S3 service '{}': server kind for image '{}' was not resolved before creating its container",
+                self.name,
+                config.docker_image
+            )
+        })?;
 
         let container_name = self.get_container_name();
         // Add volume name construction
@@ -614,8 +792,8 @@ echo '[restore] complete'"#;
         ]);
 
         // RustFS and MinIO take different credential variables and commands;
-        // the image decides which (see `s3_server_container_spec`).
-        let server_spec = s3_server_container_spec(config);
+        // the resolved server kind decides which.
+        let server_spec = s3_server_container_spec(config, kind);
         ensure_network_exists(docker)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
@@ -702,23 +880,82 @@ echo '[restore] complete'"#;
         Ok(())
     }
 
+    /// Which S3 server `config.docker_image` runs.
+    ///
+    /// An explicit `server` wins. A config without one was stored before the
+    /// field existed, so the pulled image's own metadata decides (see
+    /// [`detect_server_kind`]). When the metadata names neither server, or
+    /// both, the service runs as MinIO: every config that can lack the field
+    /// was created while this engine only ran MinIO, so that is exactly how
+    /// it ran before. An error here instead would stop an existing service
+    /// from starting over an image label. The warning names the parameter
+    /// that settles it.
+    async fn resolve_server_kind(
+        docker: &Docker,
+        config: &S3Config,
+    ) -> Result<S3ServerKind, S3ServerKindError> {
+        if let Some(kind) = config.server {
+            return Ok(kind);
+        }
+        let image = docker
+            .inspect_image(&config.docker_image)
+            .await
+            .map_err(|error| S3ServerKindError::ImageInspect {
+                image: config.docker_image.clone(),
+                error,
+            })?;
+        match detect_image_server_kind(image.config.as_ref()) {
+            Some(kind) => {
+                info!(
+                    "S3 service image '{}' has no stored server kind; its metadata says {}",
+                    config.docker_image, kind
+                );
+                Ok(kind)
+            }
+            None => {
+                warn!(
+                    "S3 service image '{}' has no stored server kind and its metadata \
+                     (entrypoint, command, env, name label) does not identify RustFS or MinIO; \
+                     running it as MinIO, as this service ran before. Set the service's `server` \
+                     parameter to 'rustfs' or 'minio' if that is wrong.",
+                    config.docker_image
+                );
+                Ok(S3ServerKind::Minio)
+            }
+        }
+    }
+
     /// Make the server image available before creating its container.
     ///
     /// `pull_image_with_retry` already falls back to a copy of the exact
-    /// reference on this host. For MinIO images two more cases are handled,
-    /// since MinIO no longer publishes them anywhere:
+    /// reference on this host. Unless the service is known to run RustFS, two
+    /// more cases are handled for MinIO images, since MinIO no longer
+    /// publishes them anywhere:
     /// - the host holds the image under its pre-quay.io Docker Hub spelling
     ///   (`minio/minio:<tag>`, see [`normalize_minio_registry`]): tag it with
     ///   the configured name and use it, no registry needed;
     /// - it is not on the host at all: fail with an error that says why and
     ///   what to do, instead of a bare registry error.
-    async fn ensure_server_image(docker: &Docker, image: &str) -> Result<()> {
+    ///
+    /// The kind is not known yet for a config stored before `server` existed
+    /// (it comes from the pulled image), so `None` gets the MinIO handling:
+    /// such a config was created as MinIO.
+    async fn ensure_server_image(
+        docker: &Docker,
+        image: &str,
+        kind: Option<S3ServerKind>,
+    ) -> Result<()> {
         let pull_error = match crate::utils::pull_image_with_retry(docker, image, None).await {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
-        if is_rustfs_image(image) {
-            return Err(anyhow::anyhow!(pull_error));
+        if kind == Some(S3ServerKind::Rustfs) {
+            return Err(anyhow::anyhow!(
+                "Cannot start S3 service: its RustFS image '{}' could not be pulled and is not \
+                 present on this host: {}",
+                image,
+                pull_error
+            ));
         }
 
         // A digest reference can't be satisfied by retagging (`docker tag`
@@ -760,7 +997,17 @@ echo '[restore] complete'"#;
             }
         }
 
-        Err(minio_image_unavailable_error(image, &pull_error))
+        // The name only picks the wording of the error.
+        if kind == Some(S3ServerKind::Minio) || image_name_mentions_minio(image) {
+            Err(minio_image_unavailable_error(image, &pull_error))
+        } else {
+            Err(anyhow::anyhow!(
+                "Cannot start S3 service: its image '{}' could not be pulled and is not present \
+                 on this host: {}",
+                image,
+                pull_error
+            ))
+        }
     }
 
     async fn pull_rc_image(&self, docker: &Docker) -> Result<()> {
@@ -1862,19 +2109,14 @@ impl ExternalService for S3Service {
             backup_location.trim_matches('/')
         );
         // First, list the buckets in the backup location
-        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
-        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
-        let listing = super::rc_client::exec_capture(docker, &container.id, &list_command).await?;
-        let buckets = if listing.exit_code == 0 {
-            super::rc_client::parse_ls_dir_names(&listing.stdout)
-                .map_err(|e| anyhow::anyhow!("{}", sensitive_values.redact(&e.to_string())))
-        } else {
-            Err(anyhow::anyhow!(
-                "rc ls exited with code {}: {}",
-                listing.exit_code,
-                sensitive_values.redact(listing.stderr.trim())
-            ))
-        };
+        let buckets = super::rc_client::list_dir_names(
+            docker,
+            &container.id,
+            &source_backup_location,
+            has_token,
+            &sensitive_values,
+        )
+        .await;
         let buckets = match buckets {
             Ok(buckets) => buckets,
             Err(e) => {
@@ -1887,11 +2129,8 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "S3 restore could not list backup location '{}': {}",
-                    source_backup_location,
-                    e
-                ));
+                // The typed error already names the listed location.
+                return Err(e.into());
             }
         };
 
@@ -2349,6 +2588,18 @@ impl ExternalService for S3Service {
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
                 new_config.docker_image = image.to_string();
+                // The source's kind described the source's image. A new image
+                // without a `server` override is resolved from its metadata.
+                new_config.server = None;
+            }
+            if let Some(server) = overrides.get("server").and_then(|v| v.as_str()) {
+                new_config.server = Some(S3ServerKind::parse(server).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid `server` override for new S3 service '{}': {}",
+                        new_service_name,
+                        e
+                    )
+                })?);
             }
             if let Some(ak) = overrides.get("access_key").and_then(|v| v.as_str()) {
                 new_config.access_key = ak.to_string();
@@ -2487,20 +2738,14 @@ impl ExternalService for S3Service {
             ctx.s3_source.bucket_name,
             ctx.backup_location.trim_matches('/')
         );
-        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
-        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
-        let listing =
-            super::rc_client::exec_capture(&self.docker, &container.id, &list_command).await?;
-        let buckets = if listing.exit_code == 0 {
-            super::rc_client::parse_ls_dir_names(&listing.stdout)
-                .map_err(|e| anyhow::anyhow!("{}", sensitive_values.redact(&e.to_string())))
-        } else {
-            Err(anyhow::anyhow!(
-                "rc ls exited with code {}: {}",
-                listing.exit_code,
-                sensitive_values.redact(listing.stderr.trim())
-            ))
-        };
+        let buckets = super::rc_client::list_dir_names(
+            &self.docker,
+            &container.id,
+            &source_backup_location,
+            has_token,
+            &sensitive_values,
+        )
+        .await;
         let buckets = match buckets {
             Ok(buckets) => buckets,
             Err(e) => {
@@ -2514,12 +2759,8 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "S3 restore to new service '{}' could not list backup location '{}': {}",
-                    new_service_name,
-                    source_backup_location,
-                    e
-                ));
+                // The typed error already names the listed location.
+                return Err(e.into());
             }
         };
 
@@ -2809,10 +3050,33 @@ impl ExternalService for S3Service {
             .trim_start_matches('/')
             .to_string();
 
+        // The server the container runs, from its own config (entrypoint,
+        // command, env, labels) — not from the image name. Stored so the
+        // service never has to guess again.
+        let container_image_config =
+            container
+                .config
+                .as_ref()
+                .map(|c| bollard::models::ImageConfig {
+                    entrypoint: c.entrypoint.clone(),
+                    cmd: c.cmd.clone(),
+                    env: c.env.clone(),
+                    labels: c.labels.clone(),
+                    ..Default::default()
+                });
+        let server = detect_image_server_kind(container_image_config.as_ref());
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
         })?;
+        let server = server.unwrap_or_else(|| {
+            warn!(
+                "Imported S3 container '{}' (image '{}') does not identify as RustFS or MinIO; \
+                 recording it as MinIO. Set the service's `server` parameter if that is wrong.",
+                container_id, image
+            );
+            S3ServerKind::Minio
+        });
 
         // Extract version from image name (e.g., "minio/minio:latest" -> "latest")
         let version = if let Some(tag_pos) = image.rfind(':') {
@@ -2925,6 +3189,7 @@ impl ExternalService for S3Service {
                 "secret_key": secret_key,
                 "use_ssl": false,
                 "docker_image": image,
+                "server": server,
                 "container_name": imported_container_name,
             }),
         };
@@ -3035,41 +3300,55 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.docker_image, LEGACY_MINIO_IMAGE);
-        assert!(!is_rustfs_image(&input.docker_image));
+        assert_eq!(input.server, None);
     }
 
     #[test]
-    fn test_schema_default_image_is_rustfs() {
+    fn test_schema_defaults_are_rustfs() {
         assert_eq!(
             default_image(),
             crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE
         );
-        assert!(is_rustfs_image(&default_image()));
+        assert_eq!(default_server_kind(), S3ServerKind::Rustfs);
+        let schema = serde_json::to_value(schemars::schema_for!(S3InputConfig)).unwrap();
+        assert_eq!(schema["properties"]["server"]["default"], "rustfs");
     }
 
     #[test]
-    fn test_is_rustfs_image_reads_the_repository_not_the_tag() {
-        for image in [
-            "rustfs/rustfs:1.0.0-rc.5",
-            "rustfs/rustfs",
-            "registry.internal:5000/mirror/rustfs:1.0.0-rc.5",
-            "ghcr.io/rustfs/rustfs@sha256:0123",
-            "RustFS/RustFS:latest",
+    fn test_server_kind_parses_and_round_trips() {
+        for (raw, kind) in [
+            ("rustfs", S3ServerKind::Rustfs),
+            ("minio", S3ServerKind::Minio),
+            (" RustFS ", S3ServerKind::Rustfs),
         ] {
-            assert!(is_rustfs_image(image), "{image}");
+            assert_eq!(S3ServerKind::parse(raw).unwrap(), kind);
         }
-        for image in [
-            "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
-            "minio/minio:latest",
-            "registry.internal:5000/minio/minio:latest",
-            // A tag that mentions rustfs does not make the image RustFS.
-            "registry.internal:5000/minio/minio:rustfs-migration",
-        ] {
-            assert!(!is_rustfs_image(image), "{image}");
-        }
+        assert!(matches!(
+            S3ServerKind::parse("ceph"),
+            Err(S3ServerKindError::Unknown { ref value }) if value == "ceph"
+        ));
+
+        let input: S3InputConfig = serde_json::from_value(serde_json::json!({
+            "docker_image": "registry.internal:5000/mirror/object-store:1.0.0",
+            "server": "rustfs",
+        }))
+        .unwrap();
+        let config = S3Config::from(input);
+        assert_eq!(config.server, Some(S3ServerKind::Rustfs));
+        let stored = serde_json::to_value(&config).unwrap();
+        assert_eq!(stored["server"], "rustfs");
+
+        // A blank form field counts as unset; an unknown kind is rejected.
+        let blank: S3InputConfig =
+            serde_json::from_value(serde_json::json!({ "server": "" })).unwrap();
+        assert_eq!(blank.server, None);
+        assert!(
+            serde_json::from_value::<S3InputConfig>(serde_json::json!({ "server": "ceph" }))
+                .is_err()
+        );
     }
 
-    fn config_for_image(image: &str) -> S3Config {
+    fn config_for(image: &str, server: Option<S3ServerKind>) -> S3Config {
         S3Config {
             port: "9000".to_string(),
             access_key: "AKIAEXAMPLE".to_string(),
@@ -3077,36 +3356,49 @@ mod tests {
             host: "localhost".to_string(),
             region: "us-east-1".to_string(),
             docker_image: image.to_string(),
+            server,
             container_name: None,
         }
     }
 
+    /// The explicit kind decides the settings, whatever the image is called:
+    /// a private mirror may publish RustFS under a name with no "rustfs" in it,
+    /// or under one that mentions "minio".
     #[test]
-    fn test_rustfs_image_gets_rustfs_env_and_default_command() {
-        let spec = s3_server_container_spec(&config_for_image(
+    fn test_explicit_rustfs_kind_gets_rustfs_env_and_default_command() {
+        for image in [
             crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE,
-        ));
-        assert_eq!(
-            spec.env,
-            vec![
-                "RUSTFS_ACCESS_KEY=AKIAEXAMPLE".to_string(),
-                "RUSTFS_SECRET_KEY=secret/with+chars".to_string(),
-            ]
-        );
-        assert_eq!(
-            spec.cmd, None,
-            "RustFS serves /data with its default command"
-        );
-        assert!(spec.healthcheck.contains("http://localhost:9000/health"));
-        assert!(
-            !spec.healthcheck.contains("mc "),
-            "RustFS images ship no mc"
-        );
+            "registry.internal:5000/mirror/object-store:1.0.0",
+            "registry.internal:5000/minio-replacement/s3:1.0.0",
+        ] {
+            let spec = s3_server_container_spec(
+                &config_for(image, Some(S3ServerKind::Rustfs)),
+                S3ServerKind::Rustfs,
+            );
+            assert_eq!(
+                spec.env,
+                vec![
+                    "RUSTFS_ACCESS_KEY=AKIAEXAMPLE".to_string(),
+                    "RUSTFS_SECRET_KEY=secret/with+chars".to_string(),
+                ],
+                "{image}"
+            );
+            assert_eq!(
+                spec.cmd, None,
+                "RustFS serves /data with its default command"
+            );
+            assert!(spec.healthcheck.contains("http://localhost:9000/health"));
+            assert!(
+                !spec.healthcheck.contains("mc "),
+                "RustFS images ship no mc"
+            );
+        }
     }
 
     #[test]
-    fn test_minio_image_keeps_minio_env_and_command() {
-        let spec = s3_server_container_spec(&config_for_image(LEGACY_MINIO_IMAGE));
+    fn test_minio_kind_keeps_minio_env_and_command() {
+        let spec =
+            s3_server_container_spec(&config_for(LEGACY_MINIO_IMAGE, None), S3ServerKind::Minio);
         assert_eq!(
             spec.env,
             vec![
@@ -3120,6 +3412,174 @@ mod tests {
             Some(vec!["server".to_string(), "/data".to_string()])
         );
         assert_eq!(spec.healthcheck, "mc ready local");
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    /// The metadata of the real images (`docker image inspect`) is what the
+    /// detection reads — not the repository name.
+    #[test]
+    fn test_detect_server_kind_from_image_metadata() {
+        let rustfs = detect_server_kind(
+            &strings(&["/entrypoint.sh"]),
+            &strings(&["rustfs"]),
+            &strings(&["PATH=/usr/bin", "RUSTFS_VOLUMES=/data"]),
+            &HashMap::from([("name".to_string(), "RustFS".to_string())]),
+        );
+        assert_eq!(rustfs, Some(S3ServerKind::Rustfs));
+
+        let minio = detect_server_kind(
+            &strings(&["/usr/bin/docker-entrypoint.sh"]),
+            &strings(&["minio"]),
+            &strings(&["PATH=/usr/bin", "MINIO_ROOT_USER_FILE=access_key"]),
+            &HashMap::from([("name".to_string(), "MinIO".to_string())]),
+        );
+        assert_eq!(minio, Some(S3ServerKind::Minio));
+
+        // One signal is enough: a rebuilt image that kept only its binary.
+        assert_eq!(
+            detect_server_kind(
+                &strings(&["/usr/local/bin/rustfs"]),
+                &[],
+                &[],
+                &HashMap::new()
+            ),
+            Some(S3ServerKind::Rustfs)
+        );
+        assert_eq!(
+            detect_server_kind(&[], &strings(&["minio server /data"]), &[], &HashMap::new()),
+            Some(S3ServerKind::Minio)
+        );
+
+        // Nothing identifying, or conflicting signals: undecided.
+        assert_eq!(
+            detect_server_kind(
+                &strings(&["/entrypoint.sh"]),
+                &strings(&["serve"]),
+                &strings(&["PATH=/usr/bin"]),
+                &HashMap::new()
+            ),
+            None
+        );
+        assert_eq!(
+            detect_server_kind(
+                &[],
+                &strings(&["rustfs"]),
+                &strings(&["MINIO_ROOT_USER=x"]),
+                &HashMap::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_pull_failure_wording_follows_kind_then_name() {
+        assert!(image_name_mentions_minio(LEGACY_MINIO_IMAGE));
+        assert!(image_name_mentions_minio(
+            "registry.internal:5000/minio/minio:x"
+        ));
+        assert!(!image_name_mentions_minio(
+            "registry.internal:5000/mirror/object-store:1.0.0"
+        ));
+        // A tag that mentions minio does not count.
+        assert!(!image_name_mentions_minio(
+            "registry.internal:5000/mirror/object-store:minio-migration"
+        ));
+    }
+
+    /// Resolution against real pulled images: an explicit kind is used as is
+    /// (no inspection, so even a nonexistent image resolves), and a legacy
+    /// config without one is resolved from the image's metadata.
+    #[tokio::test]
+    async fn test_resolve_server_kind_uses_explicit_kind_then_image_metadata() {
+        use bollard::query_parameters::{RemoveImageOptions, TagImageOptionsBuilder};
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let explicit = config_for(
+            "registry.internal:5000/mirror/does-not-exist:1",
+            Some(S3ServerKind::Rustfs),
+        );
+        assert_eq!(
+            S3Service::resolve_server_kind(&docker, &explicit)
+                .await
+                .unwrap(),
+            S3ServerKind::Rustfs
+        );
+
+        let missing = config_for("registry.internal:5000/mirror/does-not-exist:1", None);
+        assert!(matches!(
+            S3Service::resolve_server_kind(&docker, &missing).await,
+            Err(S3ServerKindError::ImageInspect { ref image, .. }) if image == &missing.docker_image
+        ));
+
+        let rustfs_image = crate::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
+        if crate::utils::pull_image_with_retry(&docker, rustfs_image, None)
+            .await
+            .is_err()
+        {
+            println!("{rustfs_image} unavailable, skipping the metadata half");
+            return;
+        }
+        // A private-mirror name that says nothing about the server, and one
+        // that says the wrong thing: both resolve to RustFS from metadata.
+        let suffix = rand::random::<u32>();
+        let mirrors = [
+            ("temps-test-mirror/object-store", format!("t{suffix}")),
+            ("temps-test-mirror/minio", format!("t{suffix}")),
+        ];
+        for (repo, tag) in &mirrors {
+            docker
+                .tag_image(
+                    rustfs_image,
+                    Some(TagImageOptionsBuilder::new().repo(repo).tag(tag).build()),
+                )
+                .await
+                .expect("tagging the RustFS image locally should succeed");
+        }
+        let mut resolved = Vec::new();
+        for (repo, tag) in &mirrors {
+            resolved.push(
+                S3Service::resolve_server_kind(
+                    &docker,
+                    &config_for(&format!("{repo}:{tag}"), None),
+                )
+                .await,
+            );
+        }
+        for (repo, tag) in &mirrors {
+            let _ = docker
+                .remove_image(&format!("{repo}:{tag}"), None::<RemoveImageOptions>, None)
+                .await;
+        }
+        for result in resolved {
+            assert_eq!(result.unwrap(), S3ServerKind::Rustfs);
+        }
+
+        // busybox names neither server: a legacy config falls back to MinIO.
+        if crate::utils::pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .is_ok()
+        {
+            assert_eq!(
+                S3Service::resolve_server_kind(&docker, &config_for("busybox:latest", None))
+                    .await
+                    .unwrap(),
+                S3ServerKind::Minio
+            );
+        }
     }
 
     #[test]
@@ -3194,7 +3654,7 @@ mod tests {
             .await
             .expect("tagging busybox locally should succeed");
         let configured = format!("quay.io/minio/minio:{tag}");
-        let adopted = S3Service::ensure_server_image(&docker, &configured).await;
+        let adopted = S3Service::ensure_server_image(&docker, &configured, None).await;
         let tagged_locally = docker.inspect_image(&configured).await.is_ok();
         for name in [format!("minio/minio:{tag}"), configured.clone()] {
             let _ = docker
@@ -3214,7 +3674,7 @@ mod tests {
             "quay.io/minio/minio:temps-missing-{}",
             rand::random::<u32>()
         );
-        let err = S3Service::ensure_server_image(&docker, &missing)
+        let err = S3Service::ensure_server_image(&docker, &missing, None)
             .await
             .expect_err("an unpullable MinIO image absent from the host must fail")
             .to_string();
@@ -3228,7 +3688,9 @@ mod tests {
     fn test_restore_in_place_script_uses_rc() {
         let script = S3Service::RESTORE_IN_PLACE_SCRIPT;
         assert!(!script.contains("mc "), "script still calls mc: {script}");
-        assert!(script.contains(r#"rc ls --no-color "${RESTORE_PREFIX}""#));
+        assert!(script.contains(r#"rc ls --json "${RESTORE_PREFIX}""#));
+        assert!(script.contains(r#"grep -q '"truncated": *true'"#));
+        assert!(script.contains(r#"if ! grep -q '"truncated": *false'"#));
         assert!(script.contains(r#"rc mb --ignore-existing "${DEST}/${bucket}""#));
         assert!(script.contains(
             r#"rc mirror --overwrite --remove "${RESTORE_PREFIX}${bucket}/" "${DEST}/${bucket}/""#
@@ -3245,7 +3707,7 @@ mod tests {
         assert!(script.contains(
             r#"bkp_rc() { rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" "$@"; }"#
         ));
-        assert!(script.contains(r#"bkp_rc ls --no-color "${RESTORE_PREFIX}""#));
+        assert!(script.contains(r#"bkp_rc ls --json "${RESTORE_PREFIX}""#));
         assert!(script
             .contains(r#"bkp_rc mirror --overwrite "${RESTORE_PREFIX}${bucket}/" "${STAGE}/""#));
         assert!(
@@ -3274,6 +3736,7 @@ mod tests {
             host: "localhost".to_string(),
             region: "us-east-1".to_string(),
             docker_image: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+            server: None,
             container_name: None,
         };
 
@@ -3308,6 +3771,7 @@ mod tests {
                 host: "localhost".to_string(),
                 region: "us-east-1".to_string(),
                 docker_image: persisted.to_string(),
+                server: None,
                 container_name: None,
             };
 
@@ -3333,6 +3797,7 @@ mod tests {
                 host: "localhost".to_string(),
                 region: "us-east-1".to_string(),
                 docker_image: custom.to_string(),
+                server: None,
                 container_name: None,
             };
 

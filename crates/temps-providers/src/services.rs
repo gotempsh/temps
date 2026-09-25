@@ -1908,6 +1908,54 @@ impl ExternalServiceManager {
         ))
     }
 
+    /// Server kind and image of a MinIO-engine service created on a remote
+    /// node. The image lives on the node, so its metadata can't be read here:
+    /// an explicit `server` wins; without one the config predates the field,
+    /// i.e. it was created as MinIO — the MinIO image this path used to
+    /// default to when none is stored, the stored image run as MinIO otherwise (logged, since a
+    /// mislabelled RustFS image would then fail its healthcheck). New
+    /// services always store `server` (see `MinioParameterStrategy`).
+    fn remote_s3_server_kind_and_image(
+        parameters: &HashMap<String, String>,
+    ) -> Result<(crate::externalsvc::s3::S3ServerKind, String), ExternalServiceError> {
+        use crate::externalsvc::s3::S3ServerKind;
+
+        let explicit = parameters
+            .get("server")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(S3ServerKind::parse)
+            .transpose()
+            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            })?;
+        let image = parameters
+            .get("docker_image")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        Ok(match (explicit, image) {
+            (Some(kind), Some(image)) => (kind, image),
+            (Some(kind), None) => (kind, kind.default_image().to_string()),
+            // The image this path defaulted to before the field existed, so
+            // a node that still holds it keeps using it.
+            (None, None) => (
+                S3ServerKind::Minio,
+                "quay.io/minio/minio:latest".to_string(),
+            ),
+            (None, Some(image)) => {
+                warn!(
+                    "Remote S3 service image '{}' has no stored server kind; running it as MinIO, \
+                     as it was created. Set the service's `server` parameter to 'rustfs' or \
+                     'minio' if that is wrong.",
+                    image
+                );
+                (S3ServerKind::Minio, image)
+            }
+        })
+    }
+
     /// Build the `RemoteServiceCreateParams` that the agent needs to create a
     /// Docker container for a given service type and parameters.
     fn build_remote_create_params(
@@ -2107,33 +2155,22 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
-                // MinIO no longer publishes server images, so a new service
-                // without an explicit image runs RustFS (same S3 API). An
-                // explicit MinIO image keeps MinIO's env and command.
-                let image = parameters
-                    .get("docker_image")
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_RUSTFS_IMAGE.to_string());
+                let (kind, image) = Self::remote_s3_server_kind_and_image(parameters)?;
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
                 let env = crate::externalsvc::s3::s3_server_credentials_env(
-                    &image,
+                    kind,
                     &access_key,
                     &secret_key,
                 )
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value))
                 .collect::<HashMap<_, _>>();
-                let binary = if crate::externalsvc::s3::is_rustfs_image(&image) {
-                    "rustfs"
-                } else {
-                    "minio"
-                };
                 let cmd = vec![
-                    binary.to_string(),
+                    kind.as_str().to_string(),
                     "server".to_string(),
                     "/data".to_string(),
                 ];
@@ -8907,6 +8944,10 @@ echo "[restore] Pre-seed complete"
                 // is recreated, so it must be refreshed like `port` rather
                 // than treated as user-provided config.
                 | "compute_ip"
+                // S3/MinIO server kind (`rustfs`/`minio`) that `init()`
+                // resolved from the image metadata for a service created
+                // without one; an explicit value comes back unchanged.
+                | "server"
         )
     }
 
@@ -12910,6 +12951,64 @@ mod tests {
                 assert_eq!(params.image, expected_image);
             }
         }
+    }
+
+    /// The remote MinIO-engine path configures the container from the
+    /// stored `server` kind, never from the image name: a private mirror of
+    /// RustFS with a neutral name runs RustFS, and a config stored before the
+    /// field existed runs as the MinIO service it was created as.
+    #[test]
+    #[allow(deprecated)]
+    fn remote_minio_engine_configures_the_container_from_the_server_kind() {
+        let manager = mock_service_manager(vec![]);
+        let build = |parameters: &[(&str, &str)]| {
+            let parameters = parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>();
+            manager.build_remote_create_params("orders", &ServiceType::Minio, &parameters)
+        };
+
+        let mirror = "registry.internal:5000/mirror/object-store:1.0.0";
+        let params = build(&[
+            ("docker_image", mirror),
+            ("server", "rustfs"),
+            ("access_key", "AKIAEXAMPLE"),
+            ("secret_key", "secret"),
+        ])
+        .unwrap();
+        assert_eq!(params.image, mirror);
+        assert_eq!(
+            params
+                .environment
+                .get("RUSTFS_ACCESS_KEY")
+                .map(String::as_str),
+            Some("AKIAEXAMPLE")
+        );
+        assert!(!params.environment.contains_key("MINIO_ROOT_USER"));
+        assert_eq!(params.command.as_ref().unwrap()[0], "rustfs");
+
+        let params = build(&[("server", "rustfs")]).unwrap();
+        assert_eq!(params.image, DEFAULT_RUSTFS_IMAGE);
+
+        // Legacy rows (no `server`): MinIO, whatever the image is called.
+        for parameters in [
+            vec![("docker_image", "registry.internal:5000/mirror/rustfs:1.0.0")],
+            vec![],
+        ] {
+            let params = build(&parameters).unwrap();
+            assert!(
+                params.environment.contains_key("MINIO_ROOT_USER"),
+                "{parameters:?}"
+            );
+            assert_eq!(params.command.as_ref().unwrap()[0], "minio");
+        }
+        assert_eq!(build(&[]).unwrap().image, "quay.io/minio/minio:latest");
+
+        assert!(matches!(
+            build(&[("server", "ceph")]),
+            Err(ExternalServiceError::ParameterValidationFailed { .. })
+        ));
     }
 
     /// Regression for the `ExternalServiceManager::Clone` fix: background

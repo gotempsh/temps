@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// `CreateImageOptions` (`from_image` + `tag`) and testcontainers'
 /// `GenericImage::new(name, tag)`.
 pub(crate) const RUSTFS_IMAGE: &str = "rustfs/rustfs";
-pub(crate) const RUSTFS_TAG: &str = "1.0.0-rc.5";
+pub(crate) const RUSTFS_TAG: &str = "1.0.0";
 /// RustFS's documented default root credential, set explicitly so the test
 /// does not depend on the image default.
 pub(crate) const RUSTFS_ACCESS_KEY: &str = "rustfsadmin";

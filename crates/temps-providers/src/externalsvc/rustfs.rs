@@ -37,13 +37,23 @@ use super::{
 
 /// Default RustFS Docker image (from Docker Hub).
 ///
-/// `1.0.0-rc.5` is the current named RustFS release and includes reliable
-/// OTLP custom-header support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`). Pinning
-/// the version avoids the moving `latest` channel. Container registries can
-/// still replace a tag, so callers that require immutable artifacts should
-/// additionally verify the image digest.
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-rc.5";
-const DEFAULT_RUSTFS_VERSION: &str = "1.0.0-rc.5";
+/// `1.0.0` is the first GA RustFS release and includes reliable OTLP
+/// custom-header support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`). Pinning the
+/// version avoids the moving `latest` channel.
+///
+/// The reference is tag-only on purpose, not `tag@digest`: the version shown
+/// for a service is the part after `:`, and an adopted container is matched
+/// by comparing this string with its image, so a digest suffix would break
+/// both. Container registries can still replace a tag, so callers that
+/// require immutable artifacts should additionally verify the image digest
+/// (`sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`
+/// for the multi-arch index of this tag).
+///
+/// Existing services are not moved to a new default: service creation
+/// stores the image it defaulted to, and nothing compares a stored image
+/// with this constant.
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
+const DEFAULT_RUSTFS_VERSION: &str = "1.0.0";
 /// Default RustFS API port
 pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
 /// Default RustFS console port
@@ -1905,31 +1915,15 @@ impl ExternalService for RustfsService {
             s3_source.bucket_name,
             backup_location.trim_matches('/')
         );
-        let list_command = super::rc_client::ls_json_command(&source_backup_location, has_token);
-        let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
-
-        let (list_ok, list_stdout, list_stderr) = self
-            .exec_in_container(docker, &container.id, list_command)
-            .await?;
-        if !list_ok {
-            let _ = docker
-                .remove_container(
-                    &container.id,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-            return Err(anyhow::anyhow!(
-                "RustFS in-place restore could not list backup location '{}': {}",
-                source_backup_location,
-                sensitive_values.redact(&list_stderr).trim()
-            ));
-        }
-
-        // Parse the bucket folders out of the listing document.
-        let buckets = match super::rc_client::parse_ls_dir_names(&list_stdout) {
+        let buckets = match super::rc_client::list_dir_names(
+            docker,
+            &container.id,
+            &source_backup_location,
+            has_token,
+            &sensitive_values,
+        )
+        .await
+        {
             Ok(buckets) => buckets,
             Err(e) => {
                 let _ = docker
@@ -1941,11 +1935,8 @@ impl ExternalService for RustfsService {
                         }),
                     )
                     .await;
-                return Err(anyhow::anyhow!(
-                    "RustFS in-place restore could not read the listing of '{}': {}",
-                    source_backup_location,
-                    sensitive_values.redact(&e.to_string())
-                ));
+                // The typed error already names the listed location.
+                return Err(e.into());
             }
         };
 
@@ -2220,29 +2211,14 @@ impl ExternalService for RustfsService {
                 ctx.s3_source.bucket_name,
                 ctx.backup_location.trim_matches('/')
             );
-            let list_command =
-                super::rc_client::ls_json_command(&source_backup_location, has_token);
-            let list_command: Vec<&str> = list_command.iter().map(String::as_str).collect();
-            let (list_ok, list_stdout, list_stderr) = self
-                .exec_in_container(&self.docker, &container.id, list_command)
-                .await?;
-            if !list_ok {
-                Err(anyhow::anyhow!(
-                    "RustFS restore to new service '{}' could not list backup location '{}': {}",
-                    new_service_name,
-                    source_backup_location,
-                    sensitive_values.redact(&list_stderr).trim()
-                ))?;
-            }
-
-            let buckets = super::rc_client::parse_ls_dir_names(&list_stdout).map_err(|e| {
-                anyhow::anyhow!(
-                    "RustFS restore to new service '{}' could not read the listing of '{}': {}",
-                    new_service_name,
-                    source_backup_location,
-                    sensitive_values.redact(&e.to_string())
-                )
-            })?;
+            let buckets = super::rc_client::list_dir_names(
+                &self.docker,
+                &container.id,
+                &source_backup_location,
+                has_token,
+                &sensitive_values,
+            )
+            .await?;
 
             info!(
                 "Restoring {} bucket(s) into new RustFS service '{}'",

@@ -4,6 +4,7 @@
 use crate::externalsvc::{
     mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
+    s3::S3ServerKind,
     ServiceResourceLimits,
 };
 use serde_json::{json, Value as JsonValue};
@@ -921,9 +922,9 @@ impl ParameterStrategy for MinioParameterStrategy {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
         // RustFS images are accepted: `S3Service` runs them with RustFS's
-        // env/command (see `externalsvc::s3::is_rustfs_image`), and RustFS is
-        // this engine's default now that MinIO no longer publishes images.
-        // MinIO doesn't require parameters for creation
+        // env/command when `server` is `rustfs`, and RustFS is this engine's
+        // default now that MinIO no longer publishes images.
+        validate_s3_server_kind(params)?;
         Ok(())
     }
 
@@ -942,6 +943,20 @@ impl ParameterStrategy for MinioParameterStrategy {
             params.insert(
                 "docker_image".to_string(),
                 JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
+            );
+        }
+
+        // Store which server the image runs, so it never has to be worked
+        // out again. The default image is RustFS; for any other image left
+        // without `server`, `S3Service::init` reads the pulled image's
+        // metadata and the resolved kind is stored with the other inferred
+        // parameters.
+        if is_empty_value(params.get("server"))
+            && params.get("docker_image").and_then(JsonValue::as_str) == Some(DEFAULT_RUSTFS_IMAGE)
+        {
+            params.insert(
+                "server".to_string(),
+                JsonValue::String(S3ServerKind::Rustfs.as_str().to_string()),
             );
         }
 
@@ -975,11 +990,12 @@ impl ParameterStrategy for MinioParameterStrategy {
                 ));
             }
         }
+        validate_s3_server_kind(updates)?;
         Ok(())
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image"]
+        vec!["port", "docker_image", "server"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -992,6 +1008,17 @@ impl ParameterStrategy for MinioParameterStrategy {
         updates: HashMap<String, JsonValue>,
     ) -> Result<(), String> {
         self.validate_for_update(&updates)?;
+
+        // The stored kind describes the stored image. A new image without a
+        // `server` of its own drops it, so the next start reads the new
+        // image's metadata instead of running it with the old server's
+        // settings.
+        let image_changed = updates.get("docker_image").is_some_and(|image| {
+            !is_empty_value(Some(image)) && existing.get("docker_image") != Some(image)
+        });
+        if image_changed && !updates.contains_key("server") {
+            existing.remove("server");
+        }
 
         for (key, value) in updates {
             existing.insert(key, value);
@@ -1023,6 +1050,12 @@ impl ParameterStrategy for MinioParameterStrategy {
                     "type": "string",
                     "description": "Docker image (updateable)",
                     "default": DEFAULT_RUSTFS_IMAGE
+                },
+                "server": {
+                    "type": "string",
+                    "enum": ["rustfs", "minio"],
+                    "description": "S3 server the image runs: decides the container's credential variables, command and healthcheck (updateable; must match docker_image)",
+                    "default": "rustfs"
                 }
             },
             "readonly": ["access_key", "secret_key"]
@@ -1360,6 +1393,21 @@ pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
 }
 
 // ============= Helper Functions =============
+
+/// A `server` parameter, when present and non-empty, must be `rustfs` or
+/// `minio`.
+fn validate_s3_server_kind(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    match params.get("server") {
+        value if is_empty_value(value) => Ok(()),
+        Some(JsonValue::String(value)) => S3ServerKind::parse(value)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Some(other) => Err(format!(
+            "Invalid S3 server kind {other}: expected 'rustfs' or 'minio'"
+        )),
+        None => Ok(()),
+    }
+}
 
 fn is_empty_value(value: Option<&JsonValue>) -> bool {
     match value {
@@ -1921,6 +1969,117 @@ mod tests {
         assert_eq!(
             strategy.get_schema().unwrap()["properties"]["docker_image"]["default"].as_str(),
             Some(DEFAULT_RUSTFS_IMAGE)
+        );
+        assert_eq!(
+            params.get("server").and_then(JsonValue::as_str),
+            Some("rustfs"),
+            "a new service stores its server kind"
+        );
+        assert_eq!(
+            strategy.get_schema().unwrap()["properties"]["server"]["default"].as_str(),
+            Some("rustfs")
+        );
+    }
+
+    #[test]
+    fn minio_engine_keeps_an_explicit_server_kind_and_leaves_custom_images_to_detection() {
+        let strategy = MinioParameterStrategy;
+        let mut explicit = HashMap::from([
+            (
+                "docker_image".to_string(),
+                JsonValue::String("registry.internal:5000/mirror/object-store:1.0.0".to_string()),
+            ),
+            (
+                "server".to_string(),
+                JsonValue::String("rustfs".to_string()),
+            ),
+        ]);
+        strategy.validate_for_creation(&explicit).unwrap();
+        strategy.auto_generate_missing(&mut explicit).unwrap();
+        assert_eq!(
+            explicit.get("server").and_then(JsonValue::as_str),
+            Some("rustfs")
+        );
+
+        // A custom image without `server` is resolved from the pulled image's
+        // metadata at init, not guessed here from its name.
+        let mut custom = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("registry.internal:5000/mirror/rustfs:1.0.0".to_string()),
+        )]);
+        strategy.auto_generate_missing(&mut custom).unwrap();
+        assert!(!custom.contains_key("server"));
+    }
+
+    #[test]
+    fn minio_engine_rejects_unknown_server_kinds() {
+        let strategy = MinioParameterStrategy;
+        for bad in [JsonValue::String("ceph".to_string()), JsonValue::Bool(true)] {
+            let params = HashMap::from([("server".to_string(), bad.clone())]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains("rustfs") && err.contains("minio"), "{err}");
+            assert!(strategy.validate_for_update(&params).is_err(), "{bad}");
+        }
+        let blank = HashMap::from([("server".to_string(), JsonValue::String(String::new()))]);
+        assert!(strategy.validate_for_creation(&blank).is_ok());
+    }
+
+    #[test]
+    fn minio_engine_image_update_without_server_drops_the_stored_kind() {
+        let strategy = MinioParameterStrategy;
+        let stored = || {
+            HashMap::from([
+                (
+                    "docker_image".to_string(),
+                    JsonValue::String(
+                        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+                    ),
+                ),
+                ("server".to_string(), JsonValue::String("minio".to_string())),
+            ])
+        };
+        let new_image =
+            JsonValue::String("registry.internal:5000/mirror/object-store:1.0.0".to_string());
+
+        let mut existing = stored();
+        strategy
+            .merge_updates(
+                &mut existing,
+                HashMap::from([("docker_image".to_string(), new_image.clone())]),
+            )
+            .unwrap();
+        assert_eq!(existing.get("docker_image"), Some(&new_image));
+        assert!(!existing.contains_key("server"));
+
+        let mut existing = stored();
+        strategy
+            .merge_updates(
+                &mut existing,
+                HashMap::from([
+                    ("docker_image".to_string(), new_image.clone()),
+                    (
+                        "server".to_string(),
+                        JsonValue::String("rustfs".to_string()),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            existing.get("server").and_then(JsonValue::as_str),
+            Some("rustfs")
+        );
+
+        // Changing only the port keeps the kind.
+        let mut existing = stored();
+        strategy
+            .merge_updates(
+                &mut existing,
+                HashMap::from([("port".to_string(), JsonValue::String("9100".to_string()))]),
+            )
+            .unwrap();
+        assert_eq!(
+            existing.get("server").and_then(JsonValue::as_str),
+            Some("minio")
         );
     }
 

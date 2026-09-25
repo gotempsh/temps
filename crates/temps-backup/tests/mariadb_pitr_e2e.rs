@@ -53,7 +53,10 @@ const DEFAULT_MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 const MASTER_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ROOT_PASSWORD: &str = "pitr-root-pw-1234"; // >= 8 chars, no quotes/backslashes
                                                  // RustFS replaced MinIO here: MinIO withdrew its public images.
-const RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-rc.5";
+                                                 // Pinned by digest (the multi-arch index of the 1.0.0 tag), matching the CI
+                                                 // pre-pull, so a re-pushed tag cannot change what this test runs.
+const RUSTFS_IMAGE: &str =
+    "rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff";
 const S3_ACCESS_KEY: &str = "rustfsadmin";
 const S3_SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "pitr-test-bucket";
@@ -165,11 +168,23 @@ async fn pull_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (name, tag) = image.split_once(':').unwrap_or((image, "latest"));
+    // A `name@digest` or `name:tag@digest` reference goes whole into
+    // `from_image`: the Engine rejects a digest passed as part of `tag`
+    // (`tag=1.0.0@sha256:...`). Splitting on the first ':' would also cut a
+    // registry port (`host:5000/repo`), so the tag is the part after the last
+    // ':' only when that part has no '/'.
+    let (from_image, tag) = if image.contains('@') {
+        (image, None)
+    } else {
+        match image.rsplit_once(':') {
+            Some((name, tag)) if !tag.contains('/') => (name, Some(tag)),
+            _ => (image, Some("latest")),
+        }
+    };
     let mut stream = docker.create_image(
         Some(bollard::query_parameters::CreateImageOptions {
-            from_image: Some(name.to_string()),
-            tag: Some(tag.to_string()),
+            from_image: Some(from_image.to_string()),
+            tag: tag.map(str::to_string),
             ..Default::default()
         }),
         None,
