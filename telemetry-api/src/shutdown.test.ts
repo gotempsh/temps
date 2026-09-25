@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, it, expect, spyOn, afterEach } from "bun:test";
+import { describe, it, expect, spyOn, beforeEach, afterEach, type Mock } from "bun:test";
 import { gracefulShutdown } from "./shutdown.js";
 
-const quiet = [spyOn(console, "log").mockImplementation(() => {}), spyOn(console, "error").mockImplementation(() => {})];
-afterEach(() => quiet.forEach((s) => s.mockClear()));
+// Silence shutdown logs for each test, and restore the real console afterwards
+// so other test files (which share this process) keep their output.
+let quiet: Mock<(...args: unknown[]) => void>[] = [];
+beforeEach(() => {
+  quiet = [spyOn(console, "log").mockImplementation(() => {}), spyOn(console, "error").mockImplementation(() => {})];
+});
+afterEach(() => quiet.forEach((s) => s.mockRestore()));
 
 describe("gracefulShutdown", () => {
   it("waits for in-flight requests before flushing the backfill, then exits 0", async () => {
