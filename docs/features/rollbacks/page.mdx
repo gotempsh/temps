@@ -70,11 +70,11 @@ The rollback shows up in your deployment history as a new deployment with its ow
 - **Application code** - Reverts to the target deployment's version
 - **Container image** - Reuses the target deployment's image (for a Git deployment with no recorded image, Temps rebuilds its recorded commit instead)
 - **Domain routing** - Moves to the new rollback deployment
+- **Port, replica count, and CPU/memory settings** - Reuses the values recorded on the target deployment (a deployment with none recorded uses the current settings instead)
 
 ### What Doesn't Change
 
 - **Environment variables** - The rollback uses the environment's *current* variables, not the ones the target deployment originally ran with
-- **CPU/memory settings** - The rollback uses the environment's and project's current resource settings
 - **Database** - Data remains unchanged
 - **File storage** - Uploaded files stay intact
 - **SSL certificates** - Certificates remain valid
@@ -128,7 +128,7 @@ bunx @temps-sdk/cli deployments list --project my-app --page 2 --per-page 20
 
 ### Compare Deployments
 
-There's no dedicated CLI command for diffing two deployments. List them as JSON and compare the fields that matter (Git commit, environment variables, resource limits) yourself, or open each deployment's details page in the dashboard side by side. `--json` returns the same single page of results, so add `--limit` or `--page` if the deployment you want is older:
+There's no dedicated CLI command for diffing two deployments. List them as JSON and compare the fields that matter (Git commit, resource settings) yourself, or open each deployment's details page in the dashboard side by side. `--json` returns the same single page of results, so add `--limit` or `--page` if the deployment you want is older:
 
 ```bash
 # List deployments with full details as JSON
@@ -138,9 +138,10 @@ bunx @temps-sdk/cli deployments list --project my-app --json
 **Shows:**
 
 - Git commit info (hash, author, message) — not a full diff, just enough to identify which commit each deployment is running
-- Environment variables used by each deployment
-- CPU/memory limits and requests
-- Other deployment configuration (exposed port, auto-deploy setting, etc.)
+- The resource settings recorded when the deployment was created: CPU/memory limits and requests, exposed port, and replica count
+- A few other settings recorded at the same time (auto-deploy, container exec, performance metrics, session recording)
+
+It doesn't include environment variables: deployments don't record the variables they ran with, so this output can't tell you whether a variable changed between two deployments.
 
 ## After Rollback
 
