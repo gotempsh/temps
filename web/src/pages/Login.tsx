@@ -43,6 +43,8 @@ const OIDC_ERROR_MESSAGES: Record<string, string> = {
   user_not_provisioned:
     'No Temps account exists for this email. Ask an administrator to create one.',
   provider_disabled: 'This SSO provider is currently disabled.',
+  credentials_changed:
+    'Your password was reset by an administrator while you were signing in. Start sign-in again.',
   provider_not_found: 'The SSO provider configuration was not found.',
   no_provider_configured:
     'No SSO provider is configured on this Temps instance.',

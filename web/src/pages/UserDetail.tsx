@@ -6,6 +6,10 @@ import {
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
+import {
+  ResetPasswordDialog,
+  ResetPasswordTarget,
+} from '@/components/users/ResetPasswordDialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,6 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -31,6 +36,7 @@ import {
   ArrowLeft,
   Calendar,
   Clock,
+  KeyRound,
   LogIn,
   Mail,
   MailCheck,
@@ -52,6 +58,10 @@ export function UserDetail() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [page, setPage] = useState(1)
   const canViewAuditLogs = useCanViewAuditLogs()
+  const { user: currentUser } = useAuth()
+  const [resetTarget, setResetTarget] = useState<ResetPasswordTarget | null>(
+    null
+  )
 
   const { data: users, isLoading: isLoadingUser } = useQuery(
     listUsersOptions({ query: { include_deleted: true } })
@@ -165,6 +175,10 @@ export function UserDetail() {
 
   return (
     <div className="space-y-6">
+      <ResetPasswordDialog
+        user={resetTarget}
+        onClose={() => setResetTarget(null)}
+      />
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -245,6 +259,15 @@ export function UserDetail() {
                       Unverified
                     </Badge>
                   )}
+                  {target.user.must_change_password && (
+                    <Badge
+                      variant="secondary"
+                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                    >
+                      <KeyRound className="h-3 w-3" />
+                      Must change password
+                    </Badge>
+                  )}
                   {target.user.deleted_at && (
                     <Badge variant="destructive" className="text-xs">
                       Deleted
@@ -261,6 +284,37 @@ export function UserDetail() {
                       @{target.user.username}
                     </div>
                   )}
+              </div>
+              <div className="ml-auto shrink-0">
+                {currentUser?.id === target.user.id ? (
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to="/account">
+                      <KeyRound className="mr-2 h-4 w-4" />
+                      Change your password
+                    </Link>
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!!target.user.deleted_at}
+                    title={
+                      target.user.deleted_at
+                        ? 'Restore this user before resetting their password'
+                        : undefined
+                    }
+                    onClick={() =>
+                      setResetTarget({
+                        id: target.user.id,
+                        name: target.user.name || target.user.username || '',
+                        email: target.user.email || '',
+                      })
+                    }
+                  >
+                    <KeyRound className="mr-2 h-4 w-4" />
+                    Reset password
+                  </Button>
+                )}
               </div>
             </div>
           )}

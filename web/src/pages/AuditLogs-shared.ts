@@ -65,6 +65,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'USER_RESTORED', label: 'User Restored' },
       { value: 'ROLE_ASSIGNED', label: 'Role Assigned' },
       { value: 'ROLE_REMOVED', label: 'Role Removed' },
+      { value: 'ADMIN_PASSWORD_RESET', label: 'Password Reset by Admin' },
     ],
   },
   {

@@ -45,6 +45,12 @@ pub enum OidcError {
     #[error("OIDC provider {provider_id} is disabled")]
     ProviderDisabled { provider_id: i32 },
 
+    /// An administrator reset the user's password between identity
+    /// resolution and issuing the forced password-change session. Nothing is
+    /// wrong with the provider; the login just has to start again.
+    #[error("Password of user {user_id} was reset during OIDC login")]
+    CredentialsChanged { user_id: i32 },
+
     #[error("Invalid issuer URL: {reason}")]
     InvalidIssuer { reason: String },
 
@@ -149,6 +155,11 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "OIDC login state {state} was not found or was already used"
                 )),
+            OidcError::CredentialsChanged { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Sign-in Interrupted")
+                .with_detail(
+                    "Your password was reset by an administrator while you were signing in. Start sign-in again.",
+                ),
             OidcError::StateExpired { state, age_secs } => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OIDC State Expired")
                 .with_detail(format!(

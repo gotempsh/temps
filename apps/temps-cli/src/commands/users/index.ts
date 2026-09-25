@@ -9,6 +9,7 @@ import {
   createUser,
   deleteUser,
   restoreUser,
+  resetUserPassword,
   assignRole,
   removeRole,
   getCurrentUser,
@@ -44,6 +45,12 @@ interface RestoreOptions {
   id: string
 }
 
+interface ResetPasswordOptions {
+  id: string
+  json?: boolean
+  yes?: boolean
+}
+
 interface RoleOptions {
   id: string
   add?: string
@@ -69,6 +76,18 @@ export function parseRolesInput(rolesOption: string | undefined): RolesInputResu
   }
 
   return { roles: selectedRoles }
+}
+
+/**
+ * Parse a user ID strictly. `parseInt` accepts a numeric prefix, so `12x` or
+ * `12.9` would silently become user 12 -- and these commands delete users,
+ * change roles and reset passwords, so a typo must never select someone else.
+ */
+export function parseUserId(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (!/^[1-9]\d*$/.test(trimmed)) return null
+  const id = Number(trimmed)
+  return Number.isSafeInteger(id) && id <= 2147483647 ? id : null
 }
 
 export function registerUsersCommands(program: Command): void {
@@ -114,6 +133,16 @@ export function registerUsersCommands(program: Command): void {
     .description('Restore a deleted user')
     .requiredOption('--id <id>', 'User ID')
     .action(restoreUserAction)
+
+  users
+    .command('reset-password')
+    .description(
+      "Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in",
+    )
+    .requiredOption('--id <id>', 'User ID')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip confirmation prompt (for automation)')
+    .action(resetPasswordAction)
 
   users
     .command('role')
@@ -282,9 +311,11 @@ async function removeUser(options: RemoveOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
@@ -320,9 +351,11 @@ async function restoreUserAction(options: RestoreOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
@@ -339,19 +372,71 @@ async function restoreUserAction(options: RestoreOptions): Promise<void> {
   success('User restored')
 }
 
+async function resetPasswordAction(options: ResetPasswordOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
+    return
+  }
+
+  if (!options.yes) {
+    warning('Their current password stops working and they are signed out of every browser session. Their API keys keep working.')
+    const confirmed = await promptConfirm({
+      message: `Reset the password of user ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const result = await withSpinner('Resetting password...', async () => {
+    const { data, error } = await resetUserPassword({
+      client,
+      path: { user_id: id },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? 'Failed to reset password')
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  success(`Password reset for user ${id}`)
+  keyValue('Temporary password', colors.bold(result.temporary_password))
+  newline()
+  info('Share it through a channel you trust. It is shown only once and cannot be retrieved later.')
+  info('The user must choose a new password the next time they sign in.')
+  newline()
+}
+
 async function manageRoles(options: RoleOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(options.id, 10)
-  if (isNaN(id)) {
-    warning('Invalid user ID')
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
     return
   }
 
   if (options.add) {
     if (!AVAILABLE_ROLES.includes(options.add)) {
       warning(`Invalid role: ${options.add}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
+      process.exitCode = 1
       return
     }
 
@@ -375,6 +460,7 @@ async function manageRoles(options: RoleOptions): Promise<void> {
   if (options.remove) {
     if (!AVAILABLE_ROLES.includes(options.remove)) {
       warning(`Invalid role: ${options.remove}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
+      process.exitCode = 1
       return
     }
 
