@@ -3894,7 +3894,7 @@ mod tests {
     }
 
     // `flavor = "multi_thread"` is required because the test uses
-    // `MinioTestContainer`, whose `Drop` impl calls
+    // `S3TestContainer`, whose `Drop` impl calls
     // `tokio::task::block_in_place` to synchronously stop/remove the
     // container. `block_in_place` panics under the default current-thread
     // runtime, and panicking inside Drop while a Tokio runtime is shutting
@@ -3926,7 +3926,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     async fn run_redis_backup_and_restore_to_s3(op_timeout: Duration) {
         use super::super::test_utils::{
-            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
         };
 
         // Check if Docker is available
@@ -3945,7 +3945,7 @@ mod tests {
         }
 
         // Start MinIO container for S3 operations
-        let minio = match MinioTestContainer::start(docker.clone(), "redis-backup-test").await {
+        let minio = match S3TestContainer::start(docker.clone(), "redis-backup-test").await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();

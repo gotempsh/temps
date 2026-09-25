@@ -13,8 +13,8 @@ export function positiveInteger(value: string | null): number | undefined {
 }
 
 export function readObservationWindow(params: URLSearchParams, now: number) {
-  const requested = params.get('range') ?? '1d'
-  const rangeParam = requested === '24h' ? '1d' : requested
+  const requested = params.get('range')
+  const rangeParam = requested === '24h' ? '1d' : (requested ?? '1d')
   const preset = Object.prototype.hasOwnProperty.call(
     QUICK_TIME_RANGES,
     rangeParam
@@ -28,19 +28,23 @@ export function readObservationWindow(params: URLSearchParams, now: number) {
     Number.isFinite(to) &&
     from < to &&
     to - from <= 30 * 86400000
-  // Keep legacy/custom absolute links accurate instead of marking a wrong quick action active.
+  // Preserve explicit historical windows. A matching preset is always
+  // relative, including links written by older versions with from/to dates.
   const range: ObservabilityRange =
-    valid && (!preset || to - from !== QUICK_TIME_RANGES[preset] * 3600000)
+    valid &&
+    (requested === null ||
+      !preset ||
+      to - from !== QUICK_TIME_RANGES[preset] * 3600000)
       ? 'custom'
       : (preset ?? '1d')
   return {
     range,
     from: new Date(
-      valid
+      range === 'custom' && valid
         ? from
         : now - QUICK_TIME_RANGES[range === 'custom' ? '1d' : range] * 3600000
     ).toISOString(),
-    to: new Date(valid ? to : now).toISOString(),
+    to: new Date(range === 'custom' && valid ? to : now).toISOString(),
   }
 }
 
@@ -52,14 +56,21 @@ export function normalizeObservationWindow(
   const window = readObservationWindow(current, now)
   const next = new URLSearchParams(current)
   const sameWindow =
-    Date.parse(current.get('from') ?? '') === Date.parse(window.from) &&
-    Date.parse(current.get('to') ?? '') === Date.parse(window.to)
+    window.range === 'custom'
+      ? Date.parse(current.get('from') ?? '') === Date.parse(window.from) &&
+        Date.parse(current.get('to') ?? '') === Date.parse(window.to)
+      : !current.has('from') && !current.has('to')
   if (!sameWindow) {
     next.delete('cursor')
     next.delete('page')
   }
-  next.set('from', window.from)
-  next.set('to', window.to)
+  if (window.range === 'custom') {
+    next.set('from', window.from)
+    next.set('to', window.to)
+  } else {
+    next.delete('from')
+    next.delete('to')
+  }
   next.set('range', window.range)
   return next
 }

@@ -2569,12 +2569,22 @@ impl WorkflowPlanner {
             .or_else(|| project.deployment_config.as_ref().map(|c| c.replicas))
             .unwrap_or(1);
 
+        // `use_external_image` only means "deploy this tag, there is no build
+        // job". Whether a remote worker can pull it is a separate question: an
+        // uploaded image exists only in this control plane's Docker and must be
+        // streamed to the worker, never pulled (see `DeployImageSource`).
+        let image_source = if is_uploaded_locally {
+            crate::jobs::DeployImageSource::ControlPlaneLocal
+        } else {
+            crate::jobs::DeployImageSource::Registry
+        };
         let mut job_config = serde_json::json!({
             "port": exposed_port,
             "configured_port": configured_port,
             "replicas": replicas,
             "image_name": external_image_ref,
             "use_external_image": true,
+            (crate::jobs::IMAGE_SOURCE_CONFIG_KEY): image_source.as_str(),
         });
         if let Some(obj) = job_config.as_object_mut() {
             self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
@@ -3914,6 +3924,129 @@ mod tests {
         assert!(
             !job_ids.contains(&"build_image".to_string()),
             "Should NOT contain build_image for Docker image deployment"
+        );
+
+        // A registry image is pulled by whichever worker runs the replica.
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .expect("deploy_container job");
+        let deploy_config = deploy_job
+            .job_config
+            .as_ref()
+            .expect("deploy_container job config");
+        assert_eq!(
+            crate::jobs::DeployImageSource::from_job_config(deploy_config),
+            Some(crate::jobs::DeployImageSource::Registry),
+            "external image deploy must be registry-sourced: {deploy_config}"
+        );
+
+        Ok(())
+    }
+
+    /// Regression: an uploaded image (`temps deploy:local-image`) exists only in
+    /// the control plane's Docker. Its deploy job must say so, or a replica
+    /// scheduled on a worker asks that worker to pull `temps.internal/...` from
+    /// a registry that doesn't exist.
+    #[tokio::test]
+    async fn test_uploaded_image_deployment_is_control_plane_local(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Docker/Postgres not available, skipping: {e}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+
+        let project = projects::ActiveModel {
+            name: Set("Uploaded Image Project".to_string()),
+            slug: Set("uploaded-image-project".to_string()),
+            repo_owner: Set(String::new()),
+            repo_name: Set(String::new()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::DockerImage),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("uploaded.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("uploaded.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await?;
+
+        let image_ref = format!(
+            "temps.internal/project-{}/environment-{}/upload-0f3c9a:immutable",
+            project.id, environment.id
+        );
+        // Same metadata the upload handler writes.
+        let deployment_metadata = temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some(image_ref.clone()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
+            image_uploaded_locally: true,
+            uploaded_image_id: Some("sha256:0f3c9a".to_string()),
+            ..Default::default()
+        };
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("uploaded-image-project-1".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(deployment_metadata)),
+            image_name: Set(Some(image_ref.clone())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment = deployment.insert(db.as_ref()).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+
+        let job_ids: Vec<&str> = jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert!(
+            job_ids.contains(&"verify_local_image") && !job_ids.contains(&"pull_external_image"),
+            "uploaded image must be verified locally, not pulled: {job_ids:?}"
+        );
+
+        let deploy_config = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .and_then(|j| j.job_config.as_ref())
+            .expect("deploy_container job config");
+        assert_eq!(
+            deploy_config.get("image_name").and_then(|v| v.as_str()),
+            Some(image_ref.as_str())
+        );
+        assert_eq!(
+            crate::jobs::DeployImageSource::from_job_config(deploy_config),
+            Some(crate::jobs::DeployImageSource::ControlPlaneLocal),
+            "uploaded image deploy must be control-plane-local: {deploy_config}"
         );
 
         Ok(())

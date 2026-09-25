@@ -25,13 +25,8 @@ import {
   YAxis,
 } from 'recharts'
 import { Link } from 'react-router'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { ChevronDown } from 'lucide-react'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -42,6 +37,7 @@ import {
 } from '@/components/ui/select'
 import { BREAKDOWN_STROKES } from '@/components/charts/chart-colors'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import { cn } from '@/lib/utils'
 import type { AnalyticsCapability } from '@/api/client/types.gen'
 import {
   histogramBucketSeconds,
@@ -101,6 +97,7 @@ export function LogHistogram({
   onRangeSelect: (from: string, to: string) => void
 }) {
   const [uiGroupBy, setUiGroupBy] = useState<string>(NONE_GROUP)
+  const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null)
   const groupBy: HistogramGroupBy =
     uiGroupBy === NONE_GROUP ? '' : (uiGroupBy as HistogramGroupBy)
   const configured = capability?.configured === true
@@ -153,37 +150,70 @@ export function LogHistogram({
         .reduce((s, [, v]) => s + Number(v), 0),
     0
   )
+  const showDetails = expandedOverride ?? (!capabilityLoading && !configured)
+  const bucketLabel =
+    bucketSecs < 60 ? `${bucketSecs}s` : `${Math.round(bucketSecs / 60)}m`
+  const summary = capabilityLoading
+    ? 'Checking log volume…'
+    : !configured
+      ? (capability?.reason ?? 'Line index not configured')
+      : histogram.isPending
+        ? 'Loading log volume…'
+        : histogram.isError
+          ? 'Log volume unavailable'
+          : `${totalLines.toLocaleString()} lines · ${bucketLabel} buckets${filters.text ? ' · text filter excluded' : ''}`
 
   return (
     <Card>
-      <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-2 pb-2">
-        <div>
-          <CardTitle className="text-base">Log volume</CardTitle>
-          <CardDescription>
-            {configured
-              ? `${bucketSecs < 60 ? `${bucketSecs}s` : `${Math.round(bucketSecs / 60)}m`} buckets · click a bar to zoom in`
-              : 'Needs the ClickHouse line index (ADR-047)'}
-          </CardDescription>
+      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-3 p-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded px-1 py-1 text-sm font-semibold hover:bg-muted/50"
+            onClick={() => setExpandedOverride(!showDetails)}
+            aria-expanded={showDetails}
+            aria-controls="global-log-volume-details"
+          >
+            <ChevronDown
+              className={cn(
+                'size-4 text-muted-foreground transition-transform',
+                showDetails && 'rotate-180'
+              )}
+            />
+            Log volume
+          </button>
+          <span className="text-xs text-muted-foreground">{summary}</span>
         </div>
         {configured && (
-          <Select value={uiGroupBy} onValueChange={setUiGroupBy}>
-            <SelectTrigger className="h-8 w-[160px] text-xs">
-              <SelectValue placeholder="Group by" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={NONE_GROUP}>None</SelectItem>
-              <SelectItem value="level">Level</SelectItem>
-              <SelectItem value="service">Service</SelectItem>
-              {(attributeKeys ?? []).map((key) => (
-                <SelectItem key={key.value} value={`attr:${key.value}`}>
-                  {key.value}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div hidden={!showDetails}>
+            <Select value={uiGroupBy} onValueChange={setUiGroupBy}>
+              <SelectTrigger className="h-8 w-[160px] text-xs">
+                <SelectValue placeholder="Group by" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE_GROUP}>None</SelectItem>
+                <SelectItem value="level">Level</SelectItem>
+                <SelectItem value="service">Service</SelectItem>
+                {(attributeKeys ?? []).map((key) => (
+                  <SelectItem key={key.value} value={`attr:${key.value}`}>
+                    {key.value}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         )}
       </CardHeader>
-      <CardContent>
+      <CardContent
+        id="global-log-volume-details"
+        hidden={!showDetails}
+        className="border-t p-4"
+      >
+        {configured && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            Click a bar to zoom in.
+          </p>
+        )}
         {filters.text && (
           <p className="mb-2 text-[11px] text-muted-foreground">
             Excludes the text filter — the line index has no message bytes to
@@ -191,7 +221,7 @@ export function LogHistogram({
           </p>
         )}
         {capabilityLoading ? (
-          <Skeleton className="h-[220px] w-full" />
+          <Skeleton className="h-[180px] w-full" />
         ) : !configured ? (
           <AnalyticsOnboarding
             analytics={
@@ -209,17 +239,17 @@ export function LogHistogram({
             }
           />
         ) : histogram.isPending ? (
-          <Skeleton className="h-[220px] w-full" />
+          <Skeleton className="h-[180px] w-full" />
         ) : histogram.isError ? (
-          <div className="flex h-[220px] items-center justify-center text-sm text-muted-foreground">
+          <div className="flex h-[180px] items-center justify-center text-sm text-muted-foreground">
             Histogram could not be loaded.
           </div>
         ) : rows.length === 0 ? (
-          <div className="flex h-[220px] items-center justify-center text-sm text-muted-foreground">
+          <div className="flex h-[180px] items-center justify-center text-sm text-muted-foreground">
             No lines in this window.
           </div>
         ) : (
-          <div className="h-[220px]">
+          <div className="h-[180px]">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
                 data={rows}
@@ -272,6 +302,7 @@ export function LogHistogram({
                     name={group}
                     stackId="lines"
                     fill={BREAKDOWN_STROKES[index % BREAKDOWN_STROKES.length]}
+                    maxBarSize={18}
                     isAnimationActive={false}
                     onClick={(entry) => {
                       const ts = Number(
@@ -290,14 +321,15 @@ export function LogHistogram({
             </ResponsiveContainer>
           </div>
         )}
-        {configured && rows.length > 0 && (
-          <p className="mt-2 text-[11px] text-muted-foreground">
-            {totalLines.toLocaleString()} lines indexed in this window
-            {capability &&
-              capability.live_chunks > 0 &&
-              ` · index coverage ${capability.indexed_chunks.toLocaleString()}/${capability.live_chunks.toLocaleString()} chunks`}
-          </p>
-        )}
+        {configured &&
+          rows.length > 0 &&
+          capability &&
+          capability.live_chunks > 0 && (
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              Index coverage {capability.indexed_chunks.toLocaleString()}/
+              {capability.live_chunks.toLocaleString()} chunks
+            </p>
+          )}
       </CardContent>
     </Card>
   )

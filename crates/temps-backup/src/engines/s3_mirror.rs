@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `S3MirrorEngine`: bucket-to-bucket mirror using `mc mirror --overwrite`,
-//! implemented against `engine_v2::BackupEngine`.
+//! `S3MirrorEngine`: bucket-to-bucket mirror using `rc mirror --overwrite`
+//! (the RustFS S3 CLI, an `mc`-compatible client), implemented against
+//! `engine_v2::BackupEngine`.
 //!
 //! ## Flow
 //!
@@ -15,27 +16,45 @@
 //!    does not (RustFS: every *project* gets its own bucket, and there is no
 //!    per-service bucket at all), enumerate the account's buckets via
 //!    `ListBuckets` over `aws-sdk-s3` and mirror each one individually --
-//!    see "Why not `mc mirror source/`" below.
-//! 4. For each bucket mirrored, run a one-shot `minio/mc` container in
-//!    `host` network mode with `MC_HOST_source` and `MC_HOST_dest` env vars.
-//!    The container's entrypoint is
-//!    `mc mirror --overwrite source/<bucket>/ dest/<bucket>/<prefix>/[<bucket>/]`.
+//!    see "Why not a whole-account mirror" below.
+//! 4. For each bucket mirrored, run a one-shot `rustfs/rc` container in
+//!    `host` network mode with `RC_HOST_source` and `RC_HOST_dest` env vars.
+//!    The container runs
+//!    `rc mirror --overwrite source/<bucket>/ dest/<bucket>/<prefix>/[<bucket>/]`
+//!    (see [`build_mirror_script`] for the session-token variant).
 //!    Container exits when mirror exits.
 //! 5. Compute the mirrored prefix's total size via list-objects, summed
 //!    across all mirrored buckets.
 //! 6. Write one `metadata.json` companion for the whole backup.
 //!
-//! ## Why not `mc mirror source/` for a whole account
+//! ## Why not a whole-account mirror
 //!
-//! `mc mirror source/` (no bucket in the path) asks the source for an
+//! `mc mirror source/` (no bucket in the path) asked the source for an
 //! account-level bucket listing to expand into per-bucket mirrors. RustFS's
 //! S3 API accepts that same `ListBuckets` call fine when issued directly via
 //! `aws-sdk-s3` (used for its own health check), but `mc` issuing the
-//! equivalent call against the same credentials gets `Access Denied` --
-//! confirmed in production. Rather than depend on `mc`'s account-level
-//! listing path working, this engine does its own `ListBuckets` (the call
-//! already proven to work) and hands `mc` a concrete, already-known bucket
-//! name every time, so `mc` never needs to perform that call itself.
+//! equivalent call against the same credentials got `Access Denied` --
+//! confirmed in production. Rather than depend on the mirror client's
+//! account-level listing path working, this engine does its own
+//! `ListBuckets` (the call already proven to work) and hands the client a
+//! concrete, already-known bucket name every time.
+//!
+//! ## Why `rc` and not `mc`
+//!
+//! MinIO withdrew every public distribution of `mc` (`quay.io/minio/mc`,
+//! Docker Hub `minio/mc`, dl.min.io), so the pinned image can no longer be
+//! pulled. `rustfs/rc` is the RustFS project's `mc`-compatible client. Two
+//! differences matter here:
+//!
+//! - Credentials come from `RC_HOST_<alias>` (it ignores `MC_HOST_*`), with
+//!   the same percent-decoded `scheme://key:secret@host` shape.
+//! - `rc` has no per-alias session token: a third userinfo field is folded
+//!   into the secret (SignatureDoesNotMatch), and its global
+//!   `-H x-amz-security-token:` header is sent to *every* endpoint, which a
+//!   source RustFS rejects. A destination carrying a session token
+//!   (Cloud-vended credentials) is therefore mirrored in two steps through
+//!   a scratch directory inside the auto-removed container; see
+//!   [`build_mirror_script`].
 
 use std::sync::Arc;
 
@@ -52,7 +71,16 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 use temps_providers::externalsvc::SensitiveValues;
 
 pub(crate) const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
+/// RustFS S3 CLI (`rc`), multi-arch, pinned by tag *and* index digest so a
+/// re-pushed tag can never run with these credentials.
+const RC_IMAGE: &str =
+    "rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699";
+/// Env var carrying the destination session token into the one-shot
+/// container for the two-step mirror, so the token never appears in the
+/// container's `Cmd` (`docker inspect`) or logs. `sh` expands it into the
+/// `rc -H` argument, so it is in that `rc` process's argv for the life of the
+/// call — rc has no env- or file-based way to set the header.
+const DEST_SESSION_TOKEN_ENV: &str = "TEMPS_DEST_SESSION_TOKEN";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
@@ -175,8 +203,8 @@ impl BackupEngine for S3MirrorEngine {
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let dest_prefix = build_dest_prefix(&s3_dest.bucket_path, &service.name, &backup_uuid);
 
-        // mc echoes the credential-bearing `MC_HOST_*` URL it could not use
-        // straight into stderr, and that stderr is folded into the
+        // The mirror client's stderr may echo credential-bearing alias URLs
+        // or request headers, and that stderr is folded into the
         // `BackupError::Failed` reason persisted on the backup row and surfaced
         // through the API. A Cloud-vended destination credential carries a
         // session token that is not individually revocable, so it must be
@@ -193,7 +221,7 @@ impl BackupEngine for S3MirrorEngine {
         // case; RustFS never does (every *project* gets its own bucket, not
         // the service). When it doesn't, enumerate the account's actual
         // buckets and mirror each individually -- see the module doc comment
-        // for why `mc mirror source/` (whole account) isn't used instead.
+        // for why a whole-account mirror isn't used instead.
         let enumerated = source_bucket.is_empty();
         let buckets = if enumerated {
             list_source_buckets(
@@ -218,7 +246,7 @@ impl BackupEngine for S3MirrorEngine {
         // Refresh the registry tag once before the whole backup run, rather
         // than per bucket, so a poisoned local cache entry cannot execute
         // with these secrets -- and so N buckets don't each pay a pull.
-        super::image_pull::force_pull_image_v2(MC_IMAGE, ENGINE_KEY).await?;
+        super::image_pull::force_pull_image_v2(RC_IMAGE, ENGINE_KEY).await?;
 
         let mut total_size_bytes: i64 = 0;
         let mut mirrored_buckets: Vec<Value> = Vec::with_capacity(buckets.len());
@@ -239,66 +267,42 @@ impl BackupEngine for S3MirrorEngine {
                 backup_id,
                 source = %source_path,
                 dest = %dest_path,
-                "S3MirrorEngine: starting mc mirror",
+                "S3MirrorEngine: starting rc mirror",
             );
 
-            let env_vars = vec![
-                format!(
-                    "MC_HOST_source=http://{}:{}@{}:{}",
-                    source_access_key, source_secret_key, source_host, source_port
-                ),
-                format!(
-                    "MC_HOST_dest={}://{}@{}",
-                    dest_scheme,
-                    temps_providers::externalsvc::mc_host_credential(
-                        &dest_access_key,
-                        &dest_secret_key,
-                        dest_session_token.as_deref(),
-                    ),
-                    dest_hostpath
-                ),
-            ];
-
-            let mirror_cmd = format!(
-                "mc mirror --overwrite {} {}",
-                v2_common::shell_escape(&source_path),
-                v2_common::shell_escape(&dest_path),
-            );
-
-            let spec = OneShotSpec {
-                image: MC_IMAGE.to_string(),
-                name: format!("temps-s3mirror-{}-{}", backup_uuid, bucket),
-                engine: ENGINE_KEY,
+            let spec = build_mirror_spec(
+                format!("temps-s3mirror-{}-{}", backup_uuid, bucket),
                 backup_id,
-                entrypoint: vec!["sh".to_string(), "-c".to_string()],
-                cmd: vec![mirror_cmd],
-                env: env_vars,
-                binds: vec![],
-                // Host network so the mc container can reach both the source
-                // MinIO (typically `host:9000`) and the destination endpoint
-                // (typically an internet S3) without extra routing.
-                network_mode: Some("host".to_string()),
-                user: None,
-                // `mc mirror` exits 0 even when it could not list one side of
-                // the mirror for comparison; see the exit_code==0 handling
-                // below for why that fallback needs to be caught rather than
-                // trusted.
-                stderr_watch: Some("access denied"),
-            };
+                &RcHost {
+                    scheme: "http",
+                    host: &format!("{}:{}", source_host, source_port),
+                    access_key: &source_access_key,
+                    secret_key: &source_secret_key,
+                },
+                &RcHost {
+                    scheme: dest_scheme,
+                    host: dest_hostpath,
+                    access_key: &dest_access_key,
+                    secret_key: &dest_secret_key,
+                },
+                dest_session_token.as_deref(),
+                &source_path,
+                &dest_path,
+            );
 
             let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {
                 Ok(r) => r,
                 Err(OneShotError::Cancelled) => return Err(BackupError::Cancelled),
                 Err(e) => {
                     return Err(BackupError::Failed {
-                        reason: format!("mc mirror one-shot failed for bucket {}: {}", bucket, e),
+                        reason: format!("rc mirror one-shot failed for bucket {}: {}", bucket, e),
                     });
                 }
             };
             if result.exit_code != 0 {
                 return Err(BackupError::Failed {
                     reason: format!(
-                        "mc mirror exited with code {} for bucket {}. stderr: {}. stdout: {}",
+                        "rc mirror exited with code {} for bucket {}. stderr: {}. stdout: {}",
                         result.exit_code,
                         bucket,
                         sensitive_values.redact(result.stderr_tail.trim()),
@@ -306,8 +310,8 @@ impl BackupEngine for S3MirrorEngine {
                     ),
                 });
             }
-            // `mc mirror` exits 0 even when it could not list one side of the
-            // mirror for comparison -- it logs the failure and falls back to
+            // `mc mirror` exited 0 even when it could not list one side of the
+            // mirror for comparison -- it logged the failure and fell back to
             // copying everything it *can* reach via plain PUT/GET, rather
             // than treating a failed diff as fatal. That fallback silently
             // turns a real access/listing problem into a "completed" backup
@@ -322,9 +326,9 @@ impl BackupEngine for S3MirrorEngine {
             if result.stderr_watch_matched {
                 return Err(BackupError::Failed {
                     reason: format!(
-                        "mc mirror could not list one side of the mirror for comparison \
-                         (access denied) for bucket {} (backup {}, service {}). mc still \
-                         exited 0 and copied what it could reach via direct PUT/GET, but \
+                        "rc mirror reported access denied while mirroring bucket {} \
+                         (backup {}, service {}). It still exited 0 and copied what it \
+                         could reach via direct PUT/GET, but \
                          the result may be an incomplete, non-diffed copy -- check that \
                          both the source and destination S3 credentials have list \
                          permission on their bucket. stderr: {}",
@@ -339,7 +343,7 @@ impl BackupEngine for S3MirrorEngine {
                 info!(
                     backup_id,
                     bucket = %bucket,
-                    "mc mirror stderr (warnings): {}",
+                    "rc mirror stderr (warnings): {}",
                     sensitive_values.redact(result.stderr_tail.trim()),
                 );
             }
@@ -381,7 +385,7 @@ impl BackupEngine for S3MirrorEngine {
             s3_source_id,
             "none",
             Some(json!({
-                "backup_tool": "mc",
+                "backup_tool": "rc",
                 "service": { "id": service_id, "name": service.name },
                 "buckets": mirrored_buckets,
             })),
@@ -406,6 +410,107 @@ impl BackupEngine for S3MirrorEngine {
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
+/// One side of an `rc mirror`: exported to the container as
+/// `RC_HOST_<alias>=<scheme>://<key>:<secret>@<host>`.
+struct RcHost<'a> {
+    scheme: &'a str,
+    /// `host[:port][/path]`, without scheme.
+    host: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+}
+
+impl RcHost<'_> {
+    fn env(&self, alias: &str) -> String {
+        // `rc` percent-decodes the userinfo like `mc` did, so the same
+        // encoder applies. It has no session-token field: a third field would
+        // be folded into the secret, so the token always travels separately
+        // (see `build_mirror_script`).
+        format!(
+            "RC_HOST_{}={}://{}@{}",
+            alias,
+            self.scheme,
+            temps_providers::externalsvc::mc_host_credential(
+                self.access_key,
+                self.secret_key,
+                None
+            ),
+            self.host
+        )
+    }
+}
+
+/// The one-shot container that mirrors `source_path` (alias `source`) into
+/// `dest_path` (alias `dest`) for a single bucket.
+fn build_mirror_spec(
+    name: String,
+    backup_id: i32,
+    source: &RcHost<'_>,
+    dest: &RcHost<'_>,
+    dest_session_token: Option<&str>,
+    source_path: &str,
+    dest_path: &str,
+) -> OneShotSpec {
+    let session_token = dest_session_token.filter(|t| !t.is_empty());
+    let mut env = vec![source.env("source"), dest.env("dest")];
+    if let Some(token) = session_token {
+        env.push(format!("{}={}", DEST_SESSION_TOKEN_ENV, token));
+    }
+    OneShotSpec {
+        image: RC_IMAGE.to_string(),
+        name,
+        engine: ENGINE_KEY,
+        backup_id,
+        entrypoint: vec!["sh".to_string(), "-c".to_string()],
+        cmd: vec![build_mirror_script(
+            source_path,
+            dest_path,
+            session_token.is_some(),
+        )],
+        env,
+        binds: vec![],
+        // Host network so the rc container can reach both the source
+        // object store (typically `host:9000`) and the destination endpoint
+        // (typically an internet S3) without extra routing.
+        network_mode: Some("host".to_string()),
+        user: None,
+        // `mc mirror` used to exit 0 even when it could not list one side of
+        // the mirror for comparison. `rc` exits non-zero on list failures,
+        // but the watch stays as a cheap guard in case a per-object "access
+        // denied" is ever logged on a 0 exit; see the exit_code==0 handling
+        // in `run`.
+        stderr_watch: Some("access denied"),
+    }
+}
+
+/// Shell script run (via `sh -c`) inside the `rc` container for one bucket.
+///
+/// Without a destination session token it is a single
+/// `rc mirror --overwrite <source> <dest>`.
+///
+/// With one, `rc` cannot scope the token to the destination alias: its only
+/// token mechanism is the global `-H x-amz-security-token:` header, which
+/// would also be signed into every *source* request, and a source RustFS
+/// rejects an unknown token. So the bucket is first mirrored into a scratch
+/// directory (no token), then mirrored from there to the destination with
+/// the header -- the second step only ever talks to the destination. The
+/// resulting object keys are identical to a direct mirror. The scratch copy
+/// lives in the container's writable layer and is discarded with the
+/// auto-removed container; the cost is local disk equal to the bucket size
+/// for the duration of the run.
+fn build_mirror_script(source_path: &str, dest_path: &str, dest_session_token: bool) -> String {
+    let source = v2_common::shell_escape(source_path);
+    let dest = v2_common::shell_escape(dest_path);
+    if !dest_session_token {
+        return format!("rc mirror --overwrite {source} {dest}");
+    }
+    format!(
+        "set -e; stage=$(mktemp -d); \
+         rc mirror --overwrite {source} \"$stage/\"; \
+         rc -H \"x-amz-security-token: ${DEST_SESSION_TOKEN_ENV}\" mirror --overwrite \"$stage/\" {dest}"
+    )
+}
+
 fn build_dest_prefix(bucket_path: &str, service_name: &str, backup_uuid: &str) -> String {
     let base = bucket_path.trim_matches('/');
     if base.is_empty() {
@@ -420,7 +525,7 @@ fn build_dest_prefix(bucket_path: &str, service_name: &str, backup_uuid: &str) -
 
 /// List the bucket names visible to a source account, used when the service
 /// config names no single bucket (RustFS). Uses `aws-sdk-s3`'s `ListBuckets`
-/// directly rather than delegating to `mc`'s equivalent call -- see the
+/// directly rather than delegating to the mirror client's equivalent call -- see the
 /// module doc comment for why.
 async fn list_source_buckets(
     access_key: &str,
@@ -506,10 +611,287 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minio_client_image_is_release_and_digest_pinned() {
-        assert!(MC_IMAGE.contains("minio/mc:RELEASE.2025-08-13T08-35-41Z@"));
-        assert!(MC_IMAGE
-            .contains("sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"));
-        assert!(MC_IMAGE.contains("@sha256:"));
+    fn rc_client_image_is_release_and_digest_pinned() {
+        assert!(RC_IMAGE.starts_with("rustfs/rc:v0.1.36@"));
+        assert!(RC_IMAGE
+            .ends_with("@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699"));
+    }
+
+    #[test]
+    fn mirror_script_without_session_token_is_a_single_direct_mirror() {
+        let script = build_mirror_script("source/data/", "dest/backups/p/", false);
+        assert_eq!(
+            script,
+            "rc mirror --overwrite 'source/data/' 'dest/backups/p/'"
+        );
+        assert!(!script.contains("x-amz-security-token"));
+    }
+
+    #[test]
+    fn mirror_script_with_session_token_stages_and_scopes_the_header_to_dest() {
+        let script = build_mirror_script("source/data/", "dest/backups/p/", true);
+        // The token is read from the env var, never inlined into the script.
+        assert!(script.contains(&format!("${DEST_SESSION_TOKEN_ENV}")));
+        // Step 1 reads the source without the token header...
+        let first = script
+            .find("rc mirror --overwrite 'source/data/' \"$stage/\"")
+            .expect("source -> stage step");
+        // ...step 2 is the only one carrying it, and only talks to dest.
+        let second = script
+            .find("rc -H \"x-amz-security-token: ")
+            .expect("stage -> dest step with header");
+        assert!(first < second);
+        assert!(script[second..].ends_with("mirror --overwrite \"$stage/\" 'dest/backups/p/'"));
+        assert!(!script[..second].contains("x-amz-security-token"));
+        assert!(script.starts_with("set -e;"));
+    }
+
+    // ---- Real `rc mirror` against a real RustFS ---------------------------
+    //
+    // These run the exact one-shot container `run` builds (image, entrypoint,
+    // RC_HOST_* env, host networking) against a RustFS testcontainer that
+    // plays both source and destination, so a drift in the rc CLI contract
+    // (env var names, mirror path semantics, exit codes) fails here instead
+    // of in a production backup.
+
+    struct MirrorFixture {
+        _container: testcontainers::ContainerAsync<testcontainers::GenericImage>,
+        docker: bollard::Docker,
+        client: S3Client,
+        port: u16,
+    }
+
+    async fn mirror_fixture() -> Option<MirrorFixture> {
+        use crate::test_rustfs::{
+            rustfs_container_request, wait_for_rustfs_ready, RUSTFS_ACCESS_KEY, RUSTFS_S3_PORT,
+            RUSTFS_SECRET_KEY,
+        };
+        use testcontainers::runners::AsyncRunner;
+
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker not available, skipping rc mirror test: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping rc mirror test: {e}");
+            return None;
+        }
+        if let Err(e) = super::super::image_pull::ensure_image_pulled_v2(RC_IMAGE, ENGINE_KEY).await
+        {
+            println!("Could not pull {RC_IMAGE}, skipping rc mirror test: {e}");
+            return None;
+        }
+
+        let container = rustfs_container_request()
+            .start()
+            .await
+            .expect("Failed to start RustFS container");
+        let port = container
+            .get_host_port_ipv4(RUSTFS_S3_PORT)
+            .await
+            .expect("Failed to get RustFS port");
+        wait_for_rustfs_ready(port)
+            .await
+            .expect("RustFS did not become healthy");
+
+        let conf = aws_sdk_s3::Config::builder()
+            .region(Region::new("us-east-1"))
+            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .credentials_provider(Credentials::new(
+                RUSTFS_ACCESS_KEY,
+                RUSTFS_SECRET_KEY,
+                None,
+                None,
+                "s3-mirror-test",
+            ))
+            .force_path_style(true)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let client = S3Client::from_conf(conf);
+
+        for bucket in ["mirror-src", "mirror-dest"] {
+            client
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("create bucket {bucket}: {e}"));
+        }
+        for (key, body) in [("a.txt", "alpha"), ("nested/dir/b.txt", "bravo")] {
+            client
+                .put_object()
+                .bucket("mirror-src")
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                    body.as_bytes(),
+                ))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("seed {key}: {e}"));
+        }
+
+        Some(MirrorFixture {
+            _container: container,
+            docker,
+            client,
+            port,
+        })
+    }
+
+    fn fixture_host<'a>(host: &'a str, secret_key: &'a str) -> RcHost<'a> {
+        RcHost {
+            scheme: "http",
+            host,
+            access_key: crate::test_rustfs::RUSTFS_ACCESS_KEY,
+            secret_key,
+        }
+    }
+
+    async fn dest_keys(client: &S3Client, prefix: &str) -> Vec<String> {
+        let resp = client
+            .list_objects_v2()
+            .bucket("mirror-dest")
+            .prefix(prefix)
+            .send()
+            .await
+            .expect("list dest");
+        let mut keys: Vec<String> = resp
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(String::from))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn rc_mirror_copies_a_bucket_under_the_destination_prefix() {
+        let Some(fx) = mirror_fixture().await else {
+            return;
+        };
+        let host = format!("127.0.0.1:{}", fx.port);
+        let secret = crate::test_rustfs::RUSTFS_SECRET_KEY;
+        let prefix = "external_services/s3/svc/backup-uuid";
+        let spec = build_mirror_spec(
+            format!("temps-s3mirror-test-{}", uuid::Uuid::new_v4()),
+            0,
+            &fixture_host(&host, secret),
+            &fixture_host(&host, secret),
+            None,
+            "source/mirror-src/",
+            &format!("dest/mirror-dest/{prefix}/"),
+        );
+
+        let result = run_one_shot(
+            &fx.docker,
+            spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("run rc mirror");
+
+        assert_eq!(
+            result.exit_code, 0,
+            "rc mirror failed: stderr={} stdout={}",
+            result.stderr_tail, result.stdout_tail
+        );
+        assert!(!result.stderr_watch_matched);
+        assert_eq!(
+            dest_keys(&fx.client, &format!("{prefix}/")).await,
+            vec![
+                format!("{prefix}/a.txt"),
+                format!("{prefix}/nested/dir/b.txt"),
+            ],
+        );
+        // The size accounting `run` does afterwards sees the mirrored bytes.
+        let size = list_total_s3_size(&fx.client, "mirror-dest", &format!("{prefix}/"))
+            .await
+            .expect("size");
+        assert_eq!(size, ("alpha".len() + "bravo".len()) as i64);
+    }
+
+    #[tokio::test]
+    async fn rc_mirror_with_bad_destination_credentials_exits_non_zero_without_leaking_them() {
+        let Some(fx) = mirror_fixture().await else {
+            return;
+        };
+        let host = format!("127.0.0.1:{}", fx.port);
+        let wrong_secret = "definitely-not-the-secret";
+        let spec = build_mirror_spec(
+            format!("temps-s3mirror-test-{}", uuid::Uuid::new_v4()),
+            0,
+            &fixture_host(&host, crate::test_rustfs::RUSTFS_SECRET_KEY),
+            &fixture_host(&host, wrong_secret),
+            None,
+            "source/mirror-src/",
+            "dest/mirror-dest/bad-creds/",
+        );
+
+        let result = run_one_shot(
+            &fx.docker,
+            spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("run rc mirror");
+
+        assert_ne!(
+            result.exit_code, 0,
+            "bad dest credentials must fail the run"
+        );
+        assert!(!result.stderr_tail.contains(wrong_secret));
+        assert!(!result.stdout_tail.contains(wrong_secret));
+        assert!(dest_keys(&fx.client, "bad-creds/").await.is_empty());
+    }
+
+    /// With a destination session token the source is read without the token
+    /// header (step 1 succeeds against a RustFS that would reject it) and only
+    /// the destination step carries it. RustFS root credentials reject an
+    /// unknown token, so step 2 failing -- after step 1 staged both objects --
+    /// is exactly the observable proof that the header is scoped to `dest`.
+    #[tokio::test]
+    async fn rc_mirror_with_session_token_reads_source_without_the_token_header() {
+        let Some(fx) = mirror_fixture().await else {
+            return;
+        };
+        let host = format!("127.0.0.1:{}", fx.port);
+        let secret = crate::test_rustfs::RUSTFS_SECRET_KEY;
+        let spec = build_mirror_spec(
+            format!("temps-s3mirror-test-{}", uuid::Uuid::new_v4()),
+            0,
+            &fixture_host(&host, secret),
+            &fixture_host(&host, secret),
+            Some("not-a-real-session-token"),
+            "source/mirror-src/",
+            "dest/mirror-dest/with-token/",
+        );
+        assert!(spec
+            .env
+            .iter()
+            .any(|e| e == &format!("{DEST_SESSION_TOKEN_ENV}=not-a-real-session-token")));
+        assert!(!spec.cmd[0].contains("not-a-real-session-token"));
+
+        let result = run_one_shot(
+            &fx.docker,
+            spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("run rc mirror");
+
+        assert!(
+            result.stdout_tail.contains("a.txt") && result.stdout_tail.contains("nested/dir/b.txt"),
+            "step 1 (source -> stage, no token) must have copied both objects: stdout={} stderr={}",
+            result.stdout_tail,
+            result.stderr_tail
+        );
+        assert_ne!(
+            result.exit_code, 0,
+            "step 2 must have sent the bogus token to the destination"
+        );
+        assert!(dest_keys(&fx.client, "with-token/").await.is_empty());
     }
 }

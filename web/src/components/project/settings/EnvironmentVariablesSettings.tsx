@@ -3,6 +3,7 @@
 
 import {
   EnvironmentVariableResponse,
+  EnvironmentInfo,
   ProjectResponse,
   listRepositoriesByConnection,
 } from '@/api/client'
@@ -42,7 +43,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
+import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -87,6 +88,56 @@ import {
   type DiscoveredEnvironmentVariable,
 } from '@/lib/compose-environment-discovery'
 import { repositoryFilePath } from '@/lib/repository-file-path'
+import {
+  compareEnvironmentVariableKeys,
+  orderEnvironments,
+  orderVariableEnvironments,
+} from '@/lib/environment-variable-comparison'
+
+function EnvironmentBadges({
+  environments,
+  previewIds,
+  includeInPreview,
+}: {
+  environments: EnvironmentInfo[]
+  previewIds: ReadonlySet<number>
+  includeInPreview: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const ordered = orderVariableEnvironments(environments, previewIds)
+  const visible = expanded ? ordered : ordered.slice(0, 2)
+  const hiddenCount = ordered.length - visible.length
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {visible.map((env) => (
+        <span
+          key={env.id}
+          className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+        >
+          {env.name}
+        </span>
+      ))}
+      {includeInPreview && (
+        <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+          Preview
+        </span>
+      )}
+      {ordered.length > 2 && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          onClick={() => setExpanded((current) => !current)}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? 'Show fewer' : 'Show all'} environments`}
+        >
+          {expanded ? 'Show fewer' : `Show all ${hiddenCount} more`}
+        </Button>
+      )}
+    </div>
+  )
+}
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -98,6 +149,7 @@ interface EnvironmentVariableRowProps {
   resolved?: ResolvedEnvVar
   checks: EnvironmentVariableCheck[]
   onManageChecks: () => void
+  previewIds: ReadonlySet<number>
 }
 
 function EnvironmentVariableRow({
@@ -110,6 +162,7 @@ function EnvironmentVariableRow({
   resolved,
   checks,
   onManageChecks,
+  previewIds,
 }: EnvironmentVariableRowProps) {
   const overridesService =
     resolved?.source.type === 'manual'
@@ -407,21 +460,11 @@ function EnvironmentVariableRow({
           </div>
         </td>
         <td className="py-4 pr-4 align-middle">
-          <div className="flex flex-wrap gap-2">
-            {variable.environments.map((env) => (
-              <span
-                key={env.name}
-                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-              >
-                {env.name}
-              </span>
-            ))}
-            {variable.include_in_preview && (
-              <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-                Preview
-              </span>
-            )}
-          </div>
+          <EnvironmentBadges
+            environments={variable.environments}
+            previewIds={previewIds}
+            includeInPreview={variable.include_in_preview}
+          />
         </td>
         <td className="py-4 pr-4 align-middle">
           <EnvironmentVariableChecks
@@ -636,6 +679,7 @@ interface IntegrationEnvVarRowProps {
   resolved: ResolvedEnvVar
   showAllValues: boolean
   environmentId: number | null
+  previewIds: ReadonlySet<number>
 }
 
 function IntegrationEnvVarRow({
@@ -643,6 +687,7 @@ function IntegrationEnvVarRow({
   resolved,
   showAllValues,
   environmentId,
+  previewIds,
 }: IntegrationEnvVarRowProps) {
   const [isVisible, setIsVisible] = useState(false)
   const [revealedValue, setRevealedValue] = useState<
@@ -767,22 +812,11 @@ function IntegrationEnvVarRow({
         </div>
       </td>
       <td className="py-4 pr-4 align-middle">
-        {' '}
-        <div className="flex gap-2 flex-wrap">
-          {resolved.environments.map((env) => (
-            <span
-              key={env.name}
-              className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-            >
-              {env.name}
-            </span>
-          ))}
-          {resolved.include_in_preview && (
-            <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-              Preview
-            </span>
-          )}
-        </div>
+        <EnvironmentBadges
+          environments={resolved.environments}
+          previewIds={previewIds}
+          includeInPreview={resolved.include_in_preview}
+        />
       </td>
       <td className="py-4 pr-4 align-middle">
         <EnvironmentVariableChecks />
@@ -1214,29 +1248,53 @@ export function EnvironmentVariablesSettings({
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
   const [showAllValues, setShowAllValues] = useState(false)
+  const [showComparison, setShowComparison] = useState(false)
   // Environment selector — when set, the resolved env-vars view shows the
   // values a deployment in that environment would actually receive
   // (per-tenant DB names like `<project>_<env>` for linked services).
   // `null` means "no specific environment" — falls back to the static
   // admin-level values for backward compatibility.
   const [selectedEnvId, setSelectedEnvId] = useState<number | null>(null)
+  const [comparisonFirstId, setComparisonFirstId] = useState<number | null>(
+    null
+  )
+  const [comparisonSecondId, setComparisonSecondId] = useState<number | null>(
+    null
+  )
 
   const { data: projectEnvironments } = useQuery({
     ...getEnvironmentsOptions({
       path: { project_id: project.id },
     }),
   })
+  const orderedEnvironments = useMemo(
+    () => orderEnvironments(projectEnvironments ?? []),
+    [projectEnvironments]
+  )
+  const previewIds = useMemo(
+    () =>
+      new Set(
+        orderedEnvironments
+          .filter((environment) => environment.is_preview)
+          .map((environment) => environment.id)
+      ),
+    [orderedEnvironments]
+  )
+  const comparisonFirst =
+    orderedEnvironments.find((env) => env.id === comparisonFirstId) ??
+    orderedEnvironments[0]
+  const comparisonSecond =
+    orderedEnvironments.find(
+      (env) => env.id === comparisonSecondId && env.id !== comparisonFirst?.id
+    ) ?? orderedEnvironments.find((env) => env.id !== comparisonFirst?.id)
 
-  // Default to the production environment (or first available) once the
-  // env list loads, so the preview is never blank.
+  // Default to production, then another stable environment when available.
   useEffect(() => {
     if (selectedEnvId !== null) return
-    const envs = projectEnvironments
-    if (!envs || envs.length === 0) return
-    const prod = envs.find((e: any) => e.name === 'production') ?? envs[0]
+    const first = orderedEnvironments[0]
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (prod) setSelectedEnvId(prod.id)
-  }, [projectEnvironments, selectedEnvId])
+    if (first) setSelectedEnvId(first.id)
+  }, [orderedEnvironments, selectedEnvId])
 
   const {
     data: envVariables,
@@ -1588,6 +1646,14 @@ export function EnvironmentVariablesSettings({
   const selectedCount = selectedVariables.size
   const allSelected =
     selectedCount === (envVariables?.length ?? 0) && hasManualVariables
+  const { missingInFirst, missingInSecond } =
+    comparisonFirst && comparisonSecond
+      ? compareEnvironmentVariableKeys(
+          envVariables ?? [],
+          comparisonFirst,
+          comparisonSecond
+        )
+      : { missingInFirst: [], missingInSecond: [] }
 
   return (
     <div className="space-y-6">
@@ -1642,7 +1708,7 @@ export function EnvironmentVariablesSettings({
                     <SelectValue placeholder="Select environment" />
                   </SelectTrigger>
                   <SelectContent>
-                    {projectEnvironments.map((env: any) => (
+                    {orderedEnvironments.map((env) => (
                       <SelectItem key={env.id} value={String(env.id)}>
                         {env.name}
                       </SelectItem>
@@ -1788,6 +1854,7 @@ export function EnvironmentVariablesSettings({
                             `/projects/${project.slug}/environment-variables/${variable.id}`
                           )
                         }
+                        previewIds={previewIds}
                       />
                     ))}
                     {integrationOnlyResolved.map((entry) => (
@@ -1797,6 +1864,7 @@ export function EnvironmentVariablesSettings({
                         resolved={entry}
                         showAllValues={showAllValues}
                         environmentId={selectedEnvId}
+                        previewIds={previewIds}
                       />
                     ))}
                     {discoveredMissingVariables.map((variable) => (
@@ -1808,6 +1876,123 @@ export function EnvironmentVariablesSettings({
                   </tbody>
                 </table>
               </div>
+              {hasManualVariables && comparisonFirst && comparisonSecond && (
+                <section
+                  className="mt-4 rounded-lg border border-border/70 bg-card"
+                  aria-label="Compare environment variables"
+                >
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm font-medium hover:bg-muted/40"
+                    onClick={() => setShowComparison((current) => !current)}
+                    aria-expanded={showComparison}
+                    aria-controls="environment-variable-comparison"
+                  >
+                    <span>Compare environments</span>
+                    <ChevronDown
+                      className={cn(
+                        'size-4 shrink-0 text-muted-foreground transition-transform',
+                        showComparison && 'rotate-180'
+                      )}
+                    />
+                  </button>
+                  <div
+                    id="environment-variable-comparison"
+                    hidden={!showComparison}
+                    className="border-t p-4"
+                  >
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Keys present in one environment but missing from the
+                          other. Preview inheritance is included.
+                        </p>
+                      </div>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <Select
+                          value={String(comparisonFirst.id)}
+                          onValueChange={(value) =>
+                            setComparisonFirstId(Number(value))
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-full sm:w-[180px]"
+                            aria-label="First comparison environment"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {orderedEnvironments.map((env) => (
+                              <SelectItem key={env.id} value={String(env.id)}>
+                                {env.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Select
+                          value={String(comparisonSecond.id)}
+                          onValueChange={(value) =>
+                            setComparisonSecondId(Number(value))
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-full sm:w-[180px]"
+                            aria-label="Second comparison environment"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {orderedEnvironments.map((env) => (
+                              <SelectItem key={env.id} value={String(env.id)}>
+                                {env.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      {[
+                        { environment: comparisonFirst, keys: missingInFirst },
+                        {
+                          environment: comparisonSecond,
+                          keys: missingInSecond,
+                        },
+                      ].map(({ environment, keys }) => (
+                        <div
+                          key={environment.id}
+                          className="rounded-md border p-3"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <h4 className="text-sm font-medium truncate">
+                              {environment.name}
+                            </h4>
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {keys.length} missing
+                            </span>
+                          </div>
+                          {keys.length === 0 ? (
+                            <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
+                              No keys missing relative to{' '}
+                              {environment.id === comparisonFirst.id
+                                ? comparisonSecond.name
+                                : comparisonFirst.name}
+                            </p>
+                          ) : (
+                            <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono">
+                              {keys.map((key) => (
+                                <li key={key} className="break-all">
+                                  {key}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              )}
             </>
           )}
         </div>

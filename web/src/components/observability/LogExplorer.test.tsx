@@ -4,7 +4,41 @@
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import type { GlobalLogFacetsResponse } from '@/api/client/types.gen'
 import { LogExplorer } from './LogExplorer'
+
+test('standalone database logs do not appear as Project 0 or application logs', () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { location: { href: 'http://localhost/logs' } },
+  })
+  const facets: GlobalLogFacetsResponse = {
+    partial: false,
+    facets: {
+      project_id: [
+        { value: '0', count: 100 },
+        { value: '7', count: 20 },
+      ],
+      external_service_id: [{ value: '4', count: 100 }],
+    },
+  }
+  try {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <LogExplorer lines={[]} facets={facets} onFilter={() => {}} />
+      </MemoryRouter>
+    )
+    expect(html).not.toContain('Project 0')
+    expect(html).toContain('Project 7')
+    expect(html).toMatch(/Applications<\/span><span[^>]*>20/)
+    expect(html).toMatch(/Databases<\/span><span[^>]*>100/)
+  } finally {
+    if (previousWindow)
+      Object.defineProperty(globalThis, 'window', previousWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
 
 test('shows loaded logs without a misleading current-page volume chart', () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
