@@ -96,7 +96,7 @@ pub use deploy_static::*;
 pub use deploy_static_bundle::*;
 pub use deploy_static_from_source::*;
 pub use download_repo::*;
-pub use image_source::{DeployImageSource, IMAGE_SOURCE_CONFIG_KEY};
+pub use image_source::{DeployImageSource, ExpectedImageIdentity, IMAGE_SOURCE_CONFIG_KEY};
 pub use mark_deployment_complete::*;
 pub use persist_static_assets::*;
 pub use prepare_source_bundle::*;

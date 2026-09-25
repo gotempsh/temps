@@ -354,6 +354,30 @@ async fn deployment_asset_origin(
     }
 }
 
+/// What a rollback or promotion knows about the image it reuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReuseImageProvenance {
+    source: crate::jobs::DeployImageSource,
+    expected_identity: Option<crate::jobs::ExpectedImageIdentity>,
+}
+
+impl ReuseImageProvenance {
+    fn apply(&self, job: crate::jobs::DeployImageJob) -> crate::jobs::DeployImageJob {
+        let job = job.with_image_source(self.source);
+        match &self.expected_identity {
+            Some(expected) => job.with_expected_image_identity(expected.clone()),
+            None => job,
+        }
+    }
+
+    fn expected_identity_label(&self) -> String {
+        self.expected_identity
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none recorded".to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -2177,21 +2201,26 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Where the image reused by a rollback or promotion lives, and so how a
-    /// remote worker obtains it.
+    /// Where the image reused by a rollback or promotion lives (and so how a
+    /// remote worker obtains it), and which image the reuse is bound to.
     ///
     /// Classified from the deployment that originally produced the image
     /// (`origin_deployment_id`, from [`deployment_asset_origin`]): the
     /// rollback/promotion rows in between record no image metadata of their
     /// own. An uploaded or control-plane-built image must be streamed to the
     /// worker; only a registry image can be pulled there.
-    async fn reuse_image_source(
+    ///
+    /// For a registry image, the expected identity is the digest recorded on
+    /// the origin's registered external image, when one was recorded. Without
+    /// it the deploy job never substitutes the control plane's copy of the tag
+    /// for a failed worker pull.
+    async fn reuse_image_provenance(
         &self,
         project: &projects::Model,
         target: &deployments::Model,
         origin_deployment_id: i32,
         image_name: &str,
-    ) -> Result<crate::jobs::DeployImageSource, DeploymentError> {
+    ) -> Result<ReuseImageProvenance, DeploymentError> {
         // `deployment_asset_origin` usually resolves the origin id from the
         // row's recorded context vars without loading the origin row, so its
         // metadata has to be fetched here.
@@ -2215,11 +2244,31 @@ impl DeploymentService {
             origin
         };
         let metadata = origin.as_ref().unwrap_or(target).metadata.as_ref();
-        Ok(crate::jobs::DeployImageSource::for_existing_deployment(
+        let source = crate::jobs::DeployImageSource::for_existing_deployment(
             project.source_type,
             metadata,
             image_name,
-        ))
+        );
+
+        let expected_identity = match (
+            source,
+            metadata.and_then(|metadata| metadata.external_image_id),
+        ) {
+            (crate::jobs::DeployImageSource::Registry, Some(external_image_id)) => {
+                temps_entities::external_images::Entity::find_by_id(external_image_id)
+                    .filter(temps_entities::external_images::Column::ProjectId.eq(project.id))
+                    .one(self.db.as_ref())
+                    .await?
+                    .and_then(|external_image| external_image.digest)
+                    .and_then(|digest| crate::jobs::ExpectedImageIdentity::repo_digest(&digest))
+            }
+            _ => None,
+        };
+
+        Ok(ReuseImageProvenance {
+            source,
+            expected_identity,
+        })
     }
 
     async fn configure_reuse_deploy_builder(
@@ -3148,8 +3197,8 @@ impl DeploymentService {
                 )
                 .await;
 
-            let image_source = self
-                .reuse_image_source(
+            let provenance = self
+                .reuse_image_provenance(
                     &project,
                     &target_deployment,
                     rollback_asset_origin.deployment_id,
@@ -3157,15 +3206,21 @@ impl DeploymentService {
                 )
                 .await?;
             info!(
-                "Rollback: image {} is {}-sourced (origin deployment #{})",
-                image_name, image_source, rollback_asset_origin.deployment_id
+                "Rollback: image {} is {}-sourced (origin deployment #{}, expected identity: {})",
+                image_name,
+                provenance.source,
+                rollback_asset_origin.deployment_id,
+                provenance.expected_identity_label()
             );
 
-            let deploy_job = deploy_builder
-                .build(self.deployer.clone())
-                .map_err(|e| DeploymentError::Other(format!("Failed to create deploy job: {}", e)))?
-                .with_external_image_tag(image_name.clone())
-                .with_image_source(image_source);
+            let deploy_job = provenance.apply(
+                deploy_builder
+                    .build(self.deployer.clone())
+                    .map_err(|e| {
+                        DeploymentError::Other(format!("Failed to create deploy job: {}", e))
+                    })?
+                    .with_external_image_tag(image_name.clone()),
+            );
 
             // Create workflow context for the NEW rollback deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
@@ -3767,8 +3822,8 @@ impl DeploymentService {
                 )
                 .await;
 
-            let image_source = self
-                .reuse_image_source(
+            let provenance = self
+                .reuse_image_provenance(
                     &project,
                     &source,
                     promotion_asset_origin.deployment_id,
@@ -3776,15 +3831,21 @@ impl DeploymentService {
                 )
                 .await?;
             info!(
-                "Promotion: image {} is {}-sourced (origin deployment #{})",
-                image_name, image_source, promotion_asset_origin.deployment_id
+                "Promotion: image {} is {}-sourced (origin deployment #{}, expected identity: {})",
+                image_name,
+                provenance.source,
+                promotion_asset_origin.deployment_id,
+                provenance.expected_identity_label()
             );
 
-            let deploy_job = deploy_builder
-                .build(self.deployer.clone())
-                .map_err(|e| DeploymentError::Other(format!("Failed to create deploy job: {}", e)))?
-                .with_external_image_tag(image_name.clone())
-                .with_image_source(image_source);
+            let deploy_job = provenance.apply(
+                deploy_builder
+                    .build(self.deployer.clone())
+                    .map_err(|e| {
+                        DeploymentError::Other(format!("Failed to create deploy job: {}", e))
+                    })?
+                    .with_external_image_tag(image_name.clone()),
+            );
 
             // Create workflow context for the promoted deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
@@ -7787,7 +7848,7 @@ mod tests {
     /// produced the image, since the rollback/promotion rows in between record
     /// no image metadata of their own.
     #[tokio::test]
-    async fn test_reuse_image_source_classifies_from_origin_deployment(
+    async fn test_reuse_image_provenance_classifies_from_origin_deployment(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::jobs::DeployImageSource;
 
@@ -7806,8 +7867,9 @@ mod tests {
         let local_build = origin.image_name.clone().unwrap_or_default();
         assert_eq!(
             service
-                .reuse_image_source(&project, &origin, origin.id, &local_build)
-                .await?,
+                .reuse_image_provenance(&project, &origin, origin.id, &local_build)
+                .await?
+                .source,
             DeployImageSource::ControlPlaneLocal,
             "a control-plane git build must be streamed, never pulled"
         );
@@ -7850,16 +7912,59 @@ mod tests {
         let origin = active.update(db.as_ref()).await?;
         assert_eq!(
             service
-                .reuse_image_source(&project, &rollback_row, origin.id, registry_image)
-                .await?,
+                .reuse_image_provenance(&project, &rollback_row, origin.id, registry_image)
+                .await?
+                .source,
             DeployImageSource::Registry
         );
         assert_eq!(
             service
-                .reuse_image_source(&project, &rollback_row, rollback_row.id, registry_image)
-                .await?,
+                .reuse_image_provenance(&project, &rollback_row, rollback_row.id, registry_image)
+                .await?
+                .source,
             DeployImageSource::ControlPlaneLocal,
             "without its origin the rollback row carries no evidence of a registry"
+        );
+        assert_eq!(
+            service
+                .reuse_image_provenance(&project, &rollback_row, origin.id, registry_image)
+                .await?
+                .expected_identity,
+            None,
+            "no registered external image: nothing to verify a local copy against"
+        );
+
+        // A registered external image with a recorded digest binds the reuse
+        // to that exact image, so a re-pointed tag on the control plane is
+        // never exported in its place.
+        let external_image = temps_entities::external_images::ActiveModel {
+            project_id: Set(project.id),
+            image_ref: Set(registry_image.to_string()),
+            digest: Set(Some("sha256:0d1e2f".to_string())),
+            tag: Set(Some("v1".to_string())),
+            pushed_at: Set(Utc::now()),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let mut active: deployments::ActiveModel = origin.clone().into();
+        active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some(registry_image.to_string()),
+            external_image_id: Some(external_image.id),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
+            ..Default::default()
+        }));
+        let origin = active.update(db.as_ref()).await?;
+        let provenance = service
+            .reuse_image_provenance(&project, &rollback_row, origin.id, registry_image)
+            .await?;
+        assert_eq!(provenance.source, DeployImageSource::Registry);
+        assert_eq!(
+            provenance.expected_identity,
+            Some(crate::jobs::ExpectedImageIdentity::RepoDigest(
+                "sha256:0d1e2f".to_string()
+            ))
         );
 
         // Uploaded image at the origin → control-plane-local, even though the
@@ -7881,8 +7986,9 @@ mod tests {
         let origin = active.update(db.as_ref()).await?;
         assert_eq!(
             service
-                .reuse_image_source(&project, &rollback_row, origin.id, &uploaded_image)
-                .await?,
+                .reuse_image_provenance(&project, &rollback_row, origin.id, &uploaded_image)
+                .await?
+                .source,
             DeployImageSource::ControlPlaneLocal,
             "an uploaded image must be streamed from the control plane, never pulled"
         );

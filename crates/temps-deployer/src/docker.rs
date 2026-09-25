@@ -3213,6 +3213,20 @@ impl ImageBuilder for DockerRuntime {
         Ok(())
     }
 
+    async fn image_identity(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::LocalImageIdentity, BuilderError> {
+        let docker = self.require_docker_for_build()?;
+        let inspect = docker.inspect_image(image_name).await.map_err(|e| {
+            BuilderError::ImageNotFound(format!("Failed to inspect image '{}': {}", image_name, e))
+        })?;
+        Ok(crate::LocalImageIdentity {
+            id: inspect.id.unwrap_or_default(),
+            repo_digests: inspect.repo_digests.unwrap_or_default(),
+        })
+    }
+
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {
         let docker = self.require_docker_for_build()?;
         let inspect = docker.inspect_image(image_name).await.map_err(|e| {

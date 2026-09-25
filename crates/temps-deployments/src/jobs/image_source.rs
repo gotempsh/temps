@@ -151,6 +151,72 @@ impl DeployImageSource {
     }
 }
 
+/// The image a deployment is bound to, recorded independently of its tag.
+///
+/// A registry tag is mutable: the control plane's copy of `app:v1` may have
+/// been re-pointed since this deployment resolved it. Anything that picks up
+/// "whatever the tag points at now" on the deployment's behalf must first
+/// check it against this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedImageIdentity {
+    /// The local image ID (`sha256:...`) resolved earlier in this deployment
+    /// (e.g. by `PullExternalImageJob`).
+    ImageId(String),
+    /// A registry manifest digest (`sha256:...`, or `repo@sha256:...`)
+    /// recorded for the deployment's registered external image.
+    RepoDigest(String),
+}
+
+impl ExpectedImageIdentity {
+    /// An expected image ID, or `None` for an empty/whitespace one (a pull
+    /// deferred to the worker records an empty ID: nothing was resolved).
+    pub fn image_id(id: &str) -> Option<Self> {
+        let id = id.trim();
+        (!id.is_empty()).then(|| ExpectedImageIdentity::ImageId(id.to_string()))
+    }
+
+    /// An expected registry digest, or `None` for an empty one.
+    pub fn repo_digest(digest: &str) -> Option<Self> {
+        let digest = digest.trim();
+        (!digest.is_empty()).then(|| ExpectedImageIdentity::RepoDigest(digest.to_string()))
+    }
+
+    /// Whether `local` is the expected image. A tag match is never enough:
+    /// only the ID or a registry digest counts.
+    pub fn matches(&self, local: &temps_deployer::LocalImageIdentity) -> bool {
+        match self {
+            ExpectedImageIdentity::ImageId(expected) => {
+                !local.id.is_empty() && strip_sha256(&local.id) == strip_sha256(expected)
+            }
+            ExpectedImageIdentity::RepoDigest(expected) => {
+                let expected = digest_part(expected);
+                local
+                    .repo_digests
+                    .iter()
+                    .any(|repo_digest| digest_part(repo_digest) == expected)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ExpectedImageIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpectedImageIdentity::ImageId(id) => write!(f, "image ID {id}"),
+            ExpectedImageIdentity::RepoDigest(digest) => write!(f, "registry digest {digest}"),
+        }
+    }
+}
+
+fn strip_sha256(value: &str) -> &str {
+    value.trim().strip_prefix("sha256:").unwrap_or(value.trim())
+}
+
+/// The `sha256:...` part of `repo@sha256:...` (or the value itself).
+fn digest_part(value: &str) -> &str {
+    strip_sha256(value.rsplit('@').next().unwrap_or(value))
+}
+
 impl std::fmt::Display for DeployImageSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -269,6 +335,52 @@ mod tests {
             DeployImageSource::resolve(GHCR, Some(DeployImageSource::Registry), true),
             DeployImageSource::Registry
         );
+    }
+
+    fn local(id: &str, repo_digests: &[&str]) -> temps_deployer::LocalImageIdentity {
+        temps_deployer::LocalImageIdentity {
+            id: id.to_string(),
+            repo_digests: repo_digests.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn expected_image_id_matches_only_the_same_id() {
+        let expected = ExpectedImageIdentity::image_id("sha256:aaa").unwrap();
+        assert!(expected.matches(&local("sha256:aaa", &[])));
+        assert!(expected.matches(&local("aaa", &[])), "prefix is optional");
+        assert!(!expected.matches(&local("sha256:bbb", &[])));
+        assert!(!expected.matches(&local("", &[])));
+    }
+
+    #[test]
+    fn expected_repo_digest_matches_any_recorded_repo_digest() {
+        let expected = ExpectedImageIdentity::repo_digest("sha256:ddd").unwrap();
+        assert!(expected.matches(&local(
+            "sha256:aaa",
+            &[
+                "ghcr.io/example-org/app@sha256:eee",
+                "ghcr.io/example-org/app@sha256:ddd"
+            ]
+        )));
+        let qualified =
+            ExpectedImageIdentity::repo_digest("ghcr.io/example-org/app@sha256:ddd").unwrap();
+        assert!(qualified.matches(&local("sha256:aaa", &["other/app@sha256:ddd"])));
+        assert!(
+            !expected.matches(&local("sha256:ddd", &[])),
+            "an image ID is not a digest"
+        );
+        assert!(!expected.matches(&local(
+            "sha256:aaa",
+            &["ghcr.io/example-org/app@sha256:eee"]
+        )));
+    }
+
+    #[test]
+    fn empty_expected_identities_are_none() {
+        assert_eq!(ExpectedImageIdentity::image_id(""), None);
+        assert_eq!(ExpectedImageIdentity::image_id("  "), None);
+        assert_eq!(ExpectedImageIdentity::repo_digest(""), None);
     }
 
     fn metadata(configure: impl FnOnce(&mut DeploymentMetadata)) -> DeploymentMetadata {

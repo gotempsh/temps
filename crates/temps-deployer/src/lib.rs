@@ -762,6 +762,18 @@ impl ContainerLaunchSpec {
     }
 }
 
+/// Content identity of an image in a local Docker daemon: what a tag
+/// currently points at, as opposed to the (mutable) tag itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalImageIdentity {
+    /// Image ID (`sha256:...`).
+    pub id: String,
+    /// Registry digests the image was pulled or pushed with
+    /// (`repository@sha256:...`). Empty for images that never touched a
+    /// registry, or when the builder cannot report them.
+    pub repo_digests: Vec<String>,
+}
+
 /// Trait for building OCI images from source code and Dockerfiles
 #[async_trait]
 pub trait ImageBuilder: Send + Sync {
@@ -851,6 +863,20 @@ pub trait ImageBuilder: Send + Sync {
 
     /// Inspect an image and return its metadata including architecture
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
+
+    /// The identity of the image `image_name` currently resolves to.
+    ///
+    /// Callers that must not trust a tag alone (a tag can be re-pointed at any
+    /// time) compare this with an identity recorded earlier. The default
+    /// reports only the image ID; implementations backed by a daemon that
+    /// knows the registry digests should include them.
+    async fn image_identity(&self, image_name: &str) -> Result<LocalImageIdentity, BuilderError> {
+        let info = self.inspect_image(image_name).await?;
+        Ok(LocalImageIdentity {
+            id: info.id,
+            repo_digests: Vec::new(),
+        })
+    }
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
     ///
