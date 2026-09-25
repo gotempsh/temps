@@ -8929,9 +8929,6 @@ export const getSettings = <ThrowOnError extends boolean = false>(options?: Opti
     ...options
 });
 
-/**
- * Update application settings
- */
 export const updateSettings = <ThrowOnError extends boolean = false>(options: Options<UpdateSettingsData, ThrowOnError>): RequestResult<UpdateSettingsResponses, UpdateSettingsErrors, ThrowOnError> => (options.client ?? client).put<UpdateSettingsResponses, UpdateSettingsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/settings',

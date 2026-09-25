@@ -19,7 +19,7 @@ mod tail;
 /// seal path's retry helper — same "transient DB hiccup, not a reason to
 /// give up" reasoning, one backoff schedule to keep in sync.
 pub(crate) use chunk_writer::retry_with_backoff;
-pub use chunk_writer::{ChunkWriterService, ManifestSink};
+pub use chunk_writer::{ChunkWriterService, CollectionStatus, ManifestSink, RecoveryState};
 pub use collector::CollectorService;
 pub use compactor::{CompactorService, GC_GRACE};
 pub use forget_sweeper::{

@@ -5271,7 +5271,7 @@ Search collected logs across every project and database you can access
 - `attributes` - Attribute keys observed in the window, most common first (requires the ClickHouse line index)
 - `histogram` - Line counts bucketed over time, optionally split by a label or attribute (requires the ClickHouse line index)
 - `aggregate` - Group-by aggregation over lines (requires the ClickHouse line index)
-- `capabilities` - Whether attribute facets, histograms and aggregates are available on this instance
+- `capabilities` - Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
 
 ### `logs search`
 
@@ -5414,7 +5414,7 @@ Group-by aggregation over lines (requires the ClickHouse line index)
 
 ### `logs capabilities`
 
-Whether attribute facets, histograms and aggregates are available on this instance
+Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
 
 **Options:**
 

@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
+import { LogCollectionNotice } from '@/components/observability/LogCollectionNotice'
 import {
   AttrPredicateChips,
   LogAttributeSidebar,
@@ -12,7 +13,6 @@ import {
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { useQueries } from '@tanstack/react-query'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { getProject } from '@/api/client/sdk.gen'
 import type { LogLevel, LogSourceKind } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -20,7 +20,7 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
-import { positiveInteger } from '@/lib/global-observability'
+import { facetProjectLabels, positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -140,10 +140,9 @@ export default function GlobalLogs() {
   const lines = search.error ? [] : search.lines
 
   // Facets count the whole time range, so they can name projects that have
-  // no line on the loaded page. Resolve those names directly instead of
-  // leaving them to the page's lines. A project this instance no longer has
-  // (deleted, or lines collected before it existed) answers 404 and is shown
-  // as unknown rather than under a name-shaped placeholder.
+  // no line on the loaded page. The facet response names them itself, under
+  // the same log access — so reading logs never also requires permission to
+  // read projects.
   const facetProjectIds = [
     ...new Set(
       facetValues(facets.data, 'project_id').flatMap((item) => {
@@ -152,34 +151,12 @@ export default function GlobalLogs() {
       })
     ),
   ]
-  const projectQueries = useQueries({
-    queries: facetProjectIds.map((id) => ({
-      // Own key: this query resolves a missing project to `null`, which must
-      // not leak into the shared project cache other pages read.
-      queryKey: ['log-facet-project', id],
-      // The Problem body carries no status, so a missing project is told
-      // apart from a failed request by the HTTP status itself.
-      queryFn: async ({ signal }: { signal: AbortSignal }) => {
-        const result = await getProject({ path: { id }, signal })
-        if (result.response?.status === 404) return null
-        if (!result.data)
-          throw new Error(
-            (result.error as { detail?: string } | undefined)?.detail ??
-              `Project ${id} could not be loaded.`
-          )
-        return result.data
-      },
-      staleTime: 60_000,
-    })),
-  })
-  const projectLabels = Object.fromEntries(
-    projectQueries.flatMap((query, index) => {
-      const id = facetProjectIds[index]
-      if (query.data) return [[String(id), query.data.name]]
-      if (query.data === null) return [[String(id), `Unknown project #${id}`]]
-      return []
-    })
-  )
+  const { labels: projectLabels, existing: facetProjectsThatExist } =
+    facetProjectLabels(
+      facetProjectIds,
+      // Optional in practice: a server predating the field omits it.
+      facets.data?.project_names as Record<string, string> | undefined
+    )
 
   // Environment IDs are all the store keeps; the interface presents slugs.
   // Resolved per-project rather than globally, since two projects can reuse
@@ -191,7 +168,7 @@ export default function GlobalLogs() {
       ...lines.flatMap((line) =>
         line.project_id != null ? [line.project_id] : []
       ),
-      ...facetProjectIds.filter((_, index) => projectQueries[index]?.data),
+      ...facetProjectsThatExist,
     ]),
   ]
   const environmentQueries = useQueries({
@@ -243,6 +220,12 @@ export default function GlobalLogs() {
       <PageHeader
         title="Logs"
         description={`${view.projectId ? 'Selected project' : 'All projects'} · application and database logs`}
+      />
+      <LogCollectionNotice
+        collection={capabilities.data?.collection}
+        statusError={capabilities.error}
+        statusUpdatedAt={capabilities.dataUpdatedAt || undefined}
+        onRetry={() => void capabilities.refetch()}
       />
       <LogExplorer
         lines={lines}

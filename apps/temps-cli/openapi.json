@@ -13789,6 +13789,37 @@
         ],
         "type": "string"
       },
+      "DeferredWalGeneration": {
+        "properties": {
+          "bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "What recovery could not read and what it did with the rest.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file_name",
+          "bytes"
+        ],
+        "type": "object"
+      },
       "DelRequest": {
         "description": "Request to delete keys",
         "properties": {
@@ -23945,10 +23976,14 @@
         "properties": {
           "analytics": {
             "$ref": "#/components/schemas/AnalyticsCapability"
+          },
+          "collection": {
+            "$ref": "#/components/schemas/LogCollectionCapability"
           }
         },
         "required": [
-          "analytics"
+          "analytics",
+          "collection"
         ],
         "type": "object"
       },
@@ -23975,6 +24010,16 @@
       "GlobalLogFacetsResponse": {
         "description": "Distinct values and counts per requested field, inside the current window.",
         "properties": {
+          "external_service_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Display names for the returned `external_service_id` values; see\n`project_names`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "facets": {
             "description": "Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values\nare ordered by count, descending.",
             "type": "object"
@@ -23982,11 +24027,23 @@
           "partial": {
             "description": "`true` when a field's value list was capped or timed out, so it is a\nprefix rather than the complete set. Reported rather than glossed: the\npoint of a facet is that a user can trust it to surface values they\nhave never seen on screen.",
             "type": "boolean"
+          },
+          "project_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Display names for the returned `project_id` values, keyed by value.\nResolved here, under the log access that produced the facets, so a\ncaller who may read these logs can tell the projects apart without\nalso needing permission to read projects — the same names search\nlines carry as `owner`. A returned value missing from this map names a\nproject this instance no longer has.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           }
         },
         "required": [
           "facets",
-          "partial"
+          "partial",
+          "project_names",
+          "external_service_names"
         ],
         "type": "object"
       },
@@ -28425,6 +28482,95 @@
           }
         },
         "type": "object"
+      },
+      "LogCollectionCapability": {
+        "description": "Whether new container log lines are being collected right now. Separate\nfrom `analytics` because the two fail independently: after a restart the\nindex can be healthy while collection waits on WAL recovery, and without\nthis the explorer shows a histogram that simply stops.",
+        "properties": {
+          "collecting": {
+            "description": "`true` only in the `running` state.",
+            "type": "boolean"
+          },
+          "deferred": {
+            "description": "The oldest few deferred generations.",
+            "items": {
+              "$ref": "#/components/schemas/DeferredWalGeneration"
+            },
+            "type": "array"
+          },
+          "deferred_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_count": {
+            "description": "Generations recovery set aside because it could not replay them in\nfull. Collection runs regardless; their lines are missing from search\nuntil an operator retries them.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_dir": {
+            "description": "Directory holding them, on the server's filesystem.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deferred_error": {
+            "description": "Set when that directory could not be read: the deferred counts and\nlist are then empty because they are unknown, not because nothing\nwas deferred.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "details_visible": {
+            "description": "`false` when the caller is not an instance administrator: `error`,\n`deferred_dir` and each generation's `reason` are then omitted, and\n`deferred_error` is generic, since they carry server filesystem paths\nand raw I/O errors. State and\ncounts are always present, so a paused collector is never hidden.",
+            "type": "boolean"
+          },
+          "error": {
+            "description": "Why collection is paused, verbatim, for `retrying` and `stopped`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_at": {
+            "description": "When the next recovery pass starts, for `retrying`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "description": "When the current state began: recovery start for `recovering`,\nrecovery end for `running`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/LogCollectionState"
+          }
+        },
+        "required": [
+          "state",
+          "collecting",
+          "deferred_count",
+          "deferred_bytes",
+          "deferred",
+          "details_visible"
+        ],
+        "type": "object"
+      },
+      "LogCollectionState": {
+        "enum": [
+          "running",
+          "recovering",
+          "retrying",
+          "stopped"
+        ],
+        "type": "string"
       },
       "LogLevel": {
         "description": "Normalized log level",
@@ -113437,7 +113583,6 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update application settings",
         "tags": [
           "Settings"
         ]

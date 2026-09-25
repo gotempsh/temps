@@ -133,6 +133,11 @@ impl From<LogAggregatorError> for Problem {
                     .with_title("Docker Stream Error")
                     .with_detail(error.to_string())
             }
+            LogAggregatorError::ContainerContextLookupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Container Lookup Failed")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::StorageConfiguration { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Storage Configuration Error")
@@ -431,6 +436,9 @@ pub struct PurgeLogsRequest {
             GlobalLogFacetsResponse,
             super::global::GlobalLogCapabilities,
             super::global::AnalyticsCapability,
+            super::global::LogCollectionCapability,
+            super::global::LogCollectionState,
+            super::global::DeferredWalGeneration,
             AttributeKeysResponse,
             FacetsAttrsResponse,
             HistogramResponse,
@@ -973,6 +981,7 @@ mod tests {
             manifests: Arc::new(crate::store::manifest::ManifestRepo::new(
                 db.connection_arc(),
             )),
+            chunk_writer: chunk_writer.clone(),
         });
 
         TestContext {
@@ -2188,6 +2197,7 @@ mod tests {
             project_access_checker: Some(checker),
             line_index: base_state.line_index.clone(),
             manifests: base_state.manifests.clone(),
+            chunk_writer: base_state.chunk_writer.clone(),
         });
         build_test_server_with_role(app_state, temps_auth::Role::User)
     }

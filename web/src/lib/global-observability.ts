@@ -107,3 +107,27 @@ export const number = (value: number | null | undefined) =>
     : new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(
         value
       )
+
+/**
+ * Labels for projects that appear only in the log facets, and which of them
+ * still exist. `names` is the facet response's `project_names`: the server
+ * names every id it still has, so an id missing from it is a project this
+ * instance no longer has. A server that predates the field sends no map at
+ * all, which says nothing about deletion — then nothing is labelled here
+ * (lines and the generic fallback name them) and every id is kept.
+ */
+export function facetProjectLabels(
+  ids: number[],
+  names: Record<string, string> | undefined
+): { labels: Record<string, string>; existing: number[] } {
+  if (!names) return { labels: {}, existing: ids }
+  return {
+    labels: Object.fromEntries(
+      ids.map((id) => [
+        String(id),
+        names[String(id)] ?? `Unknown project #${id}`,
+      ])
+    ),
+    existing: ids.filter((id) => String(id) in names),
+  }
+}

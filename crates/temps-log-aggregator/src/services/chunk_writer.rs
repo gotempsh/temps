@@ -71,7 +71,7 @@ use temps_core::retry::RetryConfig;
 
 use crate::chunk::cache::{CacheTier, ChunkCache};
 use crate::chunk::format::{ChunkEncoder, ChunkIdentity};
-use crate::chunk::wal::{WalDir, WalGeneration};
+use crate::chunk::wal::{DeferredGeneration, WalDir, WalGeneration, MAX_GENERATION_BYTES};
 use crate::chunk::{
     level_bit, ChunkLabels, DEFAULT_HEAD_MAX_BYTES, FLUSH_AGE_SECS, MAX_FLUSH_AGE_SECS,
     MIN_FLUSH_BYTES,
@@ -85,6 +85,37 @@ use crate::store::manifest::ManifestRepo;
 use crate::types::{ChunkMeta, LogLevel, LogLine};
 
 type PurgeGuard = tokio::sync::OwnedRwLockWriteGuard<Option<DateTime<Utc>>>;
+
+/// Where WAL recovery stands. Log collection runs only once it is
+/// [`RecoveryState::Complete`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryState {
+    /// Replaying the WAL the previous process left behind.
+    Recovering { started_at: DateTime<Utc> },
+    /// Replay finished, or there was no WAL: collection is running.
+    Complete { finished_at: DateTime<Utc> },
+    /// The last pass failed; the next one starts at `retry_at`.
+    Retrying {
+        error: String,
+        retry_at: DateTime<Utc>,
+    },
+    /// Recovery gave up; collection stays paused until temps restarts.
+    Stopped { error: String },
+}
+
+/// What an operator needs to know about log collection on this process.
+#[derive(Debug, Clone)]
+pub struct CollectionStatus {
+    pub recovery: RecoveryState,
+    /// `None` when the writer runs without a WAL.
+    pub wal_dir: Option<std::path::PathBuf>,
+    /// Generations recovery set aside because it could not replay them in
+    /// full; never replayed automatically.
+    pub deferred: Vec<DeferredGeneration>,
+    /// Why `deferred` could not be listed. The recovery state is reported
+    /// regardless, so a paused collector is never hidden behind this.
+    pub deferred_error: Option<String>,
+}
 
 type ProjectPurgeGate = Arc<tokio::sync::RwLock<Option<DateTime<Utc>>>>;
 
@@ -144,6 +175,9 @@ struct Thresholds {
     flush_age_secs: i64,
     min_flush_bytes: usize,
     max_flush_age_secs: i64,
+    /// On-disk WAL bytes at which a stream seals regardless of
+    /// `head_max_bytes` (see [`MAX_GENERATION_BYTES`]).
+    generation_max_bytes: u64,
 }
 
 impl Default for Thresholds {
@@ -153,6 +187,7 @@ impl Default for Thresholds {
             flush_age_secs: FLUSH_AGE_SECS,
             min_flush_bytes: MIN_FLUSH_BYTES,
             max_flush_age_secs: MAX_FLUSH_AGE_SECS,
+            generation_max_bytes: MAX_GENERATION_BYTES,
         }
     }
 }
@@ -412,6 +447,7 @@ pub struct ChunkWriterService {
     unindexed_chunks: AtomicU64,
     recovery_ready: tokio::sync::watch::Sender<bool>,
     recovery_started: AtomicBool,
+    recovery_state: arc_swap::ArcSwap<RecoveryState>,
     #[cfg(test)]
     recovery_failures: AtomicU64,
 }
@@ -468,7 +504,7 @@ impl ChunkWriterService {
         )
         .await?;
         service.recover_wal().await?;
-        service.recovery_ready.send_replace(true);
+        service.mark_recovered();
         Ok(service)
     }
 
@@ -507,6 +543,12 @@ impl ChunkWriterService {
         };
 
         let recovery_ready = tokio::sync::watch::channel(wal_dir.is_none()).0;
+        let now = Utc::now();
+        let recovery_state = arc_swap::ArcSwap::from_pointee(if wal_dir.is_none() {
+            RecoveryState::Complete { finished_at: now }
+        } else {
+            RecoveryState::Recovering { started_at: now }
+        });
         let service = Arc::new(Self {
             storage,
             manifests,
@@ -523,6 +565,7 @@ impl ChunkWriterService {
             unindexed_chunks: AtomicU64::new(0),
             recovery_ready,
             recovery_started: AtomicBool::new(false),
+            recovery_state,
             #[cfg(test)]
             recovery_failures: AtomicU64::new(0),
         });
@@ -552,7 +595,11 @@ impl ChunkWriterService {
 
     /// Schedule once, without making console readiness depend on recovery.
     /// Failed passes retain WAL and retry; no collector or destructive log
-    /// maintenance may run until an entire pass succeeds.
+    /// maintenance may run until an entire pass succeeds. A generation that
+    /// cannot be replayed in full does not fail the pass — recovery defers it
+    /// (see [`crate::chunk::wal::DEFERRED_DIR`]) — so what keeps collection
+    /// paused is only a failure that can clear: storage or the database being
+    /// unreachable, or the WAL directory itself being unreadable.
     pub fn start_background_recovery(self: &Arc<Self>) {
         if *self.recovery_ready.borrow() || self.recovery_started.swap(true, Ordering::AcqRel) {
             return;
@@ -566,6 +613,9 @@ impl ChunkWriterService {
             let mut retry_attempt = 0u32;
             tracing::info!("Background log WAL recovery started; console startup continues");
             loop {
+                writer.set_recovery_state(RecoveryState::Recovering {
+                    started_at: Utc::now(),
+                });
                 let result = async {
                     writer.recover_wal().await?;
                     if let Some(wal_dir) = &writer.wal_dir {
@@ -576,11 +626,12 @@ impl ChunkWriterService {
                 .await;
                 match result {
                     Ok(()) => {
-                        writer.recovery_ready.send_replace(true);
+                        writer.mark_recovered();
                         tracing::info!(
                             elapsed_seconds = started.elapsed().as_secs(),
                             "Background log WAL recovery completed; log collection resumed"
                         );
+                        writer.warn_about_deferred_generations().await;
                         break;
                     }
                     Err(error) => {
@@ -593,6 +644,7 @@ impl ChunkWriterService {
                                 // months cannot overflow the shift.
                                 let delay = retry.compute_delay(retry_attempt.min(31));
                                 retry_attempt = retry_attempt.saturating_add(1);
+                                writer.set_retrying(&error, delay);
                                 tracing::error!(
                                     %error,
                                     retry_seconds = delay.as_secs(),
@@ -601,6 +653,7 @@ impl ChunkWriterService {
                                 tokio::time::sleep(delay).await;
                             }
                             RetryClass::RepairRequired => {
+                                writer.set_retrying(&error, Duration::from_secs(600));
                                 tracing::error!(
                                     %error,
                                     retry_seconds = 600,
@@ -609,6 +662,9 @@ impl ChunkWriterService {
                                 tokio::time::sleep(Duration::from_secs(600)).await;
                             }
                             RetryClass::Permanent => {
+                                writer.set_recovery_state(RecoveryState::Stopped {
+                                    error: error.to_string(),
+                                });
                                 tracing::error!(
                                     %error,
                                     "Background log WAL recovery cannot continue with the current data or configuration; WAL retained and log collection remains paused; correct the reported error and restart"
@@ -620,6 +676,70 @@ impl ChunkWriterService {
                 }
             }
         });
+    }
+
+    fn set_recovery_state(&self, state: RecoveryState) {
+        self.recovery_state.store(Arc::new(state));
+    }
+
+    fn set_retrying(&self, error: &LogAggregatorError, delay: Duration) {
+        let retry_at = chrono::Duration::from_std(delay)
+            .ok()
+            .and_then(|delay| Utc::now().checked_add_signed(delay))
+            .unwrap_or_else(Utc::now);
+        self.set_recovery_state(RecoveryState::Retrying {
+            error: error.to_string(),
+            retry_at,
+        });
+    }
+
+    fn mark_recovered(&self) {
+        self.set_recovery_state(RecoveryState::Complete {
+            finished_at: Utc::now(),
+        });
+        self.recovery_ready.send_replace(true);
+    }
+
+    /// Deferred generations outlive the pass that deferred them, so every
+    /// start says how many are waiting, not just the one that created them.
+    async fn warn_about_deferred_generations(&self) {
+        let Some(wal_dir) = &self.wal_dir else {
+            return;
+        };
+        match wal_dir.deferred(0).await {
+            Ok(deferred) if deferred.is_empty() => {}
+            Ok(deferred) => warn!(
+                count = deferred.len(),
+                bytes = deferred.iter().map(|generation| generation.bytes).sum::<u64>(),
+                directory = %wal_dir.root().join(crate::chunk::wal::DEFERRED_DIR).display(),
+                "Log WAL generations are deferred: recovery could not replay them in full and \
+                 will not retry them on its own; see the Logs page or `logs capabilities`"
+            ),
+            Err(error) => warn!(%error, "could not list deferred log WAL generations"),
+        }
+    }
+
+    /// Recovery state and deferred generations, with reasons for the oldest
+    /// `reasons_for`. Lists the deferred directory on every call so an
+    /// operator moving files in or out is reflected without a restart. Never
+    /// fails: a listing error is reported beside the recovery state.
+    pub async fn collection_status(&self, reasons_for: usize) -> CollectionStatus {
+        let (deferred, deferred_error) = match &self.wal_dir {
+            Some(wal_dir) => match wal_dir.deferred(reasons_for).await {
+                Ok(deferred) => (deferred, None),
+                Err(error) => {
+                    warn!(%error, "could not list deferred log WAL generations");
+                    (Vec::new(), Some(error.to_string()))
+                }
+            },
+            None => (Vec::new(), None),
+        };
+        CollectionStatus {
+            recovery: RecoveryState::clone(&self.recovery_state.load()),
+            wal_dir: self.wal_dir.as_ref().map(|dir| dir.root().to_path_buf()),
+            deferred,
+            deferred_error,
+        }
     }
 
     /// Background log workers wait here, independently of console startup.
@@ -663,6 +783,7 @@ impl ChunkWriterService {
                 flush_age_secs,
                 min_flush_bytes,
                 max_flush_age_secs,
+                generation_max_bytes: MAX_GENERATION_BYTES,
             },
         )
         .await
@@ -770,7 +891,13 @@ impl ChunkWriterService {
                 wal.stream.append(&line).await?;
             }
             buffer.push_line(line);
+            // The head cap is in message bytes; the WAL holds whole lines as
+            // JSON. Sealing on either keeps every generation within what
+            // recovery can replay whole.
             buffer.bytes >= self.head_max_bytes()
+                || buffer.wal.as_ref().is_some_and(|wal| {
+                    wal.stream.bytes_written() >= self.thresholds.generation_max_bytes
+                })
         };
 
         if should_seal {
@@ -1648,56 +1775,135 @@ mod tests {
         assert!(has_recovery_wal(&wal_root).await);
     }
 
-    #[tokio::test]
-    async fn background_recovery_retained_generation_does_not_enable_purge() {
-        let tmp = tempfile::tempdir().unwrap();
-        let wal_root = tmp.path().join("wal");
-        seed_background_wal(&wal_root).await;
-        // A truncated header leaves its valid prefix replayable on disk.
-        let wal_dir = WalDir::open(wal_root.clone()).await.unwrap();
-        let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+    /// Append a whole record whose checksum is wrong to the single WAL file
+    /// under `root`: damage in the middle of a file, not a torn tail.
+    async fn append_corrupt_record(root: &std::path::Path) {
+        let mut entries = tokio::fs::read_dir(root).await.unwrap();
         let path = entries.next_entry().await.unwrap().unwrap().path();
+        let payload = serde_json::to_vec(&make_line(
+            "background-container",
+            LogLevel::Info,
+            "damaged",
+        ))
+        .unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        record.extend_from_slice(&payload);
         use tokio::io::AsyncWriteExt;
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .await
             .unwrap()
-            .write_all(&[1, 2])
+            .write_all(&record)
             .await
             .unwrap();
+    }
+
+    async fn files_with_extension(root: &std::path::Path, extension: &str) -> usize {
+        let mut count = 0;
+        let mut entries = tokio::fs::read_dir(root).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some(extension) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// A damaged generation used to leave recovery "incomplete" forever:
+    /// collection and purge stayed paused on every retry. Now its readable
+    /// prefix commits, the file is deferred, and everything resumes.
+    #[tokio::test]
+    async fn background_recovery_defers_damaged_wal_and_resumes_collection_and_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        append_corrupt_record(&wal_root).await;
+
+        let sink = Arc::new(VecSink::default());
         let mut writer = ChunkWriterService::open_deferred_with_index(
             Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
-            Arc::new(VecSink::default()),
+            sink.clone(),
             Some(wal_root.clone()),
             None,
             Arc::new(NoLineIndex::default()),
         )
         .await
         .unwrap();
-        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_millis(20);
-        writer.recover_wal().await.unwrap();
-        assert!(matches!(
-            wal_dir.ensure_recovery_complete().await,
-            Err(LogAggregatorError::WalRecoveryIncomplete { .. })
-        ));
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_secs(2);
         writer.start_background_recovery();
-        assert!(matches!(
-            writer.prepare_project_for_purge(1).await,
-            Err(LogAggregatorError::OperationTimedOut { .. })
-        ));
-        assert!(!*writer.recovery_ready.borrow());
-        assert!(has_recovery_wal(&wal_root).await);
+        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
+            .await
+            .expect("a damaged generation must not keep collection paused");
+
+        let rows = sink.all().await;
+        assert_eq!(rows.len(), 1, "the readable prefix commits");
+        assert_eq!(rows[0].line_count, 1);
+        let status = writer.collection_status(usize::MAX).await;
+        assert!(matches!(status.recovery, RecoveryState::Complete { .. }));
+        assert_eq!(status.deferred.len(), 1);
+        let reason = status.deferred[0].reason.as_deref().unwrap();
+        assert!(reason.contains("fails its checksum"), "{reason}");
+        assert_eq!(files_with_extension(&wal_root, "recovery-wal").await, 0);
+
+        writer
+            .write_line(make_line(
+                "fresh-container",
+                LogLevel::Info,
+                "after recovery",
+            ))
+            .await
+            .expect("collection resumes");
+        writer
+            .prepare_project_for_purge(1)
+            .await
+            .expect("purge is safe: deferred files are never replayed automatically");
     }
 
     #[tokio::test]
-    async fn background_recovery_resumes_after_retained_wal_is_repaired_in_place() {
+    async fn deferred_generation_is_not_replayed_on_the_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        seed_background_wal(&wal_root).await;
+        append_corrupt_record(&wal_root).await;
+        let first = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            Arc::new(VecSink::default()),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.collection_status(usize::MAX).await.deferred.len(), 1);
+        drop(first);
+
+        let sink = Arc::new(VecSink::default());
+        let second = ChunkWriterService::open(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            sink.all().await.is_empty(),
+            "nothing replays a deferred file"
+        );
+        let status = second.collection_status(usize::MAX).await;
+        assert_eq!(status.deferred.len(), 1, "still reported after a restart");
+        assert!(status.deferred[0].reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn torn_final_record_does_not_block_collection_or_purge() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_root = tmp.path().join("wal");
         seed_background_wal(&wal_root).await;
         let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
         let path = entries.next_entry().await.unwrap().unwrap().path();
-        let valid_len = tokio::fs::metadata(&path).await.unwrap().len();
         use tokio::io::AsyncWriteExt;
         tokio::fs::OpenOptions::new()
             .append(true)
@@ -1707,6 +1913,94 @@ mod tests {
             .write_all(&[1, 2])
             .await
             .unwrap();
+        let sink = Arc::new(VecSink::default());
+        let mut writer = ChunkWriterService::open_deferred_with_index(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(wal_root.clone()),
+            None,
+            Arc::new(NoLineIndex::default()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut writer).unwrap().wait_timeout = Duration::from_secs(2);
+        writer.start_background_recovery();
+        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
+            .await
+            .expect("a crash-torn tail is ordinary, not damage");
+        assert_eq!(sink.all().await.len(), 1);
+        assert!(writer
+            .collection_status(usize::MAX)
+            .await
+            .deferred
+            .is_empty());
+        assert!(!has_recovery_wal(&wal_root).await);
+        writer.prepare_project_for_purge(1).await.unwrap();
+    }
+
+    /// Regression for a production outage. A busy container's size-triggered
+    /// seal failed (its object write did not land), which by design keeps the
+    /// generation on disk for the next start. That generation held 8 MiB of
+    /// message bytes — the head cap — but as WAL JSON it was about three times
+    /// that, because escape-heavy lines (ANSI colour codes, quotes, escaped
+    /// newlines) inflate when serialized. Recovery only replayed generations
+    /// up to cap + 16 MiB, deferred-in-place everything larger, then declared
+    /// the pass incomplete and paused collection for good.
+    #[tokio::test]
+    async fn size_triggered_generation_kept_by_a_failed_seal_recovers_on_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        let container = "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f1a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d0e";
+        let msg = format!(
+            "\x1b[2m2026-01-01T00:00:00.000000Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2msqlx::query\x1b[0m\x1b[2m:\x1b[0m \
+             \x1b[3msummary\x1b[0m\x1b[2m=\x1b[0m\"UPDATE jobs SET state …\" \x1b[3mdb.statement\x1b[0m\x1b[2m=\x1b[0m\"\\n\\nUPDATE jobs\\n SET state = $1\\n WHERE id = $2\\n\" {}",
+            "\x1b\"".repeat(96)
+        );
+        // The parser extracts structured fields next to the raw message, and
+        // the WAL stores both — part of why a line's WAL record outweighs the
+        // message bytes the head cap counts.
+        let mut line = make_line(container, LogLevel::Info, &msg);
+        line.fields = Some(serde_json::json!({
+            "summary": "UPDATE jobs SET state …",
+            "db.statement": "\n\nUPDATE jobs\n SET state = $1\n WHERE id = $2\n",
+            "rows_affected": 1,
+            "rows_returned": 0,
+            "elapsed": "1.21ms",
+            "elapsed_secs": 0.00121,
+        }));
+
+        let failing = ChunkWriterService::open(
+            Arc::new(FailingStorage),
+            Arc::new(VecSink::default()),
+            Some(wal_root.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut written = 0u64;
+        while files_with_extension(&wal_root, "sealed-wal").await == 0 {
+            failing.write_line(line.clone()).await.unwrap();
+            written += 1;
+        }
+        assert_eq!(
+            failing.dropped_chunks(),
+            1,
+            "the seal failed and kept its WAL"
+        );
+        drop(failing);
+
+        let mut entries = tokio::fs::read_dir(&wal_root).await.unwrap();
+        let mut generation_bytes = 0;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("sealed-wal") {
+                generation_bytes = entry.metadata().await.unwrap().len();
+            }
+        }
+        let old_limit = (DEFAULT_HEAD_MAX_BYTES + crate::chunk::wal::MAX_RECORD_BYTES) as u64;
+        assert!(
+            generation_bytes > old_limit,
+            "fixture must reproduce the outage: {generation_bytes} bytes vs old limit {old_limit}"
+        );
 
         let sink = Arc::new(VecSink::default());
         let writer = ChunkWriterService::open_deferred_with_index(
@@ -1719,55 +2013,52 @@ mod tests {
         .await
         .unwrap();
         writer.start_background_recovery();
+        tokio::time::timeout(Duration::from_secs(60), writer.wait_for_recovery())
+            .await
+            .expect("recovery must replay what the writer produced and resume collection");
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while writer.recovery_failures.load(Ordering::Relaxed) == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
+        let replayed: u64 = sink
+            .all()
+            .await
+            .iter()
+            .map(|row| row.line_count as u64)
+            .sum();
+        assert_eq!(replayed, written, "every line, none deferred");
+        let status = writer.collection_status(usize::MAX).await;
+        assert!(matches!(status.recovery, RecoveryState::Complete { .. }));
+        assert!(status.deferred.is_empty());
+        assert_eq!(files_with_extension(&wal_root, "sealed-wal").await, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_seals_when_its_wal_generation_reaches_the_on_disk_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(VecSink::default());
+        let writer = ChunkWriterService::open_with_thresholds(
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap()),
+            sink.clone(),
+            Some(tmp.path().join("wal")),
+            None,
+            Arc::new(NoLineIndex::default()),
+            Thresholds {
+                generation_max_bytes: 64 * 1024,
+                ..Thresholds::default()
+            },
+        )
         .await
-        .expect("initial retained-WAL pass should enter the repair polling state");
-        // Let the recovery task enter its 600-second sleep before freezing
-        // time, so repairing below cannot race the initial completeness check.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!*writer.recovery_ready.borrow());
-        assert!(has_recovery_wal(&wal_root).await);
-        assert_eq!(sink.all().await.len(), 1);
-
-        tokio::time::pause();
-
-        let mut retained_entries = tokio::fs::read_dir(&wal_root).await.unwrap();
-        let mut retained_path = None;
-        while let Some(entry) = retained_entries.next_entry().await.unwrap() {
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("recovery-wal") {
-                retained_path = Some(entry.path());
-                break;
-            }
+        .unwrap();
+        // Far below the 8 MiB head cap in message bytes, far above 64 KiB as
+        // WAL JSON.
+        let msg = "\x1b".repeat(200);
+        for _ in 0..200 {
+            writer
+                .write_line(make_line("escape-heavy", LogLevel::Info, &msg))
+                .await
+                .unwrap();
         }
-        let retained_path = retained_path.expect("damaged generation should remain retained");
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&retained_path)
-            .await
-            .unwrap()
-            .set_len(valid_len)
-            .await
-            .unwrap();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !*writer.recovery_ready.borrow(),
-            "repair-required recovery should remain paused until its polling interval"
-        );
-
-        tokio::time::advance(Duration::from_secs(600)).await;
-        tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(2), writer.wait_for_recovery())
-            .await
-            .expect("in-place WAL repair should be detected on the next poll");
-        assert_eq!(sink.all().await.len(), 1);
-        assert!(!has_recovery_wal(&wal_root).await);
+        let rows = sink.all().await;
+        assert!(!rows.is_empty(), "the on-disk cap must trigger a seal");
+        assert!(rows.iter().all(|row| row.line_count < 200));
     }
 
     #[tokio::test]
