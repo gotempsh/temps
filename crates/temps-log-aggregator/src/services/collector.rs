@@ -25,7 +25,7 @@ use bollard::Docker;
 
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -79,6 +79,40 @@ pub struct CollectorService {
     /// Containers whose start is being retried in the background. Removing
     /// an id (on stop) cancels its retry.
     pending_starts: Mutex<HashSet<String>>,
+    /// One lock per container, held across a whole start or stop so the two
+    /// never interleave: a stop that arrives while a (retried) start is
+    /// inspecting the container waits, then tears down whatever that start
+    /// installed, instead of finding nothing to cancel and leaving a stream
+    /// behind. Entries are dropped once nobody holds or waits on them.
+    lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+/// Held for the duration of one start or stop of a container; see
+/// [`CollectorService::lifecycle_locks`].
+struct ContainerLifecycleGuard<'a> {
+    locks: &'a std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    container_id: String,
+    lock: Arc<Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for ContainerLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // Clones are only made under this map lock, so a count of two (the
+        // map's and ours) means nobody else holds or waits on it.
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::strong_count(&self.lock) == 2
+            && locks
+                .get(&self.container_id)
+                .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock))
+        {
+            locks.remove(&self.container_id);
+        }
+    }
 }
 
 impl CollectorService {
@@ -97,6 +131,7 @@ impl CollectorService {
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
             pending_starts: Mutex::new(HashSet::new()),
+            lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -123,6 +158,31 @@ impl CollectorService {
     /// Extracts context from Docker labels. If the container has no temps.sh labels,
     /// it is silently skipped.
     pub async fn start_streaming(&self, container_id: &str) -> Result<(), LogAggregatorError> {
+        let _lifecycle = self.lock_container(container_id).await;
+        self.start_streaming_locked(container_id).await
+    }
+
+    /// Wait for exclusive start/stop rights over one container.
+    async fn lock_container(&self, container_id: &str) -> ContainerLifecycleGuard<'_> {
+        let lock = self
+            .lifecycle_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(container_id.to_string())
+            .or_default()
+            .clone();
+        let guard = Arc::clone(&lock).lock_owned().await;
+        ContainerLifecycleGuard {
+            locks: &self.lifecycle_locks,
+            container_id: container_id.to_string(),
+            lock,
+            guard: Some(guard),
+        }
+    }
+
+    /// [`Self::start_streaming`] for a caller already holding the
+    /// container's lifecycle lock.
+    async fn start_streaming_locked(&self, container_id: &str) -> Result<(), LogAggregatorError> {
         // Check if already streaming
         {
             let streams = self.active_streams.lock().await;
@@ -139,7 +199,7 @@ impl CollectorService {
             None => {
                 debug!(
                     container_id = container_id,
-                    "Container has no temps.sh labels, skipping"
+                    "Container is not running or carries no labels this instance collects, skipping"
                 );
                 return Ok(());
             }
@@ -215,16 +275,18 @@ impl CollectorService {
         self: &Arc<Self>,
         container_id: &str,
     ) -> Result<(), LogAggregatorError> {
-        let error = match self.start_streaming(container_id).await {
+        let lifecycle = self.lock_container(container_id).await;
+        let error = match self.start_streaming_locked(container_id).await {
             Err(error) if Self::start_is_retryable(&error) => error,
             other => return other,
         };
-        if !self
+        let scheduled = self
             .pending_starts
             .lock()
             .await
-            .insert(container_id.to_string())
-        {
+            .insert(container_id.to_string());
+        drop(lifecycle);
+        if !scheduled {
             // A retry for this container is already running.
             return Ok(());
         }
@@ -252,6 +314,10 @@ impl CollectorService {
         let mut attempt: u32 = 0;
         loop {
             tokio::time::sleep(delay).await;
+            // Held across the pending check AND the start, so a stop either
+            // lands first (and this retry ends here) or waits and then tears
+            // down the stream this attempt installs.
+            let _lifecycle = self.lock_container(&container_id).await;
             if !self.pending_starts.lock().await.contains(&container_id) {
                 debug!(
                     container_id = %container_id,
@@ -260,7 +326,7 @@ impl CollectorService {
                 return;
             }
             attempt += 1;
-            match self.start_streaming(&container_id).await {
+            match self.start_streaming_locked(&container_id).await {
                 Err(error) if Self::start_is_retryable(&error) => {
                     if attempt.is_multiple_of(START_RETRY_LOG_EVERY) {
                         warn!(
@@ -295,6 +361,7 @@ impl CollectorService {
 
     /// Stop streaming logs for a container and flush remaining buffer.
     pub async fn stop_streaming(&self, container_id: &str) {
+        let _lifecycle = self.lock_container(container_id).await;
         self.pending_starts.lock().await.remove(container_id);
         let task = {
             let mut streams = self.active_streams.lock().await;
@@ -362,6 +429,14 @@ impl CollectorService {
                     }
                 }
             })?;
+
+        // Discovery can act on a stale view: the startup scan listed the
+        // container as running, or a start is retried, and it has exited
+        // since. Its stop was already handled, so a stream opened now would
+        // never be torn down and would make a later start skip it.
+        if inspect.state.as_ref().and_then(|state| state.running) == Some(false) {
+            return Ok(None);
+        }
 
         // Real Docker container name (e.g. "legacy-postgres"), used to resolve
         // imported external-service containers that carry no temps.* labels.
@@ -1009,51 +1084,10 @@ mod tests {
     // discovery retries it instead of dropping it for good.
     #[tokio::test]
     async fn test_container_is_collected_after_ownership_lookup_recovers() {
-        use bollard::models::ContainerCreateBody;
-        use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
-
-        let docker = match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) if docker.ping().await.is_ok() => Arc::new(docker),
-            _ => {
-                eprintln!("Skipping ownership retry test: Docker unavailable");
-                return;
-            }
-        };
-        let image = "alpine:3";
-        if docker.inspect_image(image).await.is_err() {
-            eprintln!("Skipping ownership retry test: {image} not present locally");
+        let Some(docker) = local_docker().await else {
             return;
-        }
-        let labels = HashMap::from([
-            (LABEL_PROJECT_ID.to_string(), "1".to_string()),
-            (LABEL_ENV.to_string(), "1".to_string()),
-            (LABEL_SERVICE.to_string(), "web".to_string()),
-            (LABEL_DEPLOY_ID.to_string(), "7".to_string()),
-        ]);
-        let created = docker
-            .create_container(
-                None::<CreateContainerOptions>,
-                ContainerCreateBody {
-                    image: Some(image.to_string()),
-                    cmd: Some(vec![
-                        "sh".into(),
-                        "-c".into(),
-                        "while true; do echo tick; sleep 1; done".into(),
-                    ]),
-                    labels: Some(labels),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("create test container");
-        let id = created.id;
-        docker
-            .start_container(
-                &id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .expect("start test container");
+        };
+        let id = labelled_container(&docker, "while true; do echo tick; sleep 1; done").await;
 
         // Ownership lookup fails, then succeeds on retry; the resume-point
         // lookup that follows finds no earlier chunk.
@@ -1066,23 +1100,7 @@ mod tests {
                 Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
             ])
             .into_connection();
-        let db = Arc::new(db);
-        let tmp = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn LogStorage> =
-            Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
-        let chunk_writer =
-            ChunkWriterService::open(storage, Arc::new(NoopManifestSink), None, None)
-                .await
-                .unwrap();
-        let collector = Arc::new(
-            CollectorService::new(
-                Arc::new(temps_core::DockerHandle::available(docker.clone())),
-                chunk_writer,
-                Arc::new(LogMetadataService::new(db.clone())),
-                16,
-            )
-            .with_db(db),
-        );
+        let (collector, _tmp) = docker_collector(docker.clone(), db).await;
 
         let scheduled = collector.start_streaming_with_retry(&id).await;
         let started_at_first = collector.active_containers().await.contains(&id);
@@ -1095,19 +1113,175 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         collector.stop_streaming(&id).await;
-        let _ = docker
-            .remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        remove_container(&docker, &id).await;
 
         scheduled.expect("a transient failure schedules a retry instead of failing");
         assert!(!started_at_first, "the first attempt must have failed");
         assert!(streaming, "the retry must start collecting the container");
         assert!(collector.pending_starts.lock().await.is_empty());
+    }
+
+    /// A reachable local Docker daemon with `alpine:3` present, or `None`
+    /// (the caller skips) on machines without one.
+    async fn local_docker() -> Option<Arc<bollard::Docker>> {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => Arc::new(docker),
+            _ => {
+                eprintln!("Skipping: Docker unavailable");
+                return None;
+            }
+        };
+        if docker.inspect_image("alpine:3").await.is_err() {
+            eprintln!("Skipping: alpine:3 not present locally");
+            return None;
+        }
+        Some(docker)
+    }
+
+    /// Start an `alpine:3` container labelled as deployment 7 of project 1.
+    async fn labelled_container(docker: &bollard::Docker, script: &str) -> String {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
+
+        let labels = HashMap::from([
+            (LABEL_PROJECT_ID.to_string(), "1".to_string()),
+            (LABEL_ENV.to_string(), "1".to_string()),
+            (LABEL_SERVICE.to_string(), "web".to_string()),
+            (LABEL_DEPLOY_ID.to_string(), "7".to_string()),
+        ]);
+        let id = docker
+            .create_container(
+                None::<CreateContainerOptions>,
+                ContainerCreateBody {
+                    image: Some("alpine:3".to_string()),
+                    cmd: Some(vec!["sh".into(), "-c".into(), script.into()]),
+                    labels: Some(labels),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create test container")
+            .id;
+        docker
+            .start_container(&id, None::<StartContainerOptions>)
+            .await
+            .expect("start test container");
+        id
+    }
+
+    async fn remove_container(docker: &bollard::Docker, id: &str) {
+        let _ = docker
+            .remove_container(
+                id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    async fn docker_collector(
+        docker: Arc<bollard::Docker>,
+        db: sea_orm::DatabaseConnection,
+    ) -> (Arc<CollectorService>, tempfile::TempDir) {
+        let db = Arc::new(db);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
+        let chunk_writer =
+            ChunkWriterService::open(storage, Arc::new(NoopManifestSink), None, None)
+                .await
+                .unwrap();
+        let collector = Arc::new(
+            CollectorService::new(
+                Arc::new(temps_core::DockerHandle::available(docker)),
+                chunk_writer,
+                Arc::new(LogMetadataService::new(db.clone())),
+                16,
+            )
+            .with_db(db),
+        );
+        (collector, tmp)
+    }
+
+    // A stop that arrives while a start for the same container is in flight
+    // (e.g. a retry still inspecting it) must wait for that start and then
+    // tear down the stream it installed — not find nothing to cancel and
+    // leave a stream behind that makes the next start event skip collection.
+    #[tokio::test]
+    async fn test_stop_during_an_in_flight_start_tears_down_what_it_installed() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let collector = Arc::new(collector_with_db(Arc::new(db)).await);
+        collector.pending_starts.lock().await.insert("cid".into());
+
+        // The retry has passed its pending check and is mid-start.
+        let in_flight_start = collector.lock_container("cid").await;
+        let stopping = tokio::spawn({
+            let collector = Arc::clone(&collector);
+            async move { collector.stop_streaming("cid").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !stopping.is_finished(),
+            "stop must wait for the in-flight start"
+        );
+        assert!(collector.pending_starts.lock().await.contains("cid"));
+
+        // The start completes by installing its stream.
+        collector.active_streams.lock().await.insert(
+            "cid".into(),
+            StreamTask {
+                handle: tokio::spawn(std::future::pending::<()>()),
+            },
+        );
+        drop(in_flight_start);
+        stopping.await.unwrap();
+
+        assert!(collector.active_containers().await.is_empty());
+        assert!(collector.pending_starts.lock().await.is_empty());
+        assert!(
+            collector.lifecycle_locks.lock().unwrap().is_empty(),
+            "an idle container's lock must not be kept"
+        );
+    }
+
+    // Discovery can act on a stale view (the startup scan listed it, or a
+    // retry fires) after the container exited and its stop was handled. Even
+    // with ownership confirmed, nothing is streamed for it.
+    #[tokio::test]
+    async fn test_exited_container_is_not_streamed() {
+        let Some(docker) = local_docker().await else {
+            return;
+        };
+        let id = labelled_container(&docker, "true").await;
+        for _ in 0..50 {
+            let running = docker
+                .inspect_container(
+                    &id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .ok()
+                .and_then(|inspect| inspect.state.and_then(|state| state.running));
+            if running == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(7)]])
+            .append_query_results(vec![
+                Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
+            ])
+            .into_connection();
+        let (collector, _tmp) = docker_collector(docker.clone(), db).await;
+
+        let result = collector.start_streaming(&id).await;
+        let streaming = collector.active_containers().await.contains(&id);
+        remove_container(&docker, &id).await;
+
+        result.expect("an exited container is skipped, not an error");
+        assert!(!streaming, "an exited container must not be streamed");
     }
 }
