@@ -23,8 +23,6 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 sea-orm = { workspace = true }
 chrono = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

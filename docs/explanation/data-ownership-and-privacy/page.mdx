@@ -67,7 +67,7 @@ All data lives in one PostgreSQL database:
 
 Temps reports anonymous usage events so the maintainers can tell whether the product actually works for self-hosters (e.g. "how many instances attempted a deploy vs. succeeded"). Every event carries only:
 
-- A **random instance ID** generated on your server (`~/.temps/anonymous_id`) — not derived from your hardware, domain, or account
+- A **random instance ID** generated on your server (`~/.temps/anonymous_id`, or for stateless control planes a random value stored once in your database and shared by every replica) — not derived from your hardware, domain, account, or instance name
 - The **event name** (e.g. `deploy_succeeded`, `instance_heartbeat`) and the Temps version
 - A small bag of **non-identifying properties**: counts, enum labels (build preset, source type), and coarse buckets (RAM tier — never exact specs)
 

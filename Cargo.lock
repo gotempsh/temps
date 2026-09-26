@@ -12956,12 +12956,10 @@ version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
  "chrono",
- "hex",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "temps-config",
  "temps-core",
  "thiserror 2.0.20",
