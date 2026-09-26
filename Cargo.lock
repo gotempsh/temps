@@ -11049,6 +11049,7 @@ dependencies = [
  "futures",
  "futures-util",
  "globset",
+ "http 1.5.0",
  "http-body-util",
  "mockall",
  "num_cpus",

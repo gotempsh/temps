@@ -26,6 +26,21 @@ use temps_entities::deployment_containers;
 use temps_logs::{LogLevel, LogService};
 use tokio::time::{sleep, Duration};
 
+fn verify_worker_image_platform(
+    image: &str,
+    built: &str,
+    target: Option<&str>,
+    node: &str,
+) -> Result<(), WorkflowError> {
+    if target.is_some_and(|target| temps_deployer::platform::platforms_match(built, target)) {
+        return Ok(());
+    }
+    Err(WorkflowError::JobValidationFailed(format!(
+        "Worker-built image '{image}' is {built}, but node '{node}' reports {}; select compatible target nodes or rebuild for their architecture",
+        target.unwrap_or("no architecture")
+    )))
+}
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildImageOutput {
@@ -89,6 +104,11 @@ impl BuildImageOutput {
         let builder_node_id: Option<i32> = context
             .get_output(build_job_id, "builder_node_id")?
             .flatten();
+        if builder_node_id.is_some() && image_tags_by_platform.is_empty() {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Worker build '{build_job_id}' has no verified platform metadata; rebuild before deployment"
+            )));
+        }
 
         Ok(Self {
             image_tag,
@@ -1443,18 +1463,61 @@ impl DeployImageJob {
         builder_node_id: Option<i32>,
         target_node_id: Option<i32>,
     ) -> Result<(), WorkflowError> {
-        if builder_node_id.is_some() && builder_node_id == target_node_id {
-            return match remote.image_exists(image_tag).await {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(WorkflowError::JobExecutionFailed(format!(
-                    "Worker '{}' reported a successful build of '{}' but the image is absent",
-                    node_name, image_tag
-                ))),
-                Err(error) => Err(WorkflowError::JobExecutionFailed(format!(
-                    "Cannot verify worker-built image '{}' on node '{}': {}",
-                    image_tag, node_name, error
-                ))),
+        if let Some(builder_id) = builder_node_id {
+            let owner = if Some(builder_id) == target_node_id {
+                remote.clone()
+            } else {
+                self.remote_deployer_for_node_id(builder_id).await?
             };
+            let info = owner.inspect_image(image_tag).await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot inspect worker-built image '{image_tag}' on '{}': {error}",
+                    owner.node_name()
+                ))
+            })?;
+            let platform = match remote.platform() {
+                Some(platform) => Some(platform),
+                None => remote.refresh_platform().await,
+            };
+            verify_worker_image_platform(
+                image_tag,
+                &info.platform,
+                platform.as_deref(),
+                node_name,
+            )?;
+            if Some(builder_id) == target_node_id {
+                return Ok(());
+            }
+            // Existence is insufficient: a cached tag can refer to a stale
+            // image or another architecture. Only reuse the inspected identity.
+            if let Ok(cached) = remote.inspect_image(image_tag).await {
+                if cached.id == info.id {
+                    return verify_worker_image_platform(
+                        image_tag,
+                        &cached.platform,
+                        platform.as_deref(),
+                        node_name,
+                    );
+                }
+            }
+            self.transfer_node_built_image(image_tag, builder_id, remote, node_name, context)
+                .await?;
+            let imported = remote.inspect_image(image_tag).await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot verify imported image '{image_tag}' on '{node_name}': {error}"
+                ))
+            })?;
+            if imported.id != info.id {
+                return Err(WorkflowError::JobValidationFailed(format!(
+                    "Imported worker image '{image_tag}' on '{node_name}' does not match build node {builder_id}"
+                )));
+            }
+            return verify_worker_image_platform(
+                image_tag,
+                &imported.platform,
+                platform.as_deref(),
+                node_name,
+            );
         }
         // Refuse to ship an image the node cannot execute. Without this the
         // tar transfers fine, `docker load` succeeds, and the container dies
@@ -1495,12 +1558,6 @@ impl DeployImageJob {
                     e
                 );
             }
-        }
-
-        if let Some(builder_node_id) = builder_node_id {
-            return self
-                .transfer_node_built_image(image_tag, builder_node_id, remote, node_name, context)
-                .await;
         }
 
         match self.resolved_image_source(image_tag) {
@@ -4114,6 +4171,25 @@ impl DeployImageJobBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_image_platform_must_match_before_transfer_including_same_node() {
+        use super::verify_worker_image_platform;
+        assert!(verify_worker_image_platform(
+            "app:1",
+            "linux/arm64",
+            Some("linux/arm64"),
+            "worker"
+        )
+        .is_ok());
+        assert!(verify_worker_image_platform(
+            "app:1",
+            "linux/arm64",
+            Some("linux/amd64"),
+            "worker"
+        )
+        .is_err());
+        assert!(verify_worker_image_platform("app:1", "linux/arm64", None, "worker").is_err());
+    }
     use super::*;
     use async_trait::async_trait;
 
@@ -6327,6 +6403,55 @@ mod tests {
         )
         .await
         .expect("registry pull path should succeed with zero control-plane Docker involvement");
+    }
+
+    #[tokio::test]
+    async fn worker_image_same_node_rejects_actual_architecture_mismatch() {
+        let url = spawn_sequenced_agent(1, |request| {
+            assert!(request.contains("/agent/images/inspect?"));
+            (
+                "200 OK",
+                serde_json::json!({
+                    "id": "sha256:test", "architecture": "arm64", "os": "linux",
+                    "platform": "linux/arm64", "size_bytes": 1, "tags": ["app:1"],
+                    "created": null, "working_dir": null
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+                .unwrap()
+                .with_platform(Some("linux/amd64".into())),
+        );
+        let job = job_with_image_builder(PlatformOnlyImageBuilder::confirmed(
+            "linux/amd64",
+            "linux/amd64",
+        ));
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        let error = job
+            .ensure_image_on_remote("app:1", &remote, "worker", &context, Some(7), Some(7))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("linux/arm64"));
+        assert!(error.to_string().contains("linux/amd64"));
+    }
+
+    #[tokio::test]
+    async fn worker_recorded_platform_drives_placement_without_control_plane_inspection() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: None,
+            image_platform: None,
+            discoverable: None,
+        });
+        let mut output = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        output.builder_node_id = Some(7);
+        assert_eq!(
+            job.available_image_platforms(&output).await,
+            vec!["linux/arm64"]
+        );
     }
 
     /// A control-plane-local build (no `external_image_tag`) must still use

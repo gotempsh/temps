@@ -783,6 +783,12 @@ impl BuildImageJob {
             return Ok(());
         };
 
+        if self.remote_builder_node_id.is_some() {
+            return Err(WorkflowError::JobValidationFailed(
+                "Worker builds cannot generate or transfer NPM_TOKEN/NPM_RC credentials; deploy a prebuilt registry image until build-secret handling is supported".into(),
+            ));
+        }
+
         let npmrc_path = build_context_dir.join(".npmrc");
         if let Ok(metadata) = fs::symlink_metadata(&npmrc_path) {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1167,6 +1173,11 @@ impl BuildImageJob {
     ) -> Result<(), WorkflowError> {
         let built_platform = match self.image_builder.inspect_image(image_name).await {
             Ok(info) => info.platform,
+            Err(e) if self.remote_builder_node_id.is_some() => {
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Cannot verify worker-built image '{image_name}' for {requested_platform}: {e}"
+                )));
+            }
             Err(e) => {
                 tracing::debug!(
                     image = %image_name,
@@ -2010,6 +2021,44 @@ mod tests {
             repo_name: "repo".to_string(),
         };
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn worker_build_refuses_npm_credentials_before_writing_context() {
+        for key in ["NPM_TOKEN", "NPM_RC"] {
+            let builder = Arc::new(RecordingImageBuilder::default());
+            let job = BuildImageJobBuilder::new()
+                .job_id("build".into())
+                .download_job_id("download_repo".into())
+                .image_tag("app:latest".into())
+                .remote_builder_node_id(7)
+                .build_args(vec![(key.into(), "synthetic-secret".into())])
+                .build(builder.clone())
+                .unwrap();
+            let (dir, repo) = repo_with_dockerfile();
+            let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+            let error = job.build_image(&repo, &context).await.unwrap_err();
+            assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+            assert!(!error.to_string().contains("synthetic-secret"));
+            assert!(!dir.path().join(".npmrc").exists());
+            assert!(builder.builds().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_build_requires_successful_image_inspection() {
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .remote_builder_node_id(7)
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        assert!(job
+            .verify_built_platform("app:latest", "linux/arm64", &context)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

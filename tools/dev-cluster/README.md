@@ -65,6 +65,28 @@ missing UI is rarely a blocker.
 
 ## Quick start
 
+### Worker build roles and persisted labels
+
+For a **fresh** cluster, set `DEV_CLUSTER_SERVE_PROFILE=control-plane` and
+`DEV_CLUSTER_WORKER1_LABELS='temps.sh/role=builder'` before the first `up`
+to reserve worker 1 for builds. Workers 2 and 3 remain workload targets.
+The same build protocol serves ordinary workers when no builder is available.
+
+`DEV_CLUSTER_WORKER{1,2,3}_LABELS` is consumed only by the first `temps join`.
+Labels live in the control-plane node record after that. Changing the variable,
+restarting, or recreating a container with its existing volume does **not** update
+them; the persisted join marker deliberately preserves the worker identity.
+Already-joined workers print this warning at startup. This harness does not
+support in-place relabelling: use a fresh, disposable test cluster configured
+before first join. Do not delete a worker volume or registration under running
+workloads merely to change labels. Check node labels in the console before
+testing builder-only placement.
+
+Protocol v1 supports container source builds for a single target architecture.
+Mixed-architecture target sets and image-based static extraction fail before
+source upload. Generated `NPM_TOKEN`/`NPM_RC` credentials and supplied Dockerfile
+build arguments are not supported; use prebuilt registry images for these cases.
+
 ```bash
 cd tools/dev-cluster
 

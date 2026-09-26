@@ -114,6 +114,10 @@ pub fn build_router(
         .route("/agent/images/import", post(handlers::import_image))
         .route("/agent/images/pull", post(handlers::pull_image))
         .route(
+            "/agent/images/inspect",
+            get(crate::build_handler::inspect_image),
+        )
+        .route(
             "/agent/images/build",
             post(crate::build_handler::build_image)
                 .layer(axum::extract::DefaultBodyLimit::disable()),

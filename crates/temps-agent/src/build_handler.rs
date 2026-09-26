@@ -23,13 +23,83 @@ use temps_deployer::{
         validate_archive_path, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec,
         MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES, MAX_BUILD_SPEC_BYTES,
     },
-    BuildRequest, BuildRequestWithCallback, BuilderError,
+    BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError,
 };
 use tokio::io::AsyncWriteExt;
 
-use crate::handlers::{error_response, AgentResourceLimits, AgentState};
+use crate::handlers::{AgentResourceLimits, AgentState};
+use temps_core::problemdetails::{self, Problem};
+
+#[derive(Debug, thiserror::Error)]
+enum AgentImageError {
+    #[error("Invalid worker image request: {0}")]
+    Invalid(String),
+    #[error("Worker image resource limit exceeded: {0}")]
+    TooLarge(String),
+    #[error("Worker image capacity unavailable: {0}")]
+    Unavailable(String),
+    #[error("Worker image deadline exceeded: {0}")]
+    Deadline(String),
+    #[error("Worker image not found: {0}")]
+    NotFound(String),
+    #[error("Worker image storage operation failed: {0}")]
+    Storage(String),
+}
+
+impl From<AgentImageError> for Problem {
+    fn from(error: AgentImageError) -> Self {
+        let (status, title) = match &error {
+            AgentImageError::Invalid(_) => (StatusCode::BAD_REQUEST, "Invalid image request"),
+            AgentImageError::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "Image resource limit"),
+            AgentImageError::Unavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Image capacity unavailable",
+            ),
+            AgentImageError::Deadline(_) => {
+                (StatusCode::GATEWAY_TIMEOUT, "Image operation timed out")
+            }
+            AgentImageError::NotFound(_) => (StatusCode::NOT_FOUND, "Image not found"),
+            AgentImageError::Storage(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Image operation failed")
+            }
+        };
+        problemdetails::new(status)
+            .with_title(title)
+            .with_detail(error.to_string())
+    }
+}
 
 const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Own (rather than detach) the build future. Dropping it cancels the Docker
+/// request and releases its scratch directory and admission permit before the
+/// terminal event is sent. A disconnected/slow consumer cannot retain a slot.
+async fn supervise_build(
+    build: impl std::future::Future<Output = Result<BuildResult, BuilderError>>,
+    tx: tokio::sync::mpsc::Sender<BuildEvent>,
+    deadline: tokio::time::Instant,
+) {
+    let event = tokio::select! {
+        _ = tx.closed() => return,
+        result = tokio::time::timeout_at(deadline, build) => match result {
+            Ok(Ok(result)) => BuildEvent::Result(result),
+            Ok(Err(error)) => BuildEvent::Failure(BuildFailure {
+                kind: if matches!(error, BuilderError::BuildFailed(_) | BuilderError::BuildOutOfMemory { .. }) {
+                    BuildFailureKind::Build
+                } else {
+                    BuildFailureKind::Worker
+                },
+                message: bounded_log_line(error.to_string()),
+            }),
+            Err(_) => BuildEvent::Failure(BuildFailure {
+                kind: BuildFailureKind::Timeout,
+                message: "Worker build exceeded its 30-minute deadline".into(),
+            }),
+        }
+    };
+    // Do not leave even this small task waiting forever on a full log queue.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(event)).await;
+}
 
 fn safe_extract_context(archive: &Path, destination: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive)
@@ -108,6 +178,23 @@ fn safe_extract_context(archive: &Path, destination: &Path) -> Result<(), String
                     path.display()
                 )
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry
+                    .header()
+                    .mode()
+                    .map_err(|error| format!("Invalid mode for '{}': {error}", path.display()))?;
+                // Preserve executable source scripts, but never setuid/setgid.
+                target
+                    .set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+                    .map_err(|error| {
+                        format!(
+                            "Cannot set source permissions for '{}': {error}",
+                            path.display()
+                        )
+                    })?;
+            }
         } else {
             return Err(format!(
                 "Build context entry '{}' is not a regular file or directory",
@@ -150,6 +237,7 @@ fn bounded_log_line(mut line: String) -> String {
         (status = 400, description = "Invalid build specification or archive"),
         (status = 401, description = "Unauthorized"),
         (status = 413, description = "Build context too large"),
+        (status = 500, description = "Worker build storage operation failed"),
         (status = 503, description = "Worker build capacity unavailable"),
         (status = 504, description = "Build admission or upload deadline exceeded")
     ),
@@ -158,14 +246,27 @@ fn bounded_log_line(mut line: String) -> String {
 pub async fn build_image(
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    multipart: Multipart,
+) -> Result<Response, Problem> {
+    let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
+    tokio::time::timeout_at(deadline, receive_build(state, limits, multipart, deadline))
+        .await
+        .map_err(|_| {
+            Problem::from(AgentImageError::Deadline(
+                "Build admission/upload exceeded 30 minutes".into(),
+            ))
+        })?
+}
+
+async fn receive_build(
+    state: Arc<AgentState>,
+    limits: Arc<AgentResourceLimits>,
     mut multipart: Multipart,
-) -> Response {
+    deadline: tokio::time::Instant,
+) -> Result<Response, Problem> {
     let mut spec_field = match multipart.next_field().await {
         Ok(Some(field)) if field.name() == Some("spec") => field,
-        _ => {
-            return error_response(StatusCode::BAD_REQUEST, "Expected spec field first".into())
-                .into_response()
-        }
+        _ => return Err(AgentImageError::Invalid("Expected spec field first".into()).into()),
     };
     let mut spec_bytes = Vec::new();
     loop {
@@ -177,11 +278,9 @@ pub async fn build_image(
             }
             Ok(None) => break,
             _ => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Build spec is invalid or too large".into(),
+                return Err(
+                    AgentImageError::Invalid("Build spec is invalid or too large".into()).into(),
                 )
-                .into_response()
             }
         }
     }
@@ -191,67 +290,54 @@ pub async fn build_image(
     let spec: BuildSpec = match serde_json::from_slice(&spec_bytes) {
         Ok(spec) => spec,
         Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "Build spec is not valid JSON".into(),
-            )
-            .into_response()
+            return Err(AgentImageError::Invalid("Build spec is not valid JSON".into()).into())
         }
     };
     if let Err(message) = spec.validate() {
-        return error_response(StatusCode::BAD_REQUEST, message).into_response();
+        return Err(AgentImageError::Invalid(message).into());
     }
 
-    let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
     let permit =
         match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
             .await
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                return Err(AgentImageError::Unavailable(
                     "Worker image operation capacity unavailable".into(),
                 )
-                .into_response()
+                .into())
             }
             Err(_) => {
-                return error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
+                return Err(AgentImageError::Deadline(
                     "Worker build waited 30 minutes for capacity".into(),
                 )
-                .into_response()
+                .into())
             }
         };
     let scratch = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(error) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cannot create worker build scratch directory: {error}"),
-            )
-            .into_response()
+            return Err(AgentImageError::Storage(format!(
+                "Cannot create worker build scratch directory: {error}"
+            ))
+            .into())
         }
     };
     let archive_path = scratch.path().join("context.tar");
     let mut archive_file = match tokio::fs::File::create(&archive_path).await {
         Ok(file) => file,
         Err(error) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cannot create worker build archive: {error}"),
-            )
-            .into_response()
+            return Err(AgentImageError::Storage(format!(
+                "Cannot create worker build archive: {error}"
+            ))
+            .into())
         }
     };
     let mut context = match multipart.next_field().await {
         Ok(Some(field)) if field.name() == Some("context") => field,
         _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "Expected context field after spec".into(),
-            )
-            .into_response()
+            return Err(AgentImageError::Invalid("Expected context field after spec".into()).into())
         }
     };
     let mut received = 0_u64;
@@ -260,34 +346,30 @@ pub async fn build_image(
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => break,
             Ok(Err(error)) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Build context upload failed: {error}"),
-                )
-                .into_response()
+                return Err(AgentImageError::Invalid(format!(
+                    "Build context upload failed: {error}"
+                ))
+                .into())
             }
             Err(_) => {
-                return error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
+                return Err(AgentImageError::Deadline(
                     "Build context upload exceeded 30 minutes".into(),
                 )
-                .into_response()
+                .into())
             }
         };
         received = received.saturating_add(chunk.len() as u64);
         if received > MAX_BUILD_CONTEXT_BYTES {
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"),
-            )
-            .into_response();
+            return Err(AgentImageError::TooLarge(format!(
+                "Build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"
+            ))
+            .into());
         }
         if let Err(error) = archive_file.write_all(&chunk).await {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cannot write worker build archive: {error}"),
-            )
-            .into_response();
+            return Err(AgentImageError::Storage(format!(
+                "Cannot write worker build archive: {error}"
+            ))
+            .into());
         }
     }
     drop(archive_file);
@@ -295,50 +377,43 @@ pub async fn build_image(
     match multipart.next_field().await {
         Ok(None) => {}
         _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "Unexpected field after build context".into(),
+            return Err(
+                AgentImageError::Invalid("Unexpected field after build context".into()).into(),
             )
-            .into_response()
         }
     }
     let context_dir = scratch.path().join("source");
     if let Err(error) = std::fs::create_dir(&context_dir) {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Cannot create worker source directory: {error}"),
-        )
-        .into_response();
+        return Err(AgentImageError::Storage(format!(
+            "Cannot create worker source directory: {error}"
+        ))
+        .into());
     }
     let archive_for_extract = archive_path.clone();
     let context_for_extract = context_dir.clone();
-    match tokio::task::spawn_blocking(move || {
-        safe_extract_context(&archive_for_extract, &context_for_extract)
+    let (scratch, permit) = match tokio::task::spawn_blocking(move || {
+        // A blocking extraction cannot be aborted. Keep its resources owned
+        // here if the HTTP handler disconnects or expires while it finishes.
+        safe_extract_context(&archive_for_extract, &context_for_extract).map(|()| (scratch, permit))
     })
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => {
-            return error_response(StatusCode::BAD_REQUEST, message).into_response()
-        }
+        Ok(Ok(resources)) => resources,
+        Ok(Err(message)) => return Err(AgentImageError::Invalid(message).into()),
         Err(error) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Worker build extraction task failed: {error}"),
-            )
-            .into_response()
+            return Err(AgentImageError::Storage(format!(
+                "Worker build extraction task failed: {error}"
+            ))
+            .into())
         }
-    }
+    };
     let dockerfile = context_dir.join(&spec.dockerfile);
     if !dockerfile.is_file() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Dockerfile '{}' is absent from the uploaded context",
-                spec.dockerfile
-            ),
-        )
-        .into_response();
+        return Err(AgentImageError::Invalid(format!(
+            "Dockerfile '{}' is absent from the uploaded context",
+            spec.dockerfile
+        ))
+        .into());
     }
     let (tx, rx) = tokio::sync::mpsc::channel::<BuildEvent>(64);
     let log_tx = tx.clone();
@@ -358,52 +433,39 @@ pub async fn build_image(
         log_path: scratch.path().join("build.log"),
     };
     let builder = state.image_builder.clone();
-    let mut task = tokio::spawn(async move {
+    let build = async move {
         let _permit = permit;
         let _scratch = scratch;
-        builder
+        let requested_platform = request.platform.clone();
+        let result = builder
             .build_image_with_callback(BuildRequestWithCallback {
                 request,
                 log_callback: Some(callback),
             })
-            .await
-    });
-    tokio::spawn(async move {
-        let event = match tokio::time::timeout_at(deadline, &mut task).await {
-            Ok(Ok(Ok(result))) => BuildEvent::Result(result),
-            Ok(Ok(Err(error))) => BuildEvent::Failure(BuildFailure {
-                kind: if matches!(
-                    error,
-                    BuilderError::BuildFailed(_) | BuilderError::BuildOutOfMemory { .. }
-                ) {
-                    BuildFailureKind::Build
-                } else {
-                    BuildFailureKind::Worker
-                },
-                message: error.to_string(),
-            }),
-            Ok(Err(error)) => BuildEvent::Failure(BuildFailure {
-                kind: BuildFailureKind::Worker,
-                message: format!("Worker build task failed: {error}"),
-            }),
-            Err(_) => BuildEvent::Failure(BuildFailure {
-                kind: BuildFailureKind::Timeout,
-                message: "Worker build exceeded its 30-minute deadline".into(),
-            }),
-        };
-        let _ = tx.send(event).await;
-    });
+            .await?;
+        if let Some(expected) = requested_platform {
+            let info = builder.inspect_image(&result.image_name).await?;
+            if !temps_deployer::platform::platforms_match(&info.platform, &expected) {
+                return Err(BuilderError::BuildFailed(format!(
+                    "Worker built '{}' for {} instead of requested {}",
+                    result.image_name, info.platform, expected
+                )));
+            }
+        }
+        Ok(result)
+    };
+    tokio::spawn(supervise_build(build, tx, deadline));
     let output = stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
             .map(|event| (Ok::<_, Infallible>(event_bytes(event)), rx))
     });
-    (
+    Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-ndjson")],
         Body::from_stream(output),
     )
-        .into_response()
+        .into_response())
 }
 
 /// Query for `GET /agent/images/export`. The reference travels as a query
@@ -412,6 +474,48 @@ pub async fn build_image(
 pub struct ExportImageQuery {
     /// Image reference to export, e.g. `temps-app:3f2a`.
     pub image: String,
+}
+
+/// Inspect on the daemon that actually owns the image, never on the control plane.
+#[utoipa::path(
+    tag = "Images", get, path = "/agent/images/inspect", params(ExportImageQuery),
+    responses(
+        (status = 200, description = "Image metadata", body = temps_deployer::ImageInfo),
+        (status = 400, description = "Invalid image reference"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Image not found"),
+        (status = 500, description = "Image inspection failed"),
+        (status = 504, description = "Inspection deadline exceeded")
+    ), security(("bearer_auth" = []))
+)]
+pub async fn inspect_image(
+    State(state): State<Arc<AgentState>>,
+    Query(query): Query<ExportImageQuery>,
+) -> Result<axum::Json<temps_deployer::ImageInfo>, Problem> {
+    validate_image_reference(&query.image)?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.image_builder.inspect_image(&query.image),
+    )
+    .await
+    .map_err(|_| {
+        AgentImageError::Deadline(format!("Inspect '{}' exceeded 30 seconds", query.image))
+    })?;
+    result.map(axum::Json).map_err(|error| match error {
+        BuilderError::ImageNotFound(_) => AgentImageError::NotFound(query.image).into(),
+        error => {
+            AgentImageError::Storage(format!("Cannot inspect '{}': {error}", query.image)).into()
+        }
+    })
+}
+
+fn validate_image_reference(image: &str) -> Result<(), AgentImageError> {
+    if image.is_empty() || image.len() > 256 || image.chars().any(char::is_whitespace) {
+        return Err(AgentImageError::Invalid(
+            "Image reference must be 1–256 characters without whitespace".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Stream an image on this node out as a `docker save` tar.
@@ -428,6 +532,7 @@ pub struct ExportImageQuery {
         (status = 400, description = "Invalid image reference"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Image not present on this node"),
+        (status = 500, description = "Image export failed"),
         (status = 503, description = "Image operation capacity unavailable"),
         (status = 504, description = "Timed out waiting for image operation capacity")
     ),
@@ -437,15 +542,9 @@ pub async fn export_image(
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Query(query): Query<ExportImageQuery>,
-) -> Response {
+) -> Result<Response, Problem> {
     let image = query.image;
-    if image.is_empty() || image.len() > 256 || image.chars().any(char::is_whitespace) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "Image reference must be 1–256 characters without whitespace".into(),
-        )
-        .into_response();
-    }
+    validate_image_reference(&image)?;
     let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
     let permit =
         match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
@@ -453,36 +552,40 @@ pub async fn export_image(
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                return Err(AgentImageError::Unavailable(
                     "Worker image operation capacity unavailable".into(),
                 )
-                .into_response()
+                .into())
             }
             Err(_) => {
-                return error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("Export of '{image}' waited 30 minutes for capacity"),
-                )
-                .into_response()
+                return Err(AgentImageError::Deadline(format!(
+                    "Export of '{image}' waited 30 minutes for capacity"
+                ))
+                .into())
             }
         };
-    let exported = match state.image_builder.export_image_stream(&image).await {
+    let export_result =
+        tokio::time::timeout_at(deadline, state.image_builder.export_image_stream(&image))
+            .await
+            .map_err(|_| {
+                AgentImageError::Deadline(format!(
+                    "Export of '{image}' exceeded 30 minutes before streaming"
+                ))
+            })?;
+    let exported = match export_result {
         Ok(stream) => stream,
         Err(BuilderError::ImageNotFound(_)) => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                format!("Image '{image}' is not present on this node"),
-            )
-            .into_response()
+            return Err(AgentImageError::NotFound(format!(
+                "Image '{image}' is not present on this node"
+            ))
+            .into())
         }
         Err(error) => {
             tracing::error!(image = %image, "Image export failed to start: {error}");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cannot export image '{image}': {error}"),
-            )
-            .into_response();
+            return Err(AgentImageError::Storage(format!(
+                "Cannot export image '{image}': {error}"
+            ))
+            .into());
         }
     };
     tracing::info!(image = %image, "Streaming image export");
@@ -508,17 +611,122 @@ pub async fn export_image(
             }
         },
     );
-    (
+    Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-tar")],
         Body::from_stream(body),
     )
-        .into_response()
+        .into_response())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_build_timeout_releases_capacity_and_scratch_before_terminal_event() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().to_owned();
+        let build = async move {
+            let _permit = permit;
+            let _scratch = scratch;
+            std::future::pending::<Result<BuildResult, BuilderError>>().await
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        supervise_build(
+            build,
+            tx,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(slots.available_permits(), 1);
+        assert!(!path.exists());
+        assert!(matches!(
+            rx.recv().await,
+            Some(BuildEvent::Failure(BuildFailure {
+                kind: BuildFailureKind::Timeout,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_build_disconnect_releases_capacity_and_scratch() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().to_owned();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let build = async move {
+            let _permit = permit;
+            let _scratch = scratch;
+            let _ = started_tx.send(());
+            std::future::pending::<Result<BuildResult, BuilderError>>().await
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(supervise_build(
+            build,
+            tx,
+            tokio::time::Instant::now() + BUILD_DEADLINE,
+        ));
+        started_rx.await.unwrap();
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(slots.available_permits(), 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn worker_image_errors_are_problem_details() {
+        for (error, status) in [
+            (
+                AgentImageError::Invalid("bad spec".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AgentImageError::TooLarge("context limit".into()),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                AgentImageError::Unavailable("closed capacity".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                AgentImageError::Deadline("build deadline".into()),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                AgentImageError::NotFound("app:1".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                AgentImageError::Storage("scratch creation".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = Problem::from(error).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let detail: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            // Problem's status is conveyed by HTTP; the JSON status member is optional.
+            assert!(detail["title"].is_string());
+            assert!(
+                detail["detail"].as_str().unwrap().contains("Worker")
+                    || detail["detail"].as_str().unwrap().contains("worker")
+            );
+        }
+    }
 
     #[test]
     fn archive_extracts_regular_files_and_rejects_links() {
@@ -529,7 +737,7 @@ mod tests {
         let contents = b"FROM scratch\n";
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(0o4755);
         header.set_cksum();
         tar.append_data(&mut header, "Dockerfile", &contents[..])
             .expect("append file");
@@ -541,6 +749,18 @@ mod tests {
             std::fs::read(source.join("Dockerfile")).expect("read source"),
             contents
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(source.join("Dockerfile"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755
+            );
+        }
 
         let linked = root.path().join("linked.tar");
         let file = std::fs::File::create(&linked).expect("create tar");

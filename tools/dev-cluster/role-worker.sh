@@ -134,6 +134,8 @@ if [[ ! -f "$JOIN_MARKER" ]]; then
   log "joined cluster successfully"
 else
   log "already joined (marker present); skipping registration"
+  log "WORKER_LABELS is a first-join input only; current labels are stored on the control plane."
+  log "Restarting/recreating this container does not update labels. Set DEV_CLUSTER_WORKER{1,2,3}_LABELS before the first join of a fresh test cluster; see tools/dev-cluster/README.md. Existing node identities and workloads are preserved."
 fi
 
 # 5. run the agent. Reads ~/.temps/agent.json that `temps join` wrote.

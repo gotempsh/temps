@@ -39,19 +39,48 @@ const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 
+async fn bounded_agent_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T, BuilderError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            BuilderError::Other(format!("{operation}: response stream failed: {error}"))
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_BUILD_EVENT_BYTES {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "{operation}: response exceeds {MAX_BUILD_EVENT_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        BuilderError::Other(format!("{operation}: invalid JSON response: {error}"))
+    })
+}
+
 /// Read an agent's refusal body for an error message, bounded so a
 /// misbehaving agent cannot inflate a deployment log.
 async fn agent_error_detail(response: reqwest::Response) -> String {
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(error) => return format!("unreadable response body: {error}"),
-    };
-    let body = &body[..body.len().min(MAX_AGENT_ERROR_BYTES)];
-    match serde_json::from_slice::<AgentResponse<serde_json::Value>>(body) {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(MAX_AGENT_ERROR_BYTES);
+    while body.len() < MAX_AGENT_ERROR_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = MAX_AGENT_ERROR_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Some(Err(error)) => return format!("unreadable response body: {error}"),
+            None => break,
+        }
+    }
+    match serde_json::from_slice::<AgentResponse<serde_json::Value>>(&body) {
         Ok(AgentResponse {
             error: Some(error), ..
         }) => error,
-        _ => String::from_utf8_lossy(body).trim().to_string(),
+        _ => String::from_utf8_lossy(&body).trim().to_string(),
     }
 }
 
@@ -190,6 +219,18 @@ fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, 
 fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
+    // These inputs materialise as a generated .npmrc before archiving. Never
+    // rely on application-owned ignore rules to enforce the credential boundary.
+    if request
+        .build_args
+        .keys()
+        .chain(request.build_args_buildkit.keys())
+        .any(|key| matches!(key.as_str(), "NPM_TOKEN" | "NPM_RC"))
+    {
+        return Err(BuilderError::InvalidContext(
+            "Worker builds cannot transfer generated NPM_TOKEN/NPM_RC credentials; use a prebuilt registry image until build-secret handling is supported".into(),
+        ));
+    }
     let root = request
         .context_path
         .canonicalize()
@@ -1058,26 +1099,30 @@ impl ImageBuilder for RemoteNodeDeployer {
                     self.node_name
                 ))
             })?;
-            pending.extend_from_slice(&chunk);
-            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
-                if end > MAX_BUILD_EVENT_BYTES {
+            // A transport chunk may contain many events or one huge event.
+            // Check each fragment before copying it into our bounded buffer.
+            for fragment in chunk.split_inclusive(|byte| *byte == b'\n') {
+                let complete = fragment.last() == Some(&b'\n');
+                let data = if complete {
+                    &fragment[..fragment.len() - 1]
+                } else {
+                    fragment
+                };
+                if pending.len().saturating_add(data.len()) > MAX_BUILD_EVENT_BYTES {
                     return Err(BuilderError::Other(format!(
                         "Node '{}' sent an oversized build event",
                         self.node_name
                     )));
                 }
-                let line: Vec<u8> = pending.drain(..=end).collect();
-                if let Some(result) =
-                    dispatch_build_event(&line[..end], log_callback.as_ref()).await?
-                {
-                    return Ok(result);
+                pending.extend_from_slice(data);
+                if complete {
+                    if let Some(result) =
+                        dispatch_build_event(&pending, log_callback.as_ref()).await?
+                    {
+                        return Ok(result);
+                    }
+                    pending.clear();
                 }
-            }
-            if pending.len() > MAX_BUILD_EVENT_BYTES {
-                return Err(BuilderError::Other(format!(
-                    "Node '{}' sent an oversized build event",
-                    self.node_name
-                )));
             }
         }
         Err(BuilderError::Other(format!(
@@ -1199,12 +1244,11 @@ impl ImageBuilder for RemoteNodeDeployer {
                 self.node_name
             )));
         }
-        let body: AgentResponse<String> = response.json().await.map_err(|error| {
-            BuilderError::Other(format!(
-                "Invalid response from node {} during image import: {error}",
-                self.node_name
-            ))
-        })?;
+        let body: AgentResponse<String> = bounded_agent_json(
+            response,
+            &format!("Image '{tag}' import on node '{}'", self.node_name),
+        )
+        .await?;
         if !body.success {
             return Err(BuilderError::Other(format!(
                 "Image import failed on node {} ({status}): {}",
@@ -1245,10 +1289,33 @@ impl ImageBuilder for RemoteNodeDeployer {
         ))
     }
 
-    async fn inspect_image(&self, _image_name: &str) -> Result<ImageInfo, BuilderError> {
-        Err(BuilderError::Other(
-            "Inspect image not supported on remote nodes".into(),
-        ))
+    async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError> {
+        let response = self
+            .client
+            .get(format!("{}/agent/images/inspect", self.agent_url))
+            .bearer_auth(&self.token)
+            .query(&[("image", image_name)])
+            .timeout(Duration::from_secs(35))
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot inspect image '{image_name}' on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(BuilderError::Other(format!(
+                "Node '{}' refused inspection of '{image_name}': {}",
+                self.node_name,
+                agent_error_detail(response).await
+            )));
+        }
+        bounded_agent_json(
+            response,
+            &format!("Inspect image '{image_name}' on node '{}'", self.node_name),
+        )
+        .await
     }
 
     fn get_native_platform(&self) -> String {
@@ -1267,6 +1334,77 @@ impl ImageBuilder for RemoteNodeDeployer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_error_body_stops_reading_at_limit_without_waiting_for_eof() {
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; MAX_AGENT_ERROR_BYTES - 1])),
+            Ok(bytes::Bytes::from_static(b"yz")),
+        ])
+        .chain(futures::stream::pending());
+        let response =
+            reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(chunks)));
+        let detail = tokio::time::timeout(Duration::from_secs(1), agent_error_detail(response))
+            .await
+            .expect("must not wait for EOF after reaching the cap");
+        assert_eq!(detail.len(), MAX_AGENT_ERROR_BYTES);
+        assert!(detail.ends_with('y'));
+    }
+
+    #[tokio::test]
+    async fn worker_success_status_error_envelope_is_bounded_before_json_parsing() {
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"{\"success\":false,\"error\":\"",
+            )),
+            Ok(bytes::Bytes::from(vec![b'x'; MAX_BUILD_EVENT_BYTES])),
+        ])
+        .chain(futures::stream::pending());
+        let response =
+            reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(chunks)));
+        assert!(response.status().is_success());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bounded_agent_json::<AgentResponse<String>>(response, "worker import"),
+        )
+        .await
+        .expect("must reject before EOF");
+        assert!(matches!(
+            result,
+            Err(BuilderError::ResourceLimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn worker_build_refuses_generated_credentials_without_dockerignore() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nCOPY . /app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join(".npmrc"),
+            "//registry.npmjs.org/:_authToken=synthetic-secret",
+        )
+        .unwrap();
+        for name in ["NPM_TOKEN", "NPM_RC"] {
+            for buildkit in [false, true] {
+                let mut request = context_request(source.path(), None);
+                let args = if buildkit {
+                    &mut request.build_args_buildkit
+                } else {
+                    &mut request.build_args
+                };
+                args.insert(name.into(), "synthetic-secret".into());
+                let error = prepare_build_context(&request)
+                    .err()
+                    .expect("must reject before archive upload");
+                assert!(matches!(error, BuilderError::InvalidContext(_)));
+                assert!(!error.to_string().contains("synthetic-secret"));
+            }
+        }
+    }
 
     #[test]
     fn worker_context_archive_excludes_git_metadata() {
@@ -1555,6 +1693,19 @@ mod tests {
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer token"));
+    }
+
+    #[tokio::test]
+    async fn worker_image_inspection_uses_authenticated_owner_endpoint() {
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        assert_eq!(info.platform, "linux/arm64");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /agent/images/inspect?image=app%3A1 "));
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer test-token"));
     }
 
     #[tokio::test]

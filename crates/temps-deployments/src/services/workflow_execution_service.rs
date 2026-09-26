@@ -615,6 +615,26 @@ struct SelectedNodeBuilder {
     remote: Arc<dyn ImageBuilder>,
 }
 
+fn validate_worker_build_scope(
+    deployment_id: i32,
+    platforms: &[String],
+    needs_static_extraction: bool,
+) -> Result<(), WorkflowExecutionError> {
+    let reason = if needs_static_extraction {
+        Some("Static image builds require artifact extraction, which worker build protocol v1 does not support. Use a full-profile control plane or deploy a prebuilt static bundle.")
+    } else if platforms.len() != 1 {
+        Some("Worker build protocol v1 requires exactly one target architecture. Restrict target nodes/labels to a single architecture, or deploy a prebuilt multi-platform registry image.")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(WorkflowExecutionError::InvalidJobConfig(format!(
+            "Deployment {deployment_id}: {reason} Reported target platforms: {platforms:?}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
@@ -1476,6 +1496,16 @@ impl WorkflowExecutionService {
                 let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled {
                     self.image_builder.clone()
                 } else {
+                    // Fail before sending source or starting a build that the
+                    // downstream static job cannot extract without a daemon.
+                    let static_job = deployment_jobs::Entity::find()
+                        .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                        .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+                        .one(self.db.as_ref())
+                        .await?;
+                    if static_job.is_some() {
+                        validate_worker_build_scope(deployment.id, &[], true)?;
+                    }
                     // No local daemon: build on a node. The image is then
                     // handed to each replica's node by DeployImageJob.
                     let target_nodes = environment
@@ -2880,6 +2910,17 @@ impl WorkflowExecutionService {
                 "Deployment {deployment_id} cannot select a build node: node scheduler is unavailable"
             ))
         })?;
+        let required_platforms = scheduler
+            .required_build_platforms(target_labels, target_nodes)
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot determine worker build platforms: {error}"
+                ))
+            })?;
+        // Inspect the entire eligible target set, not just the first replica.
+        // Protocol v1 has one image owner; never silently drop other platforms.
+        validate_worker_build_scope(deployment_id, &required_platforms, false)?;
         let outcome = scheduler
             .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
                 replica_count: 1,
@@ -2887,7 +2928,7 @@ impl WorkflowExecutionService {
                 target_node_ids: target_nodes,
                 anti_affinity: true,
                 exclude_node_ids: &[],
-                image_platforms: &[],
+                image_platforms: &required_platforms,
                 project_slug: Some(project_slug),
             })
             .await
@@ -3804,6 +3845,18 @@ impl From<anyhow::Error> for WorkflowExecutionError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_build_scope_rejects_mixed_architectures_and_static_before_building() {
+        use super::validate_worker_build_scope;
+        assert!(validate_worker_build_scope(42, &["linux/amd64".into()], false).is_ok());
+        for platforms in [vec![], vec!["linux/amd64".into(), "linux/arm64".into()]] {
+            let error = validate_worker_build_scope(42, &platforms, false).unwrap_err();
+            assert!(error.to_string().contains("Deployment 42"));
+            assert!(error.to_string().contains("target nodes/labels"));
+        }
+        let error = validate_worker_build_scope(42, &["linux/arm64".into()], true).unwrap_err();
+        assert!(error.to_string().contains("artifact extraction"));
+    }
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;

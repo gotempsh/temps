@@ -277,7 +277,7 @@ pub struct BuildResult {
 }
 
 /// Information about a Docker image, including architecture and platform details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImageInfo {
     /// Image ID (sha256:...)
     pub id: String,

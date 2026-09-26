@@ -55,6 +55,7 @@ urlencoding = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 tempfile = { workspace = true }
 env_logger = "0.11"
 tokio-test = "0.4"

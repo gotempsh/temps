@@ -2029,21 +2029,21 @@ impl DockerRuntime {
         use http_body_util::Full;
 
         // Write the tar archive to a temporary file to avoid holding the entire
-        // build context in memory.  The temp file is cleaned up when `_tmp` drops.
+        // build context in memory. Keep its cleanup owner in the blocking
+        // task so cancellation cannot unlink then recreate an orphan archive.
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
         let tmp_path = tmp.path().to_path_buf();
 
         // Tar creation is synchronous and CPU-bound — run it on a blocking thread.
         let ctx = context_path.clone();
-        let out_path = tmp_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::create(&out_path).map_err(BuilderError::IoError)?;
+        let _tmp = tokio::task::spawn_blocking(move || {
+            let file = tmp.reopen().map_err(BuilderError::IoError)?;
             let mut tar_builder = tar::Builder::new(file);
             tar_builder
                 .append_dir_all(".", ctx)
                 .map_err(BuilderError::IoError)?;
             tar_builder.finish().map_err(BuilderError::IoError)?;
-            Ok::<(), BuilderError>(())
+            Ok::<_, BuilderError>(tmp)
         })
         .await
         .map_err(|e| BuilderError::Other(format!("Tar task panicked: {}", e)))??;
