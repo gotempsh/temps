@@ -7756,7 +7756,7 @@
             "type": "string"
           },
           "gave_up_at": {
-            "description": "When delivery of this stretch last gave up.",
+            "description": "When delivery of the latest span in this stretch gave up — the same\nfailure `last_error` describes.",
             "format": "date-time",
             "type": [
               "string",
@@ -35903,6 +35903,10 @@
             },
             "type": "array"
           },
+          "delivery_gaps_truncated": {
+            "description": "Whether older delivery gaps exist beyond the ones listed. Their spans\nare still counted in `dead_lettered_spans`, so a client can say how many\nolder undelivered spans the list leaves out rather than presenting it as\ncomplete.",
+            "type": "boolean"
+          },
           "effective_reason": {
             "oneOf": [
               {
@@ -36000,6 +36004,7 @@
           "delivery_failing",
           "retrying_spans",
           "delivery_gaps",
+          "delivery_gaps_truncated",
           "gap_windows",
           "intervals"
         ],

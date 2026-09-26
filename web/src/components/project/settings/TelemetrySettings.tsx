@@ -68,6 +68,11 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 
+/** Poll while spans are failing or queued, so the alert tracks reality. */
+const DELIVERY_POLL_ACTIVE_MS = 15_000
+/** Slower otherwise, so a failure that starts while the page is open appears. */
+const DELIVERY_POLL_IDLE_MS = 60_000
+
 interface TelemetrySettingsProps {
   project: ProjectResponse
 }
@@ -181,11 +186,14 @@ function DeliveryFailingAlert({
  * is which time range in Traces is incomplete and why.
  */
 function DeliveryGapList({
-  gaps,
+  settings,
 }: {
-  gaps: ProjectCloudTelemetryResponse['delivery_gaps']
+  settings: ProjectCloudTelemetryResponse
 }) {
+  const gaps = settings.delivery_gaps
   if (gaps.length === 0) return null
+  const listed = gaps.reduce((sum, gap) => sum + gap.undelivered_spans, 0)
+  const unlisted = Math.max(settings.dead_lettered_spans - listed, 0)
   return (
     <div className="space-y-2">
       <p className="text-xs font-medium">
@@ -216,6 +224,14 @@ function DeliveryGapList({
           )}
         </div>
       ))}
+      {settings.delivery_gaps_truncated && (
+        <p className="text-xs text-muted-foreground">
+          Only the {gaps.length} most recent periods are listed.{' '}
+          {unlisted > 0
+            ? `${unlisted.toLocaleString()} older undelivered span${unlisted === 1 ? '' : 's'} ${unlisted === 1 ? 'is' : 'are'} not shown here.`
+            : ''}
+        </p>
+      )}
     </div>
   )
 }
@@ -230,26 +246,36 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
     isError,
     error,
     refetch,
-  } = useQuery(
-    getProjectCloudTelemetryOptions({ path: { project_id: project.id } })
-  )
+  } = useQuery({
+    ...getProjectCloudTelemetryOptions({ path: { project_id: project.id } }),
+    // Delivery state changes without anyone touching this page: a failing
+    // alert has to clear once Cloud accepts again, and a new failure has to
+    // appear, while the operator is looking at it.
+    refetchInterval: (query) =>
+      query.state.data?.delivery_failing || query.state.data?.queued_spans
+        ? DELIVERY_POLL_ACTIVE_MS
+        : DELIVERY_POLL_IDLE_MS,
+  })
 
   const [writeMode, setWriteMode] = useState<CloudTelemetryWriteMode>('local')
   const [fidelity, setFidelity] = useState<CloudTelemetryFidelity>('metered')
   const [aiMetadata, setAiMetadata] = useState(false)
 
+  // Reset the draft controls only when the *saved* values change (a save, or
+  // another operator's edit). Keyed on the whole response, the delivery-state
+  // polling above would overwrite an unsaved choice every few seconds.
+  const savedWriteMode = settings?.write_mode
+  const savedFidelity = settings?.fidelity
+  const savedAllowlist = settings?.attribute_allowlist
   useEffect(() => {
-    if (!settings) return
-    // The query may refresh after a save or external change; reset both draft controls.
+    if (!savedWriteMode || !savedFidelity || !savedAllowlist) return
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setWriteMode(settings.write_mode)
-    setFidelity(settings.fidelity)
+    setWriteMode(savedWriteMode)
+    setFidelity(savedFidelity)
     setAiMetadata(
-      CLOUD_AI_METADATA_KEYS.every((key) =>
-        settings.attribute_allowlist.includes(key)
-      )
+      CLOUD_AI_METADATA_KEYS.every((key) => savedAllowlist.includes(key))
     )
-  }, [settings])
+  }, [savedWriteMode, savedFidelity, savedAllowlist])
 
   const save = useMutation({
     mutationFn: async ({
@@ -670,7 +696,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               </div>
             )}
 
-            <DeliveryGapList gaps={settings.delivery_gaps} />
+            <DeliveryGapList settings={settings} />
 
             <div className="overflow-hidden rounded-md border">
               {settings.intervals.map((interval) => (

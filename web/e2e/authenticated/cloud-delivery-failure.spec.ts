@@ -47,6 +47,7 @@ const baseSettings = {
   delivery_failing: false,
   retrying_spans: 0,
   delivery_gaps: [pastGap],
+  delivery_gaps_truncated: false,
   gap_windows: [],
   intervals: [
     {
@@ -58,7 +59,7 @@ const baseSettings = {
   ],
 }
 
-async function mockProject(page: Page, settings: object) {
+async function mockProject(page: Page, settings: object | (() => object)) {
   await page.route('**/api/projects?*', (route) =>
     route.fulfill({ json: { projects: [project], total: 1 } })
   )
@@ -73,8 +74,24 @@ async function mockProject(page: Page, settings: object) {
   )
   await page.route(
     `**/api/otel/cloud-telemetry/projects/${project.id}`,
-    (route) => route.fulfill({ json: settings })
+    (route) =>
+      route.fulfill({
+        json: typeof settings === 'function' ? settings() : settings,
+      })
   )
+}
+
+const failingSettings = {
+  ...baseSettings,
+  queued_spans: 1_200,
+  delivery_failing: true,
+  retrying_spans: 1_200,
+  delivery_failing_since: '2026-09-26T08:00:00.000Z',
+  delivery_failure_error:
+    'Credential rejected by the backend — re-enroll this instance',
+  delivery_failure_action:
+    "Temps Cloud rejected this instance's credential. Re-enroll the instance in Temps Cloud settings; the spans still being retried are delivered once it is accepted again.",
+  delivery_failure_setup_path: '/settings/cloud',
 }
 
 const failingTitle = 'Delivery to Temps Cloud is failing'
@@ -105,18 +122,7 @@ test('a recovered instance shows the loss as history, not as an alert', async ({
 test('a failing delivery alerts and links straight to re-enrollment', async ({
   page,
 }) => {
-  await mockProject(page, {
-    ...baseSettings,
-    queued_spans: 1_200,
-    delivery_failing: true,
-    retrying_spans: 1_200,
-    delivery_failing_since: '2026-09-26T08:00:00.000Z',
-    delivery_failure_error:
-      'Credential rejected by the backend — re-enroll this instance',
-    delivery_failure_action:
-      "Temps Cloud rejected this instance's credential. Re-enroll the instance in Temps Cloud settings; the spans still being retried are delivered once it is accepted again.",
-    delivery_failure_setup_path: '/settings/cloud',
-  })
+  await mockProject(page, failingSettings)
   await page.goto(`/projects/${project.slug}/settings/telemetry`)
 
   await expect(page.getByText(failingTitle)).toBeVisible()
@@ -150,4 +156,51 @@ test('a project that never lost a span shows neither', async ({ page }) => {
   await expect(page.getByText('Storage history')).toBeVisible()
   await expect(page.getByText(failingTitle)).toHaveCount(0)
   await expect(page.getByText(historyHeading)).toHaveCount(0)
+})
+
+test('the alert clears on its own when delivery recovers, keeping unsaved edits', async ({
+  page,
+}) => {
+  // Nobody reloads a settings page to find out an outage ended. The page
+  // polls, and that polling must not throw away a choice the operator has
+  // made but not saved yet.
+  let recovered = false
+  await mockProject(page, () =>
+    recovered ? { ...baseSettings, queued_spans: 0 } : failingSettings
+  )
+  await page.clock.install()
+  await page.goto(`/projects/${project.slug}/settings/telemetry`)
+  await expect(page.getByText(failingTitle)).toBeVisible()
+
+  await page.getByText('Where spans are stored').click()
+  await page.locator('#write-mode-local').click()
+  await expect(page.locator('#write-mode-local')).toHaveAttribute(
+    'data-state',
+    'checked'
+  )
+
+  recovered = true
+  await page.clock.fastForward(16_000)
+
+  await expect(page.getByText(failingTitle)).toHaveCount(0)
+  await expect(page.getByText(historyHeading)).toBeVisible()
+  await expect(page.locator('#write-mode-local')).toHaveAttribute(
+    'data-state',
+    'checked'
+  )
+})
+
+test('a truncated history says how many older spans it leaves out', async ({
+  page,
+}) => {
+  await mockProject(page, {
+    ...baseSettings,
+    dead_lettered_spans: 60_000,
+    delivery_gaps_truncated: true,
+  })
+  await page.goto(`/projects/${project.slug}/settings/telemetry`)
+
+  await expect(
+    page.getByText(/11,787 older undelivered spans are not shown here/)
+  ).toBeVisible()
 })

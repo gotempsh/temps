@@ -1836,7 +1836,7 @@ async fn past_delivery_failures_are_history_and_only_retrying_spans_mean_failing
                ($1, 'span', '{}', 2, now() - INTERVAL '5 days 90 minutes', 10, 'dead_letter', \
                 now() - INTERVAL '5 days', 'Backend returned 503'), \
                ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours 45 minutes', 10, 'dead_letter', \
-                now() - INTERVAL '2 days 1 hour', 'Backend returned 503'), \
+                now() - INTERVAL '1 day', 'Backend returned 503'), \
                ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours', 10, 'dead_letter', \
                 now() - INTERVAL '2 days', 'Credential rejected by the backend'), \
                ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours', 10, 'dead_letter', \
@@ -1878,6 +1878,18 @@ async fn past_delivery_failures_are_history_and_only_retrying_spans_mean_failing
         "a gap reports the reason its last give-up gave"
     );
     assert!(gaps[0].first_span_at < gaps[0].last_span_at);
+    // The gap's older span gave up *later* (a day ago, with a 503). The time
+    // and the reason must still describe one and the same failure — the
+    // latest span's — not a give-up time from one row and a reason from
+    // another.
+    let gave_up = gaps[0]
+        .last_settled_at
+        .expect("a dead-lettered gap records when it gave up");
+    assert!(
+        gave_up < chrono::Utc::now() - chrono::Duration::hours(36),
+        "gave_up_at must be the credential rejection's (2 days ago), not the later 503's: \
+         {gave_up}"
+    );
     assert_eq!(gaps[1].rows, 2);
     assert_eq!(gaps[1].last_error.as_deref(), Some("Backend returned 503"));
     assert!(gaps[1].last_span_at < gaps[0].first_span_at);
@@ -1891,7 +1903,9 @@ async fn past_delivery_failures_are_history_and_only_retrying_spans_mean_failing
                  (project_id, entity_type, payload, payload_bytes, enqueued_at, attempts, state, \
                   last_error) \
              VALUES ($1, 'span', '{}', 2, now() - INTERVAL '3 minutes', 2, 'pending', \
-                     'Credential rejected by the backend — re-enroll this instance')",
+                     'Credential rejected by the backend — re-enroll this instance'), \
+                    ($1, 'span', '{}', 2, now() - INTERVAL '1 minute', 1, 'pending', \
+                     'Backend returned 503')",
             vec![project.into()],
         ))
         .await
@@ -1901,8 +1915,11 @@ async fn past_delivery_failures_are_history_and_only_retrying_spans_mean_failing
         .delivery_failure_for_project(project)
         .await
         .expect("the failure summary must be readable");
-    assert_eq!(failure.retrying_rows, 1);
+    assert_eq!(failure.retrying_rows, 2);
     assert!(failure.oldest_enqueued_at.is_some());
+    // Claims are FIFO, so the front of the queue was in the most recent
+    // attempt. The newer row's 503 is an older reason (it was tried once,
+    // earlier) and must not be reported as the current failure.
     assert_eq!(
         failure.last_error.as_deref(),
         Some("Credential rejected by the backend — re-enroll this instance")

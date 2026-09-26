@@ -182,7 +182,8 @@ pub struct CloudDeliveryGapResponse {
     #[schema(value_type = String, format = DateTime)]
     pub last_span_at: chrono::DateTime<chrono::Utc>,
     pub undelivered_spans: i64,
-    /// When delivery of this stretch last gave up.
+    /// When delivery of the latest span in this stretch gave up — the same
+    /// failure `last_error` describes.
     #[schema(value_type = Option<String>, format = DateTime)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gave_up_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -305,6 +306,11 @@ pub struct ProjectCloudTelemetryResponse {
     /// Past stretches of span time that were never delivered, newest first.
     /// Rendered as history, not as an alert.
     pub delivery_gaps: Vec<CloudDeliveryGapResponse>,
+    /// Whether older delivery gaps exist beyond the ones listed. Their spans
+    /// are still counted in `dead_lettered_spans`, so a client can say how many
+    /// older undelivered spans the list leaves out rather than presenting it as
+    /// complete.
+    pub delivery_gaps_truncated: bool,
     /// Gap windows in the last 30 days.
     pub gap_windows: Vec<TelemetryGapWindowResponse>,
     /// The write-mode ledger, newest first.
@@ -875,14 +881,18 @@ async fn build_project_response(
                     .delivery_failure_for_project(project_id)
                     .await
                     .unwrap_or_default(),
+                // One past the page size, only to learn whether more exist.
                 outbox
-                    .delivery_gaps_for_project(project_id, MAX_ITEMS)
+                    .delivery_gaps_for_project(project_id, MAX_ITEMS + 1)
                     .await
                     .unwrap_or_default(),
             ),
             None => Default::default(),
         };
     let delivery = delivery_failure_state(&link, &failure);
+    let mut delivery_gaps = delivery_gaps;
+    let delivery_gaps_truncated = delivery_gaps.len() as u64 > MAX_ITEMS;
+    delivery_gaps.truncate(MAX_ITEMS as usize);
 
     Ok(ProjectCloudTelemetryResponse {
         project_id,
@@ -915,6 +925,7 @@ async fn build_project_response(
             .into_iter()
             .map(CloudDeliveryGapResponse::from)
             .collect(),
+        delivery_gaps_truncated,
         gap_windows,
         intervals,
     })

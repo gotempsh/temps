@@ -265,7 +265,9 @@ pub struct DeliveryGap {
     /// When the latest one did.
     pub last_span_at: chrono::DateTime<chrono::Utc>,
     pub rows: i64,
-    /// When delivery of this stretch last gave up.
+    /// When delivery of the latest span in this stretch gave up. Read from the
+    /// same row as `last_error`, so the time and the reason always describe
+    /// one failure.
     pub last_settled_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Why delivery of the latest span in this stretch failed.
     pub last_error: Option<String>,
@@ -526,6 +528,14 @@ impl SpanOutbox {
     /// Dead letters are deliberately not part of this. They record a past loss
     /// and never change state, so deriving "failing" from them would keep an
     /// instance that recovered looking broken forever.
+    ///
+    /// The reason is read from the *front* of the queue, not the newest row.
+    /// [`Self::claim`] is strictly FIFO over pending rows, and a pending row
+    /// stays at the front until it is delivered or dead-lettered, so the oldest
+    /// failing row was part of the most recent attempt and carries its reason.
+    /// A newer row can hold an older reason — it may have been attempted
+    /// earlier and then left behind a released claim — so "highest id" is not
+    /// "most recent failure".
     pub async fn delivery_failure_for_project(
         &self,
         project_id: i32,
@@ -537,7 +547,7 @@ impl SpanOutbox {
                     ( SELECT last_error FROM cloud_telemetry_outbox \
                       WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending' \
                         AND last_error IS NOT NULL \
-                      ORDER BY id DESC LIMIT 1 ) AS last_error \
+                      ORDER BY enqueued_at, id LIMIT 1 ) AS last_error \
              FROM cloud_telemetry_outbox \
              WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending' \
                AND last_error IS NOT NULL",
@@ -571,36 +581,40 @@ impl SpanOutbox {
             // `idx_cloud_telemetry_outbox_entity_project`, so both windows run
             // without a sort and the grouping is a hash over a handful of gaps:
             // memory stays constant however many spans were lost. The reason
-            // is looked up per gap (at most `limit` index probes) rather than
-            // aggregated, because an ordered aggregate would sort every row.
+            // and give-up time are looked up per gap from one row — the latest
+            // span in it — with at most `limit` index probes rather than
+            // aggregated: an ordered aggregate would sort every row, and two
+            // separate aggregates could describe two different failures.
             "WITH dead AS ( \
-                 SELECT enqueued_at, settled_at, \
+                 SELECT enqueued_at, \
                         CASE WHEN enqueued_at - LAG(enqueued_at) OVER (ORDER BY enqueued_at) \
                                   > ($2 * INTERVAL '1 second') \
                              THEN 1 ELSE 0 END AS starts_gap \
                  FROM cloud_telemetry_outbox \
                  WHERE entity_type = 'span' AND project_id = $1 AND state = 'dead_letter' \
              ), numbered AS ( \
-                 SELECT enqueued_at, settled_at, \
+                 SELECT enqueued_at, \
                         SUM(starts_gap) OVER (ORDER BY enqueued_at ROWS UNBOUNDED PRECEDING) \
                             AS gap_no \
                  FROM dead \
              ), gaps AS ( \
                  SELECT MIN(enqueued_at) AS first_span_at, \
                         MAX(enqueued_at) AS last_span_at, \
-                        COUNT(*)::bigint AS rows, \
-                        MAX(settled_at) AS last_settled_at \
+                        COUNT(*)::bigint AS rows \
                  FROM numbered \
                  GROUP BY gap_no \
                  ORDER BY last_span_at DESC \
                  LIMIT $3 \
              ) \
-             SELECT g.first_span_at, g.last_span_at, g.rows, g.last_settled_at, \
-                    ( SELECT o.last_error FROM cloud_telemetry_outbox o \
-                      WHERE o.entity_type = 'span' AND o.project_id = $1 \
-                        AND o.state = 'dead_letter' AND o.enqueued_at = g.last_span_at \
-                      ORDER BY o.id DESC LIMIT 1 ) AS last_error \
+             SELECT g.first_span_at, g.last_span_at, g.rows, \
+                    latest.settled_at AS last_settled_at, latest.last_error \
              FROM gaps g \
+             LEFT JOIN LATERAL ( \
+                 SELECT o.settled_at, o.last_error FROM cloud_telemetry_outbox o \
+                 WHERE o.entity_type = 'span' AND o.project_id = $1 \
+                   AND o.state = 'dead_letter' AND o.enqueued_at = g.last_span_at \
+                 ORDER BY o.id DESC LIMIT 1 \
+             ) latest ON TRUE \
              ORDER BY g.last_span_at DESC",
             vec![
                 project_id.into(),

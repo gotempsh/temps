@@ -3495,7 +3495,8 @@ export type CloudDeliveryGapResponse = {
      */
     first_span_at: string;
     /**
-     * When delivery of this stretch last gave up.
+     * When delivery of the latest span in this stretch gave up — the same
+     * failure `last_error` describes.
      */
     gave_up_at?: string | null;
     /**
@@ -16408,6 +16409,13 @@ export type ProjectCloudTelemetryResponse = {
      * Rendered as history, not as an alert.
      */
     delivery_gaps: Array<CloudDeliveryGapResponse>;
+    /**
+     * Whether older delivery gaps exist beyond the ones listed. Their spans
+     * are still counted in `dead_lettered_spans`, so a client can say how many
+     * older undelivered spans the list leaves out rather than presenting it as
+     * complete.
+     */
+    delivery_gaps_truncated: boolean;
     effective_reason?: null | TelemetryWriteIntervalReason;
     effective_reason_message?: string | null;
     /**

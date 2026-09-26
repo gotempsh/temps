@@ -105,6 +105,7 @@ describe('describeDelivery', () => {
   const recovered = {
     delivery_failing: false,
     retrying_spans: 0,
+    dead_lettered_spans: 1234,
     delivery_gaps: [
       {
         first_span_at: '2026-09-24T09:00:00Z',
@@ -143,8 +144,31 @@ describe('describeDelivery', () => {
     const { alert } = describeDelivery({
       delivery_failing: true,
       retrying_spans: 1,
+      dead_lettered_spans: 0,
       delivery_gaps: [],
     })
     expect(alert).toHaveLength(1)
+  })
+
+  test('an older server without dated gaps still reports lost spans', () => {
+    // Such a server sends neither `delivery_failing` nor `delivery_gaps`.
+    // Dropping its dead-letter total would make the loss invisible.
+    const { alert, history } = describeDelivery({
+      dead_lettered_spans: 500,
+      last_dead_letter_error: 'Backend returned 503',
+      last_dead_letter_at: '2026-09-24T17:00:00Z',
+    } as Parameters<typeof describeDelivery>[0])
+    expect(alert).toBeNull()
+    expect(history[0]).toContain('500 span(s) never delivered')
+    expect(history[1]).toContain('Backend returned 503')
+  })
+
+  test('a truncated gap list says how many older spans it leaves out', () => {
+    const { history } = describeDelivery({
+      ...recovered,
+      dead_lettered_spans: 5000,
+      delivery_gaps_truncated: true,
+    })
+    expect(history.at(-1)).toContain('3,766 older undelivered span(s)')
   })
 })

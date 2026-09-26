@@ -100,8 +100,13 @@ export interface ProjectCloudTelemetry {
   /** The fix, when the operator can apply one (a rejected credential). */
   delivery_failure_action?: string
   delivery_failure_setup_path?: string
-  /** Past stretches of span time never delivered to Cloud, newest first. */
-  delivery_gaps: CloudDeliveryGap[]
+  /**
+   * Past stretches of span time never delivered to Cloud, newest first.
+   * Absent from servers older than this CLI — see {@link describeDelivery}.
+   */
+  delivery_gaps?: CloudDeliveryGap[]
+  /** Older gaps exist beyond the ones listed. */
+  delivery_gaps_truncated?: boolean
   gap_windows: TelemetryGapWindow[]
   intervals: TelemetryWriteInterval[]
 }
@@ -209,6 +214,10 @@ export function describeDelivery(
     | 'delivery_failure_action'
     | 'delivery_failure_setup_path'
     | 'delivery_gaps'
+    | 'delivery_gaps_truncated'
+    | 'dead_lettered_spans'
+    | 'last_dead_letter_error'
+    | 'last_dead_letter_at'
   >,
 ): { alert: string[] | null; history: string[] } {
   const alert = settings.delivery_failing
@@ -229,14 +238,45 @@ export function describeDelivery(
           : []),
       ]
     : null
-  // `?? []`: a server older than this CLI does not send the field.
-  const history = (settings.delivery_gaps ?? []).flatMap((gap) => [
+  return { alert, history: describeDeliveryHistory(settings) }
+}
+
+function describeDeliveryHistory(
+  settings: Parameters<typeof describeDelivery>[0],
+): string[] {
+  // A server older than this CLI sends no dated gaps, only the dead-letter
+  // total. Losing that total would hide lost spans entirely, so say it the way
+  // that server can.
+  if (settings.delivery_gaps === undefined) {
+    if (settings.dead_lettered_spans <= 0) return []
+    return [
+      `${settings.dead_lettered_spans.toLocaleString()} span(s) never delivered` +
+        (settings.last_dead_letter_at
+          ? ` (most recently ${formatDate(settings.last_dead_letter_at)})`
+          : ''),
+      ...(settings.last_dead_letter_error
+        ? [`  ${settings.last_dead_letter_error}`]
+        : []),
+    ]
+  }
+  const gaps = settings.delivery_gaps
+  const lines = gaps.flatMap((gap) => [
     `${formatDate(gap.first_span_at)} → ${formatDate(gap.last_span_at)}: ` +
       `${gap.undelivered_spans.toLocaleString()} span(s) never delivered` +
       (gap.gave_up_at ? ` (gave up ${formatDate(gap.gave_up_at)})` : ''),
     ...(gap.last_error ? [`  ${gap.last_error}`] : []),
   ])
-  return { alert, history }
+  if (settings.delivery_gaps_truncated) {
+    const listed = gaps.reduce((sum, gap) => sum + gap.undelivered_spans, 0)
+    const unlisted = Math.max(settings.dead_lettered_spans - listed, 0)
+    lines.push(
+      `Only the ${gaps.length} most recent periods are listed` +
+        (unlisted > 0
+          ? `; ${unlisted.toLocaleString()} older undelivered span(s) are not shown.`
+          : '.'),
+    )
+  }
+  return lines
 }
 
 function describeMode(mode: CloudTelemetryWriteMode): string {
