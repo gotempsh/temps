@@ -68,6 +68,11 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 
+/** Poll while spans are failing or queued, so the alert tracks reality. */
+const DELIVERY_POLL_ACTIVE_MS = 15_000
+/** Slower otherwise, so a failure that starts while the page is open appears. */
+const DELIVERY_POLL_IDLE_MS = 60_000
+
 interface TelemetrySettingsProps {
   project: ProjectResponse
 }
@@ -126,6 +131,111 @@ function WriteModeBadge({
   return <Badge variant="destructive">Falling back to local storage</Badge>
 }
 
+/**
+ * Shown only while delivery is failing *now* — spans that already failed an
+ * attempt are still being retried. It clears on its own once Cloud accepts
+ * again. Spans that were lost to a past failure are history, not an alert, and
+ * live in {@link DeliveryGapList}: an alert driven by them would stay red on an
+ * instance that recovered long ago.
+ */
+function DeliveryFailingAlert({
+  settings,
+}: {
+  settings: ProjectCloudTelemetryResponse
+}) {
+  if (!settings.delivery_failing) return null
+  return (
+    <Alert variant="destructive">
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>Delivery to Temps Cloud is failing</AlertTitle>
+      <AlertDescription className="space-y-2">
+        <p>
+          {settings.retrying_spans.toLocaleString()} span
+          {settings.retrying_spans === 1 ? ' is' : 's are'} waiting to be
+          delivered
+          {settings.delivery_failing_since
+            ? `, the oldest since ${new Date(settings.delivery_failing_since).toLocaleString()}`
+            : ''}
+          . They are not in Traces until Temps Cloud accepts them. Spans that
+          run out of retries are lost and listed under Storage history.
+        </p>
+        {settings.delivery_failure_action && (
+          <p>{settings.delivery_failure_action}</p>
+        )}
+        {settings.delivery_failure_error && (
+          <p className="font-mono text-xs break-all">
+            {settings.delivery_failure_error}
+          </p>
+        )}
+        {settings.delivery_failure_setup_path && (
+          <Button asChild size="sm" variant="outline" className="gap-1.5">
+            <Link to={settings.delivery_failure_setup_path}>
+              Open Temps Cloud settings
+              <ArrowRight className="size-3.5" />
+            </Link>
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+/**
+ * Stretches of span time that reached this instance but never reached Temps
+ * Cloud. Neutral on purpose: the failure is over, and what the operator needs
+ * is which time range in Traces is incomplete and why.
+ */
+function DeliveryGapList({
+  settings,
+}: {
+  settings: ProjectCloudTelemetryResponse
+}) {
+  const gaps = settings.delivery_gaps
+  if (gaps.length === 0) return null
+  const listed = gaps.reduce((sum, gap) => sum + gap.undelivered_spans, 0)
+  const unlisted = Math.max(settings.dead_lettered_spans - listed, 0)
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium">
+        Spans never delivered to Temps Cloud
+      </p>
+      {gaps.map((gap) => (
+        <div
+          key={`${gap.first_span_at}-${gap.last_span_at}`}
+          className="rounded-md border bg-muted/30 p-3 text-xs leading-5"
+        >
+          <p className="font-medium">
+            {gap.undelivered_spans.toLocaleString()} span
+            {gap.undelivered_spans === 1 ? '' : 's'} from{' '}
+            {new Date(gap.first_span_at).toLocaleString()} to{' '}
+            {new Date(gap.last_span_at).toLocaleString()}
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            Retries ran out
+            {gap.gave_up_at
+              ? ` on ${new Date(gap.gave_up_at).toLocaleString()}`
+              : ''}
+            , so traces from this range are incomplete in Traces.
+          </p>
+          {gap.last_error && (
+            <p className="mt-1 font-mono break-all text-muted-foreground">
+              {gap.last_error}
+            </p>
+          )}
+        </div>
+      ))}
+      {settings.delivery_gaps_truncated && (
+        <p className="text-xs text-muted-foreground">
+          Only the {gaps.length} most recent periods are listed.{' '}
+          {unlisted > 0
+            ? `${unlisted.toLocaleString()} older undelivered span${unlisted === 1 ? '' : 's'} ${unlisted === 1 ? 'is' : 'are'} not shown here.`
+            : ''}
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   usePageTitle(`Telemetry storage - ${project.name}`)
   const queryClient = useQueryClient()
@@ -136,26 +246,36 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
     isError,
     error,
     refetch,
-  } = useQuery(
-    getProjectCloudTelemetryOptions({ path: { project_id: project.id } })
-  )
+  } = useQuery({
+    ...getProjectCloudTelemetryOptions({ path: { project_id: project.id } }),
+    // Delivery state changes without anyone touching this page: a failing
+    // alert has to clear once Cloud accepts again, and a new failure has to
+    // appear, while the operator is looking at it.
+    refetchInterval: (query) =>
+      query.state.data?.delivery_failing || query.state.data?.queued_spans
+        ? DELIVERY_POLL_ACTIVE_MS
+        : DELIVERY_POLL_IDLE_MS,
+  })
 
   const [writeMode, setWriteMode] = useState<CloudTelemetryWriteMode>('local')
   const [fidelity, setFidelity] = useState<CloudTelemetryFidelity>('metered')
   const [aiMetadata, setAiMetadata] = useState(false)
 
+  // Reset the draft controls only when the *saved* values change (a save, or
+  // another operator's edit). Keyed on the whole response, the delivery-state
+  // polling above would overwrite an unsaved choice every few seconds.
+  const savedWriteMode = settings?.write_mode
+  const savedFidelity = settings?.fidelity
+  const savedAllowlist = settings?.attribute_allowlist
   useEffect(() => {
-    if (!settings) return
-    // The query may refresh after a save or external change; reset both draft controls.
+    if (!savedWriteMode || !savedFidelity || !savedAllowlist) return
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setWriteMode(settings.write_mode)
-    setFidelity(settings.fidelity)
+    setWriteMode(savedWriteMode)
+    setFidelity(savedFidelity)
     setAiMetadata(
-      CLOUD_AI_METADATA_KEYS.every((key) =>
-        settings.attribute_allowlist.includes(key)
-      )
+      CLOUD_AI_METADATA_KEYS.every((key) => savedAllowlist.includes(key))
     )
-  }, [settings])
+  }, [savedWriteMode, savedFidelity, savedAllowlist])
 
   const save = useMutation({
     mutationFn: async ({
@@ -314,7 +434,9 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
         </Alert>
       )}
 
-      {settings.queued_spans > 0 && (
+      <DeliveryFailingAlert settings={settings} />
+
+      {settings.queued_spans > 0 && !settings.delivery_failing && (
         <Alert>
           <Info className="h-4 w-4" />
           <AlertTitle>
@@ -325,31 +447,6 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
           <AlertDescription>
             These are durably queued on this instance and survive a restart.
             They are not readable in Traces until Cloud accepts them.
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {settings.dead_lettered_spans > 0 && (
-        <Alert variant="destructive">
-          <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>
-            {settings.dead_lettered_spans.toLocaleString()} span
-            {settings.dead_lettered_spans === 1 ? '' : 's'} were never delivered
-            to Temps Cloud
-          </AlertTitle>
-          <AlertDescription>
-            <p>
-              Delivery was retried until it gave up. These spans are not in
-              Traces and will not be retried automatically.
-              {settings.last_dead_letter_at
-                ? ` Most recently on ${new Date(settings.last_dead_letter_at).toLocaleString()}.`
-                : ''}
-            </p>
-            {settings.last_dead_letter_error && (
-              <p className="mt-1 font-mono text-xs break-all">
-                {settings.last_dead_letter_error}
-              </p>
-            )}
           </AlertDescription>
         </Alert>
       )}
@@ -565,7 +662,9 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       </SettingsSection>
 
       {/* ── History ────────────────────────────────────────────────── */}
-      {(settings.intervals.length > 0 || settings.gap_windows.length > 0) && (
+      {(settings.intervals.length > 0 ||
+        settings.gap_windows.length > 0 ||
+        settings.delivery_gaps.length > 0) && (
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Storage history</CardTitle>
@@ -596,6 +695,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
                 ))}
               </div>
             )}
+
+            <DeliveryGapList settings={settings} />
 
             <div className="overflow-hidden rounded-md border">
               {settings.intervals.map((interval) => (

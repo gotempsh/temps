@@ -3481,6 +3481,35 @@ export type CloudCapability = {
     setup_path: string;
 };
 
+/**
+ * A stretch of span time whose spans reached this instance but were never
+ * delivered to Temps Cloud (their retries were exhausted).
+ *
+ * Distinct from [`TelemetryGapWindowResponse`], which records spans refused
+ * at the door because the queue was full: these were accepted and queued, and
+ * the loss happened later, on the way out.
+ */
+export type CloudDeliveryGapResponse = {
+    /**
+     * When the earliest undelivered span in this stretch reached the instance.
+     */
+    first_span_at: string;
+    /**
+     * When delivery of the latest span in this stretch gave up — the same
+     * failure `last_error` describes.
+     */
+    gave_up_at?: string | null;
+    /**
+     * The instance's own bounded failure reason — never span content.
+     */
+    last_error?: string | null;
+    /**
+     * When the latest one did. Traces between the two are incomplete.
+     */
+    last_span_at: string;
+    undelivered_spans: number;
+};
+
 export type CloudFeatureSwitchesRequest = {
     backups_enabled: boolean;
     notifications_enabled: boolean;
@@ -16351,6 +16380,42 @@ export type ProjectCloudTelemetryResponse = {
      * failures.
      */
     dead_lettered_spans: number;
+    /**
+     * Whether delivery to Temps Cloud is failing for this project *now*:
+     * spans that already failed an attempt are still being retried.
+     *
+     * This, not `dead_lettered_spans`, is what decides whether the console
+     * shows an alert. Dead letters are a permanent record of a past loss and
+     * stay non-zero after the instance recovers; an alert driven by them tells
+     * a healthy instance it is broken, forever.
+     */
+    delivery_failing: boolean;
+    /**
+     * When the oldest span still being retried reached this instance.
+     */
+    delivery_failing_since?: string | null;
+    /**
+     * What the operator has to do to end the failure, when it is something
+     * they can fix — today, re-enrolling after Cloud rejected the credential.
+     */
+    delivery_failure_action?: string | null;
+    /**
+     * Why the most recent attempt failed, while `delivery_failing`.
+     */
+    delivery_failure_error?: string | null;
+    delivery_failure_setup_path?: string | null;
+    /**
+     * Past stretches of span time that were never delivered, newest first.
+     * Rendered as history, not as an alert.
+     */
+    delivery_gaps: Array<CloudDeliveryGapResponse>;
+    /**
+     * Whether older delivery gaps exist beyond the ones listed. Their spans
+     * are still counted in `dead_lettered_spans`, so a client can say how many
+     * older undelivered spans the list leaves out rather than presenting it as
+     * complete.
+     */
+    delivery_gaps_truncated: boolean;
     effective_reason?: null | TelemetryWriteIntervalReason;
     effective_reason_message?: string | null;
     /**
@@ -16386,6 +16451,10 @@ export type ProjectCloudTelemetryResponse = {
      * `cloud_write_mode_available` is false.
      */
     reason?: string | null;
+    /**
+     * Spans that failed at least one attempt and are still being retried.
+     */
+    retrying_spans: number;
     setup_path?: string | null;
     /**
      * The operator's declared intent.

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { formatBytes, formatAge } from './telemetry.js'
+import { describeDelivery, formatAge, formatBytes } from './telemetry.js'
 
 // ---------------------------------------------------------------------------
 // formatBytes
@@ -94,5 +94,81 @@ describe('formatAge', () => {
   test('renders days for very old spans', () => {
     // 7 days
     expect(formatAge(604800)).toBe('7.0d')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeDelivery
+// ---------------------------------------------------------------------------
+
+describe('describeDelivery', () => {
+  const recovered = {
+    delivery_failing: false,
+    retrying_spans: 0,
+    dead_lettered_spans: 1234,
+    delivery_gaps: [
+      {
+        first_span_at: '2026-09-24T09:00:00Z',
+        last_span_at: '2026-09-24T15:00:00Z',
+        undelivered_spans: 1234,
+        gave_up_at: '2026-09-24T17:00:00Z',
+        last_error: 'Credential rejected by the backend — re-enroll this instance',
+      },
+    ],
+  }
+
+  test('a recovered instance gets no alert, only dated history', () => {
+    // Dead letters never go away. If they raised the alert, an instance that
+    // recovered days ago would keep telling its operator to re-enroll.
+    const { alert, history } = describeDelivery(recovered)
+    expect(alert).toBeNull()
+    expect(history[0]).toContain('1,234 span(s) never delivered')
+    expect(history[1]).toContain('Credential rejected')
+  })
+
+  test('a failing delivery alerts and names the fix when there is one', () => {
+    const { alert } = describeDelivery({
+      ...recovered,
+      delivery_failing: true,
+      retrying_spans: 42,
+      delivery_failure_error: 'Credential rejected by the backend',
+      delivery_failure_action: 'Re-enroll the instance in Temps Cloud settings.',
+      delivery_failure_setup_path: '/settings/cloud',
+    })
+    expect(alert?.[0]).toContain('failing: 42 span(s) waiting to be delivered')
+    expect(alert).toContain('Re-enroll the instance in Temps Cloud settings.')
+    expect(alert).toContain('Fix it at: /settings/cloud')
+  })
+
+  test('a failure with no operator fix does not invent one', () => {
+    const { alert } = describeDelivery({
+      delivery_failing: true,
+      retrying_spans: 1,
+      dead_lettered_spans: 0,
+      delivery_gaps: [],
+    })
+    expect(alert).toHaveLength(1)
+  })
+
+  test('an older server without dated gaps still reports lost spans', () => {
+    // Such a server sends neither `delivery_failing` nor `delivery_gaps`.
+    // Dropping its dead-letter total would make the loss invisible.
+    const { alert, history } = describeDelivery({
+      dead_lettered_spans: 500,
+      last_dead_letter_error: 'Backend returned 503',
+      last_dead_letter_at: '2026-09-24T17:00:00Z',
+    } as Parameters<typeof describeDelivery>[0])
+    expect(alert).toBeNull()
+    expect(history[0]).toContain('500 span(s) never delivered')
+    expect(history[1]).toContain('Backend returned 503')
+  })
+
+  test('a truncated gap list says how many older spans it leaves out', () => {
+    const { history } = describeDelivery({
+      ...recovered,
+      dead_lettered_spans: 5000,
+      delivery_gaps_truncated: true,
+    })
+    expect(history.at(-1)).toContain('3,766 older undelivered span(s)')
   })
 })

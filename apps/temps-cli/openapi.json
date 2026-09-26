@@ -7747,6 +7747,46 @@
         ],
         "type": "object"
       },
+      "CloudDeliveryGapResponse": {
+        "description": "A stretch of span time whose spans reached this instance but were never\ndelivered to Temps Cloud (their retries were exhausted).\n\nDistinct from [`TelemetryGapWindowResponse`], which records spans refused\nat the door because the queue was full: these were accepted and queued, and\nthe loss happened later, on the way out.",
+        "properties": {
+          "first_span_at": {
+            "description": "When the earliest undelivered span in this stretch reached the instance.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "gave_up_at": {
+            "description": "When delivery of the latest span in this stretch gave up — the same\nfailure `last_error` describes.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "The instance's own bounded failure reason — never span content.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_span_at": {
+            "description": "When the latest one did. Traces between the two are incomplete.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "undelivered_spans": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "first_span_at",
+          "last_span_at",
+          "undelivered_spans"
+        ],
+        "type": "object"
+      },
       "CloudFeatureSwitchesRequest": {
         "properties": {
           "backups_enabled": {
@@ -35824,6 +35864,49 @@
             "format": "int64",
             "type": "integer"
           },
+          "delivery_failing": {
+            "description": "Whether delivery to Temps Cloud is failing for this project *now*:\nspans that already failed an attempt are still being retried.\n\nThis, not `dead_lettered_spans`, is what decides whether the console\nshows an alert. Dead letters are a permanent record of a past loss and\nstay non-zero after the instance recovers; an alert driven by them tells\na healthy instance it is broken, forever.",
+            "type": "boolean"
+          },
+          "delivery_failing_since": {
+            "description": "When the oldest span still being retried reached this instance.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_failure_action": {
+            "description": "What the operator has to do to end the failure, when it is something\nthey can fix — today, re-enrolling after Cloud rejected the credential.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_failure_error": {
+            "description": "Why the most recent attempt failed, while `delivery_failing`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_failure_setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_gaps": {
+            "description": "Past stretches of span time that were never delivered, newest first.\nRendered as history, not as an alert.",
+            "items": {
+              "$ref": "#/components/schemas/CloudDeliveryGapResponse"
+            },
+            "type": "array"
+          },
+          "delivery_gaps_truncated": {
+            "description": "Whether older delivery gaps exist beyond the ones listed. Their spans\nare still counted in `dead_lettered_spans`, so a client can say how many\nolder undelivered spans the list leaves out rather than presenting it as\ncomplete.",
+            "type": "boolean"
+          },
           "effective_reason": {
             "oneOf": [
               {
@@ -35892,6 +35975,11 @@
               "null"
             ]
           },
+          "retrying_spans": {
+            "description": "Spans that failed at least one attempt and are still being retried.",
+            "format": "int64",
+            "type": "integer"
+          },
           "setup_path": {
             "type": [
               "string",
@@ -35913,6 +36001,10 @@
           "cloud_write_mode_available",
           "queued_spans",
           "dead_lettered_spans",
+          "delivery_failing",
+          "retrying_spans",
+          "delivery_gaps",
+          "delivery_gaps_truncated",
           "gap_windows",
           "intervals"
         ],
@@ -113583,6 +113675,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Update application settings",
         "tags": [
           "Settings"
         ]
